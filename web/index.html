@@ -1,0 +1,879 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>GARGANTUA v1 控制台</title><style>
+  :root {
+    --bg: #0d1117; --bg2: #161b22; --bg3: #21262d; --bg4: #30363d;
+    --fg: #e6edf3; --fg2: #8b949e; --fg3: #6e7681;
+    --accent: #58a6ff; --accent2: #79c0ff; --green: #3fb950; --red: #f85149;
+    --orange: #d29922; --purple: #a371f7;
+    --border: #30363d;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         overflow: hidden; }
+  #statusbar { display: flex; gap: 12px; align-items: center; padding: 0 16px;
+    height: 46px; background: var(--bg2); border-bottom: 1px solid var(--border);
+    position: relative; z-index: 20; }
+  #statusbar .title { font-weight: 800; color: var(--accent); font-size: 15px;
+                      letter-spacing: .3px; display: flex; align-items: center; gap: 8px; }
+  #statusbar .title svg { width: 20px; height: 20px; fill: currentColor; }
+  .pill { padding: 3px 10px; border-radius: 12px; background: var(--bg3);
+          color: var(--fg2); font-size: 12px; white-space: nowrap; }
+  .pill.on { color: var(--green); }
+  .pill.warn { color: var(--orange); }
+  #app { display: flex; height: calc(100vh - 46px); }
+  #sidebar { display: flex; flex-direction: column; background: var(--bg2);
+             border-right: 1px solid var(--border); transition: width .18s ease;
+             width: 200px; flex-shrink: 0; }
+  #sidebar.collapsed { width: 56px; }
+  #sidebar .top { display: flex; align-items: center; justify-content: space-between;
+                  padding: 10px; border-bottom: 1px solid var(--border); }
+  #sidebar.collapsed .top { justify-content: center; }
+  #sidebar .logo-text { font-weight: 700; color: var(--accent); font-size: 13px; }
+  #sidebar.collapsed .logo-text { display: none; }
+  #toggle-nav { background: none; border: none; color: var(--fg2); cursor: pointer;
+                padding: 4px; border-radius: 6px; display: flex; }
+  #toggle-nav:hover { background: var(--bg3); color: var(--fg); }
+  #nav { flex: 1; overflow-y: auto; padding: 8px; }
+  .nav-item { display: flex; align-items: center; gap: 12px; width: 100%;
+              padding: 10px 12px; margin-bottom: 4px; border-radius: 8px;
+              background: none; border: none; color: var(--fg2); cursor: pointer;
+              text-align: left; transition: .15s; font-size: 13px; }
+  .nav-item:hover { background: var(--bg3); color: var(--fg); }
+  .nav-item.active { background: var(--bg4); color: var(--accent); }
+  .nav-item svg { width: 20px; height: 20px; flex-shrink: 0; fill: currentColor; }
+  .nav-item .label { white-space: nowrap; overflow: hidden; }
+  #sidebar.collapsed .nav-item { justify-content: center; padding: 10px 0; }
+  #sidebar.collapsed .nav-item .label { display: none; }
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #pages { flex: 1; overflow: hidden; padding: 16px; position: relative; }
+  .page { display: none; height: 100%; animation: fade .18s ease; }
+  .page.active { display: flex; flex-direction: column; }
+  .page.scroll { overflow-y: auto; }
+  @keyframes fade { from { opacity: 0; transform: translateY(4px); }
+                    to { opacity: 1; transform: translateY(0); } }
+  h2 { margin: 0 0 14px; font-size: 17px; color: var(--accent); flex-shrink: 0; }
+  textarea, input[type=text], input[type=number], select {
+    background: var(--bg3); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 10px; width: 100%; font-family: inherit;
+    font-size: 13px; outline: none; }
+  textarea:focus, input:focus, select:focus { border-color: var(--accent); }
+  textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, monospace; }
+  button.act { background: var(--accent); color: #06101f; border: none;
+    border-radius: 6px; padding: 7px 16px; cursor: pointer; font-weight: 600;
+    font-size: 13px; display: inline-flex; align-items: center; gap: 6px; }
+  button.act:hover { background: var(--accent2); }
+  button.act:disabled { opacity: .45; cursor: default; }
+  button.act.sec { background: var(--bg3); color: var(--fg); border: 1px solid var(--border); }
+  button.act.sec:hover { background: var(--bg4); }
+  button.act.danger { background: var(--red); color: #fff; }
+  button.act.danger:hover { background: #ff7b72; }
+  button.act.xs { padding: 3px 9px; font-size: 12px; border-radius: 5px; }
+  .row { display: flex; gap: 12px; align-items: center; margin: 10px 0;
+         flex-wrap: wrap; }
+  .row label { color: var(--fg2); font-size: 12px; display: flex;
+               align-items: center; gap: 6px; }
+  .row input[type=number] { width: 78px; }
+  .card { background: var(--bg2); border: 1px solid var(--border);
+          border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+  .card-head { display: flex; justify-content: space-between; align-items: center;
+               margin-bottom: 10px; }
+  .card-title { font-weight: 600; color: var(--fg); font-size: 14px; }
+  .hint { color: var(--fg2); font-size: 12px; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px;
+           background: var(--bg3); color: var(--fg2); font-size: 11px; }
+  .badge.on { color: var(--green); }
+  pre { background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+        padding: 10px; overflow: auto; font-size: 12px; margin: 0;
+        white-space: pre-wrap; word-break: break-all;
+        font-family: ui-monospace, SFMono-Regular, monospace; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+  th { background: var(--bg3); color: var(--fg2); font-weight: 600; }
+  tr:hover td { background: rgba(88,166,255,.06); }
+  canvas.chart { background: var(--bg); border: 1px solid var(--border);
+           border-radius: 6px; width: 100%; }
+  .svg-out svg { max-width: 100%; height: auto; display: block;
+                 border: 1px solid var(--border); border-radius: 6px; background: #fff; }
+  .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                 gap: 12px; margin-bottom: 12px; }
+  .metric { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
+            padding: 14px; }
+  .metric .k { color: var(--fg2); font-size: 12px; }
+  .metric .v { font-size: 18px; font-weight: 700; color: var(--fg); margin-top: 4px; }
+  .train-top { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; flex-shrink: 0; }
+  .train-bottom { flex: 1; display: flex; flex-direction: column; gap: 12px; min-height: 0; }
+  .train-bottom .card { margin-bottom: 0; display: flex; flex-direction: column; }
+  #train-log-card { flex: 1.2; min-height: 0; }
+  #train-log-card pre { flex: 1; min-height: 120px; }
+  #train-loss-card { flex: 1; min-height: 0; }
+  #loss-canvas { flex: 1; min-height: 160px; }
+  @media (max-width: 1100px) { .train-top { grid-template-columns: 1fr; } }
+  .queue-item { display: flex; justify-content: space-between; align-items: center;
+                padding: 7px 10px; background: var(--bg); border-radius: 6px;
+                margin-bottom: 6px; border: 1px solid var(--border); }
+  .queue-item .name { font-family: monospace; font-size: 12px; overflow: hidden;
+                      text-overflow: ellipsis; white-space: nowrap; }
+  #train-queue { max-height: 260px; overflow-y: auto; }
+  #infer-wrap { flex: 1; display: flex; gap: 0; min-height: 0; }
+  #infer-main { flex: 1; display: flex; flex-direction: column; min-width: 0;
+                padding: 0 24px; }
+  #chat-history { flex: 1; overflow-y: auto; padding: 8px 0;
+                  display: flex; flex-direction: column; gap: 16px; }
+  #chat-empty { margin: auto; text-align: center; color: var(--fg2); }
+  #chat-empty .big { font-size: 42px; font-weight: 800; letter-spacing: 4px;
+                     color: var(--fg); margin-bottom: 12px; }
+  .msg-row { display: flex; width: 100%; }
+  .msg { max-width: 76%; padding: 10px 16px; border-radius: 16px;
+         line-height: 1.6; word-break: break-word; }
+  .msg.user { margin-left: auto; background: var(--accent); color: #06101f;
+              border-bottom-right-radius: 4px; }
+  .msg.model { margin-right: auto; background: var(--bg3); color: var(--fg);
+               border-bottom-left-radius: 4px; }
+  .msg .media img, .msg .media video { max-width: 100%; border-radius: 10px;
+                                        display: block; margin-top: 6px; }
+  .msg .media audio { margin-top: 6px; }
+  #input-dock { flex-shrink: 0; padding: 8px 0 12px; }
+  #input-box { background: var(--bg2); border: 1px solid var(--border);
+               border-radius: 20px; padding: 10px 14px; }
+  #infer-prompt { border: none; background: none; resize: none; padding: 4px 2px;
+                  font-size: 14px; }
+  #infer-prompt:focus { outline: none; border: none; }
+  #input-tools { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+  #send-btn { margin-left: auto; width: 34px; height: 34px; border-radius: 50%;
+              border: none; background: var(--accent); color: #06101f;
+              cursor: pointer; display: flex; align-items: center;
+              justify-content: center; font-size: 16px; }
+  #send-btn:hover { background: var(--accent2); }
+  #send-btn:disabled { opacity: .4; cursor: default; }
+  #attach-preview { display: none; margin-top: 6px; }
+  #attach-preview img, #attach-preview video { max-height: 100px; border-radius: 8px; }
+  #debug-panel { width: 220px; flex-shrink: 0; background: var(--bg2);
+                 border-left: 1px solid var(--border); padding: 14px;
+                 overflow-y: auto; transition: width .18s, padding .18s; }
+  #debug-panel.collapsed { width: 44px; padding: 14px 4px; }
+  #debug-panel .head { display: flex; justify-content: space-between;
+                       align-items: center; margin-bottom: 12px; }
+  #debug-panel.collapsed .head { justify-content: center; }
+  #debug-panel.collapsed .head span, #debug-panel.collapsed .field { display: none; }
+  #debug-panel .toggle { background: none; border: none; color: var(--fg2);
+                         cursor: pointer; padding: 4px; border-radius: 6px; }
+  #debug-panel .toggle:hover { background: var(--bg3); color: var(--fg); }
+  .field { margin-bottom: 12px; }
+  .field label { display: block; color: var(--fg2); font-size: 12px; margin-bottom: 4px; }
+  .codec-io { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; flex: 1;
+              min-height: 0; }
+  .codec-io pre { max-height: none; height: 100%; }
+  @media (max-width: 900px) { .codec-io { grid-template-columns: 1fr; } }
+  .token-palette { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  .token-palette button { background: var(--bg3); border: 1px solid var(--border);
+                          color: var(--fg2); border-radius: 6px; padding: 5px 10px;
+                          cursor: pointer; font-size: 12px;
+                          font-family: ui-monospace, monospace; }
+  .token-palette button:hover { background: var(--bg4); color: var(--fg); }
+  #json-editor { flex: 1; border: 1px solid var(--border); border-radius: 8px;
+                 background: var(--bg); font-family: ui-monospace, SFMono-Regular, monospace;
+                 font-size: 13px; padding: 12px; outline: none; overflow: auto;
+                 white-space: pre; tab-size: 2; min-height: 300px; }
+  #json-editor:focus { border-color: var(--accent); }
+
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--bg4); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--fg3); }</style></head><body><div id="statusbar"><span class="title"><svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>GARGANTUA v1</span><span class="pill" id="sb-model">模型: —</span><span class="pill" id="sb-params">参数量: —</span><span class="pill" id="sb-train">训练: 空闲</span><span class="pill" id="sb-queue">队列: 0</span><span class="pill" id="sb-kv" title="">KV</span></div><div id="app"><nav id="sidebar"><div class="top"><span class="logo-text">控制台</span><button id="toggle-nav" title="折叠/展开"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button></div><div id="nav"></div></nav><main id="main"><div id="pages"><section class="page scroll active" id="p-home"><h2>主页</h2><div class="metric-grid"><div class="metric"><div class="k">活动模型</div><div class="v" id="home-model">—</div></div><div class="metric"><div class="k">参数量</div><div class="v" id="home-params">—</div></div><div class="metric"><div class="k">训练状态</div><div class="v" id="home-train">空闲</div></div><div class="metric"><div class="k">队列长度</div><div class="v" id="home-queue">0</div></div><div class="metric"><div class="k">PyTorch</div><div class="v" id="home-torch">—</div></div><div class="metric"><div class="k">设备</div><div class="v" id="home-device">—</div></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><span class="card-title">环境与依赖</span></div>
+          <pre id="home-env">加载中…</pre>
+        </div>
+        <div class="card">
+          <div class="card-head"><span class="card-title">KV 架构</span></div>
+          <pre id="home-kv">加载中…</pre>
+        </div>
+      </section>
+      <section class="page scroll" id="p-models">
+        <h2>模型</h2>
+        <div class="card">
+          <div class="card-head"><span class="card-title">创建新模型</span></div>
+          <div class="row">
+            <input type="text" id="model-name" placeholder="模型目录名，如 beta" style="max-width:260px">
+            <label title="默认 4">enc blocks <input type="number" id="model-enc" value="4" min="1" max="64" style="width:60px"></label>
+            <label title="默认 6">dec blocks <input type="number" id="model-dec" value="6" min="1" max="64" style="width:60px"></label>
+            <button class="act" id="model-create">创建并初始化</button>
+            <span class="hint" id="model-create-msg"></span>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><span class="card-title">已有模型</span>
+            <button class="act sec xs" id="model-refresh">刷新</button></div>
+          <table>
+            <thead><tr><th>名称</th><th>参数量</th><th>操作</th></tr></thead>
+            <tbody id="model-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="page" id="p-train">
+        <h2>训练</h2>
+        <div class="train-top">
+          <div class="card">
+            <div class="card-head"><span class="card-title">创建训练任务</span></div>
+            <div class="hint">上传训练数据 JSON 文件：单个对象 {"text":"..."}、对象数组，或 JSONL 每行一个对象，均必须含 text 字段</div>
+            <div class="row"><input type="file" id="train-file" accept=".json,.jsonl"></div>
+            <div class="row">
+              <label>优化器（Muon：隐藏层矩阵；AdamW：embedding/输出头/RMSNorm）
+                <select id="train-mode">
+                  <option value="muon" selected>muon + adamw（分工）</option>
+                  <option value="adamw">全部 adamw</option>
+                </select>
+              </label>
+              <label>目标模型 <select id="train-target"><option value="">当前活动模型</option></select></label>
+            </div>
+            <div class="row">
+              <label title="每次训练从文本中随机截取的连续 token 窗口长度">上下文窗口 block_size
+                <input type="number" id="train-block" value="16" min="4" step="2"></label>
+              <label>steps/文件 <input type="number" id="train-steps" value="20" min="1"></label>
+              <button class="act" id="train-enqueue">提交训练任务</button>
+              <span class="hint" id="train-enqueue-msg"></span>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head"><span class="card-title">训练队列</span>
+              <button class="act sec xs" id="queue-refresh">刷新</button></div>
+            <div id="train-queue"><span class="hint">加载中…</span></div>
+          </div>
+        </div>
+        <div class="train-bottom">
+          <div class="card" id="train-log-card">
+            <div class="card-head"><span class="card-title">训练日志</span>
+              <span>
+                <button class="act xs" id="train-start">开始训练</button>
+                <button class="act danger xs" id="train-stop">停止</button>
+                <span class="hint" id="train-state" style="margin-left:8px;"></span>
+              </span>
+            </div>
+            <pre id="train-log">—</pre>
+          </div>
+          <div class="card" id="train-loss-card">
+            <div class="card-head"><span class="card-title">Loss 曲线</span>
+              <span class="hint">每步 = 单个样本随机窗口的独立 loss；悬停查看数值，点与点之间无平均，波动为样本难度差异，非回升</span></div>
+            <canvas class="chart" id="loss-canvas" width="1200" height="240"></canvas>
+          </div>
+        </div>
+      </section>
+      <section class="page" id="p-infer">
+        <div id="infer-wrap">
+          <div id="infer-main">
+            <div id="chat-history">
+              <div id="chat-empty">
+                <div class="big">GARGANTUA</div>
+                <div>尽管问，或上传图片 / 音频 / 视频作为上下文</div>
+              </div>
+            </div>
+            <div id="input-dock">
+              <div id="input-box">
+                <div id="attach-preview"></div>
+                <textarea id="infer-prompt" rows="2" placeholder="输入消息…"></textarea>
+                <div id="input-tools">
+                  <label class="act sec xs" style="cursor:pointer;margin:0;">＋ 附件
+                    <input type="file" id="infer-media" accept="image/*,video/*,.wav,.mp3,.flac,.ogg,.mid,.midi" style="display:none">
+                  </label>
+                  <label title="最多生成多少个新 token">max_new
+                    <input type="number" id="infer-maxnew" value="32" min="1" max="512" style="width:64px"></label>
+                  <span class="hint" id="infer-status"></span>
+                  <button id="send-btn" title="发送">↑</button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <aside id="debug-panel">
+            <div class="head">
+              <span class="card-title">调试参数</span>
+              <button class="toggle" title="折叠">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M15 6l-6 6 6 6"/></svg>
+              </button>
+            </div>
+            <div class="field" title="采样温度：越低输出越确定"><label>temperature</label>
+              <input type="number" id="infer-temp" value="0.8" step="0.1" min="0.05"></div>
+            <div class="field" title="核采样累计概率阈值：只从累计概率达到 top_p 的最小 token 集合中采样"><label>top_p</label>
+              <input type="number" id="infer-topp" value="0.95" step="0.01" min="0.01" max="1"></div>
+          </aside>
+        </div>
+      </section>
+      <section class="page" id="p-text">
+        <h2>文本 → token 转换</h2>
+        <div class="row">
+          <label>谁的输入/输出
+            <select id="text-bound"><option value="user">用户输入 &lt;user&gt;</option>
+              <option value="model" selected>模型输出 &lt;model&gt;</option></select></label>
+          <button class="act" id="text-encode">编码</button>
+          <span class="hint">输出为项目定制 token 时间步格式：{}=一个时间步，{}内 token 以半角逗号分隔，裸字符/数字不带符号</span>
+        </div>
+        <div class="codec-io">
+          <textarea id="text-in" placeholder="粘贴文本…">Hello, 世界！</textarea>
+          <pre id="text-out">—</pre>
+        </div>
+      </section>
+      <section class="page" id="p-audio">
+        <h2>音频 → token 转换</h2>
+        <div class="hint">支持 wav / mp3 / flac / ogg（ffmpeg 解码后重采样到 16kHz 单声道）；533 个采样点平铺为一条向量 = 1 个音元（≈30 tok/s），embedding 时直接乘矩阵投影，外围裹 &lt;audio&gt;…&lt;audio/&gt;</div>
+        <div class="row">
+          <label>谁的输入/输出
+            <select id="audio-bound"><option value="user" selected>用户输入 &lt;user&gt;</option>
+              <option value="model">模型输出 &lt;model&gt;</option></select></label>
+          <input type="file" id="audio-file" accept=".wav,.mp3,.flac,.ogg,audio/*">
+          <button class="act" id="audio-encode">编码</button>
+        </div>
+        <div id="audio-preview" class="row"></div>
+        <pre id="audio-out" style="flex:1;">—</pre>
+      </section>
+      <section class="page" id="p-image">
+        <h2>图片 → token 转换（单帧）</h2>
+        <div class="hint">图片拆 32×32 patches，patch 内部平铺成一条向量，embedding 时乘矩阵投影，所有 patch 放在同一个时间步内，外围裹 &lt;visual&gt;…&lt;visual/&gt;</div><div class="row"><label>谁的输入/输出<select id="image-bound"><option value="user" selected>用户输入 &lt;user&gt;</option><option value="model">模型输出 &lt;model&gt;</option></select></label><input type="file" id="image-file" accept="image/*"><button class="act" id="image-encode">编码</button></div><div class="codec-io" style="margin-top:10px;"><div><img id="image-preview" style="max-width:100%;max-height:320px;border-radius:6px;border:1px solid var(--border);" alt=""></div><pre id="image-out">—</pre></div></section><section class="page" id="p-video"><h2>视频 → token 转换（含声音）</h2><div class="hint">导入视频（mp4/mov/webm/mkv/gif，ffmpeg 抽帧 30fps、提取音轨）；每帧 = patches 裹 &lt;visual&gt; + 该帧 533 采样音频裹 &lt;audio&gt;，同一帧放在同一个时间步</div><div class="row"><label>谁的输入/输出<select id="video-bound"><option value="user" selected>用户输入 &lt;user&gt;</option><option value="model">模型输出 &lt;model&gt;</option></select></label><input type="file" id="video-file" accept="video/*,.gif,.webp"><button class="act" id="video-encode">编码</button></div><div class="row"><video id="video-preview" controls style="max-height:180px;border-radius:6px;display:none;"></video></div><div id="video-stats" class="hint"></div><pre id="video-out" style="flex:1;">—</pre></section><section class="page" id="p-prims"><h2>图像 → 图元转换（可视化）</h2><div class="hint">上传图片，按 wonderfulearth/primitive-operation-painter 的 image-to-sequence 思路（贪心拟合矩形/椭圆+背景，残差最小化）转换为图元序列并渲染</div><div class="row"><input type="file" id="prims-file" accept="image/*"><label class="hint" for="prims-steps">步数上限</label><input type="number" id="prims-steps" value="100" min="1" max="5000" step="1" style="width:80px;" title="默认 100；越大质量越高，耗时线性增长"><label class="hint" for="prims-quality">模式</label><select id="prims-quality" style="width:80px;" title="fast=快，20候选/步；slow=慢，50候选/步+短爬山"><option value="fast">fast</option><option value="slow">slow</option></select><button class="act" id="prims-convert">转换</button><span class="hint" id="prims-msg"></span></div><div class="codec-io" style="margin-top:10px;"><div><div class="hint">原图</div><img id="prims-src" style="max-width:100%;max-height:320px;border-radius:6px;border:1px solid var(--border);" alt=""></div><div><div class="hint">图元渲染（SVG）</div><div id="prims-render" class="svg-out"></div></div></div><pre id="prims-out" style="flex-shrink:0;max-height:200px;">—</pre></section><section class="page" id="p-midi"><h2>MIDI → token 转换</h2><div class="hint">导入 .mid / .midi（SMF），解析 note_on/note_off/velocity/program/tempo/time_shift 为离散 token，输出定制时间步格式（每 token 一个时间步）</div><div class="row"><input type="file" id="midi-file" accept=".mid,.midi"><button class="act" id="midi-encode">编码</button></div><pre id="midi-out">—</pre><div class="card" style="margin-top:12px;"><div class="hint">token 序列（JSON 数组）→ 下载 .mid</div><textarea id="midi-tokens-in" rows="2" placeholder="[77610, 77866, ...]"></textarea><div class="row"><button class="act" id="midi-decode">生成并下载 .mid</button><span class="hint" id="midi-decode-msg"></span></div></div></section><section class="page" id="p-json"><h2>Token 编辑器</h2><div class="hint">GARGANTUA token stream（.gts）：{} 为时间步原子，&lt;...&gt; 为特殊/边界 token，裸字符为 char token。所有边界 token 各自独占一个时间步。同时间步多 token 仅用于图像/视频帧。</div><div class="row"><button class="act" id="json-format">格式化</button><button class="act sec" id="json-minify">压缩</button><button class="act sec" id="json-copy">复制</button><span class="hint" id="json-msg"></span></div><div class="token-palette" id="json-palette"></div><div id="json-editor" contenteditable="true" spellcheck="false">{<user>}{h}{e}{l}{l}{o}{<user/>}</div></section></div></main></div>
+<script>
+const $ = id => document.getElementById(id);
+const $$ = (sel, el=document) => el.querySelectorAll(sel);
+
+async function api(path, body) {
+  const opt = body === undefined ? {} :
+    {method: "POST", headers: {"Content-Type": "application/json"},
+     body: JSON.stringify(body)};
+  const r = await fetch(path, opt);
+  const txt = await r.text();
+  const j = txt ? JSON.parse(txt) : {};
+  if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+  return j;
+}
+function esc(s) { const d = document.createElement("div"); d.textContent = s;
+  return d.innerHTML; }
+function fileToB64(f) {
+  return new Promise((res, rej) => {
+    const rd = new FileReader();
+    rd.onload = () => res(rd.result.split(",")[1]);
+    rd.onerror = rej;
+    rd.readAsDataURL(f);
+  });
+}
+function fileToUrl(f) { return URL.createObjectURL(f); }
+const _B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+function b64ToBytes(b64) {
+  const out = new Uint8Array(b64.length * 3 / 4);
+  let p = 0, buf = 0, bits = 0;
+  for (const c of b64) {
+    if (c === "=") break;
+    buf = (buf << 6) | _B64_CHARS.indexOf(c); bits += 6;
+    if (bits >= 8) { bits -= 8; out[p++] = (buf >> bits) & 0xFF; }
+  }
+  return out.subarray(0, p);
+}
+const _F32 = new Float32Array(1), _U32 = new Uint32Array(_F32.buffer);
+function f32hex(f) { _F32[0] = f; return _U32[0].toString(16).padStart(8, "0"); }
+
+function audioStepHex(st) {
+  const meta = st.meta || {};
+  if (!meta.samples_b64) return "00000000";
+  const b = b64ToBytes(meta.samples_b64);
+  if (b.length < 4) return "00000000";
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  return f32hex(dv.getFloat32(0, true));
+}
+
+function visualPatchToken(p) {
+  const b = b64ToBytes(p.vec_b64 || "");
+  const n = b.length >> 2;
+  if (n === 0) return `<x-axis:${p.x},y-axis:${p.y},R0,G0,B0,A0>`;
+  let rs = 0, gs = 0, bs = 0, as = 0;
+  for (let i = 0; i < b.length; i += 4) {
+    rs += b[i]; gs += b[i + 1]; bs += b[i + 2]; as += b[i + 3];
+  }
+  const q = (v, lv) => Math.round(v / n / 255 * (lv - 1));
+  return `<x-axis:${p.x},y-axis:${p.y},R${q(rs,1024)},G${q(gs,1024)},` +
+         `B${q(bs,1024)},A${q(as,1000)}>`;
+}
+
+function stepsToGts(steps, bound) {
+  const typeTag = bound === "user" ? "<user>" : "<model>";
+  const endTag = bound === "user" ? "<user/>" : "<model/>";
+  const parts = ["{" + typeTag + "}"];
+  let i = 0;
+  while (i < steps.length) {
+    const st = steps[i];
+    if (st.time_step) {
+      parts.push("{<visual>}");
+      while (i < steps.length && steps[i].time_step) {
+        const frame = steps[i].time_step;
+        const visual = frame.find(s => s.modality === "visual");
+        const toks = [];
+        if (visual) {
+          for (const p of ((visual.meta || {}).patches || []))
+            toks.push(visualPatchToken(p));
+        }
+        for (const sub of frame) {
+          if (sub.modality === "audio") toks.push(`<wave:${audioStepHex(sub)}>`);
+        }
+        if (toks.length) parts.push("{" + toks.join(",") + "}");
+        i++;
+      }
+      parts.push("{<visual/>}");
+      continue;
+    }
+
+    if (st.modality === "audio") {
+      parts.push("{<audio>}");
+      while (i < steps.length && steps[i].modality === "audio") {
+        parts.push(`{<wave:${audioStepHex(steps[i])}>}`);
+        i++;
+      }
+      parts.push("{<audio/>}");
+      continue;
+    }
+
+    if (st.modality === "visual") {
+      parts.push("{<visual>}");
+      while (i < steps.length && steps[i].modality === "visual") {
+        const patches = ((steps[i].meta || {}).patches) || [];
+        const toks = patches.map(visualPatchToken);
+        parts.push("{" + toks.join(",") + "}");
+        i++;
+      }
+      parts.push("{<visual/>}");
+      continue;
+    }
+
+    if (st.modality === "draw") {
+      const ids = st.token_ids || [];
+      for (let j = 0; j + 9 <= ids.length; j += 9)
+        parts.push("{" + ids.slice(j, j + 9).map(t => `<id:${t}>`).join(",") + "}");
+      i++;
+      continue;
+    }
+    const ids = st.token_ids || [];
+    if (ids.length === 0) { parts.push("{}"); i++; continue; }
+    for (const id of ids) parts.push(`{<id:${id}>}`);
+    i++;
+  }
+  parts.push("{" + endTag + "}");
+  return parts.join("");
+}
+const NAV = [
+  {id:"home", label:"主页", icon:"M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"},
+  {id:"models", label:"模型", icon:"M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"},
+  {id:"train", label:"训练", icon:"M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"},
+  {id:"infer", label:"推理", icon:"M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"},
+  {id:"text", label:"文本→token", icon:"M4 6h16M4 12h16M4 18h7"},
+  {id:"audio", label:"音频→token", icon:"M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2z"},
+  {id:"image", label:"图片→token", icon:"M4 16l4.586-5.657a2 2 0 013 0L15 14m-2-2l2.586-3.657a2 2 0 013 0L20 12M4 6h16M4 12h16M4 18h16"},
+  {id:"video", label:"视频→token", icon:"M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"},
+  {id:"prims", label:"图像→图元", icon:"M12 3l1.9 5.8H20l-4.9 3.6 1.9 5.8-5-3.6-5 3.6 1.9-5.8L4 8.8h6.1z"},
+  {id:"midi", label:"MIDI→token", icon:"M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2"},
+  {id:"json", label:"Token 编辑器", icon:"M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"},
+];
+const navEl = $("nav");
+NAV.forEach(n => {
+  const b = document.createElement("button");
+  b.className = "nav-item" + (n.id === "home" ? " active" : "");
+  b.dataset.p = n.id;
+  b.innerHTML = `<svg viewBox="0 0 24 24"><path d="${n.icon}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="label">${esc(n.label)}</span>`;
+  b.onclick = () => switchPage(n.id);
+  navEl.appendChild(b);
+});
+function switchPage(id) {
+  $$(".nav-item").forEach(x => x.classList.toggle("active", x.dataset.p === id));
+  $$(".page").forEach(x => x.classList.toggle("active", x.id === "p-" + id));
+  if (id === "models") refreshModels();
+  if (id === "train") refreshQueue();
+}
+$("toggle-nav").onclick = () => $("sidebar").classList.toggle("collapsed");
+async function refreshStatus() {
+  try {
+    const s = await api("/api/status");
+    $("sb-model").textContent = "模型: " +
+      (s.model || (s.loading ? s.loading + "（加载中）" : "—"));
+    $("sb-model").className = "pill" + (s.model ? " on" : s.loading ? " warn" : "");
+    $("sb-params").textContent = "参数量: " +
+      (s.params ? (s.params / 1e6).toFixed(1) + "M" : "—");
+    $("sb-train").textContent = "训练: " + (s.training ? "运行中" : "空闲");
+    $("sb-train").className = "pill" + (s.training ? " on" : "");
+    $("sb-queue").textContent = "队列: " + s.queue;
+    $("sb-kv").title = s.kv_note || "";
+    $("home-model").textContent = s.model || (s.loading || "—");
+    $("home-params").textContent = s.params ? (s.params / 1e6).toFixed(1) + "M" : "—";
+    $("home-train").textContent = s.training ? "运行中" : "空闲";
+    $("home-queue").textContent = s.queue;
+  } catch (e) {}
+}
+setInterval(refreshStatus, 2000);
+refreshStatus();
+async function refreshHome() {
+  try {
+    const s = await api("/api/system");
+    $("home-torch").textContent = s.torch || "—";
+    $("home-device").textContent = s.device || "—";
+    $("home-env").textContent = JSON.stringify({
+      torch: s.torch, device: s.device, python: s.python,
+      dependencies: s.dependencies,
+    }, null, 2);
+    $("home-kv").textContent = s.kv_note || "—";
+  } catch (e) { $("home-env").textContent = "获取失败: " + e.message; }
+}
+refreshHome();
+async function refreshModels() {
+  try {
+    const r = await api("/api/models");
+    $("model-tbody").innerHTML = r.models.map(m =>
+      `<tr><td>${esc(m.name)} ${m.name === r.active ? '<span class="badge on">当前</span>' : ""}</td>
+       <td>${m.params ? (m.params/1e6).toFixed(1)+"M" : "—"}</td>
+       <td><button class="act sec xs" onclick="loadModel('${esc(m.name)}')">加载</button></td></tr>`).join("");
+    const target = $("train-target");
+    const cur = target.value;
+    target.innerHTML = '<option value="">当前活动模型</option>' +
+      r.models.map(m => `<option value="${esc(m.name)}">${esc(m.name)}</option>`).join("");
+    target.value = cur;
+  } catch (e) {}
+}
+window.loadModel = async name => {
+  try { await api("/api/model/load", {name});
+        $("model-create-msg").textContent = "已加载 " + name; refreshStatus(); }
+  catch (e) { $("model-create-msg").textContent = "错误: " + e.message; }
+};
+$("model-create").onclick = async () => {
+  const name = $("model-name").value.trim();
+  if (!name) return;
+  $("model-create-msg").textContent = "初始化中…";
+  try {
+    const {task_id} = await api("/api/model/init", {
+      name,
+      n_enc_blocks: parseInt($("model-enc").value) || undefined,
+      n_dec_blocks: parseInt($("model-dec").value) || undefined,
+    });
+    const t0 = Date.now();
+    while (Date.now() - t0 < 120000) {
+      await new Promise(r => setTimeout(r, 1500));
+      const t = await api("/api/task/" + task_id);
+      if (t.status === "done") {
+        $("model-create-msg").textContent = "创建成功";
+        refreshModels(); refreshStatus(); return;
+      }
+      if (t.status === "error") throw new Error(t.error);
+    }
+    $("model-create-msg").textContent = "轮询超时";
+  } catch (e) { $("model-create-msg").textContent = "错误: " + e.message; }
+};
+$("model-refresh").onclick = refreshModels;
+$("train-enqueue").onclick = async () => {
+  const file = $("train-file").files[0];
+  const msg = $("train-enqueue-msg");
+  if (!file) { msg.textContent = "请先选择 JSON / JSONL 训练数据文件"; return; }
+  try {
+    const r = await api("/api/train/enqueue", {
+      json_b64: await fileToB64(file), filename: file.name,
+      optimizer: $("train-mode").value,
+    });
+    msg.textContent = `已入队 ${r.queued.length} 个训练任务（共 ${r.n_samples} 条样本）`;
+    $("train-file").value = "";
+    refreshQueue(); refreshStatus();
+  } catch (e) { msg.textContent = "错误: " + e.message; }
+};
+async function refreshQueue() {
+  try {
+    const r = await api("/api/train/queue");
+    const el = $("train-queue");
+    if (!r.items.length) { el.innerHTML = '<span class="hint">队列为空</span>'; return; }
+    el.innerHTML = r.items.map(it =>
+      `<div class="queue-item"><span class="name" title="${esc(it.name)}">${esc(it.name)}
+        <span class="hint">（${it.optimizer || "?"}）</span></span>
+       <button class="act danger xs" onclick="deleteQueue('${esc(it.name)}')">删除</button></div>`
+    ).join("");
+  } catch (e) { $("train-queue").textContent = "错误: " + e.message; }
+}
+window.deleteQueue = async name => {
+  try { await api("/api/train/delete", {name}); refreshQueue(); refreshStatus(); }
+  catch (e) { alert(e.message); }
+};
+$("queue-refresh").onclick = refreshQueue;
+$("train-start").onclick = async () => {
+  try {
+    const r = await api("/api/train/start", {
+      steps: +$("train-steps").value, block_size: +$("train-block").value});
+    $("train-state").textContent = r.started ? "已启动" : "已在运行中";
+  } catch (e) { $("train-state").textContent = "错误: " + e.message; }
+};
+$("train-stop").onclick = async () => {
+  try { await api("/api/train/stop", {});
+        $("train-state").textContent = "停止请求已发送"; }
+  catch (e) { $("train-state").textContent = "错误: " + e.message; }
+};
+function drawLoss(tail) {
+  const cv = $("loss-canvas"), ctx = cv.getContext("2d");
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.fillStyle = "#8b949e"; ctx.font = "12px ui-monospace, monospace";
+  if (!tail.length) { ctx.fillText("暂无 loss 数据", 20, 30); cv._pts = null; return; }
+  const losses = tail.map(r => r.loss);
+  const lo = Math.min(...losses), hi = Math.max(...losses);
+  const pad = 40, W = cv.width - pad * 2, H = cv.height - pad * 2;
+  ctx.strokeStyle = "#30363d"; ctx.strokeRect(pad, pad, W, H);
+  ctx.fillText(hi.toFixed(3), 4, pad + 4); ctx.fillText(lo.toFixed(3), 4, pad + H);
+  ctx.fillText("step " + tail[0].step + " → " + tail[tail.length - 1].step,
+               pad, cv.height - 10);
+  const pts = tail.map((r, i) => {
+    const x = pad + (tail.length === 1 ? W / 2 : i / (tail.length - 1) * W);
+    const y = pad + H - (hi === lo ? H / 2 : (r.loss - lo) / (hi - lo) * H);
+    return {x, y, step: r.step, loss: r.loss, file: r.file || ""};
+  });
+  cv._pts = pts;
+  ctx.strokeStyle = "#58a6ff"; ctx.lineWidth = 1.2; ctx.beginPath();
+  pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+  ctx.stroke();
+  ctx.fillStyle = "#58a6ff";
+  pts.forEach(p => { ctx.beginPath(); ctx.arc(p.x, p.y, 2, 0, 7); ctx.fill(); });
+}
+$("loss-canvas").onmousemove = e => {
+  const cv = e.currentTarget, pts = cv._pts;
+  if (!pts || !pts.length) return;
+  const rect = cv.getBoundingClientRect();
+  const sx = cv.width / rect.width, sy = cv.height / rect.height;
+  const mx = (e.clientX - rect.left) * sx, my = (e.clientY - rect.top) * sy;
+  let best = null, bd = 1e9;
+  for (const p of pts) {
+    const d = (p.x - mx) ** 2 + (p.y - my) ** 2;
+    if (d < bd) { bd = d; best = p; }
+  }
+  if (best && bd < 4000) {
+    cv.title = `step ${best.step}  loss=${best.loss}` +
+               (best.file ? `\n样本: ${best.file}` : "");
+  }
+};
+async function refreshTrain() {
+  try {
+    const s = await api("/api/train/status");
+    drawLoss(s.loss_tail || []);
+    $("train-log").textContent = (s.log_tail || []).slice(-200).join("\n") || "—";
+    $("train-state").textContent =
+      (s.running ? "运行中 step=" + s.step : "空闲 step=" + s.step);
+  } catch (e) {}
+}
+setInterval(refreshTrain, 2000);
+const chatHistory = $("chat-history");
+let lastMedia = null, mediaObjUrl = null;
+function hideEmpty() { const e = $("chat-empty"); if (e) e.style.display = "none"; }
+function addMsg(role, html) {
+  hideEmpty();
+  const row = document.createElement("div"); row.className = "msg-row";
+  const d = document.createElement("div"); d.className = "msg " + role;
+  d.innerHTML = html; row.appendChild(d);
+  chatHistory.appendChild(row); chatHistory.scrollTop = chatHistory.scrollHeight;
+}
+$("infer-media").onchange = () => {
+  const f = $("infer-media").files[0]; if (!f) return;
+  lastMedia = f;
+  if (mediaObjUrl) URL.revokeObjectURL(mediaObjUrl);
+  mediaObjUrl = fileToUrl(f);
+  let tag = "";
+  if (f.type.startsWith("image/")) tag = `<img src="${mediaObjUrl}">`;
+  else if (f.type.startsWith("video/")) tag = `<video src="${mediaObjUrl}" controls></video>`;
+  else tag = `<div class="hint">已选择音频/文件：${esc(f.name)}</div><audio src="${mediaObjUrl}" controls></audio>`;
+  const ap = $("attach-preview"); ap.innerHTML = tag; ap.style.display = "block";
+};
+$("send-btn").onclick = async () => {
+  const st = $("infer-status");
+  const prompt = $("infer-prompt").value;
+  if (!prompt.trim() && !lastMedia) return;
+  let userHtml = esc(prompt);
+  if (lastMedia) {
+    let tag = "";
+    if (lastMedia.type.startsWith("image/")) tag = `<img src="${mediaObjUrl}">`;
+    else if (lastMedia.type.startsWith("video/")) tag = `<video src="${mediaObjUrl}" controls></video>`;
+    else tag = `<audio src="${mediaObjUrl}" controls></audio>`;
+    userHtml += `<div class="media">${tag}</div>`;
+  }
+  addMsg("user", userHtml);
+  $("infer-prompt").value = "";
+  st.textContent = "思考中…";
+  $("send-btn").disabled = true;
+  try {
+    const body = {prompt,
+                  max_new_tokens: +$("infer-maxnew").value,
+                  temperature: +$("infer-temp").value,
+                  top_p: +$("infer-topp").value};
+    if (lastMedia) { body.media_b64 = await fileToB64(lastMedia);
+                     body.media_name = lastMedia.name; }
+    const {task_id} = await api("/api/infer", body);
+    const t0 = Date.now();
+    while (Date.now() - t0 < 600000) {
+      await new Promise(r => setTimeout(r, 1500));
+      const t = await api("/api/task/" + task_id);
+      if (t.status === "done") {
+        addMsg("model", esc(t.result.text || "（无文本输出）"));
+        st.textContent = "";
+        $("attach-preview").style.display = "none";
+        $("attach-preview").innerHTML = "";
+        $("infer-media").value = "";
+        lastMedia = null;
+        return;
+      }
+      if (t.status === "error") throw new Error(t.error);
+      st.textContent = "思考中… " + t.status;
+    }
+    st.textContent = "轮询超时";
+  } catch (e) { st.textContent = "错误: " + e.message; addMsg("model", "⚠ " + esc(e.message)); }
+  finally { $("send-btn").disabled = false; }
+};
+$("infer-prompt").addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("send-btn").click(); }
+});
+$("debug-panel").querySelector(".toggle").onclick =
+  () => $("debug-panel").classList.toggle("collapsed");
+$("text-encode").onclick = async () => {
+  try {
+    const r = await api("/api/codec/text", {text: $("text-in").value});
+    $("text-out").textContent = stepsToGts(r.steps, $("text-bound").value);
+  } catch (e) { $("text-out").textContent = "错误: " + e.message; }
+};
+$("audio-encode").onclick = async () => {
+  const f = $("audio-file").files[0]; if (!f) return;
+  $("audio-preview").innerHTML = `<audio src="${fileToUrl(f)}" controls></audio>`;
+  $("audio-out").textContent = "编码中…";
+  try {
+    const r = await api("/api/codec/audio", {audio_b64: await fileToB64(f),
+                                             filename: f.name});
+    $("audio-out").textContent =
+      `# 音元数 ${r.n_tokens}，时长 ${r.duration_s}s\n` +
+      stepsToGts(r.steps, $("audio-bound").value);
+  } catch (e) { $("audio-out").textContent = "错误: " + e.message; }
+};
+$("image-encode").onclick = async () => {
+  const f = $("image-file").files[0]; if (!f) return;
+  $("image-preview").src = fileToUrl(f);
+  $("image-out").textContent = "编码中…";
+  try {
+    const r = await api("/api/codec/image", {image_b64: await fileToB64(f)});
+    const st = r.steps[0];
+    $("image-out").textContent =
+      `# grid ${st.meta.grid[0]}×${st.meta.grid[1]}，patch 数 ${st.meta.n_patches}\n` +
+      stepsToGts(r.steps, $("image-bound").value);
+  } catch (e) { $("image-out").textContent = "错误: " + e.message; }
+};
+$("video-encode").onclick = async () => {
+  const f = $("video-file").files[0]; if (!f) return;
+  const vp = $("video-preview"); vp.src = fileToUrl(f); vp.style.display = "block";
+  $("video-out").textContent = "编码中（ffmpeg 抽帧 + 提取音轨）…";
+  try {
+    const r = await api("/api/codec/video", {video_b64: await fileToB64(f),
+                                             filename: f.name});
+    $("video-stats").textContent =
+      `帧数: ${r.n_frames}　总 patches: ${r.total_patches}　音元: ${r.n_audio_tokens}`;
+    $("video-out").textContent = stepsToGts(r.steps, $("video-bound").value);
+  } catch (e) { $("video-out").textContent = "错误: " + e.message;
+                $("video-stats").textContent = ""; }
+};
+$("prims-convert").onclick = async () => {
+  const f = $("prims-file").files[0]; if (!f) return;
+  $("prims-src").src = fileToUrl(f);
+  $("prims-msg").textContent = "转换中（贪心图元拟合，后台任务）…";
+  $("prims-render").innerHTML = ""; $("prims-out").textContent = "—";
+  try {
+    const {task_id} = await api("/api/codec/image2prims",
+                                {image_b64: await fileToB64(f),
+                                 max_steps: parseInt($("prims-steps").value) || 100,
+                                 quality: $("prims-quality").value || "fast"});
+    const t0 = Date.now();
+    let r = null;
+    while (Date.now() - t0 < 120000) {
+      await new Promise(res => setTimeout(res, 1200));
+      const t = await api("/api/task/" + task_id);
+      if (t.status === "done") { r = t.result; break; }
+      if (t.status === "error") throw new Error(t.error);
+      $("prims-msg").textContent = "转换中… " + t.status;
+    }
+    if (!r) throw new Error("轮询超时");
+    $("prims-render").innerHTML = r.svg;
+    $("prims-out").textContent =
+      `# ${r.note}\n# 图元 ${r.n_primitives} 个，token ${r.tokens.length} 个（9/图元）\n` +
+      stepsToGts([{modality: "draw", token_ids: r.tokens, meta: {}}], "model");
+    $("prims-msg").textContent = r.n_primitives + " 个图元";
+  } catch (e) { $("prims-msg").textContent = "错误: " + e.message; }
+};
+$("midi-encode").onclick = async () => {
+  const f = $("midi-file").files[0]; if (!f) return;
+  $("midi-out").textContent = "编码中…";
+  try {
+    const r = await api("/api/codec/midi", {midi_b64: await fileToB64(f)});
+    $("midi-tokens-in").value = JSON.stringify(r.tokens);
+    $("midi-out").textContent =
+      `# token 数 ${r.n}\n` +
+      stepsToGts([{modality: "midi", token_ids: r.tokens, meta: {}}], "model");
+  } catch (e) { $("midi-out").textContent = "错误: " + e.message; }
+};
+$("midi-decode").onclick = async () => {
+  try {
+    const tokens = JSON.parse($("midi-tokens-in").value);
+    const r = await api("/api/codec/midi", {tokens});
+    const bin = atob(r.midi_b64), buf = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([buf], {type: "audio/midi"}));
+    a.download = "out.mid"; a.click();
+    $("midi-decode-msg").textContent = "已下载 out.mid";
+  } catch (e) { $("midi-decode-msg").textContent = "错误: " + e.message; }
+};
+const TOKEN_PALETTE = [
+  {label:"<think>",   insert:"<think>"},
+  {label:"<think/>",  insert:"<think/>"},
+  {label:"<answer>",  insert:"<answer>"},
+  {label:"<answer/>", insert:"<answer/>"},
+  {label:"<text>",    insert:"<text>"},
+  {label:"<text/>",   insert:"<text/>"},
+  {label:"<visual>",  insert:"<visual>"},
+  {label:"<visual/>", insert:"<visual/>"},
+  {label:"<audio>",   insert:"<audio>"},
+  {label:"<audio/>",  insert:"<audio/>"},
+  {label:"<model>",   insert:"<model>"},
+  {label:"<model/>",  insert:"<model/>"},
+  {label:"<user>",    insert:"<user>"},
+  {label:"<user/>",   insert:"<user/>"},
+  {label:"<stop>",    insert:"<stop>"},
+  {label:"<caps>",    insert:"<caps>"},
+  {label:"<allcaps>", insert:"<allcaps>"},
+  {label:"<italic>",  insert:"<italic>"},
+  {label:"<italic/>", insert:"<italic/>"},
+  {label:"<bold>",    insert:"<bold>"},
+  {label:"<bold/>",   insert:"<bold/>"},
+  {label:"<under>",   insert:"<under>"},
+  {label:"<under/>",  insert:"<under/>"},
+  {label:"<mid>",     insert:"<mid>"},
+  {label:"<mid/>",    insert:"<mid/>"},
+  {label:"<high>",    insert:"<high>"},
+  {label:"<high/>",   insert:"<high/>"},
+  {label:"时间步 {}", insert:"{}", back: 1},
+];
+const paletteEl = $("json-palette");
+TOKEN_PALETTE.forEach(t => {
+  const b = document.createElement("button");
+  b.textContent = t.label;
+  b.onclick = () => insertAtCursor(t.insert, t.back || 0);
+  paletteEl.appendChild(b);
+});
+function insertAtCursor(text, back) {
+  const ed = $("json-editor"); ed.focus();
+  document.execCommand("insertText", false, text);
+  if (back > 0) {
+    const sel = window.getSelection();
+    for (let i = 0; i < back && sel.modify; i++)
+      sel.modify("move", "backward", "character");
+  }
+}
+$("json-format").onclick = () => {
+  const t = $("json-editor").innerText.replace(/\s+/g, "");
+  $("json-editor").textContent = t.replace(/\}\{/g, "}\n{");
+  $("json-msg").textContent = "";
+};
+$("json-minify").onclick = () => {
+  $("json-editor").textContent = $("json-editor").innerText.replace(/\s+/g, "");
+  $("json-msg").textContent = "";
+};
+$("json-copy").onclick = () => {
+  navigator.clipboard.writeText($("json-editor").innerText)
+    .then(() => $("json-msg").textContent = "已复制");
+};
+</script>
+</body>
+</html>
