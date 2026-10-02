@@ -1,27 +1,98 @@
 @echo off
-REM ===========================================================================
-REM GARGANTUA v1 — Windows 一键启动
-REM 用法：
-REM   run.bat                  启动网页工作台 http://127.0.0.1:8712
-REM   run.bat --port 9000      指定端口
-REM   run.bat --no-open        不自动打开浏览器
-REM   run.bat --test           跑全量测试
-REM   run.bat --init NAME      创建模型 models\NAME
-REM   run.bat --train NAME     用 data\ 训练 models\NAME
-REM   run.bat --infer NAME     推理（提示词先 set PROMPT=...）
-REM ===========================================================================
 setlocal
+
 cd /d "%~dp0"
 
-REM 优先项目 venv
-set "PY=.venv\Scripts\python.exe"
+set "VENV=.venv"
+set "PY=%VENV%\Scripts\python.exe"
+
+REM ============================================================
+REM GARGANTUA - Windows launcher
+REM 自动使用系统 Python 创建 .venv
+REM ============================================================
+
 if not exist "%PY%" (
-  REM 其次找系统 python
-  where python >nul 2>nul && (set "PY=python") || (
-    echo [run.bat] 找不到 Python，请先安装 Python 3.10+ 并加入 PATH
+
+    echo [GARGANTUA] 未找到项目 Python 环境，正在寻找系统 Python...
+
+    REM 优先使用 py launcher
+    where py >nul 2>nul
+    if not errorlevel 1 (
+        set "SYS_PY=py -3"
+        goto :create_venv
+    )
+
+    REM 其次使用 python
+    where python >nul 2>nul
+    if not errorlevel 1 (
+        set "SYS_PY=python"
+        goto :create_venv
+    )
+
+    echo.
+    echo [GARGANTUA] 找不到系统 Python
+    echo 请先安装 Python 3.10+
+    echo.
+    pause
     exit /b 1
-  )
 )
 
-"%PY%" run.py %*
+goto :run
+
+
+:create_venv
+
+echo [GARGANTUA] 使用系统 Python: %SYS_PY%
+echo [GARGANTUA] 正在创建 .venv...
+
+%SYS_PY% -m venv "%VENV%"
+
+if errorlevel 1 (
+    echo.
+    echo [GARGANTUA] 创建 venv 失败
+    echo.
+    pause
+    exit /b 1
+)
+
+if not exist "%PY%" (
+    echo.
+    echo [GARGANTUA] .venv 创建失败
+    echo.
+    pause
+    exit /b 1
+)
+
+REM 安装依赖
+if exist requirements.txt (
+    echo.
+    echo [GARGANTUA] 正在安装依赖...
+
+    "%PY%" -m pip install -U pip
+
+    if errorlevel 1 (
+        echo [GARGANTUA] pip 更新失败
+        pause
+        exit /b 1
+    )
+
+    "%PY%" -m pip install -r requirements.txt
+
+    if errorlevel 1 (
+        echo [GARGANTUA] 依赖安装失败
+        pause
+        exit /b 1
+    )
+)
+
+goto :run
+
+
+:run
+
+"%PY%" "%~dp0run.py" %*
+
+set "EXITCODE=%ERRORLEVEL%"
+
 endlocal
+exit /b %EXITCODE%
