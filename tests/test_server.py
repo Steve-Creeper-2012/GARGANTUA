@@ -215,7 +215,9 @@ class TestServer(unittest.TestCase):
         # 1600 采样 / 533 = 3.001 → 4 音元（末尾补零）
         self.assertEqual(j["n_tokens"], 4)
         self.assertAlmostEqual(j["duration_s"], 4 * 533 / 16000, places=3)
-        self.assertEqual(j["steps"][-1]["n"], 1600 - 3 * 533)
+        # 当前契约：step_to_json 把音元参数收在 meta 下（与前端
+        # stepsToGts / image 页的 st.meta.* 访问一致）
+        self.assertEqual(j["steps"][-1]["meta"]["n"], 1600 - 3 * 533)
 
     def test_07_codec_midi_roundtrip(self):
         b64 = make_midi_b64()
@@ -256,15 +258,23 @@ class TestServer(unittest.TestCase):
 
     def test_09_train_flow(self):
         # enqueue → queue 文件出现
-        code, j = http("POST", self.port, "/api/train/enqueue",
-                       {"text": "你好世界 " * 40})
+        # 当前契约：仅支持 json_b64 上传（{"text": ...} 对象 / 对象数组 /
+        # JSONL），queued 返回裸文件名，落盘在 <data_dir>/queue 下
+        # （与前端 train-file 上传走同一通道）
+        def enqueue(obj, filename="t.json"):
+            raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            return http("POST", self.port, "/api/train/enqueue",
+                        {"json_b64": base64.b64encode(raw).decode(),
+                         "filename": filename})
+        code, j = enqueue({"text": "你好世界 " * 40})
         self.assertEqual(code, 200)
         queued = j["queued"]
-        self.assertTrue(os.path.exists(queued))
-        self.assertIn("queue", queued)
-        # enqueue 多文本
-        code, j = http("POST", self.port, "/api/train/enqueue",
-                       {"texts": ["甲", "乙"]})
+        self.assertEqual(len(queued), 1)
+        qpath = os.path.join(self.data_dir, "queue", queued[0])
+        self.assertTrue(os.path.exists(qpath))
+        self.assertIn("queue", qpath)
+        # enqueue 多文本（JSON 数组）
+        code, j = enqueue([{"text": "甲"}, {"text": "乙"}])
         self.assertEqual(code, 200)
         self.assertEqual(len(j["queued"]), 2)
         # start → running
