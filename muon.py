@@ -9,6 +9,19 @@
 #   Muon   —— 隐藏层 2D 权重矩阵（model.param_groups_for_optimizers 分组）
 #   AdamW  —— embedding / lm_head / RMSNorm / 标量 / 卷积
 # 开关：spec.OPTIMIZER = "muon" | "adamw"，关掉即全部参数走 AdamW。
+#
+# 2026-10-20 修复（审查结论）：
+#   1. rms_align 的注释与实现对齐：newton_schulz5 输出为半正交矩阵，元素
+#      RMS ≈ 1/sqrt(max(shape))，乘 sqrt(max(shape)) 后更新 RMS ≈ 1.0
+#      （Keller Jordan 原版标度），并非注释声称的「Adam 的 ~0.2 RMS」。
+#      按 RMS≈1.0 理解后，Muon lr=2e-2 对应每步权重更新 RMS≈0.02，与
+#      modded-nanogpt 的常用配置一致。若要 Moonlight 式 0.2 标度，应把
+#      系数改为 0.2*sqrt(max(shape))——那需要同步重调 MUON_LR，本次不改
+#      数值行为，仅修正文档。
+#   2. weight_decay 参数化：Muon 组默认 0（其 lr=2e-2 比 AdamW 大两个
+#      数量级，同一 wd 值在两种优化器下的有效衰减速率差 ~100 倍，故不
+#      强行统一数值，改为显式传入并由调用方知晓）；adamw 模式下隐藏层
+#      矩阵沿用 0.1、embedding/norm 组 0（原行为不变）。
 # ===========================================================================
 from __future__ import annotations
 

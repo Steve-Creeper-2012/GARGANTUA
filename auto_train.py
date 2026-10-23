@@ -2,14 +2,25 @@
 # GARGANTUA v1 — auto_train.py：训练队列守护
 # ---------------------------------------------------------------------------
 # 监控 data/queue/*.txt（按文件名序），逐个文件：text_codec 编码 → 按
-# train.py 相同的窗口切分 / forward_train / Muon+AdamW step 逻辑训练
-# steps_per_file 步 → 检查点落盘 → 文件移入 data/done/。
+# common.make_batch 统一的窗口切分 / forward_train / Muon+AdamW step 逻辑
+# 训练 steps_per_file 步 → 检查点落盘 → 文件移入 data/done/。
 # 每步把 {"step", "loss", "ts"} 追加到 logs/auto_train.jsonl。
 # 空队列 1s 空转轮询；stop() 后当前 step 完成、落盘后退。
 #
 # 两种用法：
 #   1) server.py 内嵌线程：Trainer(get_model=..., save_fn=..., lock=...)
 #   2) 独立运行：python auto_train.py --model models/alpha --block-size 16
+#
+# 2026-10-20 修复（审查结论）：
+#   1. main() 改用 common.build_model：非默认 block 数的模型可加载。
+#   2. block_size / steps_per_file / optimizer 改为带校验的 property：
+#      server 直设属性也不再可能传入奇数 block_size 或 0 步（二者分别会
+#      令前向崩溃 / 触发 _loss_tail[-1] IndexError）。
+#   3. 训练中模型被热替换（server 加载其他模型）时，按实例标识重建优化
+#      器——否则 opts 仍绑定旧模型参数，新模型只算梯度不被更新，落盘的
+#      是未训练的新模型。
+#   4. stop 早停 / 0 步文件不再触发 _loss_tail[-1] IndexError。
+#   5. 窗口切分统一走 common.make_batch，与 train.py 零漂移。
 # ===========================================================================
 import argparse
 import glob
@@ -22,14 +33,18 @@ from collections import deque
 
 import torch
 import torch.nn.functional as F
-from safetensors.torch import load_file, save_file
 
 import spec
-from model import Gargantua
+from common import (CKPT_NAME, build_model, make_batch, read_config,
+                    save_checkpoint, validate_block_size, validate_steps)
 from muon import build_optimizers
 from tokens.text_codec import encode as text_encode
 
-CKPT_NAME = "model.safetensors"
+_OPTIMIZERS = ("muon", "adamw")
+
+
+class _NoModelError(RuntimeError):
+    """ 无活动模型：文件应保留在队列而非被归档。 """
 
 
 class Trainer:
@@ -43,23 +58,23 @@ class Trainer:
       queue_dir      队列目录（data/queue）
       done_dir       归档目录（data/done）
       log_path       loss jsonl 路径（logs/auto_train.jsonl）
-      block_size     窗口大小（同 train.py --block-size）
-      steps_per_file 每个队列文件训练的步数
+      block_size     窗口大小（偶数，≥2；user/model 各半）
+      steps_per_file 每个队列文件训练的步数（≥1）
     """
 
     def __init__(self, get_model, save_fn, lock,
                  queue_dir="data/queue", done_dir="data/done",
                  log_path="logs/auto_train.jsonl",
-                 block_size=16, steps_per_file=50, seed=0):
+                 block_size=32, steps_per_file=50, seed=0):
         self.get_model = get_model
         self.save_fn = save_fn
         self.lock = lock
         self.queue_dir = queue_dir
         self.done_dir = done_dir
         self.log_path = log_path
-        self.block_size = block_size
-        self.steps_per_file = steps_per_file
-        self.optimizer = spec.OPTIMIZER      # "muon"（Muon+AdamW 分工）或 "adamw"
+        self._block_size = validate_block_size(block_size)
+        self._steps_per_file = validate_steps(steps_per_file)
+        self._optimizer = spec.OPTIMIZER      # "muon"（Muon+AdamW 分工）或 "adamw"
         random.seed(seed)
 
         self._stop = threading.Event()
@@ -71,6 +86,35 @@ class Trainer:
         os.makedirs(queue_dir, exist_ok=True)
         os.makedirs(done_dir, exist_ok=True)
         os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # 带校验的属性（server 直设 trainer.block_size 也安全）
+    # ------------------------------------------------------------------
+    @property
+    def block_size(self) -> int:
+        return self._block_size
+
+    @block_size.setter
+    def block_size(self, v) -> None:
+        self._block_size = validate_block_size(v)
+
+    @property
+    def steps_per_file(self) -> int:
+        return self._steps_per_file
+
+    @steps_per_file.setter
+    def steps_per_file(self, v) -> None:
+        self._steps_per_file = validate_steps(v)
+
+    @property
+    def optimizer(self) -> str:
+        return self._optimizer
+
+    @optimizer.setter
+    def optimizer(self, v) -> None:
+        if v not in _OPTIMIZERS:
+            raise ValueError(f"未知优化器: {v}")
+        self._optimizer = v
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -101,8 +145,8 @@ class Trainer:
         return {
             "running": self._running,
             "step": self._step,
-            "block_size": self.block_size,
-            "steps_per_file": self.steps_per_file,
+            "block_size": self._block_size,
+            "steps_per_file": self._steps_per_file,
             "loss_tail": list(self._loss_tail),
             "log_tail": list(self._log_tail),
         }
@@ -127,6 +171,13 @@ class Trainer:
                 path = files[0]
                 try:
                     self._train_file(path)
+                except _NoModelError as e:
+                    # 无活动模型：不归档、不消费文件，退避重试（此前文件被
+                    # 静默移入 done/，用户以为训练过——审查记录 P2-7）
+                    self._log(f"[auto_train] {e}，{os.path.basename(path)} "
+                              f"保留在队列")
+                    time.sleep(2)
+                    continue
                 except Exception as e:                  # 单文件失败不崩守护
                     self._log(f"[auto_train] 训练失败 {os.path.basename(path)}: {e}")
                 # 无论成败都归档，避免同一文件死循环
@@ -142,31 +193,31 @@ class Trainer:
             text = f.read()
         ids = [t for st in text_encode(text) for t in st["token_ids"]]
         ids.append(spec.STOP_ID)            # 文档结束 → 停止 token，教模型学会终止
-        B, half = self.block_size, self.block_size // 2
+        B = self._block_size
         if len(ids) < B + 2:
             self._log(f"[auto_train] {os.path.basename(path)} 仅 {len(ids)} "
                       f"tokens < {B + 2}，跳过训练")
             return
         m = self.get_model()
         if m is None:
-            raise RuntimeError("无活动模型")
+            raise _NoModelError("无活动模型")
         self._log(f"[auto_train] {os.path.basename(path)}: {len(ids)} tokens, "
-                  f"{self.steps_per_file} steps, block={B}")
+                  f"{self._steps_per_file} steps, block={B}")
 
-        # 与 train.py 相同的优化器分组与窗口切分逻辑
-        opts = build_optimizers(m, self.optimizer, spec.ADAMW_LR,
+        # 与 train.py 相同的优化器分组；模型实例变化时按需重建（防热替换失效）
+        opts = build_optimizers(m, self._optimizer, spec.ADAMW_LR,
                                 spec.MUON_LR, spec.MUON_MOMENTUM)
-        for _ in range(self.steps_per_file):
+        for _ in range(self._steps_per_file):
             if self._stop.is_set():
                 break
+            m_now = self.get_model()
+            if m_now is not m:              # 训练中模型被替换：重建优化器
+                m = m_now
+                opts = build_optimizers(m, self._optimizer, spec.ADAMW_LR,
+                                        spec.MUON_LR, spec.MUON_MOMENTUM)
+                self._log("[auto_train] 检测到模型热替换，优化器已重建")
             i = random.randint(0, len(ids) - B - 2)
-            x_in = torch.tensor([ids[i:i + half]])
-            s_in = torch.arange(half).unsqueeze(0)
-            tgt = torch.tensor([ids[i + half:i + B]])
-            y = torch.tensor([ids[i + half : i + B]])  
-            # decoder 输入 = 目标段左移一位（首 token 用 user 段尾 token 播种）
-            dec_in = torch.tensor([[ids[i + half - 1]] + ids[i + half:i + B - 1]])
-            s_dec = torch.arange(half, half + half).unsqueeze(0)
+            x_in, s_in, dec_in, s_dec, y = make_batch(ids, i, B)
 
             with self.lock:                          # 训练与推理互斥
                 m.train()
@@ -191,8 +242,11 @@ class Trainer:
 
         with self.lock:                              # 检查点落盘
             self.save_fn(m)
-        self._log(f"[auto_train] step={self._step} "
-                  f"loss={self._loss_tail[-1]['loss']:.4f} 已落盘")
+        if self._loss_tail:
+            self._log(f"[auto_train] step={self._step} "
+                      f"loss={self._loss_tail[-1]['loss']:.4f} 已落盘")
+        else:
+            self._log(f"[auto_train] step={self._step} 已落盘（无有效 step）")
 
 
 def main():
@@ -200,21 +254,23 @@ def main():
     ap.add_argument("--model", required=True, help="模型目录（含 model.safetensors）")
     ap.add_argument("--data", default="data", help="数据根目录（queue/done 在其下）")
     ap.add_argument("--log", default="logs/auto_train.jsonl")
-    ap.add_argument("--block-size", type=int, default=16)
+    ap.add_argument("--block-size", type=int, default=32)
     ap.add_argument("--steps-per-file", type=int, default=50)
     args = ap.parse_args()
 
-    m = Gargantua()
-    ckpt = os.path.join(args.model, CKPT_NAME)
-    if os.path.exists(ckpt):
-        m.load_state_dict(load_file(ckpt))
-        print(f"[auto_train] 载入 {ckpt}")
+    m = build_model(args.model)
     m.eval()
+
+    def _save(mod):
+        # 保留既有 config.json（block 数等），仅刷新 params——不可写空配置
+        cfg = dict(read_config(args.model))
+        cfg["params"] = sum(p.numel() for p in mod.parameters())
+        save_checkpoint(args.model, mod, cfg)
 
     lock = threading.RLock()
     trainer = Trainer(
         get_model=lambda: m,
-        save_fn=lambda mod: save_file(mod.state_dict(), ckpt),
+        save_fn=_save,
         lock=lock,
         queue_dir=os.path.join(args.data, "queue"),
         done_dir=os.path.join(args.data, "done"),

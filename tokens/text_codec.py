@@ -7,7 +7,8 @@ Step 结构（见 spec.py 第 8 节）：
 
 编码规则（严格按 spec / 任务约定）：
   - 中文单字逐字查 CJK 区；ASCII 可打印字符（含空格、a–z）逐字符查
-    SYMBOL 区；数字逐字符查 DIGIT 区。
+    SYMBOL 区；\t \n \r 控制字符查 SYMBOL 区 reserved 消耗槽
+    （2026-10-20 补入词表，多行文本换行不再丢）；数字逐字符查 DIGIT 区。
   - 英文单词：[A-Za-z]+ 连续段 → 全小写查 ENGLISH 区。命中时按大小写
     规则前置 <caps>（首字母大写，含 McDonald 这类内部大写不保留）或
     <allcaps>（全大写且长度>1）；未命中则 fallback 逐字母输出，大写
@@ -15,6 +16,9 @@ Step 结构（见 spec.py 第 8 节）：
   - 字面 "<bold>" 等 12 个格式化 token 与 14 个边界 token 字符串识别为
     对应特殊 token 时间步（decode 还原为原字符串）；其余 "<...>" 按
     普通字符逐字编码。
+  - 已知有损：字面 "<stop>" 会被识别为停止 token，decode 不还原
+    （词表无第二表示）；全部字符均未收录时 skipped 信息无处安放
+    （返回空 steps）——调用方应自行校验非空。
   - 未收录字符（CJK 扩展 B 及以后、emoji 等）：跳过，记入返回序列
     最后一个 Step 的 meta["skipped"]（decode 无法还原，可接受）。
 """

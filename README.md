@@ -161,55 +161,161 @@ The decoder stops immediately when `<stop>` (ID 27) is sampled.
 A built-in web UI provides:
 - **Model Management**: Create models with configurable encoder/decoder block counts.
 - **Training Queue**: Upload JSON datasets, queue training tasks with automatic execution.
-- **Inference Chat**: Standard AI chat interface with collapsible debug panel (temperature, top-k, repetition penalty, max_new_tokens).
+- **Inference Chat**: Standard AI chat interface with collapsible debug panel (temperature, top-p, max_new_tokens).
 - **Codec Visualizers**:
   - Text → Token conversion
   - Audio → Wave token conversion
   - Image/Video → Patch token conversion
   - Image → Primitive sequence conversion
-  - Token editor with spec-aligned token panel
+  - Token editor with spec-aligned token panel and vocab search
 
 ### Launch
+
+One `run.py` holds every bit of logic; the per-platform entry points only
+locate the system Python and delegate to it:
+
 ```bash
-# macOS / Linux
-./run.sh
-
-# Windows
-run.bat
-
-# Or directly
-python run.py
+./run.sh          # macOS / Linux
+./run.command     # macOS: double-click in Finder (opens Terminal, then the app window)
+run.bat           # Windows (double-click)
+python run.py     # any platform, direct
 ```
+
+On first launch `run.py` creates `.venv/`, installs `requirements.txt`,
+and verifies the imports before starting anything. torch 2.2.2 has no wheel
+above Python 3.12, so a newer interpreter is refused with an actionable
+message instead of a 20-minute source build.
+
+| Flag | Effect |
+| --- | --- |
+| `--port N` | Port for the HTTP server (default 8712) |
+| `--no-window` | Server only — no GUI window (SSH / servers / CI) |
+| `--test` | Full regression, one process per suite |
+| `--init NAME` / `--train NAME` / `--infer NAME` | CLI shortcuts, no server |
+
+### The window is not a browser
+
+The UI opens in a **standalone desktop window** via
+[pywebview](https://pywebview.flowrl.com/) (macOS `WKWebView` / Windows
+`WebView2` / Linux `WebKitGTK`) — the OS web component, not a second browser
+engine. Chrome/Firefox spend 300–800 MB per tab on renderer processes,
+extensions and their own GPU pipeline; that budget belongs to training here
+(model + optimizer state + KV cache). The window dependency is deliberately
+**not** in `requirements.txt`:
+
+```bash
+pip install -r requirements-window.txt   # ~18 MB, optional
+```
+
+Without it `run.py` still starts the server and prints the URL — you can
+open it in a browser by hand.
+
+Process model (deliberate, Steam-like):
+
+```
+run.py ──┬── server.py    training + inference + HTTP  (closing the window does not stop it)
+         └── window.py    the UI window               (crash/kill does not stop training)
+```
+
+- Closing or crashing the window leaves the server running; the log prints
+  the command to reopen the UI.
+- Exiting the server takes the window down with it (no orphan pointing at a
+  dead port). Ctrl-C is forwarded to both.
+- `PYTHONUNBUFFERED=1` is forced on children so startup logs appear
+  immediately instead of after 8 KB of buffering.
+
+### HTTP contract
+
+All `/api/*` endpoints share one error convention, so the UI never has to
+guess:
+
+| Status | Meaning |
+| --- | --- |
+| `400` | Invalid/missing parameter (odd `block_size`, `steps < 1`, `temperature <= 0`, illegal model name, unknown `quality`, malformed JSON) |
+| `404` | Unknown path |
+| `409` | State conflict — training running while switching/creating a model, or overwriting an existing model without `overwrite:true` |
+| `411` | `Content-Length` required (chunked encoding rejected) |
+| `413` | Body larger than 512 MB |
+
+Long-running work (inference, model init, image→primitives) returns `202`
+with a `task_id`; poll `GET /api/task/<task_id>` until `status == "done"`.
+Numeric parameters are never silently defaulted: an explicit `0` is validated
+as `0` rather than being replaced by the default value.
 
 ## Project Structure
 
 ```
 .
 ├── spec.py              # Frozen architecture contract (single source of truth)
+├── common.py            # Shared checkpoint I/O + validation (config.json contract)
 ├── model.py             # Gargantua model (KDA, MLA, FastWeight, SharedKV)
 ├── train.py             # Training loop with Muon/AdamW optimizer routing
 ├── infer.py             # Autoregressive generation
 ├── init.py              # Model initialization
 ├── auto_train.py        # Trainer class with queue support
-├── server.py            # HTTP API server + web UI backend
-├── run.py               # Cross-platform launcher (venv auto-setup)
-├── run.sh / run.bat     # Shell entry points
+├── server.py            # HTTP layer only: App assembly + routing + Handler
+├── server_models.py     # ModelManager / TaskPool / step_to_json / ConflictError
+├── server_media.py      # Uploaded-media decode + size guards (b64_to_pil / ffmpeg)
+├── server_codecs.py     # CodecApi mixin — all /api/codec/* endpoints
+├── server_train.py      # TrainApi mixin — all /api/train/* endpoints
+├── server_util.py       # num_param (explicit 0 is never swallowed by a default)
+├── window.py            # Standalone desktop window (pywebview, no browser)
+├── run.py               # Cross-platform launcher: venv, deps, server + window
+├── run.sh               # Linux/macOS entry — finds system Python, delegates
+├── run.command          # macOS double-click entry (Finder → Terminal → window)
+├── run.bat              # Windows entry — finds system Python, delegates
 ├── muon.py              # Muon optimizer implementation
+├── requirements.txt     # Pinned runtime dependencies (single source)
+├── requirements-window.txt  # Optional: pywebview only (~18 MB, OS webview)
 ├── tokens/              # Codecs for all modalities
 │   ├── text_codec.py    # Text tokenization
 │   ├── audio_codec.py   # Audio → wave tokens
 │   ├── image_codec.py   # Image/Video → patch tokens
 │   ├── draw_codec.py    # Primitive sequence ↔ drawing tokens + PNG/SVG render
-│   └── image_to_primitives.py  # Image → primitive sequence (fast_shape_render)
+│   ├── midi_codec.py    # MIDI ↔ MIDI tokens
+│   ├── image_to_primitives.py  # Image → primitive sequence (fast_shape_render)
+│   ├── build_vocab.py   # vocab.json generator (layout from spec.py)
+│   └── vocab.py         # Vocab view with region-specific maps
 ├── web/                 # Frontend
-│   └── index.html       # Single-page app (collapsible nav, 11 pages)
-└── tests/               # Unit tests
+│   ├── index_source.html  # Single-page app source (11 pages)
+│   ├── index.html        # Minified artifact (regenerate via web/minify.py)
+│   └── minify.py         # Safe minifier with --check self-test
+└── tests/               # Unit + integration tests
     ├── test_model.py
     ├── test_codecs.py
     ├── test_tokens.py
     ├── test_image2prim.py
-    └── test_server.py
+    ├── test_server.py
+    └── test_fixes.py    # Regression tests for the 2026-10-20 audit
 ```
+
+`server.py` used to be one 986-line file holding the HTTP layer, the model
+manager, the task pool, the ffmpeg plumbing and every API handler. It is now
+366 lines of routing plus five focused modules (`server_models`,
+`server_media`, `server_codecs`, `server_train`, `server_util`); `App`
+composes the two API mixins. All previous `from server import X` paths still
+work through re-exports, and `tests/test_server.py` passes unchanged.
+
+### Model directory contract
+
+Every model lives in `models/NAME/` with `model.safetensors` (weights) and
+`config.json` (records `n_enc_blocks` / `n_dec_blocks` and more). All entry
+points (`init.py`, `train.py`, `infer.py`, `auto_train.py`, `server.py`)
+construct and load models through `common.build_model()` so a model created
+with custom block counts loads identically everywhere.
+
+## Testing
+
+```bash
+python run.py --test          # all suites, one process per suite
+python -m unittest tests.test_model -v   # a single suite
+```
+
+Suites run in **separate processes** on purpose: a full `Gargantua()` is
+~527.9M params (~2.1 GB fp32), and PyTorch's CPU allocator keeps freed blocks
+in its own pool, so RSS never drops within a process — running every suite
+under one `unittest discover` gets SIGKILLed (exit 137) partway through
+`test_model`.
 
 ## Technical References
 

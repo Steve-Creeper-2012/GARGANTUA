@@ -1,1 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
 
+# 本地虚拟环境（run.py 自动创建；依赖清单以 requirements.txt 为准）
+.venv/
+
+# 运行产物：模型权重（单个 safetensors 可达数 GB）、数据集、日志
+models/
+data/
+logs/
+*.safetensors
+
+# 测试/构建缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+
+# Agent 工作区数据（会话记录 / 记忆 / 快照，本地产物，不属于代码仓库）
+.workbuddy/

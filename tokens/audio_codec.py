@@ -115,8 +115,18 @@ def waveform_to_steps(samples: Union[np.ndarray, Sequence[int]]) -> List[Step]:
 
     每 533 采样一个音元；末尾不足补零，meta["n"] 记录真实采样数。
     samples 字段 = 533 个 float32 小端（int16/32768 归一化到 [-1,1]）。
+
+    2026-10-20：float 输入按 [-1,1] 显式转 int16（与 load_audio 的
+    浮点路径一致）。此前直接 np.asarray(..., dtype=np.int16) 会把
+    0.5 截断成 0——波形静音的数据损坏。
     """
-    arr = np.asarray(samples, dtype=np.int16).reshape(-1)
+    arr = np.asarray(samples)
+    if arr.dtype.kind == "f":
+        arr = np.clip(arr, -1.0, 1.0)
+        arr = np.rint(arr * 32767.0).astype(np.int16)
+    else:
+        arr = arr.astype(np.int16)
+    arr = arr.reshape(-1)
     steps: List[Step] = []
     for start in range(0, len(arr), N):
         chunk = arr[start:start + N]

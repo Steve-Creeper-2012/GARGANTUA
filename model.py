@@ -35,7 +35,7 @@ import spec
 class RMSNorm(nn.Module):
     """ Root Mean Square LayerNorm（无均值平移，优化器归 AdamW 组）。 """
 
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = spec.KDA_NORM_EPS):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
@@ -208,7 +208,13 @@ class MLAAttention(nn.Module):
         kv: [B, Tk, D] 共享 KV 流（或 encoder 段自身 hidden，双向）
         因果规则：x 的每个位置可看 kv 中 step_id 严格小于自身 step 的全部
         位置，以及同 step 内的全部位置（步内双向）。kv 为 encoder 段时
-        causal=False 全双向。 """
+        causal=False 全双向。
+        2026-10-20：causal=True 而任一 step_ids 缺失时直接 raise——
+        此前静默跳过掩码会使 decoder 层退化为全双向（未来泄漏）。 """
+        if self.causal and (kv_step_ids is None or x_step_ids is None):
+            raise ValueError(
+                "causal MLA 需要 kv_step_ids 与 x_step_ids（缺失会导致"
+                "因果掩码被静默跳过、未来信息泄漏）")
         B, Tq, _ = x.shape
         Tk = kv.shape[1]
         q = self.w_uq(self.w_dq(x)).view(B, Tq, self.H, self.dh).transpose(1, 2)
@@ -254,36 +260,44 @@ def group_by_step(step_ids: torch.Tensor, ratio: int
     """ 把一段位置按时间步聚成「压缩组」，返回 (start, end) 切片列表。
     规则：整步合并，组内 token 数达到 ratio 即封组；
     单步 token 数 ≥ ratio 时步内按 ratio 切多组（步内压缩，允许）；
-    绝不把不同步的 token 与超过 ratio 的组合并。 """
-    groups = []
+    绝不把不同步的 token 与超过 ratio 的组合并。
+    2026-10-20：步边界检测改为张量运算 + 单次 tolist()，消除逐 token
+    .item() 的 GPU 同步（CPU 上亦少一次解释器往返）。 """
     n = step_ids.numel()
-    i = 0
+    if n == 0:
+        return []
+    if n > 1:
+        bnd = (step_ids[1:] != step_ids[:-1]).nonzero(as_tuple=True)[0].tolist()
+        starts = [0] + [b + 1 for b in bnd]
+    else:
+        starts = [0]
+    ends = starts[1:] + [n]                        # 每个时间步的结束下标（开）
+    lens = [e - s for s, e in zip(starts, ends)]
+    n_steps = len(lens)
+    groups = []
+    i, si = 0, 0                                   # token 指针 / step 指针
     while i < n:
-        sid = step_ids[i].item()
-        j = i
-        while j < n and step_ids[j].item() == sid:
-            j += 1
-        # [i, j) 是一个完整时间步
-        step_len = j - i
-        if step_len >= ratio:
-            for s in range(i, j, ratio):           # 步内切分（不跨步）
+        prev_i = i
+        if lens[si] >= ratio:
+            j = ends[si]                           # 单步就够 ratio：步内切分
+            for s in range(i, j, ratio):
                 groups.append((s, min(s + ratio, j)))
+            i = j
+            si += 1
         else:
-            g_start, count = i, step_len
-            k = j
-            while k < n and count < ratio:          # 整步累加到 ratio
-                nid = step_ids[k].item()
-                e = k
-                while e < n and step_ids[e].item() == nid:
-                    e += 1
-                if count + (e - k) > ratio:
-                    break                            # 下一步放进来会超 ratio
-                count += e - k
-                k = e
-            groups.append((g_start, k))
-            i = k
-            continue
-        i = j
+            # 整步累加到 ratio：能吃下下一步就吃，吃不下就封组。
+            # 封组后 si 必须再进一格——否则下一轮会重复处理已消费的步，
+            # 产出 (x, x) 空组并使 i 停滞（实测：无限循环直到被 OOM kill）
+            count = lens[si]
+            while si + 1 < n_steps and count + lens[si + 1] <= ratio:
+                count += lens[si + 1]
+                si += 1
+            groups.append((i, ends[si]))
+            i = ends[si]
+            si += 1
+        if i <= prev_i:                            # 兜底：绝不静默死循环
+            raise RuntimeError(
+                f"group_by_step 指针未前进（i={i}, si={si}, ratio={ratio}）")
     return groups
 
 
@@ -324,27 +338,40 @@ class SharedKV:
 
     def mark_primitive_token(self):
         """ decoder 每输出一个图元 token 调一次；满 9 个触发就地 9:1 压缩
-        （CSA 打包摘要语义：9 参数 → 1 向量，长度差由缓冲区吸收）。 """
+        （CSA 打包摘要语义：9 参数 → 1 向量，长度差由缓冲区吸收）。
+        契约：调用方必须保证相邻 9 次 mark 之间的 append 全部属于同一个
+        图元（decoder 输出图元段时天然成立）；混入其他 token 会打包错误
+        内容（2026-10-20 审查记录）。 """
         self._pending_draw.append(1)
         if len(self._pending_draw) >= spec.DRAW_KV_COMPRESS:
             n = len(self.entries)
+            if n < spec.DRAW_KV_COMPRESS:
+                # 条目不足 9（滑窗丢过）：无法打包，计数作废重来
+                self._pending_draw.clear()
+                return
             idx = list(range(n - spec.DRAW_KV_COMPRESS, n))
-            if len(idx) == spec.DRAW_KV_COMPRESS:
-                vs = torch.stack([self.entries[i].vec for i in idx])
-                m = torch.ones(len(idx), dtype=torch.bool, device=vs.device)
-                packed = self.draw_packer(vs.unsqueeze(0), m.unsqueeze(0))[0]
-                e0 = self.entries[idx[0]]
-                self.entries[idx[0]] = KVEntry(packed, e0.step_id, e0.type_id, e0.source)
-                for i in reversed(idx[1:]):
-                    del self.entries[i]
+            vs = torch.stack([self.entries[i].vec for i in idx])
+            m = torch.ones(len(idx), dtype=torch.bool, device=vs.device)
+            packed = self.draw_packer(vs.unsqueeze(0), m.unsqueeze(0))[0]
+            e0 = self.entries[idx[0]]
+            self.entries[idx[0]] = KVEntry(packed.detach(), e0.step_id,
+                                           e0.type_id, e0.source)
+            for i in reversed(idx[1:]):
+                del self.entries[i]
             self._pending_draw.clear()
 
     # ---- 滑窗（时间步原子）----
     def _evict(self):
+        evicted = False
         while len(self.entries) > spec.CTX_TOTAL:
             sid = self.entries[0].step_id
             while self.entries and self.entries[0].step_id == sid:
                 self.entries.pop(0)          # 整步丢弃
+            evicted = True
+        if evicted:
+            # 滑窗可能丢掉尚未打包满 9 个的图元 token → 计数作废，防止用
+            # 「已被丢掉的条目 + 新条目」拼出一个错误的压缩组
+            self._pending_draw.clear()
 
     # ---- 读取视图 ----
     def _stack(self, entries: List[KVEntry]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -386,8 +413,11 @@ class SharedKV:
                 g = torch.cat([g, g.new_zeros(pad, g.shape[-1])])
                 m = torch.cat([m, m.new_zeros(pad)])
             vec = comp(g.unsqueeze(0), m.unsqueeze(0))[0]
-            out.append(KVEntry(vec, entries[s].step_id, entries[s].type_id,
-                               entries[s].source))
+            # step_id 取组内【最大】步：保守因果——组可能跨步聚合，
+            # 若取首步，组内后续步的 token 会透过掩码泄漏给更早的查询
+            # （2026-10-20 审查实测复现，见 tests/test_model.py 泄漏回归）
+            out.append(KVEntry(vec.detach(), entries[e - 1].step_id,
+                               entries[e - 1].type_id, entries[e - 1].source))
         return out
 
 
@@ -433,6 +463,8 @@ class FastWeightBank(nn.Module):
         state = self._state
         if state is not None and state.shape[0] != B:
             state = None                              # batch 变化则重置
+        if state is not None and state.device != x.device:
+            state = state.to(x.device)                # 设备迁移守卫（.to() 后）
         out, new_state = kda_recurrence(q, k, v, alpha, beta, state)
         if write:
             self._state = new_state.detach() if detach_state else new_state
@@ -486,7 +518,9 @@ class Block(nn.Module):
         h, _ = self.kda3(self.norms[4](x))
         x = x + h
         x = x + self._ffn(self.norms[5](x))
-        return x + torch.tanh(self.attn_res_gate) * x0   # attnRes（零初始化门）
+        if spec.ATTNRES_ENABLED:
+            return x + torch.tanh(self.attn_res_gate) * x0   # attnRes（零初始化门）
+        return x
 
 
 # ===========================================================================
@@ -569,22 +603,62 @@ class Gargantua(nn.Module):
 
     def build_views(self, vecs: torch.Tensor, step_ids: torch.Tensor):
         """ 从活张量构建 HCA/CSA 视图（训练路径，梯度不断）。
-        vecs: [1, N, D]，step_ids: [1, N]。N ≤ CTX_FULL 时双视图都是全量。 """
+        vecs: [1, N, D]，step_ids: [1, N]。
+
+        2026-10-20 修复（审查结论）：
+        1. CSA 视图与推理路径 SharedKV.view("csa") 对齐：压缩区（可空）
+           + 完整区尾部 CSA_LOCAL_WINDOW。此前 n ≤ CTX_FULL 时 CSA 直接
+           返回全量 n，而推理同长度只保留尾部 512，train/infer 不一致
+           （实测 n=600 时差异 4.06，已回归测试固定）。
+        2. 压缩区按整步截断到 CTX_COMPRESS：此前 n > 4096 时压缩区
+           无界增长，压缩注意力 O((n-1024)²) 爆炸；现在与 SharedKV
+           的滑窗语义一致（超出部分按整步原子丢弃）。
+        """
         n = vecs.shape[1]
-        if n <= spec.CTX_FULL:
-            return (vecs, step_ids), (vecs, step_ids)
-        full = vecs[:, n - spec.CTX_FULL:]
-        full_s = step_ids[:, n - spec.CTX_FULL:]
-        comp = vecs[:, :n - spec.CTX_FULL]
-        comp_s = step_ids[:, :n - spec.CTX_FULL]
-        hca_c = self._compress_live(comp, comp_s, spec.HCA_RATIO)
-        csa_c = self._compress_live(comp, comp_s, spec.CSA_RATIO)
-        kv_hca = (torch.cat([hca_c[0], full], 1), torch.cat([hca_c[1], full_s], 1))
-        csa_tail = full[:, -min(n, spec.CSA_LOCAL_WINDOW):]
-        csa_tail_s = full_s[:, -min(n, spec.CSA_LOCAL_WINDOW):]
-        kv_csa = (torch.cat([csa_c[0], csa_tail], 1),
-                  torch.cat([csa_c[1], csa_tail_s], 1))
+        full_n = min(n, spec.CTX_FULL)
+        full = vecs[:, n - full_n:]
+        full_s = step_ids[:, n - full_n:]
+        comp, comp_s = self._cap_comp(vecs[:, :n - full_n],
+                                      step_ids[:, :n - full_n])
+        # HCA：32:1 压缩区 + 完整区（comp 为空时即全量，与 SharedKV 一致）
+        if comp.shape[1] > 0:
+            hca_c = self._compress_live(comp, comp_s, spec.HCA_RATIO)
+            kv_hca = (torch.cat([hca_c[0], full], 1),
+                      torch.cat([hca_c[1], full_s], 1))
+        else:
+            kv_hca = (full, full_s)
+        # CSA：4:1 压缩区 + 完整区尾部局部窗口
+        tail_n = min(full_n, spec.CSA_LOCAL_WINDOW)
+        csa_tail = full[:, full_n - tail_n:]
+        csa_tail_s = full_s[:, full_n - tail_n:]
+        if comp.shape[1] > 0:
+            csa_c = self._compress_live(comp, comp_s, spec.CSA_RATIO)
+            kv_csa = (torch.cat([csa_c[0], csa_tail], 1),
+                      torch.cat([csa_c[1], csa_tail_s], 1))
+        else:
+            kv_csa = (csa_tail, csa_tail_s)
         return kv_hca, kv_csa
+
+    @staticmethod
+    def _cap_comp(comp: torch.Tensor, comp_s: torch.Tensor):
+        """ 压缩区按整步原子截断到 CTX_COMPRESS（丢最旧的整步）。 """
+        n = comp.shape[1]
+        if n <= spec.CTX_COMPRESS:
+            return comp, comp_s
+        ss = comp_s[0].tolist()
+        total, start, i = 0, n, n - 1
+        while i >= 0:                               # 从尾部向前累积整步
+            sid = ss[i]
+            j = i
+            while j >= 0 and ss[j] == sid:
+                j -= 1
+            step_len = i - j
+            if total + step_len > spec.CTX_COMPRESS:
+                break
+            total += step_len
+            start = j + 1
+            i = j
+        return comp[:, start:], comp_s[:, start:]
 
     def _compress_live(self, vecs: torch.Tensor, step_ids: torch.Tensor,
                        ratio: int):
@@ -598,7 +672,8 @@ class Gargantua(nn.Module):
                 g = torch.cat([g, g.new_zeros(ratio - (e - s), g.shape[-1])])
                 m = torch.cat([m, m.new_zeros(ratio - (e - s))])
             out_v.append(comp(g.unsqueeze(0), m.unsqueeze(0))[0])
-            out_s.append(ss[s:s + 1])
+            # 取组内最大步：保守因果，防跨步聚合泄漏未来 token（同 _compress_entries）
+            out_s.append(ss[e - 1:e])
         return torch.stack(out_v).unsqueeze(0), torch.cat(out_s).unsqueeze(0)
 
     def forward_train(self, input_ids: torch.Tensor, input_steps: torch.Tensor,
@@ -608,7 +683,11 @@ class Gargantua(nn.Module):
         embed_audio 拼入后再调本函数的同构逻辑）。
         input_*：用户输入段（TYPE_USER）；target_*：模型输出段（TYPE_MODEL，
         已左移一位作为 decoder 输入）。
-        返回 decoder 每个位置的 logits [1, T_dec, V]。 """
+        返回 decoder 每个位置的 logits [1, T_dec, V]。
+        2026-10-20：入口重置 fast weight 状态——Gargantua 从不自行 reset，
+        连续调用会跨样本泄漏持久记忆（实测 logits 差 20.19，已回归测试）。
+        训练样本相互独立，状态不应跨 forward 推进。 """
+        self.fast_weight.reset()
         emb_in = self.embed_text(input_ids, torch.full_like(input_ids, spec.TYPE_USER))
         enc_out = self.encode(emb_in, input_steps)
         # 共享 KV = encoder 输出 + decoder 已生成 token 的 embedding（类型=模型输出）
@@ -623,12 +702,18 @@ class Gargantua(nn.Module):
         return self.lm_head(dec_out)
 
     # ---- 多模态装配：混合 Step 列表 → (emb, step_ids) ----
-    def assemble_embeddings(self, steps: List[dict]):
+    def assemble_embeddings(self, steps: List[dict], base_step: int = 0):
         """ 把 text/visual/audio（可混合）Step 列表装配成统一嵌入序列。
         Step 结构见 spec 8；视觉步 meta.patches=[{x,y,vec}]，音频步
         meta.samples=bytes(533 float32)；视频步可同时含 patches 与
         audio（同 t 刻，patches 在前、音频 token 在后，共享 step_id）。
-        返回 (emb [1, N, D], step_ids [1, N])，step 内顺序保持。 """
+        返回 (emb [1, N, D], step_ids [1, N])，step 内顺序保持。
+
+        base_step：Step 列表第一项对应的时间步编号（默认 0）。
+        2026-10-20：多个 assemble 结果若直接拼接，step_id 会从 0 重新
+        计数造成撞名（视觉帧内「步内双向」会跨帧泄漏，实测 logits 差
+        17.98，已回归测试）。多段拼接时第二段起必须传 base_step。
+        """
         embs, sids = [], []
         for sid, st in enumerate(steps):
             tid_val = st.get("type", spec.TYPE_NONE)
@@ -639,35 +724,62 @@ class Gargantua(nn.Module):
                 parts.append(self.embed_text(
                     ids, torch.full_like(ids, tid_val)))
             if "patches" in meta:                     # 视觉 patch
-                vecs = torch.stack([torch.frombuffer(bytearray(p["vec"]),
-                                  dtype=torch.uint8) for p in meta["patches"]])
-                coords = torch.tensor([[p["x"], p["y"]]
-                                       for p in meta["patches"]])
+                vecs = []
+                coords = []
+                for p in meta["patches"]:
+                    raw = bytes(p["vec"])
+                    if len(raw) != spec.PATCH_VEC_DIM:
+                        raise ValueError(
+                            f"patch vec 长度 {len(raw)} != "
+                            f"PATCH_VEC_DIM {spec.PATCH_VEC_DIM}")
+                    vecs.append(torch.frombuffer(bytearray(raw),
+                                                 dtype=torch.uint8))
+                    coords.append((p["x"], p["y"]))
+                vecs = torch.stack(vecs)
+                coords = torch.tensor(coords)
+                if int(coords.max()) >= self.visual_coord_x.num_embeddings:
+                    raise ValueError(
+                        f"patch 坐标越界: max={int(coords.max())} >= "
+                        f"{self.visual_coord_x.num_embeddings}")
                 parts.append(self.embed_visual(
                     vecs, coords, torch.full((len(vecs),), tid_val)).unsqueeze(0))
             if "samples" in meta:                     # 单音频 token
-                s = torch.frombuffer(bytearray(meta["samples"]),
-                                     dtype=torch.float32).unsqueeze(0)
+                s = self._audio_tensor(meta["samples"])
                 parts.append(self.embed_audio(
                     s, torch.full((1,), tid_val)).unsqueeze(0))
             if "audio" in meta:                       # 视频步内的音频 token 列表
                 for a in meta["audio"]:
-                    s = torch.frombuffer(bytearray(a["samples"]),
-                                         dtype=torch.float32).unsqueeze(0)
+                    s = self._audio_tensor(a["samples"])
                     parts.append(self.embed_audio(
                         s, torch.full((1,), tid_val)).unsqueeze(0))
-            assert parts, f"空 Step: {st}"
+            if not parts:
+                raise ValueError(f"空 Step（无 token_ids/patches/samples）: {st}")
             e = torch.cat(parts, 1)                   # [1, n, D]
             embs.append(e)
-            sids.extend([sid] * e.shape[1])
+            sids.extend([base_step + sid] * e.shape[1])
+        if not embs:
+            raise ValueError("assemble_embeddings 收到空 steps 列表")
         return torch.cat(embs, 1), torch.tensor([sids])
+
+    @staticmethod
+    def _audio_tensor(buf) -> torch.Tensor:
+        """ 533×float32 字节 → [1, 533] 张量（带长度校验）。 """
+        raw = bytes(buf)
+        if len(raw) != spec.AUDIO_SAMPLES_PER_TOKEN * 4:
+            raise ValueError(
+                f"音频 samples 长度 {len(raw)} != "
+                f"{spec.AUDIO_SAMPLES_PER_TOKEN * 4}（533×float32）")
+        return torch.frombuffer(bytearray(raw),
+                                dtype=torch.float32).unsqueeze(0)
 
     def forward_train_embeddings(self, emb_in: torch.Tensor,
                                  s_in: torch.Tensor,
                                  emb_dec: torch.Tensor,
                                  s_dec: torch.Tensor) -> torch.Tensor:
         """ 多模态教师强制前向（embedding 已装配）。与 forward_train 同构，
-        区别仅在输入段/输出段直接使用给定嵌入（文本路径走 forward_train）。 """
+        区别仅在输入段/输出段直接使用给定嵌入（文本路径走 forward_train）。
+        同样在入口重置 fast weight 状态（样本独立性，见 forward_train）。 """
+        self.fast_weight.reset()
         enc_out = self.encode(emb_in, s_in)
         kv_vecs = torch.cat([enc_out, emb_dec], 1)
         kv_steps = torch.cat([s_in, s_dec], 1)

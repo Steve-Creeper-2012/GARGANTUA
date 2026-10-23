@@ -1,0 +1,11 @@
+# GARGANTUA v1 — 独立窗口（可选依赖）
+# ---------------------------------------------------------------------------
+# 主依赖只有 requirements.txt 那四项；窗口层单独放这里，因为：
+#   1. 无 GUI 环境（服务器 / SSH / CI）根本不需要它，装了纯占地方；
+#   2. pywebview 在 macOS 上要拉 pyobjc-framework-Cocoa/WebKit/Quartz
+#      等一整套 Objective-C 绑定，让「跑训练」的依赖变脏。
+#
+# 装法（约 18MB，用的是系统 WebView，不另带浏览器内核）：
+#   pip install -r requirements-window.txt
+# run.py 起窗口时发现没装，会打印上面这条命令，然后照常起 server。
+pywebview>=6.0

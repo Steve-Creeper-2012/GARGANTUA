@@ -68,12 +68,68 @@
                     to { opacity: 1; transform: translateY(0); } }
   h2 { margin: 0 0 14px; font-size: 17px; color: var(--accent); flex-shrink: 0; }
 
-  /* ---------- 通用组件 ---------- */
-  textarea, input[type=text], input[type=number], select {
-    background: var(--bg3); color: var(--fg); border: 1px solid var(--border);
-    border-radius: 6px; padding: 8px 10px; width: 100%; font-family: inherit;
-    font-size: 13px; outline: none; }
-  textarea:focus, input:focus, select:focus { border-color: var(--accent); }
+  /* ---------- 表单控件（统一设计系统） ----------
+     深色主题下 macOS/WKWebView 的原生控件（灰渐变 select、白按钮 file input、
+     number 上下箭头）和界面完全不是一个世界。全部 appearance:none 抹掉系统外观，
+     用自己的边框/圆角/focus ring 重画，视觉才统一。 */
+  :root {
+    --field-bg: var(--bg3);
+    --field-border: var(--border);
+    --field-radius: 8px;
+    --field-ring: 0 0 0 3px rgba(88, 166, 255, .18);
+  }
+  input, select, textarea {
+    appearance: none; -webkit-appearance: none;
+    background: var(--field-bg); color: var(--fg);
+    border: 1px solid var(--field-border);
+    border-radius: var(--field-radius);
+    padding: 8px 11px; width: 100%; font-family: inherit;
+    font-size: 13px; line-height: 1.4; outline: none;
+    transition: border-color .15s ease, box-shadow .15s ease,
+                background-color .15s ease; }
+  input::placeholder, textarea::placeholder { color: var(--fg3); }
+  @media (hover: hover) and (pointer: fine) {
+    input:hover:not(:focus):not(:disabled),
+    select:hover:not(:focus):not(:disabled),
+    textarea:hover:not(:focus):not(:disabled) { border-color: var(--fg3); }
+  }
+  input:focus, select:focus, textarea:focus {
+    border-color: var(--accent); box-shadow: var(--field-ring); }
+  input:disabled, select:disabled, textarea:disabled {
+    opacity: .5; cursor: not-allowed; }
+  /* select：右侧自带 chevron（系统那个箭头被 appearance:none 抹掉了） */
+  select {
+    padding-right: 30px; cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238b949e' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 10px center; }
+  select option { background: var(--bg2); color: var(--fg); }
+  /* number：去掉上下微调箭头（截图里圈出的那个，深色下尤其突兀） */
+  input[type=number] { -moz-appearance: textfield; font-variant-numeric: tabular-nums; }
+  input[type=number]::-webkit-inner-spin-button,
+  input[type=number]::-webkit-outer-spin-button {
+    appearance: none; -webkit-appearance: none; margin: 0; }
+  /* file input：整个藏起来，用 label 里的假按钮 + 文件名接管交互
+     （JS 仍通过 input.files 读文件，行为不变） */
+  input[type=file] { position: absolute; width: 1px; height: 1px;
+                     opacity: 0; pointer-events: none; }
+  .file-pick { display: inline-flex; align-items: center; gap: 10px;
+               min-width: 0; max-width: 100%; cursor: pointer; }
+  .file-pick .file-btn { flex-shrink: 0; padding: 7px 14px; font-size: 12px;
+    font-weight: 600; color: var(--fg); background: var(--bg3);
+    border: 1px solid var(--border); border-radius: var(--field-radius);
+    transition: border-color .15s ease, background-color .15s ease; }
+  @media (hover: hover) and (pointer: fine) {
+    .file-pick:hover .file-btn { border-color: var(--fg3); background: var(--bg4); }
+  }
+  .file-pick .file-name { color: var(--fg2); font-size: 12px; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-pick.has-file .file-name { color: var(--accent2); }
+  .file-pick.has-file .file-btn { border-color: var(--accent); color: var(--accent2); }
+  .grow { flex: 1 1 auto; min-width: 140px; }
+  code { background: var(--bg3); border: 1px solid var(--border);
+         border-radius: 4px; padding: 0 5px; font-size: 12px;
+         font-family: ui-monospace, SFMono-Regular, monospace; }
   textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, monospace; }
   button.act { background: var(--accent); color: #06101f; border: none;
     border-radius: 6px; padding: 7px 16px; cursor: pointer; font-weight: 600;
@@ -99,6 +155,23 @@
   .badge { display: inline-block; padding: 1px 8px; border-radius: 10px;
            background: var(--bg3); color: var(--fg2); font-size: 11px; }
   .badge.on { color: var(--green); }
+  /* 环境与依赖：结构化展示，不再把 JSON 原文倒出来 */
+  .env-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+              gap: 10px; margin-bottom: 12px; }
+  .env-cell { background: var(--bg3); border: 1px solid var(--border);
+              border-radius: 8px; padding: 8px 12px; }
+  .env-cell .k { color: var(--fg2); font-size: 11px; }
+  .env-cell .v { color: var(--fg); font-size: 15px; font-weight: 700; margin-top: 2px;
+                 font-variant-numeric: tabular-nums; }
+  .dep-list { display: flex; flex-wrap: wrap; gap: 8px; }
+  .dep { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+         border-radius: 14px; background: var(--bg3); border: 1px solid var(--border);
+         font-size: 12px; color: var(--fg); }
+  .dep .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  .dep.ok .dot { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dep.miss { color: var(--fg2); }
+  .dep.miss .dot { background: var(--fg3); }
+  .dep .ver { color: var(--fg2); font-size: 11px; font-variant-numeric: tabular-nums; }
   pre { background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
         padding: 10px; overflow: auto; font-size: 12px; margin: 0;
         white-space: pre-wrap; word-break: break-all;
@@ -246,16 +319,24 @@
           <div class="metric"><div class="k">参数量</div><div class="v" id="home-params">—</div></div>
           <div class="metric"><div class="k">训练状态</div><div class="v" id="home-train">空闲</div></div>
           <div class="metric"><div class="k">队列长度</div><div class="v" id="home-queue">0</div></div>
-          <div class="metric"><div class="k">PyTorch</div><div class="v" id="home-torch">—</div></div>
-          <div class="metric"><div class="k">设备</div><div class="v" id="home-device">—</div></div>
         </div>
         <div class="card">
-          <div class="card-head"><span class="card-title">环境与依赖</span></div>
-          <pre id="home-env">加载中…</pre>
+          <div class="card-head"><span class="card-title">环境与依赖</span>
+            <span class="hint" id="home-env-note"></span>
+            <button class="act sec xs" id="home-opt-install"
+                    style="display:none" title="cv2 / soundfile 是可选加速项，缺失不影响主流程">安装可选依赖</button></div>
+          <div class="env-grid">
+            <div class="env-cell"><div class="k">PyTorch</div>
+              <div class="v" id="home-torch2">—</div></div>
+            <div class="env-cell"><div class="k">设备</div>
+              <div class="v" id="home-device2">—</div></div>
+          </div>
+          <div class="dep-list" id="home-deps">加载中…</div>
+          <div class="hint" id="home-opt-msg" style="margin-top:8px"></div>
         </div>
         <div class="card">
           <div class="card-head"><span class="card-title">KV 架构</span></div>
-          <pre id="home-kv">加载中…</pre>
+          <div class="hint" id="home-kv" style="line-height:1.7">加载中…</div>
         </div>
       </section>
 
@@ -266,8 +347,8 @@
           <div class="card-head"><span class="card-title">创建新模型</span></div>
           <div class="row">
             <input type="text" id="model-name" placeholder="模型目录名，如 beta" style="max-width:260px">
-            <label title="默认 4">enc blocks <input type="number" id="model-enc" value="4" min="1" max="64" style="width:60px"></label>
-            <label title="默认 6">dec blocks <input type="number" id="model-dec" value="6" min="1" max="64" style="width:60px"></label>
+            <label title="默认 4">enc blocks <input type="number" id="model-enc" value="4" min="1" max="64"></label>
+            <label title="默认 6">dec blocks <input type="number" id="model-dec" value="6" min="1" max="64"></label>
             <button class="act" id="model-create">创建并初始化</button>
             <span class="hint" id="model-create-msg"></span>
           </div>
@@ -289,7 +370,9 @@
           <div class="card">
             <div class="card-head"><span class="card-title">创建训练任务</span></div>
             <div class="hint">上传训练数据 JSON 文件：单个对象 {"text":"..."}、对象数组，或 JSONL 每行一个对象，均必须含 text 字段</div>
-            <div class="row"><input type="file" id="train-file" accept=".json,.jsonl"></div>
+            <div class="row"><label class="file-pick" for="train-file"><input type="file" id="train-file" accept=".json,.jsonl">
+            <span class="file-btn">选择文件</span>
+            <span class="file-name" id="train-file-name">未选择</span></label></div>
             <div class="row">
               <label>优化器（Muon：隐藏层矩阵；AdamW：embedding/输出头/RMSNorm）
                 <select id="train-mode">
@@ -351,7 +434,7 @@
                     <input type="file" id="infer-media" accept="image/*,video/*,.wav,.mp3,.flac,.ogg,.mid,.midi" style="display:none">
                   </label>
                   <label title="最多生成多少个新 token">max_new
-                    <input type="number" id="infer-maxnew" value="32" min="1" max="512" style="width:64px"></label>
+                    <input type="number" id="infer-maxnew" value="32" min="1" max="512"></label>
                   <span class="hint" id="infer-status"></span>
                   <button id="send-btn" title="发送">↑</button>
                 </div>
@@ -397,7 +480,9 @@
           <label>谁的输入/输出
             <select id="audio-bound"><option value="user" selected>用户输入 &lt;user&gt;</option>
               <option value="model">模型输出 &lt;model&gt;</option></select></label>
-          <input type="file" id="audio-file" accept=".wav,.mp3,.flac,.ogg,audio/*">
+          <label class="file-pick" for="audio-file"><input type="file" id="audio-file" accept=".wav,.mp3,.flac,.ogg,audio/*">
+            <span class="file-btn">选择文件</span>
+            <span class="file-name" id="audio-file-name">未选择</span></label>
           <button class="act" id="audio-encode">编码</button>
         </div>
         <div id="audio-preview" class="row"></div>
@@ -412,7 +497,9 @@
           <label>谁的输入/输出
             <select id="image-bound"><option value="user" selected>用户输入 &lt;user&gt;</option>
               <option value="model">模型输出 &lt;model&gt;</option></select></label>
-          <input type="file" id="image-file" accept="image/*">
+          <label class="file-pick" for="image-file"><input type="file" id="image-file" accept="image/*">
+            <span class="file-btn">选择文件</span>
+            <span class="file-name" id="image-file-name">未选择</span></label>
           <button class="act" id="image-encode">编码</button>
         </div>
         <div class="codec-io" style="margin-top:10px;">
@@ -429,7 +516,9 @@
           <label>谁的输入/输出
             <select id="video-bound"><option value="user" selected>用户输入 &lt;user&gt;</option>
               <option value="model">模型输出 &lt;model&gt;</option></select></label>
-          <input type="file" id="video-file" accept="video/*,.gif,.webp">
+          <label class="file-pick" for="video-file"><input type="file" id="video-file" accept="video/*,.gif,.webp">
+            <span class="file-btn">选择文件</span>
+            <span class="file-name" id="video-file-name">未选择</span></label>
           <button class="act" id="video-encode">编码</button>
         </div>
         <div class="row"><video id="video-preview" controls style="max-height:180px;border-radius:6px;display:none;"></video></div>
@@ -442,12 +531,13 @@
         <h2>图像 → 图元转换（可视化）</h2>
         <div class="hint">上传图片，按 wonderfulearth/primitive-operation-painter 的 image-to-sequence 思路（贪心拟合矩形/椭圆+背景，残差最小化）转换为图元序列并渲染</div>
         <div class="row">
-          <input type="file" id="prims-file" accept="image/*">
+          <label class="file-pick" for="prims-file"><input type="file" id="prims-file" accept="image/*">
+            <span class="file-btn">选择文件</span>
+            <span class="file-name" id="prims-file-name">未选择</span></label>
           <label class="hint" for="prims-steps">步数上限</label>
-          <input type="number" id="prims-steps" value="100" min="1" max="5000" step="1"
-                 style="width:80px;" title="默认 100；越大质量越高，耗时线性增长">
+          <input type="number" id="prims-steps" value="100" min="1" max="1000" step="1" title="默认 100，服务端上限 1000；越大质量越高，耗时线性增长">
           <label class="hint" for="prims-quality">模式</label>
-          <select id="prims-quality" style="width:80px;" title="fast=快，20候选/步；slow=慢，50候选/步+短爬山">
+          <select id="prims-quality" title="fast=快，20候选/步；slow=慢，50候选/步+短爬山">
             <option value="fast">fast</option>
             <option value="slow">slow</option>
           </select>
@@ -467,7 +557,9 @@
         <h2>MIDI → token 转换</h2>
         <div class="hint">导入 .mid / .midi（SMF），解析 note_on/note_off/velocity/program/tempo/time_shift 为离散 token，输出定制时间步格式（每 token 一个时间步）</div>
         <div class="row">
-          <input type="file" id="midi-file" accept=".mid,.midi">
+          <label class="file-pick" for="midi-file"><input type="file" id="midi-file" accept=".mid,.midi">
+            <span class="file-btn">选择文件</span>
+            <span class="file-name" id="midi-file-name">未选择</span></label>
           <button class="act" id="midi-encode">编码</button>
         </div>
         <pre id="midi-out">—</pre>
@@ -490,6 +582,13 @@
           <span class="hint" id="json-msg"></span>
         </div>
         <div class="token-palette" id="json-palette"></div>
+        <div class="row">
+          <input class="grow" id="vocab-q" type="search" autocomplete="off"
+                 placeholder="搜索词表 token（如 think / 你 / x-axis / midi）">
+          <button class="act sec" id="vocab-search">搜索</button>
+          <span class="hint" id="vocab-msg"></span>
+        </div>
+        <div class="hint" id="vocab-hits"></div>
         <div id="json-editor" contenteditable="true" spellcheck="false">{<user>}{h}{e}{l}{l}{o}{<user/>}</div>
       </section>
 
@@ -501,6 +600,14 @@
 const $ = id => document.getElementById(id);
 const $$ = (sel, el=document) => el.querySelectorAll(sel);
 
+// 数值入参钳位：空输入 / 手敲越界值在前端就地修正，不让 400 打到用户脸上。
+// NaN（空输入框）回落到 default，而不是被 `|| default` 把合法的 0 也吃掉。
+function clampNum(v, lo, hi, dflt) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.min(hi, Math.max(lo, n));
+}
+
 async function api(path, body) {
   const opt = body === undefined ? {} :
     {method: "POST", headers: {"Content-Type": "application/json"},
@@ -511,8 +618,13 @@ async function api(path, body) {
   if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
   return j;
 }
-function esc(s) { const d = document.createElement("div"); d.textContent = s;
-  return d.innerHTML; }
+function esc(s) {
+  // 2026-10-20：补引号转义。textContent→innerHTML 只转义 & < >，
+  // 不转义 " '，拼进 data-name="..." 等属性时模型名含引号可注入
+  // 属性（XSS / 按钮功能错乱）。补转义后文本与属性上下文均安全。
+  const d = document.createElement("div"); d.textContent = s;
+  return d.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
 function fileToB64(f) {
   return new Promise((res, rej) => {
     const rd = new FileReader();
@@ -675,6 +787,26 @@ function switchPage(id) {
 }
 $("toggle-nav").onclick = () => $("sidebar").classList.toggle("collapsed");
 
+/* ---------- 文件选择器（自定义外观） ----------
+   原生 file input 用 CSS 藏起来了，视觉由 label.file-pick 接管；
+   这里只负责把选中的文件名回填到 .file-name，并切 has-file 状态。 */
+function wireFileInput(id) {
+  const input = $(id);
+  const label = input.closest(".file-pick");
+  const name = $(id + "-name");
+  if (!input || !label || !name) return;
+  const sync = () => {
+    const f = input.files && input.files[0];
+    name.textContent = f ? f.name : "未选择";
+    name.title = f ? `${f.name}（${(f.size / 1024).toFixed(1)} KB）` : "";
+    label.classList.toggle("has-file", !!f);
+  };
+  input.addEventListener("change", sync);
+  sync();
+}
+["train-file", "audio-file", "image-file", "video-file", "prims-file",
+ "midi-file"].forEach(wireFileInput);
+
 /* ---------- 状态栏 ---------- */
 async function refreshStatus() {
   try {
@@ -737,24 +869,47 @@ $("model-create").onclick = async () => {
   if (!name) return;
   $("model-create-msg").textContent = "初始化中…";
   try {
-    const {task_id} = await api("/api/model/init", {
-      name,
-      n_enc_blocks: parseInt($("model-enc").value) || undefined,
-      n_dec_blocks: parseInt($("model-dec").value) || undefined,
-    });
-    const t0 = Date.now();
-    while (Date.now() - t0 < 120000) {
-      await new Promise(r => setTimeout(r, 1500));
-      const t = await api("/api/task/" + task_id);
-      if (t.status === "done") {
-        $("model-create-msg").textContent = "创建成功";
-        refreshModels(); refreshStatus(); return;
+    await createModel(name, false);
+  } catch (e) {
+    // 已存在 → 确认后覆盖（服务端 init_new 默认拒绝覆盖）
+    if (e.message.includes("已存在") &&
+        confirm("模型 " + name + " 已存在，覆盖其检查点？")) {
+      try {
+        await createModel(name, true);
+        return;
+      } catch (e2) {
+        $("model-create-msg").textContent = "错误: " + e2.message;
       }
-      if (t.status === "error") throw new Error(t.error);
+    } else {
+      $("model-create-msg").textContent = "错误: " + e.message;
     }
-    $("model-create-msg").textContent = "轮询超时";
-  } catch (e) { $("model-create-msg").textContent = "错误: " + e.message; }
+  }
 };
+async function createModel(name, overwrite) {
+  const {task_id} = await api("/api/model/init", {
+    name, overwrite,
+    n_enc_blocks: parseInt($("model-enc").value) || undefined,
+    n_dec_blocks: parseInt($("model-dec").value) || undefined,
+  });
+  const t0 = Date.now();
+  while (Date.now() - t0 < 120000) {
+    await new Promise(r => setTimeout(r, 1500));
+    const t = await api("/api/task/" + task_id);
+    if (t.status === "done") {
+      $("model-create-msg").textContent = "创建成功";
+      refreshModels(); refreshStatus();
+      // 首个模型创建后自动激活（此前不加载，训练/推理仍报「无活动模型」）
+      if (!$("sb-model").textContent.includes(name)) {
+        try { await api("/api/model/load", {name}); refreshStatus(); }
+        catch (e) { $("model-create-msg").textContent =
+          "已创建（自动激活失败: " + e.message + "）"; }
+      }
+      return;
+    }
+    if (t.status === "error") throw new Error(t.error);
+  }
+  $("model-create-msg").textContent = "轮询超时";
+}
 $("model-refresh").onclick = refreshModels;
 
 /* ---------- 训练 ---------- */
@@ -792,7 +947,10 @@ $("queue-refresh").onclick = refreshQueue;
 $("train-start").onclick = async () => {
   try {
     const r = await api("/api/train/start", {
-      steps: +$("train-steps").value, block_size: +$("train-block").value});
+      steps: clampNum($("train-steps").value, 1, 1e6, 20),
+      // & ~1：强制为偶数（block_size 会二分给 enc/dec，奇数令前向崩溃）
+      block_size: clampNum($("train-block").value, 4, 2048, 32) & ~1,
+      target: $("train-target").value});
     $("train-state").textContent = r.started ? "已启动" : "已在运行中";
   } catch (e) { $("train-state").textContent = "错误: " + e.message; }
 };
@@ -894,9 +1052,9 @@ $("send-btn").onclick = async () => {
   $("send-btn").disabled = true;
   try {
     const body = {prompt,
-                  max_new_tokens: +$("infer-maxnew").value,
-                  temperature: +$("infer-temp").value,
-                  top_p: +$("infer-topp").value};
+                  max_new_tokens: clampNum($("infer-maxnew").value, 1, 512, 32),
+                  temperature: clampNum($("infer-temp").value, 0.05, 5, 0.8),
+                  top_p: clampNum($("infer-topp").value, 0.01, 1, 0.95)};
     if (lastMedia) { body.media_b64 = await fileToB64(lastMedia);
                      body.media_name = lastMedia.name; }
     const {task_id} = await api("/api/infer", body);
@@ -978,7 +1136,8 @@ $("prims-convert").onclick = async () => {
   try {
     const {task_id} = await api("/api/codec/image2prims",
                                 {image_b64: await fileToB64(f),
-                                 max_steps: parseInt($("prims-steps").value) || 100,
+                                 // 钳到服务端区间 [1,1000]，避免越界后只能等到 400
+                                 max_steps: clampNum($("prims-steps").value, 1, 1000, 100),
                                  quality: $("prims-quality").value || "fast"});
     const t0 = Date.now();
     let r = null;
@@ -1085,6 +1244,25 @@ $("json-copy").onclick = () => {
   navigator.clipboard.writeText($("json-editor").innerText)
     .then(() => $("json-msg").textContent = "已复制");
 };
+
+/* ---------- 词表搜索（/api/vocab，GET ?q=） ---------- */
+async function vocabSearch() {
+  const q = $("vocab-q").value.trim();
+  const msg = $("vocab-msg"), hits = $("vocab-hits");
+  if (!q) { msg.textContent = ""; hits.textContent = ""; return; }
+  msg.textContent = "搜索中…";
+  try {
+    const r = await api("/api/vocab?q=" + encodeURIComponent(q));
+    msg.textContent = `${r.hits.length} 项命中（词表共 ${r.vocab_size}）`;
+    hits.innerHTML = r.hits.length
+      ? r.hits.map(h => `<code>${esc(h.token)}</code><span class="hint">#${h.id}</span>`).join("　")
+      : '<span class="hint">无命中</span>';
+  } catch (e) { msg.textContent = "错误: " + e.message; hits.textContent = ""; }
+}
+$("vocab-search").onclick = vocabSearch;
+$("vocab-q").addEventListener("keydown", e => {
+  if (e.key === "Enter") vocabSearch();
+});
 </script>
 </body>
 </html>

@@ -59,7 +59,10 @@ DIGIT_SIZE = 10
 SYMBOL_BEGIN = DIGIT_BEGIN + DIGIT_SIZE           # 74–585
 # ASCII 可打印字符 0x20–0x7E（95 个，含 a-z fallback 字母与半角符号）
 # + 全角符号区 U+FF01–U+FF5E、U+3000–U+303F 常用全角标点
+# + 3 个控制字符 \t \n \r（占用 reserved 槽；2026-10-20 补充：多行文本
+#   训练数据的换行此前被静默丢弃，属数据损坏，故在 RESERVE 段内消耗 3 槽）
 # 剩余槽位 reserved。注：a–z 既是 ASCII 符号也是英文 fallback token（同一 ID）。
+SYMBOL_CONTROL_CHARS = ["\t", "\n", "\r"]
 SYMBOL_SIZE = 512
 
 CJK_BEGIN = SYMBOL_BEGIN + SYMBOL_SIZE            # 586–28169
@@ -67,7 +70,13 @@ CJK_BEGIN = SYMBOL_BEGIN + SYMBOL_SIZE            # 586–28169
 CJK_SIZE = 20992 + 6592                           # 27584
 
 ENGLISH_BEGIN = CJK_BEGIN + CJK_SIZE              # 28170–68169
-ENGLISH_SIZE = 40000          # 英文常用词 + 常见专有名词，全小写
+# 英文常用词 + 常见专有名词，全小写
+# 撞名警告（2026-10-20 审查修正注释）：本区含 "a"/"i"/"o"/"x" 等 36 个
+# 与 DIGIT/SYMBOL 区同文本的 token（同一字符串两个 ID），token_to_id 对
+# 这些字符串是二义的。编码/解码一律使用区间专用映射
+# （vocab.Vocab 的 digit/symbol/cjk/english_ids），禁止依赖 token_to_id
+# 的反查结果；本区不因此跳过单字母词（改动会动词表内容 = 改契约）。
+ENGLISH_SIZE = 40000
 
 # —— 绘图输出 token（仅输出侧；视觉输入的像素参数不入词表，走投影）——
 DRAW_X_BEGIN = ENGLISH_BEGIN + ENGLISH_SIZE       # 68170–70089：<x-axis:n>

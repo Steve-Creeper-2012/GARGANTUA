@@ -3,96 +3,55 @@ setlocal
 
 cd /d "%~dp0"
 
-set "VENV=.venv"
-set "PY=%VENV%\Scripts\python.exe"
-
 REM ============================================================
-REM GARGANTUA - Windows launcher
-REM 自动使用系统 Python 创建 .venv
+REM GARGANTUA - Windows launcher (thin delegate)
+REM
+REM This file only locates the system Python. All logic (venv
+REM creation, dependency check, Python version guard, server +
+REM independent window lifecycle) lives in run.py.
+REM
+REM 2026-10-23: this file used to carry its own venv/pip logic,
+REM which duplicated run.py and drifted from it. Now it only
+REM finds an interpreter and execs run.py, same as run.sh /
+REM run.command do.
 REM ============================================================
 
-if not exist "%PY%" (
+set "SYS_PY="
 
-    echo [GARGANTUA] 未找到项目 Python 环境，正在寻找系统 Python...
-
-    REM 优先使用 py launcher
-    where py >nul 2>nul
-    if not errorlevel 1 (
-        set "SYS_PY=py -3"
-        goto :create_venv
-    )
-
-    REM 其次使用 python
-    where python >nul 2>nul
-    if not errorlevel 1 (
-        set "SYS_PY=python"
-        goto :create_venv
-    )
-
-    echo.
-    echo [GARGANTUA] 找不到系统 Python
-    echo 请先安装 Python 3.10+
-    echo.
-    pause
-    exit /b 1
+REM Prefer the py launcher (picks the newest 3.x), then python
+where py >nul 2>nul
+if not errorlevel 1 (
+    set "SYS_PY=py -3"
+    goto :found
 )
 
-goto :run
-
-
-:create_venv
-
-echo [GARGANTUA] 使用系统 Python: %SYS_PY%
-echo [GARGANTUA] 正在创建 .venv...
-
-%SYS_PY% -m venv "%VENV%"
-
-if errorlevel 1 (
-    echo.
-    echo [GARGANTUA] 创建 venv 失败
-    echo.
-    pause
-    exit /b 1
+where python >nul 2>nul
+if not errorlevel 1 (
+    set "SYS_PY=python"
+    goto :found
 )
 
-if not exist "%PY%" (
-    echo.
-    echo [GARGANTUA] .venv 创建失败
-    echo.
-    pause
-    exit /b 1
-)
+echo.
+echo [GARGANTUA] No system Python found.
+echo Please install Python 3.12 ^(torch==2.2.2 has no wheel for 3.13^):
+echo   https://www.python.org/downloads/windows/
+echo.
+pause
+exit /b 1
 
-REM 安装依赖
-if exist requirements.txt (
-    echo.
-    echo [GARGANTUA] 正在安装依赖...
+:found
+echo [GARGANTUA] Using system Python: %SYS_PY%
+echo [GARGANTUA] First launch creates .venv and installs dependencies.
+echo.
 
-    "%PY%" -m pip install -U pip
-
-    if errorlevel 1 (
-        echo [GARGANTUA] pip 更新失败
-        pause
-        exit /b 1
-    )
-
-    "%PY%" -m pip install -r requirements.txt
-
-    if errorlevel 1 (
-        echo [GARGANTUA] 依赖安装失败
-        pause
-        exit /b 1
-    )
-)
-
-goto :run
-
-
-:run
-
-"%PY%" "%~dp0run.py" %*
-
+%SYS_PY% "%~dp0run.py" %*
 set "EXITCODE=%ERRORLEVEL%"
+
+if not "%EXITCODE%"=="0" (
+    echo.
+    echo [GARGANTUA] Exited with code %EXITCODE%
+    pause
+)
 
 endlocal
 exit /b %EXITCODE%

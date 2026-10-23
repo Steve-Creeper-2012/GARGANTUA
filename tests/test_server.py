@@ -91,18 +91,23 @@ class TestServer(unittest.TestCase):
         cls.log_file = os.path.join(cls.tmp, "logs", "auto_train.jsonl")
         os.makedirs(cls.model_dir)
 
-        # 小模型替身：与 init.py 相同的 safetensors + config.json 方式
+        # 小模型替身：与 init.py 相同的 safetensors + config.json 方式。
+        # 2026-10-20：改用具名 block 数（1+1）的小模型——默认构造是
+        # 527M 参数（2.1GB safetensors），磁盘压力大且与本测试意图
+        # （API 行为，与规模无关）不符；同时顺带覆盖 config.json 的
+        # block 数经 server 加载路径。
         import torch
         from safetensors.torch import save_file
         from model import Gargantua
         torch.manual_seed(0)
-        m = Gargantua()
+        m = Gargantua(n_enc_blocks=1, n_dec_blocks=1)
         n = sum(p.numel() for p in m.parameters())
         d = os.path.join(cls.model_dir, "tiny")
         os.makedirs(d)
         save_file(m.state_dict(), os.path.join(d, "model.safetensors"))
         with open(os.path.join(d, "config.json"), "w") as f:
-            json.dump({"name": "tiny", "params": n}, f)
+            json.dump({"name": "tiny", "params": n,
+                       "n_enc_blocks": 1, "n_dec_blocks": 1}, f)
         cls.params = n
         del m
 
@@ -344,6 +349,89 @@ class TestServer(unittest.TestCase):
         self.assertEqual(code, 404)
         code, _ = http("GET", self.port, "/api/status")
         self.assertEqual(code, 200)
+
+    # ------------------------------------------------------------------
+    # 2026-10-20 审查修复的参数校验回归
+    # ------------------------------------------------------------------
+    def test_12_param_validation(self):
+        # 奇数 block_size → 400（此前令前向必崩）
+        code, j = http("POST", self.port, "/api/train/start",
+                       {"block_size": 15})
+        self.assertEqual(code, 400)
+        self.assertIn("偶数", j.get("error", ""))
+        # 0 步 → 400（此前触发 Trainer _loss_tail[-1] IndexError）
+        code, j = http("POST", self.port, "/api/train/start", {"steps": 0})
+        self.assertEqual(code, 400)
+        # max_new 越界 → 400
+        code, j = http("POST", self.port, "/api/infer",
+                       {"prompt": "hi", "max_new_tokens": 999999})
+        self.assertEqual(code, 400)
+        # temperature 非法 → 400
+        code, j = http("POST", self.port, "/api/infer",
+                       {"prompt": "hi", "temperature": 0})
+        self.assertEqual(code, 400)
+        # 显式 0 不被 or 默认值吞掉：max_new_tokens=0 此前静默变 32
+        code, j = http("POST", self.port, "/api/infer",
+                       {"prompt": "hi", "max_new_tokens": 0})
+        self.assertEqual(code, 400)
+        # 非数值 → 400（此前 float("x") 抛 ValueError 也会 400，但消息不可读）
+        code, j = http("POST", self.port, "/api/infer",
+                       {"prompt": "hi", "temperature": "abc"})
+        self.assertEqual(code, 400)
+        self.assertIn("temperature", j.get("error", ""))
+        # 模型名路径穿越 → 400（此前可加载 model_dir 外目录）
+        code, j = http("POST", self.port, "/api/model/load",
+                       {"name": "../escaped"})
+        self.assertEqual(code, 400)
+        # image2prims：非法 quality 此前被静默改成 fast
+        code, j = http("POST", self.port, "/api/codec/image2prims",
+                       {"image_b64": "AAAA", "quality": "medium"})
+        self.assertEqual(code, 400)
+        self.assertIn("quality", j.get("error", ""))
+        # max_steps=0 此前被静默改成 100
+        code, j = http("POST", self.port, "/api/codec/image2prims",
+                       {"image_b64": "AAAA", "max_steps": 0})
+        self.assertEqual(code, 400)
+        # 非法 JSON → 400
+        import urllib.request
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/infer", data=b"not-json",
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            self.fail("应拒绝非法 JSON")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 400)
+
+    def test_13_model_init_conflict(self):
+        # 重名创建默认拒绝（任务报错），overwrite=True 才成功。
+        # 用小 block 数：默认构造写 2.1GB safetensors，磁盘吃不消。
+        def init_and_wait(name, overwrite=None, timeout=300):
+            body = {"name": name, "n_enc_blocks": 1, "n_dec_blocks": 1}
+            if overwrite is not None:
+                body["overwrite"] = overwrite
+            code, j = http("POST", self.port, "/api/model/init", body)
+            self.assertEqual(code, 202)
+            tid = j["task_id"]
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                code, t = http("GET", self.port, f"/api/task/{tid}")
+                if t["status"] in ("done", "error"):
+                    return t
+                time.sleep(1)
+            self.fail("init 任务超时")
+        t = init_and_wait("tiny")           # setUpClass 已建 tiny
+        self.assertEqual(t["status"], "error")
+        self.assertIn("已存在", t["error"])
+        # 先清盘再覆盖：os.replace 前 .tmp 与旧文件并存，双倍体积
+        shutil.rmtree(os.path.join(self.model_dir, "tiny"))
+        t = init_and_wait("tiny", overwrite=True)
+        self.assertEqual(t["status"], "done", t.get("error"))
+        # 覆盖后磁盘 config.json 仍完整
+        cfg_path = os.path.join(self.model_dir, "tiny", "config.json")
+        self.assertTrue(os.path.exists(cfg_path))
+        with open(cfg_path, encoding="utf-8") as f:
+            self.assertIn("params", json.load(f))
 
 
 if __name__ == "__main__":

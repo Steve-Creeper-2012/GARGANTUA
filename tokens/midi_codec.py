@@ -17,11 +17,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import struct
 from typing import List, Sequence, Tuple, Union
 
 import spec
+
+log = logging.getLogger(__name__)
 
 TPQ = 480                                       # ticks per quarter（写出）
 DEFAULT_BPM = 120.0
@@ -102,7 +105,12 @@ def _read_varlen(data: bytes, i: int) -> Tuple[int, int]:
 
 
 def _parse_track(data: bytes) -> List[Tuple[int, str, int, int]]:
-    """单轨字节流 → [(abs_tick, kind, a, b)]；未知事件跳过不报错。"""
+    """单轨字节流 → [(abs_tick, kind, a, b)]；未知事件跳过不报错。
+
+    2026-10-20：meta/sysex 事件后清空 running status——MIDI 规范要求
+    system 消息后 running status 失效，此前保留 0xFF 会把后续数据字节
+    误判为 meta type（畸形文件可致错位解析）。
+    """
     events: List[Tuple[int, str, int, int]] = []
     i, tick, status = 0, 0, 0
     n = len(data)
@@ -123,11 +131,13 @@ def _parse_track(data: bytes) -> List[Tuple[int, str, int, int]]:
                 if us > 0:
                     events.append((tick, "tempo", us, 0))
             i += length
+            status = 0                                  # meta 后清 running status
             if mtype == 0x2F:                           # end of track
                 break
         elif status in (0xF0, 0xF7):                    # sysex
             length, i = _read_varlen(data, i)
             i += length
+            status = 0                                  # sysex 后清 running status
         else:
             hi = status & 0xF0
             if hi == 0x80:                              # note off
@@ -225,6 +235,7 @@ def tokens_to_events(ids: Sequence[int]) -> List[Event]:
     def flush_pending() -> None:
         nonlocal pending_pitch
         if pending_pitch is not None:
+            # 默认 velocity 档 24 → q_to_vel(24) = 24*4+2 = 98（非 96）
             events.append((ms, "on", pending_pitch, q_to_vel(24)))
             pending_pitch = None
 
@@ -243,6 +254,10 @@ def tokens_to_events(ids: Sequence[int]) -> List[Event]:
                 events.append((ms, "on", pending_pitch,
                                q_to_vel(rel - OFF_VEL)))
                 pending_pitch = None
+            else:
+                # 孤儿 velocity（前面没有 note_on）：按契约丢弃，但留痕
+                log.warning("midi_codec: 孤儿 velocity 档 %d 被丢弃",
+                            rel - OFF_VEL)
         elif rel < OFF_TEMPO:                           # program
             flush_pending()
             events.append((ms, "prog", rel - OFF_PROG, 0))

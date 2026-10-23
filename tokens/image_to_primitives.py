@@ -64,7 +64,8 @@ HEIGHT_MUTATION_RANGE = 28.0
 ANGLE_MUTATION_RANGE_DEG = 16.0
 MIN_HALF_SIZE = 1.0
 MAX_HALF_SIZE = 128.0
-HISTORY_WINDOW = 1000
+HISTORY_WINDOW = 50           # 早停比较窗口（步）：必须 < max_steps 才可能触发
+                              # （2026-10-20：原 1000 > max_steps=100，早停是死代码）
 EARLY_STOP_THRESHOLD = 0.0005
 
 _EPS = 1e-6

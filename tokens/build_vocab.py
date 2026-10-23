@@ -162,10 +162,13 @@ def build_tokens(english_words):
     tokens.extend(str(d) for d in range(10))
     assert len(tokens) == spec.DIGIT_BEGIN + spec.DIGIT_SIZE
 
-    # 3. SYMBOL 74–585：ASCII 可打印 + 全角符号，剩余 reserved
+    # 3. SYMBOL 74–585：ASCII 可打印 + 全角符号 + 3 控制字符（\t\n\r，
+    #    占用 reserved 槽——spec 许可「只可在 RESERVE 段内消耗」），
+    #    剩余 reserved
     assert len(tokens) == spec.SYMBOL_BEGIN
     tokens.extend(chr(cp) for cp in range(0x20, 0x7E + 1))  # 95 个
     tokens.extend(_fullwidth_symbols())
+    tokens.extend(spec.SYMBOL_CONTROL_CHARS)   # \t \n \r（2026-10-20 审查后补）
     pad_to(spec.SYMBOL_BEGIN + spec.SYMBOL_SIZE)
 
     # 4. CJK 586–28169：U+4E00–U+9FFF 接 U+3400–U+4DBF（各按码点升序）

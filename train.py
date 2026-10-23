@@ -6,6 +6,13 @@
 # 优化器：Muon（隐藏层 2D）+ AdamW（embedding/head/norm），--optimizer 可关。
 # 用法：
 #   python train.py --model models/alpha --data data --steps 200 --block-size 32
+#
+# 2026-10-20 修复（审查结论）：
+#   1. main() 改用 common.build_model：按模型目录 config.json 的 block 数
+#      构造与加载，非默认 block 数的模型不再崩溃。
+#   2. block_size 经 common.validate_block_size 校验（偶数 ≥2）——奇数会
+#      令 s_dec 与 dec_in 长度不一致，forward_train 必崩（已实测复现）。
+#   3. 删除死变量 tgt（与 y 完全相同）。
 # ===========================================================================
 import argparse
 import glob
@@ -15,14 +22,12 @@ import time
 
 import torch
 import torch.nn.functional as F
-from safetensors.torch import load_file, save_file
 
 import spec
-from model import Gargantua
+from common import (CKPT_NAME, build_model, make_batch, read_config,
+                    save_checkpoint, validate_block_size)
 from muon import build_optimizers
 from tokens.text_codec import encode as text_encode
-
-CKPT_NAME = "model.safetensors"
 
 
 def load_corpus_ids(data_dir: str):
@@ -40,11 +45,11 @@ def load_corpus_ids(data_dir: str):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True)
+    ap.add_argument("--model", required=True, help="模型目录（含 model.safetensors）")
     ap.add_argument("--data", default="data")
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--block-size", type=int, default=32,
-                    help="窗口大小（token/时间步）；user/model 各一半")
+                    help="窗口大小（token/时间步，偶数）；user/model 各一半")
     ap.add_argument("--lr", type=float, default=spec.ADAMW_LR)
     ap.add_argument("--muon-lr", type=float, default=spec.MUON_LR)
     ap.add_argument("--optimizer", default=spec.OPTIMIZER,
@@ -56,32 +61,21 @@ def main():
     torch.manual_seed(args.seed)
     random.seed(args.seed)
 
-    m = Gargantua()
-    ckpt = os.path.join(args.model, CKPT_NAME)
-    if os.path.exists(ckpt):
-        m.load_state_dict(load_file(ckpt))
-        print(f"[train] 载入 {ckpt}")
+    B = validate_block_size(args.block_size)
+    m = build_model(args.model)
     m.train()
 
     opts = build_optimizers(m, args.optimizer, args.lr, args.muon_lr,
                             spec.MUON_MOMENTUM)
     ids = load_corpus_ids(args.data)
-    B = args.block_size
-    half = B // 2
-    assert len(ids) > B + 1, f"语料太少：{len(ids)} tokens < {B + 1}"
+    assert len(ids) > B + 1, f"语料太少：{len(ids)} tokens < {B + 2}"
     print(f"[train] corpus={len(ids)} tokens  steps={args.steps}  "
           f"block={B}  optimizer={args.optimizer}")
 
     t0 = time.time()
     for step in range(1, args.steps + 1):
         i = random.randint(0, len(ids) - B - 2)
-        x_in = torch.tensor([ids[i:i + half]])
-        s_in = torch.arange(half).unsqueeze(0)
-        tgt = torch.tensor([ids[i + half:i + B]])
-        y = torch.tensor([ids[i + half : i + B]])  
-        # decoder 输入 = 目标段左移一位（首 token 用 user 段尾 token 播种）
-        dec_in = torch.tensor([[ids[i + half - 1]] + ids[i + half:i + B - 1]])
-        s_dec = torch.arange(half, half + half).unsqueeze(0)
+        x_in, s_in, dec_in, s_dec, y = make_batch(ids, i, B)
 
         logits = m.forward_train(x_in, s_in, dec_in, s_dec)
         loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), y.view(-1))
@@ -98,10 +92,29 @@ def main():
             print(f"[train] step {step:4d}/{args.steps}  "
                   f"loss {loss.item():.4f}  {el/step:.2f}s/it")
         if step % args.save_every == 0:
-            save_file(m.state_dict(), ckpt)
-            print(f"[train] saved {ckpt}")
-    save_file(m.state_dict(), ckpt)
-    print(f"[train] done, saved {ckpt}")
+            save_checkpoint(args.model, m, _config_dict(args, m))
+            print(f"[train] saved {os.path.join(args.model, CKPT_NAME)}")
+    save_checkpoint(args.model, m, _config_dict(args, m))
+    print(f"[train] done, saved {os.path.join(args.model, CKPT_NAME)}")
+
+
+def _config_dict(args, m) -> dict:
+    """ 与 init.py / server.py 同构的 config.json 内容（block 数以实例为准，
+    保留首次创建的 created 时间戳）。 """
+    cfg = dict(read_config(args.model))          # 保留既有字段（如 created）
+    cfg.update({
+        "name": os.path.basename(os.path.normpath(args.model)),
+        "params": sum(p.numel() for p in m.parameters()),
+        "d_model": spec.D_MODEL, "head_dim": spec.HEAD_DIM,
+        "n_enc_blocks": len(m.enc_blocks),
+        "n_dec_blocks": len(m.dec_blocks),
+        "vocab_size_padded": spec.VOCAB_SIZE_PADDED,
+        "ctx_full": spec.CTX_FULL, "ctx_compress": spec.CTX_COMPRESS,
+        "csa_ratio": spec.CSA_RATIO, "hca_ratio": spec.HCA_RATIO,
+        "optimizer": args.optimizer,
+    })
+    cfg.setdefault("created", time.strftime("%Y-%m-%d %H:%M:%S"))
+    return cfg
 
 
 if __name__ == "__main__":

@@ -1,115 +1,52 @@
 #!/bin/sh
 # ===========================================================================
-# GARGANTUA v1 — 一键启动（macOS / Linux）
+# GARGANTUA v1 — Linux / macOS 启动入口（薄委托）
+# ---------------------------------------------------------------------------
+# 本脚本只做一件事：找到系统 Python，然后把全部逻辑交给 run.py
+# （venv 创建 / 依赖校验 / 版本守卫 / server + 独立窗口生命周期）。
+#
 # 用法：
-#   ./run.sh                  启动网页工作台 http://127.0.0.1:8712
+#   ./run.sh                  启动 server + 独立桌面窗口
 #   ./run.sh --port 9000      指定端口
-#   ./run.sh --no-open        不自动打开浏览器
-#   ./run.sh --test           跑全量测试（model + tokens + codecs + server）
+#   ./run.sh --no-window      只起 server
+#   ./run.sh --test           跑全量测试（逐套件分进程）
 #   ./run.sh --init NAME      创建模型 models/NAME
-#   ./run.sh --train NAME     用 data/ 训练 models/NAME
-#   ./run.sh --infer NAME "提示词"
+#   ./run.sh --train NAME     训练
+#   ./run.sh --infer NAME ["提示词"]
+#
+# 2026-10-20：本脚本收敛为薄委托。此前它自带一套 venv 创建逻辑，会绕过
+# run.py 的 Python≤3.12 守卫，且引用一个并不存在的 requirements.txt
+# （依赖从未装上）。
 # ===========================================================================
 
 set -e
 cd "$(dirname "$0")"
 
-VENV=".venv"
-PY="$VENV/bin/python"
-
-# 找系统 Python
-if [ ! -x "$PY" ]; then
-    if command -v python3 >/dev/null 2>&1; then
-        SYS_PY="$(command -v python3)"
-    elif command -v python >/dev/null 2>&1; then
-        SYS_PY="$(command -v python)"
-    else
-        echo "[GARGANTUA] 找不到系统 Python"
-        echo "请先安装 Python 3.10+"
-        exit 1
+# 候选解释器顺序：3.12 优先（torch 2.2.2 最高支持 3.12，spec 第 7 节
+# 约定 3.12.14），其次 python3，最后 python。
+SYS_PY=""
+for c in python3.12 python3 python; do
+    if command -v "$c" >/dev/null 2>&1; then
+        if "$c" -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)' 2>/dev/null; then
+            SYS_PY="$c"
+            break
+        fi
+        # 记住第一个可用的：万一整机只有非 3.12，交给 run.py 去提示
+        if [ -z "$SYS_PY" ]; then
+            SYS_PY="$c"
+        fi
     fi
-
-    echo "[GARGANTUA] 使用系统 Python: $SYS_PY"
-    "$SYS_PY" -m venv "$VENV"
-
-    if [ ! -x "$PY" ]; then
-        echo "[GARGANTUA] 创建 venv 失败"
-        exit 1
-    fi
-
-    # 安装依赖
-    if [ -f requirements.txt ]; then
-        echo "[GARGANTUA] 安装依赖..."
-        "$PY" -m pip install -U pip
-        "$PY" -m pip install -r requirements.txt
-    fi
-fi
-
-PORT=8712
-OPEN=1
-CMD="serve"
-ARGS=""
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --port)
-            PORT="$2"
-            shift 2
-            ;;
-        --no-open)
-            OPEN=0
-            shift
-            ;;
-        --test)
-            CMD="test"
-            shift
-            ;;
-        --init)
-            CMD="init"
-            ARGS="$2"
-            shift 2
-            ;;
-        --train)
-            CMD="train"
-            ARGS="$2"
-            shift 2
-            ;;
-        --infer)
-            CMD="infer"
-            ARGS="$2"
-            shift 2
-            ;;
-        *)
-            shift
-            ;;
-    esac
 done
 
-case "$CMD" in
-    test)
-        exec "$PY" -m unittest discover -s tests -p "test_*.py" -v
-        ;;
-    init)
-        exec "$PY" init.py --name "$ARGS"
-        ;;
-    train)
-        exec "$PY" train.py --model "models/$ARGS" --data data
-        ;;
-    infer)
-        exec "$PY" infer.py --model "models/$ARGS" --prompt "${PROMPT:-你好}"
-        ;;
-    serve)
-        if [ "$OPEN" = "1" ]; then
-            (
-                sleep 2
-                if command -v open >/dev/null 2>&1; then
-                    open "http://127.0.0.1:$PORT"
-                elif command -v xdg-open >/dev/null 2>&1; then
-                    xdg-open "http://127.0.0.1:$PORT"
-                fi
-            ) &
-        fi
+if [ -z "$SYS_PY" ]; then
+    echo "[GARGANTUA] 找不到系统 Python"
+    echo "请先安装 Python 3.12（spec 第 7 节约定 3.12.14）"
+    exit 1
+fi
 
-        exec "$PY" server.py --port "$PORT"
-        ;;
-esac
+# 版本提示（不阻塞：真正的守卫和回退由 run.py 决定）
+if ! "$SYS_PY" -c 'import sys; sys.exit(0 if sys.version_info[:2] <= (3, 12) else 1)' 2>/dev/null; then
+    echo "[GARGANTUA] 提示: $SYS_PY 版本过新，torch==2.2.2 没有预编译轮子"
+fi
+
+exec "$SYS_PY" run.py "$@"
