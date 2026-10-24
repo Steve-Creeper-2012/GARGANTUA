@@ -40,17 +40,18 @@ boot.bootstrap()
 
 ROOT = boot.project_root()
 
-# 套件 → (模块, 超时秒)。重量级（建真模型/起子进程）的给大超时。
+# 套件 → (显示名, 目标, 超时秒, 类型)。重量级（建真模型/起子进程）的给大超时。
+# 类型：unittest = `python -m unittest <模块>`；script = 独立可执行校验脚本。
 SUITES = [
-    ("test_model", "service.test.test_model", 1800),
-    ("test_codecs", "service.test.test_codecs", 900),
-    ("test_tokens", "service.test.test_tokens", 900),
-    ("test_image2prim", "service.test.test_image2prim", 900),
-    ("test_fixes", "service.test.test_fixes", 1800),
-    ("test_audit_20261023", "service.test.test_audit_20261023", 1800),
-    ("test_services", "service.test.test_services", 600),
-    ("test_server", "service.test.test_server", 2400),
-    ("verify_formats", "service.test.verify_formats", 600),
+    ("test_model", "service.test.test_model", 1800, "unittest"),
+    ("test_codecs", "service.test.test_codecs", 900, "unittest"),
+    ("test_tokens", "service.test.test_tokens", 900, "unittest"),
+    ("test_image2prim", "service.test.test_image2prim", 900, "unittest"),
+    ("test_fixes", "service.test.test_fixes", 1800, "unittest"),
+    ("test_audit_20261023", "service.test.test_audit_20261023", 1800, "unittest"),
+    ("test_services", "service.test.test_services", 600, "unittest"),
+    ("test_server", "service.test.test_server", 2400, "unittest"),
+    ("verify_formats", "service/test/verify_formats.py", 600, "script"),
 ]
 
 
@@ -94,12 +95,15 @@ def static_gates() -> list:
     return failures
 
 
-def run_suite(name: str, module: str, timeout: int) -> dict:
+def run_suite(name: str, target: str, timeout: int, kind: str = "unittest") -> dict:
     t0 = time.time()
+    if kind == "script":
+        cmd = [sys.executable, os.path.join(ROOT, target)]
+    else:
+        cmd = [sys.executable, "-m", "unittest", "-v", target]
     try:
-        r = subprocess.run(
-            [sys.executable, "-m", "unittest", "-v", module],
-            capture_output=True, text=True, timeout=timeout, cwd=ROOT)
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, cwd=ROOT)
         ok = r.returncode == 0
         out = (r.stdout or "") + (r.stderr or "")
     except subprocess.TimeoutExpired:
@@ -119,8 +123,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     if args.list:
-        for name, module, timeout in SUITES:
-            print(f"{name:22s} {module:38s} timeout={timeout}s")
+        for name, target, timeout, kind in SUITES:
+            print(f"{name:22s} {target:42s} {kind:9s} timeout={timeout}s")
         return 0
 
     suites = SUITES
@@ -145,9 +149,9 @@ def main(argv=None) -> int:
         print("[static] ✓ 全过")
 
     results = []
-    for name, module, timeout in suites:
-        print(f"\n[run] {name}（{module}，timeout={timeout}s）...")
-        res = run_suite(name, module, timeout)
+    for name, target, timeout, kind in suites:
+        print(f"\n[run] {name}（{target}，{kind}，timeout={timeout}s）...")
+        res = run_suite(name, target, timeout, kind)
         results.append(res)
         mark = "✓" if res["ok"] else "✗"
         print(f"[run] {mark} {name}  {res['sec']:.1f}s")
