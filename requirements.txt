@@ -1,7 +1,0 @@
-# GARGANTUA v1 运行时依赖（单一来源：run.py / run.sh / run.bat 都读它）
-# 版本依据 spec.py 第 7 节：torch 2.2.2 是最后一个带 macOS x86_64 官方
-# 轮子的版本，且最高支持 Python 3.12（3.13 无预编译轮子，只能源码编译）。
-torch==2.2.2
-numpy<2
-pillow
-safetensors

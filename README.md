@@ -45,41 +45,88 @@ MLA1/2: [Full KV] | [Buffer] | [HCA]
 - **Sliding Window**: Eviction happens at time-step granularity (whole steps discarded together).
 - **Buffer**: Compensates for length changes when primitive/audio tokens are compressed.
 
+### Context Length (model-creation-time option)
+
+The unified KV stream is split into two regions, and the split is chosen when the model is created (recorded in `config.json`, honored by every entry point via `common.build_model`):
+
+| Region | Meaning | Default |
+|---|---|---|
+| **Full** (`ctx_full`) | Uncompressed recent tokens | 1024 |
+| **Compressed** (`ctx_compress`) | Capacity, counted in **original** tokens, of everything older | 3072 |
+
+Total context = `ctx_full + ctx_compress` (default 4096). The compressed region is served by **two views over the same content** — this is the "two compression layers" of the spec:
+
+- **CSA** (`csa_ratio`:1, default 4): learnable step-grouped compression + a local sliding window (`csa_local_window`, default 512) over the tail of the full region.
+- **HCA** (`hca_ratio`:1, default 32): heavier compression + global attention.
+
+Compression, sliding-window eviction and the causal mask are all **time-step atomic** — a group never straddles a step boundary, and eviction discards whole steps. `csa_ratio` is an architectural parameter (the compressor's position embedding is `[ratio, d_model]`), so changing it changes the checkpoint layout; `hca_ratio ≥ csa_ratio` and `csa_local_window ≤ ctx_full` are enforced.
+
+Choose it three ways (all validated, all landing in the same `config.json` contract):
+
+```bash
+python init.py --name alpha --ctx-full 2048 --ctx-compress 8192 \
+    --csa-ratio 8 --hca-ratio 64 --csa-window 1024   # total 10240
+python run.py --init alpha --ctx-full 2048            # same flags via launcher
+```
+
+or in the web UI's model-creation form (five number inputs, defaults shown), or `POST /api/model/init` with `ctx_full` / `ctx_compress` / `csa_ratio` / `hca_ratio` / `csa_local_window` (omitted = spec default, illegal value = 400). `GET /api/status` and `GET /api/system` return the active model's real configuration (`ctx` + `kv_note`), so the UI never shows a stale spec constant.
+
 ## Token System
 
-All tokens are discrete. The vocabulary is organized into continuous intervals:
+All text tokens are discrete. Token IDs are **32-bit**; the `.tokens` binary
+format (tok-32) is a plain big-endian `uint32` stream — 4 bytes per
+"character", one character per token — so any other program opening it sees
+garbage. Hex text form uses 8 hex digits per token.
 
-### Content Tokens
-- **Chinese**: All Unicode CJK basic + A-extension characters (single character, no phrases).
-- **English**: 40K common words + proper nouns (lowercase), with `<caps>` / `<allcaps>` modifiers.
-- **Symbols**: All full-width/half-width ASCII symbols.
-- **Fallback**: 26 lowercase letters `a-z` for OOV English words.
-- **Digits**: `0-9`.
+The vocabulary (88,704 slots) is split into **four categories**; `enctok`
+only ever looks up the two visible ones:
 
-### Special Tokens
-- **Formatting**: `<caps>`, `<allcaps>`, `<italic>`, `<bold>`, `<under>`, `<mid>`, `<high>` (with matching close tokens).
-- **Boundary**: `<think>`, `<answer>`, `<text>`, `<visual>`, `<audio>`, `<model>`, `<user>` (with matching close tokens).
-- **Stop**: `<stop>` (ID 27) — generation terminates immediately when sampled.
+| Category | Contents | Example |
+|---|---|---|
+| `regular` (visible) | digits, whitespace, all Unicode P*/S* symbols (half+full width), all emoji (incl. ZWJ/VS16/tag components), all CJK basic + ext-A chars, 30K common English words | `你`, `😀`, `hello`, `！` |
+| `fallback` (visible) | 26 lowercase letters `a-z` (OOV words are spelled letter-by-letter) | `q` |
+| `special` (invisible) | `<caps>`, `<user>`, `<user/>`, `<model>`, `<model/>`, `<stop>`; primitive (draw) output tokens — geometrize_256_v1 layout | `<caps>` |
+| `system` (invisible) | time-step structure: `{` open, `}` close, `|` intra-step separator | `{` |
 
-### Modality-Specific Tokens
-- **Visual Input (not in vocab)**: `<x-axis:n>`, `<y-axis:n>`, `<Rn>`, `<Gn>`, `<Bn>`, `<An>` — one token per 32×32 patch, RGB 1024-level, A 1000-level.
-- **Audio Input (not in vocab)**: `<wave:hex>` — 533 samples compressed to one token (~30 tok/s).
-- **Drawing Output (in vocab)**: `<x-axis>`, `<y-axis>`, `<width>`, `<length>`, `<rot>` — 9 parameters per primitive (rectangle/ellipse/triangle).
-- **Audio Output (in vocab)**: MIDI discrete tokens.
+- Every surface string is unique across the whole vocabulary (single-letter
+  words `a`/`i` are *not* word tokens — the fallback letters cover them), so
+  `token_to_id` reverse lookup is unambiguous. The only intentional exception:
+  the three system display characters `{ } |` also exist as visible symbols;
+  text→ID always resolves to the visible symbol, ID→display shows the literal.
+- **Adding tokens**: `POST /api/vocab/add` (or `Vocab.add_token`) with one of
+  the four categories. Duplicates are rejected against the entire vocabulary;
+  new tokens consume reserved tail slots of their category, so the model
+  output dimension never changes. User additions persist in `vocab.json`
+  (`meta["user_added"]`) and are replayed on rebuild.
+- **enctok** (`python tokens/enctok.py "text"`): word segments `[A-Za-z]+`
+  hit the word list (`<caps>` + word for `Hello`; ALL-CAPS/mixed case is
+  spelled letter-by-letter with `<caps>` per capital — lossless); other chars
+  look up regular tokens, then fallback letters; unmapped chars are skipped
+  and reported. Output: hex string or `.tokens` binary.
+- **dectok** (`python tokens/dectok.py stream.tokens`): `{ } |` render as
+  literals, everything else as 8-hex IDs; `--text` renders surface text.
 
-### Time-Step Format (.gts)
+### Time-Step Format (.gts / { } |)
 
-GARGANTUA uses a custom token stream format where `{}` denotes a time-step:
+A time-step is the atomic unit for KDA recurrent-state recursion and logical
+parallelism (compression, sliding-window eviction and causality never cross a
+step boundary). Each step is wrapped by the system tokens `{ }`; multiple
+tokens inside one step are separated by `|`:
 
 ```
-{<user>}{<visual>}{<x-axis:0,y-axis:0,R1015,G0,B0,A999>,<wave:00000000>}
-{<x-axis:3,y-axis:5,R105,G43,B50,A99>,<wave:00110000>}{<visual/>}{<user/>}
+{<user>}{h|e|l|l|o}{<user/>}
 ```
 
-- Boundary tokens (`<visual>`, `<visual/>`, etc.) occupy their own time-steps.
-- Within a time-step, multiple tokens are comma-separated, no spaces.
-- Video frames: each frame is one time-step containing all its patch tokens + corresponding audio wave tokens.
-- Text: one token per time-step.
+- Text: one token per time-step (`{ } |` stay implicit in the Step list).
+- Image: one time-step (all patch tokens inside).
+- Audio: 533 samples = one token = one time-step.
+- Video: each frame = one time-step (all patch tokens + that frame's audio
+  token inside).
+- `.tokenvector` (UTF-8) archives audio/visual vectors — no discrete IDs for
+  those modalities. Header declares `dim=` and `precision=` (`f32`/`f16`/
+  `bf16`); steps are `{ }`-delimited and intra-step token vectors are
+  `|`-separated; the body is numbers only. Video frames store patch and audio
+  vectors projected to the same `d_model` in a single file.
 
 ## Embedding Strategy
 
@@ -116,18 +163,50 @@ Within a single time-step (e.g., one video frame), all patches and audio tokens 
 - **Input**: 16kHz mono, any format (mp3/flac/ogg/wav via ffmpeg).
 - **Tokenization**: 533 samples → 1 token (~30 tok/s).
 - **Embedding**: 533-sample vector → `audio_proj` → `d_model=1024`.
-- **Output**: MIDI discrete tokens (not raw waveform).
+- **Output**: MIDI discrete tokens temporarily removed (2026-10-24,
+  steve: to be redesigned; midi_codec and /api/codec/midi were removed).
 
-## Image-to-Primitives (Drawing Output)
+## Primitive Pipeline (image → primitive tokens)
 
-Based on [wonderfulearth/primitive-operation-painter](https://github.com/wonderfulearth/primitive-operation-painter)'s fast_shape_render algorithm:
+Adopted from [wonderfulearth/primitive-operation-painter](https://github.com/wonderfulearth/primitive-operation-painter)
+(vendored verbatim under `third_party/primitive-operation-painter/`).
+**Languages**: the image→sequence converter (`fast_shape_render/`) is
+**Rust + wgpu** (GPU compute; Metal on macOS, DirectX 12 on Windows,
+Vulkan on Linux); the model / training / generation code is **Python +
+PyTorch**.
 
-- **CPU-adapted greedy fitting**: Background average color → residual block fitting with rectangle/ellipse primitives.
-- **Two quality modes**:
-  - `fast`: 20 candidates/step, no hill-climbing (~2–5s for 100 steps).
-  - `slow`: 50 candidates/step + short hill-climbing (~30–60s for 100 steps).
-- **Parameters per primitive**: `(x, y, shape, width, length, rot, R, G, B)` — 9 tokens.
-- **CSA Compression**: After a sequence of primitives is output, the 9 tokens per primitive are compressed 10:1 into the KV cache.
+- **Converter (照搬第三方代码)**: reads images, fits a sequence of
+  rectangle/ellipse operations on the GPU (275 search steps), and writes
+  CSV (`image_name,cx,cy,w,h,shape_type,theta,r,g,b`; first row per image
+  is the background). Driven by `tokens/image_to_primitives.py`
+  (`convert_with_renderer`, subprocess).
+- **CPU fallback**: the same greedy algorithm in pure numpy (no GPU
+  required), outputting the identical primitive schema.
+- **Tokens (照搬第三方布局, `geometrize_256_v1`)**: 9 tokens per primitive
+  in field order `cx, cy, theta, w, h, shape, r, g, b`, each field an
+  independent bin range (token ID = `DRAW_BEGIN + field offset + bin`);
+  canvas 256×256; a step-first token in the special bin range ends the
+  sequence. See `spec.py` (DRAW_*) and `tokens/draw_codec.py`.
+- **Quality modes** (CPU path): `fast` = 20 candidates/step, no
+  hill-climbing (~2–5s/100 steps); `slow` = 50 candidates + short
+  hill-climbing (~30–60s/100 steps).
+- **CSA Compression**: after a primitive's 9 tokens are written, the KV
+  cache compresses them 9:1 in place.
+
+### Startup dependencies
+
+```sh
+sh third_party/primitive-operation-painter/setup.sh
+```
+
+installs the Rust toolchain (rustup), builds the GPU converter
+(`cargo build --release`, first run ~5–15 min), and pip-installs the
+Python-side deps (`pandas`, `matplotlib`; torch/numpy come from the
+GARGANTUA venv). Without the build the pipeline automatically falls back
+to the CPU fitter; `GARGANTUA_SHAPE_RENDERER` overrides the binary path.
+Converter env vars (`SHAPE_RENDERER_INPUT_DIR`, `_OUTPUT_DIR`,
+`_NUM_VERSIONS`, `_MAX_OUTPUT_STEPS`) are documented in
+`third_party/primitive-operation-painter/fast_shape_render/README.md`.
 
 ## Training
 
@@ -159,7 +238,7 @@ The decoder stops immediately when `<stop>` (ID 27) is sampled.
 ## Web Interface
 
 A built-in web UI provides:
-- **Model Management**: Create models with configurable encoder/decoder block counts.
+- **Model Management**: Create models with configurable encoder/decoder block counts **and context length** (full / compressed capacity + CSA/HCA compression ratios — see "Context Length" above).
 - **Training Queue**: Upload JSON datasets, queue training tasks with automatic execution.
 - **Inference Chat**: Standard AI chat interface with collapsible debug panel (temperature, top-p, max_new_tokens).
 - **Codec Visualizers**:
@@ -237,17 +316,15 @@ guess:
 | `411` | `Content-Length` required (chunked encoding rejected) |
 | `413` | Body larger than 512 MB |
 
-Long-running work (inference, model init, image→primitives) returns `202`
-with a `task_id`; poll `GET /api/task/<task_id>` until `status == "done"`.
-Numeric parameters are never silently defaulted: an explicit `0` is validated
-as `0` rather than being replaced by the default value.
+Long-running work (inference, model init, image→primitives, **drawing render**) returns `202` with a `task_id`; poll `GET /api/task/<task_id>` until `status == "done"`. Numeric parameters are never silently defaulted: an explicit `0` is validated as `0` rather than being replaced by the default value. Booleans, non-numeric strings and negative `Content-Length` are rejected with `400` (the last one used to bypass the 512 MB cap and turn into an unbounded read).
 
 ## Project Structure
 
 ```
 .
 ├── spec.py              # Frozen architecture contract (single source of truth)
-├── common.py            # Shared checkpoint I/O + validation (config.json contract)
+├── common.py            # Shared checkpoint I/O + validation (config.json contract,
+│                        #   incl. context-length config: validate/read_ctx_config)
 ├── model.py             # Gargantua model (KDA, MLA, FastWeight, SharedKV)
 ├── train.py             # Training loop with Muon/AdamW optimizer routing
 ├── infer.py             # Autoregressive generation
@@ -258,6 +335,7 @@ as `0` rather than being replaced by the default value.
 ├── server_media.py      # Uploaded-media decode + size guards (b64_to_pil / ffmpeg)
 ├── server_codecs.py     # CodecApi mixin — all /api/codec/* endpoints
 ├── server_train.py      # TrainApi mixin — all /api/train/* endpoints
+├── server_tokens.py     # TokensApi mixin — /api/tokens/* + /api/vocab/add
 ├── server_util.py       # num_param (explicit 0 is never swallowed by a default)
 ├── window.py            # Standalone desktop window (pywebview, no browser)
 ├── run.py               # Cross-platform launcher: venv, deps, server + window
@@ -268,14 +346,20 @@ as `0` rather than being replaced by the default value.
 ├── requirements.txt     # Pinned runtime dependencies (single source)
 ├── requirements-window.txt  # Optional: pywebview only (~18 MB, OS webview)
 ├── tokens/              # Codecs for all modalities
-│   ├── text_codec.py    # Text tokenization
-│   ├── audio_codec.py   # Audio → wave tokens
-│   ├── image_codec.py   # Image/Video → patch tokens
+│   ├── tok32.py         # tok-32 interpreter: .tokens binary ↔ IDs ↔ hex
+│   ├── enctok.py        # Text → token ID stream (regular first, fallback next)
+│   ├── dectok.py        # Token ID stream → readable ({ } | + hex / surface text)
+│   ├── timestep.py      # { } | time-step structure (wrap/unwrap/render)
+│   ├── tokenvector.py   # .tokenvector vector archive format (dim+precision)
+│   ├── text_codec.py    # Text ↔ List[Step] (one token per step)
+│   ├── audio_codec.py   # Audio → wave tokens (+ .tokenvector export)
+│   ├── image_codec.py   # Image/Video → patch tokens (+ .tokenvector export)
 │   ├── draw_codec.py    # Primitive sequence ↔ drawing tokens + PNG/SVG render
-│   ├── midi_codec.py    # MIDI ↔ MIDI tokens
 │   ├── image_to_primitives.py  # Image → primitive sequence (fast_shape_render)
 │   ├── build_vocab.py   # vocab.json generator (layout from spec.py)
-│   └── vocab.py         # Vocab view with region-specific maps
+│   ├── vocab.py         # Vocab view: 4-category maps + add_token
+│   ├── vocab.json       # Built vocabulary (88,704 slots)
+│   └── words_en.txt     # 30K English word list (frequency order)
 ├── web/                 # Frontend
 │   ├── index_source.html  # Single-page app source (11 pages)
 │   ├── index.html        # Minified artifact (regenerate via web/minify.py)
@@ -286,14 +370,15 @@ as `0` rather than being replaced by the default value.
     ├── test_tokens.py
     ├── test_image2prim.py
     ├── test_server.py
-    └── test_fixes.py    # Regression tests for the 2026-10-20 audit
+    ├── test_fixes.py    # Regression tests for the 2026-10-20 audit
+    └── test_audit_20261023.py  # 2026-10-23 audit fixes + context-length feature
 ```
 
 `server.py` used to be one 986-line file holding the HTTP layer, the model
 manager, the task pool, the ffmpeg plumbing and every API handler. It is now
-366 lines of routing plus five focused modules (`server_models`,
-`server_media`, `server_codecs`, `server_train`, `server_util`); `App`
-composes the two API mixins. All previous `from server import X` paths still
+366 lines of routing plus six focused modules (`server_models`,
+`server_media`, `server_codecs`, `server_train`, `server_tokens`,
+`server_util`); `App` composes the three API mixins. All previous `from server import X` paths still
 work through re-exports, and `tests/test_server.py` passes unchanged.
 
 ### Model directory contract
