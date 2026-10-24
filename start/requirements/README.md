@@ -15,7 +15,9 @@
   `-c` 约束（见 `server/server_util.py:optional_install_cmd`），否则会被顶到 2.x。
 
 ## 安装顺序（由 setup 脚本自动完成）
-1. 下载 python-build-standalone 3.12.x → `start/.python/`
-2. 建虚拟环境 → `start/.venv/`
-3. `pip install -r core.txt`（必要），按需补 `window.txt` / `dev.txt`
+1. 下载 python-build-standalone 3.12 系列最新版 → `environment/python/`
+   （镜像自动测速选取：gh-proxy / GitHub 直连 / SJTU）
+2. 建虚拟环境 → `environment/venv/`
+3. `pip install -r core.txt`（必要；pip 源测速选取），按需补
+   `window.txt` / `dev.txt`
 4. 写 stamp 文件，下次启动跳过重复安装

@@ -5,6 +5,17 @@
 #   与仓库 CSV 一致）
 # 运行：cd <ROOT> && python -m unittest tests.test_image2prim -v
 # ===========================================================================
+# ---- GARGANTUA 路径引导（2026-10-24 目录树重构：server/ service/ start/）----
+import sys as _sys
+from pathlib import Path as _Path
+for _anc in _Path(__file__).resolve().parents:
+    if (_anc / "start" / "boot.py").is_file():
+        _sys.path.insert(0, str(_anc / "start"))
+        break
+else:
+    raise SystemExit("找不到 GARGANTUA 项目根（start/boot.py）")
+import boot
+boot.bootstrap()
 import unittest
 
 import numpy as np
@@ -13,7 +24,7 @@ from PIL import Image
 import spec
 from tokens.draw_codec import (Primitive, primitives_to_tokens,
                                tokens_to_primitives)
-from tokens.image_to_primitives import image_to_primitives
+from prims.image_to_primitives import image_to_primitives
 
 
 def _red_circle_target(path="/tmp/garg_fit_target.png") -> Image.Image:

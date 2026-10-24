@@ -3,6 +3,17 @@
 # 运行：cd ROOT && python -m unittest tests.test_codecs -v
 # ===========================================================================
 
+# ---- GARGANTUA 路径引导（2026-10-24 目录树重构：server/ service/ start/）----
+import sys as _sys
+from pathlib import Path as _Path
+for _anc in _Path(__file__).resolve().parents:
+    if (_anc / "start" / "boot.py").is_file():
+        _sys.path.insert(0, str(_anc / "start"))
+        break
+else:
+    raise SystemExit("找不到 GARGANTUA 项目根（start/boot.py）")
+import boot
+boot.bootstrap()
 import io
 import math
 import os
@@ -15,7 +26,6 @@ import wave
 import numpy as np
 from PIL import Image
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import spec
 from tokens import audio_codec, draw_codec, image_codec

@@ -56,8 +56,8 @@ for _anc in _Path(__file__).resolve().parents:
         break
 else:
     raise SystemExit("找不到 GARGANTUA 项目根（start/boot.py）")
-import boot as _boot
-_boot.bootstrap()
+import boot
+boot.bootstrap()
 import spec
 from common import (CKPT_NAME, build_model, make_batch, read_config,
                     save_checkpoint, validate_block_size, validate_steps)
@@ -341,8 +341,17 @@ def _serve_handle(req: dict, st: _ServeState) -> dict:
     try:
         if op == "start":
             if st.trainer is not None and st.trainer.running:
-                return {"id": rid, "ok": False,
-                        "error": "训练进行中，请先 stop 再 start"}
+                # 幂等：已在跑 → 返回现状（与 Trainer.start() 旧语义一致：
+                # started=False + 200，不是错误——UI 的重复点击/轮询重试
+                # 都走这条路）。但换了模型目录是编程错误，拒绝。
+                if (req.get("model_dir")
+                        and req["model_dir"] != st.model_dir):
+                    return {"id": rid, "ok": False,
+                            "error": "训练进行中，不能切换模型（请先 stop）"}
+                return {"id": rid, "ok": True,
+                        "result": {"started": False,
+                                   **st.trainer.status(),
+                                   "model_dir": st.model_dir}}
             model_dir = req["model_dir"]
             if not os.path.exists(os.path.join(model_dir, CKPT_NAME)):
                 raise ValueError(f"模型目录无 {CKPT_NAME}: {model_dir}")

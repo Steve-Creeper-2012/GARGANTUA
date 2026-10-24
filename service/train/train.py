@@ -32,13 +32,14 @@ for _anc in _Path(__file__).resolve().parents:
         break
 else:
     raise SystemExit("找不到 GARGANTUA 项目根（start/boot.py）")
-import boot as _boot
-_boot.bootstrap()
+import boot
+boot.bootstrap()
 import spec
 from common import (CKPT_NAME, build_model, make_batch, read_config,
                     save_checkpoint, validate_block_size)
 from muon import build_optimizers
 from tokens.text_codec import encode as text_encode
+from tokens.vocab import set_model_vocab
 
 
 def load_corpus_ids(data_dir: str):
@@ -74,6 +75,7 @@ def main():
 
     B = validate_block_size(args.block_size)
     m = build_model(args.model)
+    set_model_vocab(args.model)          # 每模型词表（vocab.txt 覆盖）
     m.train()
 
     opts = build_optimizers(m, args.optimizer, args.lr, args.muon_lr,

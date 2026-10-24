@@ -39,7 +39,8 @@ PATH_DIRS = (
     "service/test",
 )
 
-# 入口文件顶部的标准引导头（复制到各入口 .py，放在任何项目内 import 之前）：
+# 入口文件顶部的标准引导头（复制到各入口 .py，放在任何项目内 import 之前；
+# 注意：若文件有模块 docstring 或 `from __future__`，头要放在它们之后）：
 #     import sys as _sys
 #     from pathlib import Path as _Path
 #     for _anc in _Path(__file__).resolve().parents:
@@ -48,8 +49,8 @@ PATH_DIRS = (
 #             break
 #     else:
 #         raise SystemExit("找不到 GARGANTUA 项目根（start/boot.py）")
-#     import boot as _boot
-#     _boot.bootstrap()
+#     import boot
+#     boot.bootstrap()
 BOOT_HEADER = '''import sys as _sys
 from pathlib import Path as _Path
 for _anc in _Path(__file__).resolve().parents:
@@ -58,8 +59,8 @@ for _anc in _Path(__file__).resolve().parents:
         break
 else:
     raise SystemExit("找不到 GARGANTUA 项目根（start/boot.py）")
-import boot as _boot
-_boot.bootstrap()
+import boot
+boot.bootstrap()
 '''
 
 

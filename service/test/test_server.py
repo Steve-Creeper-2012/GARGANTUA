@@ -6,6 +6,17 @@
 # 标准库 urllib 打全部 API。
 # 运行：python -m unittest tests.test_server -v
 # ===========================================================================
+# ---- GARGANTUA 路径引导（2026-10-24 目录树重构：server/ service/ start/）----
+import sys as _sys
+from pathlib import Path as _Path
+for _anc in _Path(__file__).resolve().parents:
+    if (_anc / "start" / "boot.py").is_file():
+        _sys.path.insert(0, str(_anc / "start"))
+        break
+else:
+    raise SystemExit("找不到 GARGANTUA 项目根（start/boot.py）")
+import boot
+boot.bootstrap()
 import base64
 import io
 import json
@@ -22,7 +33,7 @@ import urllib.request
 import urllib.error
 import wave
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = boot.project_root()   # 2026-10-24：项目根（旧布局曾是 service/）
 
 
 def free_port():
@@ -74,7 +85,6 @@ def make_wav_b64(n_samples=1600, sr=16000):
 class TestServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        sys.path.insert(0, ROOT)
         cls.tmp = tempfile.mkdtemp(prefix="garg_test_")
         cls.model_dir = os.path.join(cls.tmp, "models")
         cls.data_dir = os.path.join(cls.tmp, "data")
@@ -103,13 +113,13 @@ class TestServer(unittest.TestCase):
 
         # tok-32 词表备份：test_15_vocab_add 会经 API 改写仓库里的
         # tokens/vocab.json（server 子进程 cwd=ROOT），测后必须还原
-        cls.vocab_path = os.path.join(ROOT, "tokens", "vocab.json")
+        cls.vocab_path = os.path.join(ROOT, "service", "tokens", "vocab.json")
         cls.vocab_backup = os.path.join(cls.tmp, "vocab.json.bak")
         shutil.copy(cls.vocab_path, cls.vocab_backup)
 
         cls.port = free_port()
         cls.proc = subprocess.Popen(
-            [sys.executable, os.path.join(ROOT, "server.py"),
+            [sys.executable, os.path.join(ROOT, "server", "server.py"),
              "--port", str(cls.port),
              "--model-dir", cls.model_dir,
              "--data-dir", cls.data_dir,

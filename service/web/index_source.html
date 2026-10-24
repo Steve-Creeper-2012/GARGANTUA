@@ -535,7 +535,7 @@
       <!-- 图像 -> 图元 -->
       <section class="page" id="p-prims">
         <h2>图像 → 图元转换（可视化）</h2>
-        <div class="hint">上传图片，转换为图元序列并渲染。优先调用 vendored 的 Rust/wgpu GPU 转换器（third_party/primitive-operation-painter/fast_shape_render，照搬 wonderfulearth/primitive-operation-painter，需 cargo build --release）；未构建时回退 CPU 贪心拟合。token 布局照搬仓库 geometrize_256_v1：每图元 9 token（cx,cy,theta,w,h,shape,r,g,b），画布 256×256。</div>
+        <div class="hint">上传图片，转换为图元序列并渲染。优先调用 vendored 的 Rust/wgpu GPU 转换器（service/prims/fast_shape_render，照搬 wonderfulearth/primitive-operation-painter，用 sh service/prims/setup.sh 构建）；未构建时回退 CPU 贪心拟合。token 布局照搬仓库 geometrize_256_v1：每图元 9 token（cx,cy,theta,w,h,shape,r,g,b），画布 256×256。</div>
         <div class="row">
           <label class="file-pick" for="prims-file"><input type="file" id="prims-file" accept="image/*">
             <span class="file-btn">选择文件</span>

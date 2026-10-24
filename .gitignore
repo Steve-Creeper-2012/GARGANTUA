@@ -3,10 +3,14 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
-# 隔离运行时（start/terminal/setup.sh 构建：独立 Python + venv，全部本地产物）
-start/.python/
-start/.venv/
-.venv/
+# 隔离运行时（environment/README.md 有契约说明；全部本地产物，可脚本重建）
+# 注意用 environment/* + !README 的形式：直接写 environment/ 会导致无法
+# 再 re-include 其中的任何文件（git 不允许重新包含被排除目录内的文件）。
+environment/*
+!environment/README.md
+
+# Rust 构建产物（service/prims/fast_shape_render，cargo build 生成）
+service/prims/fast_shape_render/target/
 
 # 运行产物：模型权重（单个 safetensors 可达数 GB）、数据集、日志
 models/

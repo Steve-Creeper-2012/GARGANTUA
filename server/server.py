@@ -3,12 +3,11 @@
 # ---------------------------------------------------------------------------
 # 用法：python server.py [--port 8712] [--host 127.0.0.1] [--model-dir models]
 #                     [--data-dir data] [--log-file logs/auto_train.jsonl]
-#                     [--no-window] [--no-verify] [--idle-timeout 300]
+#                     [--no-window] [--idle-timeout 300]
 #
 # 2026-10-24 重构（steve 的启动链要求）——server 是唯一入口之后的「管家」：
 #   1. 环境预检（解释器版本 + 主依赖）——server_env.check_environment；
-#   2. window.py 完整性校验（sha256 不一致弹窗，可跳过）并拉起独立窗口
-#      ——server_env.verify_window_integrity；
+#   2. 拉起独立桌面窗口 service/window/window.py（--no-window 可关）；
 #   3. HTTP 服务（本文件：路由 + Handler + App 装配）；
 #   4. 按需调度 infer / train 服务子进程（server_services.ServiceSupervisor）：
 #      有请求才起进程，空闲超时自行退出，模型权重不常驻 server。
@@ -17,7 +16,7 @@
 # 只路由 + 记账，常驻内存 ~百 MB 级（codec 用的 numpy/PIL 除外）。
 #
 # 2026-10-23 拆分（每层只干一件事，server.py 主体只留装配与路由）：
-#   server_env.py      环境预检 + 窗口完整性 + 弹窗 + 子进程工具
+#   server_env.py      环境预检 + 子进程管理小工具
 #   server_services.py 服务监督器（按需子进程 + JSON-lines 协议）
 #   server_models.py   ModelManager（注册表，不含权重）+ TaskPool
 #   server_media.py    上传媒体解码与尺寸守卫（b64_to_pil / ffmpeg / 抽帧）
@@ -53,12 +52,10 @@ for _anc in _Path(__file__).resolve().parents:
         break
 else:
     raise SystemExit("找不到 GARGANTUA 项目根（start/boot.py）")
-import boot as _boot
-_boot.bootstrap()
-from common import (CKPT_NAME, MAX_BLOCKS, MAX_NEW_TOKENS, read_config,
-                    save_checkpoint, valid_model_name, validate_ctx_config)
-from server_env import (ROOT, check_environment, kill_proc,
-                        verify_window_integrity, wait_port, wait_status)
+import boot
+boot.bootstrap()
+from common import MAX_BLOCKS, MAX_NEW_TOKENS, valid_model_name, validate_ctx_config
+from server_env import ROOT, check_environment, kill_proc
 from server_models import (ConflictError, ModelManager, TaskPool,
                            step_to_json)
 from server_media import (MAX_IMAGE_DIM, MAX_PATCHES_TOTAL, b64_to_pil,
@@ -303,7 +300,7 @@ class App(TrainApi, CodecApi, TokensApi):
                     entry["why"] = opt["why"]
                 else:                      # 主依赖缺失是真问题，保留原因
                     entry["note"] = str(sys.exc_info()[1])
-        deps.append(entry)
+            deps.append(entry)
         device = "unknown"
         if torch is not None:
             device = "cpu"
@@ -563,8 +560,6 @@ def main(argv=None):
                     default=os.path.join(ROOT, "logs", "auto_train.jsonl"))
     ap.add_argument("--no-window", action="store_true",
                     help="不起独立窗口（仅 HTTP server，SSH/CI 用）")
-    ap.add_argument("--no-verify", action="store_true",
-                    help="跳过 window.py 完整性弹窗（CI / 无 GUI）")
     ap.add_argument("--idle-timeout", type=int, default=300,
                     help="服务子进程空闲多少秒后自行退出（默认 300）")
     args = ap.parse_args(argv)
@@ -578,13 +573,7 @@ def main(argv=None):
     app.mgr.auto_load_unique()
     app.apply_model_vocab()
 
-    # 2) 窗口完整性校验（sha256 不一致 → 弹窗，可跳过）。
-    #    放在绑定端口之前：弹窗阻塞时不存在「起了一半」的状态。
-    launch_window = not args.no_window
-    if launch_window and not args.no_verify:
-        launch_window = verify_window_integrity(ROOT)
-
-    # 3) HTTP 服务
+    # 2) HTTP 服务
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.app = app
     srv.daemon_threads = True
@@ -592,7 +581,7 @@ def main(argv=None):
           f"model_dir={args.model_dir}  data_dir={args.data_dir}")
 
     window_proc = None
-    if launch_window:
+    if not args.no_window:
         try:
             window_proc = spawn_window(args.port, args.host)
             threading.Thread(target=_watch_window,

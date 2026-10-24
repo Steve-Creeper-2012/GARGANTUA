@@ -1,21 +1,20 @@
 # ===========================================================================
-# GARGANTUA v1 — server_env.py：server 侧的环境检查与窗口完整性校验
+# GARGANTUA v1 — server_env.py：server 侧的环境预检
 # ---------------------------------------------------------------------------
-# 2026-10-24 重构：steve 的要求是「Server 检查环境，启动 windows.py 并进行
-# 哈希值校验（不匹配就弹窗告知，可跳过）」。原 start/launcher.py 的这套
-# 逻辑并入 server：终端脚本（start/terminal/*）只负责搭好隔离环境并
-# exec server.py，其余全部由 server 自己做。
+# 2026-10-24 重构：steve 的要求是「Server 检查环境，启动 windows.py」。
+# 终端脚本（start/terminal/*）只负责搭好隔离环境并 exec server.py，
+# 环境预检由 server 自己做（原 start/launcher.py 的职责并入 server）。
 #
 # 本模块（纯标准库，server 启动早期就能跑，缺依赖时也能给出可读提示）：
 #   check_deps            探针：解释器能否 import 主依赖
 #   check_environment     解释器版本 + 主依赖预检（server main 第一步）
-#   verify_window_integrity   window.py sha256 校验（首次写基准，不一致弹窗）
-#   popup                 跨平台弹窗（tkinter → osascript → zenity → stdin）
-#   wait_port / kill_proc 子进程管理小工具（测试复用）
+#   wait_port / wait_status / kill_proc   子进程管理小工具（测试复用）
+#
+# 注：window.py 的 sha256 完整性校验曾在这里，2026-10-24 steve 判定
+# 「过于复杂」已整体移除（基准文件 + 弹窗 + 测试面一并删除）。
 # ===========================================================================
 from __future__ import annotations
 
-import hashlib
 import os
 import socket
 import subprocess
@@ -25,10 +24,6 @@ import urllib.request
 
 # 主依赖：缺任何一个，server 的核心功能（模型/训练/推理）都跑不了
 REQUIRED_MODULES = ("torch", "numpy", "PIL", "safetensors")
-
-# 窗口完整性基准文件（相对项目根）：记录 window.py 上一次启动时的 sha256
-WINDOW_SHA_RELPATH = os.path.join("start", "window.sha256")
-WINDOW_PY_RELPATH = os.path.join("service", "window", "window.py")
 
 
 def project_root() -> str:
@@ -117,103 +112,6 @@ def check_environment(python_exe: str = None) -> bool:
         return False
     print("[server] 主依赖（torch/numpy/PIL/safetensors）✓")
     return True
-
-
-# ---------------------------------------------------------------------------
-# 窗口完整性校验（sha256 + 弹窗）
-# ---------------------------------------------------------------------------
-def sha256_of(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 16), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def popup(title: str, message: str) -> bool:
-    """跨平台弹窗；返回 True 表示「继续」（False = 跳过窗口启动）。
-
-    优先级：tkinter → macOS osascript → Linux zenity → 纯文本 stdin。
-    无图形会话时降级为命令行提示（回车继续，输入 s 跳过窗口）。
-    """
-    # 1) tkinter（有图形会话时最稳；仅提示 + 单 OK 按钮）
-    try:
-        import tkinter as tk
-        from tkinter import messagebox
-
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showwarning(title, message)
-        root.destroy()
-        return True
-    except Exception:
-        pass
-
-    # 2) macOS 原生对话框
-    if sys.platform == "darwin":
-        try:
-            script = (
-                f'display dialog "{message}" with title "{title}" '
-                f'buttons {{"继续", "跳过窗口"}} default button "继续"'
-            )
-            r = subprocess.run(["osascript", "-e", script],
-                               capture_output=True, text=True, timeout=30)
-            return "跳过" not in (r.stdout or "")
-        except Exception:
-            pass
-
-    # 3) Linux zenity
-    if sys.platform.startswith("linux"):
-        try:
-            r = subprocess.run(
-                ["zenity", "--question", "--title", title,
-                 "--text", message, "--ok-label", "继续",
-                 "--cancel-label", "跳过窗口"],
-                capture_output=True, text=True, timeout=30)
-            return r.returncode == 0
-        except Exception:
-            pass
-
-    # 4) 纯文本降级
-    print(f"\n⚠️  {title}\n{message}")
-    try:
-        ans = input("回车继续启动窗口；输入 s 跳过窗口启动：[ ] ").strip().lower()
-    except EOFError:
-        return True
-    return ans != "s"
-
-
-def verify_window_integrity(root: str = None, no_verify: bool = False) -> bool:
-    """校验 window.py 完整性；返回是否「应继续启动窗口」。
-
-    - 基准文件不存在 → 写入当前哈希（首次运行）；
-    - 哈希一致 → 静默通过；
-    - 哈希不一致 → 弹窗告知（可跳过；--no-verify 时只打印不弹窗）。
-    """
-    root = root or ROOT
-    window_py = os.path.join(root, WINDOW_PY_RELPATH)
-    sha_path = os.path.join(root, WINDOW_SHA_RELPATH)
-    if not os.path.isfile(window_py):
-        print("[server] 未找到 service/window/window.py，跳过窗口校验。")
-        return False
-    cur = sha256_of(window_py)
-    if not os.path.isfile(sha_path):
-        os.makedirs(os.path.dirname(sha_path), exist_ok=True)
-        with open(sha_path, "w", encoding="utf-8") as f:
-            f.write(cur + "\n")
-        print("[server] 已写入 window.py 完整性基准（首次运行）。")
-        return True
-    with open(sha_path, "r", encoding="utf-8") as f:
-        base = f.read().strip()
-    if cur == base:
-        return True
-    msg = ("检测到 service/window/window.py 与上次启动时的内容不一致"
-           "（sha256 不匹配）。\n可能是文件被修改或损坏。"
-           "是否仍启动窗口？")
-    if no_verify:
-        print("[server] ⚠️ window.py 完整性不一致（--no-verify，已跳过弹窗）。")
-        return True
-    return popup("GARGANTUA 窗口完整性警告", msg)
 
 
 # ---------------------------------------------------------------------------

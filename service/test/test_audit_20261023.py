@@ -25,6 +25,17 @@
 # 注释重建覆盖面（原文件从未提交 git，无副本可恢复）；MIDI 相关用例随
 # midi_codec 暂时删除一并移除。
 # ===========================================================================
+# ---- GARGANTUA 路径引导（2026-10-24 目录树重构：server/ service/ start/）----
+import sys as _sys
+from pathlib import Path as _Path
+for _anc in _Path(__file__).resolve().parents:
+    if (_anc / "start" / "boot.py").is_file():
+        _sys.path.insert(0, str(_anc / "start"))
+        break
+else:
+    raise SystemExit("找不到 GARGANTUA 项目根（start/boot.py）")
+import boot
+boot.bootstrap()
 import base64
 import gc
 import io
@@ -49,8 +60,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
+ROOT = boot.project_root()   # 2026-10-24：项目根（旧布局曾是 service/）
 
 import spec
 import common
@@ -402,7 +412,7 @@ class TestAuditMisc(unittest.TestCase):
 
     def test_frontend_dom_ids_exist(self):
         # 修复前：refreshHome 引用不存在的 DOM id（home 环境卡片死亡）
-        html = (Path(ROOT) / "web" / "index_source.html").read_text(
+        html = (Path(ROOT) / "service" / "web" / "index_source.html").read_text(
             encoding="utf-8")
         # 负向回顾排除 $$（querySelectorAll，参数是 CSS 选择器不是 id）
         js_ids = set(re.findall(r'(?<!\$)\$\("([^"]+)"\)', html))

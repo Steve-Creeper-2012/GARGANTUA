@@ -21,6 +21,17 @@
 #   P2-t  Trainer 参数校验
 # 运行：cd <ROOT> && <torch解释器> -m unittest tests.test_fixes -v
 # ===========================================================================
+# ---- GARGANTUA 路径引导（2026-10-24 目录树重构：server/ service/ start/）----
+import sys as _sys
+from pathlib import Path as _Path
+for _anc in _Path(__file__).resolve().parents:
+    if (_anc / "start" / "boot.py").is_file():
+        _sys.path.insert(0, str(_anc / "start"))
+        break
+else:
+    raise SystemExit("找不到 GARGANTUA 项目根（start/boot.py）")
+import boot
+boot.bootstrap()
 import json
 import math
 import os
@@ -558,11 +569,14 @@ class TestInferCliCustomBlocks(unittest.TestCase):
             md = os.path.join(tmp, "models", "small")
             m = small_model()
             save_checkpoint(md, m, {"n_enc_blocks": 1, "n_dec_blocks": 1})
-            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             r = subprocess.run(
-                [sys.executable, "infer.py", "--model", md,
+                [sys.executable,
+                 os.path.join(boot.project_root(), "service", "infer",
+                              "infer.py"),
+                 "--model", md,
                  "--prompt", "你好", "--max-new-tokens", "1"],
-                cwd=root, capture_output=True, text=True, timeout=600)
+                cwd=boot.project_root(), capture_output=True, text=True,
+                timeout=600)
             self.assertEqual(r.returncode, 0,
                              f"CLI 推理失败:\n{r.stderr[-800:]}")
         finally:
@@ -634,16 +648,32 @@ class TestGroupByStepContract(unittest.TestCase):
             self._invariants(ss.tolist(), ratio)
 
 
-class TestRunPyLauncher(unittest.TestCase):
-    """ run.py 启动器：依赖探针 + 参数默认值语义。 """
+class TestServerEnvLauncher(unittest.TestCase):
+    """ server 侧启动链（2026-10-24 起环境检查/窗口校验归 server 管）：
+    依赖探针语义 + 参数默认值语义。 """
 
     def test_check_deps_detects_current_interpreter(self):
         # 回归：探针曾写成 `import importlib`（不绑定 importlib.util），
-        # 恒抛 AttributeError → 恒判「缺依赖」→ 每次 run.py 都去重装一遍
+        # 恒抛 AttributeError → 恒判「缺依赖」→ 每次启动都重装一遍
         # torch（--test 被拖成 16 分钟假死，无网直接崩）
-        import run
-        self.assertTrue(run.check_deps(sys.executable),
+        import server_env
+        self.assertTrue(server_env.check_deps(sys.executable),
                         "当前解释器已装齐依赖，check_deps 必须返回 True")
+
+    def test_check_deps_rejects_interpreter_without_torch(self):
+        # 反证：换一个只有标准库的解释器（系统 python3 未必有 torch，
+        # 用 -S -I 隔离站点目录必然缺 torch）→ 必须 False
+        import server_env
+        import shutil
+        bare = shutil.which("python3") or shutil.which("python")
+        if not bare:
+            self.skipTest("找不到系统 python3")
+        probe = ("import importlib.util,sys;"
+                 "sys.exit(0 if importlib.util.find_spec('torch') else 1)")
+        r = subprocess.run([bare, "-c", probe], capture_output=True)
+        expect = (r.returncode == 0)
+        self.assertEqual(server_env.check_deps(bare), expect,
+                         "check_deps 必须与 find_spec('torch') 事实一致")
 
     def test_num_param_keeps_explicit_zero(self):
         # server.num_param：显式 0 不得被默认值吞掉
@@ -657,11 +687,11 @@ class TestRunPyLauncher(unittest.TestCase):
 
 
 class TestStartupChain(unittest.TestCase):
-    """ 2026-10-23 启动链整合 + server 拆分的回归。
+    """ 2026-10-24 启动链（server 拥有环境检查/窗口校验/服务调度）的回归。
 
-    端到端（run.py 起 server + 窗口子进程、窗口崩溃不影响训练、server
-    退出带走窗口）已手工验证；这里固化不依赖 GUI 的部分：模块边界、
-    re-export 完整性、窗口冒烟、收尸逻辑。 """
+    端到端（setup.sh 装隔离环境 → server.py 起窗口+服务子进程、窗口崩溃
+    不影响 server、server 退出带走服务）已手工验证；这里固化不依赖 GUI
+    的部分：模块边界、re-export 完整性、窗口冒烟、收尸逻辑、环境预检。 """
 
     def test_server_reexports_intact(self):
         # 拆分后所有旧 import 路径必须仍然可用（test_server.py 走子进程，
@@ -671,12 +701,14 @@ class TestStartupChain(unittest.TestCase):
                      "ConflictError", "b64_to_pil", "size_guard_pil",
                      "extract_video_frames", "decode_audio_any",
                      "MAX_PATCHES_TOTAL", "MAX_IMAGE_DIM", "App",
-                     "Handler", "BodyTooLarge", "num_param", "main"):
+                     "Handler", "BodyTooLarge", "num_param", "main",
+                     # 2026-10-24 新增模块的符号也要在 server 命名空间可见
+                     "ServiceSupervisor", "ServiceError", "ROOT"):
             self.assertTrue(hasattr(server, name), f"server.{name} 丢失")
 
     def test_app_mixin_assembly(self):
-        # App 由 TrainApi + CodecApi 组合而成；任一路由表里的方法缺失都会
-        # 在运行时 500，这里提前拦
+        # App 由 TrainApi + CodecApi + TokensApi 组合而成；任一路由表里的
+        # 方法缺失都会在运行时 500，这里提前拦
         import server
         expected = {
             "api_status", "api_models", "api_model_init", "api_model_load",
@@ -693,18 +725,73 @@ class TestStartupChain(unittest.TestCase):
                    if not callable(getattr(server.App, m, None))]
         self.assertEqual(missing, [], f"App 缺少路由方法: {missing}")
 
+    def test_server_does_not_import_torch_at_module_level(self):
+        # 2026-10-24 架构回归：server 本体不加载 torch（重活全在服务子进程），
+        # 否则「按需启动省内存」就是空话——server 常驻即常驻一份 torch+模型
+        import subprocess
+        import sys
+        root = boot.project_root()
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, %r); import boot; boot.bootstrap();"
+             "import server; print('torch' in dir(server))" % os.path.join(root, "start")],
+            capture_output=True, text=True, timeout=300)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "False",
+                         "server 模块级不得出现 torch")
+
     def test_window_smoke(self):
         # pywebview 可导入、窗口对象可创建（无显示环境也能验证）。
         # 装不了/没装时给出可执行提示而不是默默失败。
         import subprocess
         import sys
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        r = subprocess.run([sys.executable, os.path.join(root, "window.py"),
+        root = boot.project_root()
+        r = subprocess.run([sys.executable, os.path.join(root, "service", "window", "window.py"),
                             "--smoke"], capture_output=True, text=True,
                            timeout=180)
         self.assertEqual(r.returncode, 0,
                          f"window.py --smoke 失败:\n{r.stdout}\n{r.stderr}")
         self.assertIn("smoke OK", r.stdout)
+
+    def test_environment_precheck_rejects_bogus_interpreter(self):
+        # server_env.check_environment：读不到版本的解释器必须拒（False），
+        # 并且不能抛异常（启动早期要能给出可读提示而不是 traceback）
+        import server_env
+        self.assertFalse(server_env.check_environment("/no/such/python-3.12"))
+        # 版本门槛：torch 2.2.2 只支持 ≤3.12——当前解释器必然在门内
+        self.assertGreaterEqual(server_env.python_version(sys.executable),
+                                (3, 12))
+
+    def test_launcher_helpers(self):
+        import server_env
+        # wait_port：关着的端口 False，开着的 True
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+        try:
+            self.assertTrue(server_env.wait_port(port, timeout=2))
+        finally:
+            s.close()
+        self.assertFalse(server_env.wait_port(port, timeout=1))
+        # kill_proc 真的能收尸
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        server_env.kill_proc(p, grace=3)
+        self.assertIsNotNone(p.poll(), "kill_proc 后进程必须退出")
+
+    def test_launcher_uses_current_interpreter_when_complete(self):
+        # 2026-10-20 坑：探针 `import importlib` 不绑定 importlib.util，
+        # 恒判缺依赖 → 每次启动都重装 torch
+        import server_env
+        self.assertTrue(server_env.check_deps(sys.executable),
+                        "当前解释器依赖齐全时 check_deps 必须为 True")
+        probe = ("import importlib.util,sys;"
+                 "mods=['torch','numpy','PIL','safetensors'];"
+                 "ok=all(importlib.util.find_spec(m) is not None "
+                 "for m in mods);sys.exit(0 if ok else 1)")
+        r = subprocess.run([sys.executable, "-c", probe])
+        self.assertEqual(r.returncode, 0)
 
     def test_system_reports_dependency_versions(self):
         # 回归：api_system 曾用裸 `_DIST_NAME` 访问类属性（NameError），
@@ -739,45 +826,14 @@ class TestStartupChain(unittest.TestCase):
         # pip 会把 numpy 升到 2.x，而 torch==2.2.2 只支持 numpy<2——主依赖
         # 契约被一个「可选」安装悄悄破坏（实测发生过：numpy 1.26.4 → 2.5.4）。
         from server_util import optional_install_cmd
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        req = os.path.join(root, "start", "requirements", "core.txt")
+        req = os.path.join(boot.project_root(), "start",
+                           "requirements", "core.txt")
         cmd = optional_install_cmd("/py", ["opencv-python"], req)
         self.assertIn("-c", cmd)
         self.assertIn(req, cmd)
         self.assertIn("opencv-python", cmd)
         # 源参数也必须带上（国内默认清华）
         self.assertTrue(any(a.startswith("https://") for a in cmd))
-
-    def test_launcher_helpers(self):
-        import launcher
-        # wait_port：关着的端口 False，开着的 True
-        import socket
-        s = socket.socket()
-        s.bind(("127.0.0.1", 0))
-        s.listen(1)
-        port = s.getsockname()[1]
-        try:
-            self.assertTrue(launcher.wait_port(port, timeout=2))
-        finally:
-            s.close()
-        self.assertFalse(launcher.wait_port(port, timeout=1))
-        # _kill 真的能收尸
-        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-        launcher._kill(p, grace=3)
-        self.assertIsNotNone(p.poll(), "_kill 后进程必须退出")
-
-    def test_launcher_uses_current_interpreter_when_complete(self):
-        # 2026-10-20 坑：探针 `import importlib` 不绑定 importlib.util，
-        # 恒判缺依赖 → 每次启动都重装 torch
-        import launcher
-        self.assertTrue(launcher.check_deps(sys.executable),
-                        "当前解释器依赖齐全时 check_deps 必须为 True")
-        probe = ("import importlib.util,sys;"
-                 "mods=['torch','numpy','PIL','safetensors'];"
-                 "ok=all(importlib.util.find_spec(m) is not None "
-                 "for m in mods);sys.exit(0 if ok else 1)")
-        r = subprocess.run([sys.executable, "-c", probe])
-        self.assertEqual(r.returncode, 0)
 
 
 if __name__ == "__main__":

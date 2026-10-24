@@ -16,6 +16,17 @@
 #
 # 用法：cd ROOT && python verify_formats.py
 # ===========================================================================
+# ---- GARGANTUA 路径引导（2026-10-24 目录树重构：server/ service/ start/）----
+import sys as _sys
+from pathlib import Path as _Path
+for _anc in _Path(__file__).resolve().parents:
+    if (_anc / "start" / "boot.py").is_file():
+        _sys.path.insert(0, str(_anc / "start"))
+        break
+else:
+    raise SystemExit("找不到 GARGANTUA 项目根（start/boot.py）")
+import boot
+boot.bootstrap()
 import struct
 import sys
 import tempfile
@@ -23,8 +34,7 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT))
+ROOT = Path(boot.project_root())   # 2026-10-24：项目根
 
 from tokens import dectok, enctok, text_codec, tokenvector, tok32  # noqa: E402
 

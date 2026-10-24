@@ -48,8 +48,8 @@ for _anc in _Path(__file__).resolve().parents:
         break
 else:
     raise SystemExit("找不到 GARGANTUA 项目根（start/boot.py）")
-import boot as _boot
-_boot.bootstrap()
+import boot
+boot.bootstrap()
 import spec
 from common import CKPT_NAME, MAX_NEW_TOKENS, build_model
 from tokens.text_codec import encode as text_encode, decode as text_decode

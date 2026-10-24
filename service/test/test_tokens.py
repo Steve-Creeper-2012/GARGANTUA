@@ -1,10 +1,22 @@
 """tokens 包测试：tok-32 词表布局、构建幂等、编解码 roundtrip、
 时间步结构、.tokenvector 格式与添加 token。
 
-运行：cd ROOT && python -m unittest tests.test_tokens -v
+运行：cd ROOT && python -m unittest service.test.test_tokens -v
 前置：tokens/vocab.json 已由 tokens/build_vocab.py 生成。
 """
 from __future__ import annotations
+
+# ---- GARGANTUA 路径引导（2026-10-24 目录树重构：server/ service/ start/）----
+import sys as _sys
+from pathlib import Path as _Path
+for _anc in _Path(__file__).resolve().parents:
+    if (_anc / "start" / "boot.py").is_file():
+        _sys.path.insert(0, str(_anc / "start"))
+        break
+else:
+    raise SystemExit("找不到 GARGANTUA 项目根（start/boot.py）")
+import boot
+boot.bootstrap()
 
 import re
 import shutil
@@ -15,8 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+ROOT = Path(boot.project_root())   # 2026-10-24：项目根
 
 import spec  # noqa: E402
 from tokens import dectok, enctok, text_codec, timestep, tok32, tokenvector

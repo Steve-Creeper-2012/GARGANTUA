@@ -37,8 +37,8 @@ for _anc in _Path(__file__).resolve().parents:
         break
 else:
     raise SystemExit("找不到 GARGANTUA 项目根（start/boot.py）")
-import boot as _boot
-_boot.bootstrap()
+import boot
+boot.bootstrap()
 import spec
 from common import (MAX_BLOCKS, save_checkpoint, valid_model_name,
                     validate_ctx_config)

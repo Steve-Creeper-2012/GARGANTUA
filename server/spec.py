@@ -37,7 +37,7 @@
 #   - 音频/视觉输入token 不入词表，走投影；其向量存档格式为
 #     .tokenvector（UTF-8，头部声明维度与精度）。
 #   - 图元（draw）token 布局照搬 wonderfulearth/primitive-operation-painter
-#     的 geometrize_256_v1（third_party/ 内 vendored，转换器为 Rust/wgpu）；
+#     的 geometrize_256_v1（service/prims/ 内 vendored，转换器为 Rust/wgpu）；
 #     MIDI 输出 token 暂时删除。
 # ===========================================================================
 
@@ -286,9 +286,10 @@ MUON_LR = 2e-2
 # ---------------------------------------------------------------------------
 # Python 3.12 系列最新版（standalone，项目内隔离安装；steve 2026-10-24：
 # 用 latest 不锁 patch）+ torch 2.2.2（macOS x86_64 最后官方轮子）。
-# 隔离运行时全部装在项目里，不碰系统 Python：
-#   start/.python/   python-build-standalone 解包（setup.sh 自动下载）
-#   start/.venv/     以上述解释器建的虚拟环境（core/window/dev 依赖）
+# 隔离运行时全部装在 environment/，不碰系统 Python：
+#   environment/python/  python-build-standalone 解包（setup.sh 自动下载）
+#   environment/venv/    以上述解释器建的虚拟环境（core/window/dev 依赖）
+#   environment/rust/    Rust 工具链（service/prims/setup.sh 隔离安装）
 # torch 2.2.2 最高支持 Python 3.12（3.13 无预编译轮子）——所以锁 3.12
 # 系列而不是 latest overall。
 DTYPE = "float32"            # 训练/推理默认 FP32（x86_64 mac 无 CUDA）
@@ -301,13 +302,20 @@ DTYPE = "float32"            # 训练/推理默认 FP32（x86_64 mac 无 CUDA）
 #     terminal/    终端脚本：setup.{sh,bat}（装隔离环境）+ start.{sh,bat,command}
 #     requirements/ 分类依赖：core（必装）/ window（GUI）/ dev（测试）
 #     boot.py      路径引导（把 server/ 与 service/* 放上 sys.path）
-#     window.sha256  window.py 完整性基准（server 启动时校验）
+#   environment/   全部依赖/工具链（与系统隔离，见第 7 节）：
+#     python/       standalone CPython（setup 脚本下载）
+#     venv/         以上述解释器建的虚拟环境（core/window/dev 依赖）
+#     rust/         Rust 工具链（rustup/cargo，service/prims/setup.sh 装）
 #   server/        全部 server 文件：spec / common / model / muon +
-#                  server.py（装配+路由+启动编排）+ server_env（环境检查/
-#                  窗口校验/弹窗）+ server_services（服务监督器）+
+#                  server.py（装配+路由+启动编排）+ server_env（环境
+#                  预检）+ server_services（服务监督器）+
 #                  server_models / media / codecs / train / tokens / util
-#   service/       每个服务一个目录：infer / train / init / tokens / web /
-#                  window / test（按需启动，见下）
+#   service/       每个服务一个目录：infer / train / init / tokens / prims /
+#                  web / window / test（按需启动，见下）
+#     prims/       图元管线：image_to_primitives.py（驱动+CPU 兜底）+
+#                  fast_shape_render/（逐字照搬的第三方 Rust/wgpu 转换器，
+#                  未改动；setup.sh 用 environment/rust 隔离构建）+
+#                  upstream/（上游仓库完整留档）
 #   models/        models/NAME/{model.safetensors, config.json, vocab.txt?}
 #   data/          data/queue/（待训练）+ data/done/（已训练归档）
 #   logs/          auto_train.jsonl 等运行日志
@@ -336,11 +344,10 @@ DTYPE = "float32"            # 训练/推理默认 FP32（x86_64 mac 无 CUDA）
 #
 # 启动链（唯一入口）：
 #   start/terminal/start.{sh,bat,command}
-#     → setup.{sh,bat}（幂等：装/复用 start/.python + start/.venv）
+#     → setup.{sh,bat}（幂等：装/复用 environment/python + environment/venv；
+#        下载镜像与 pip 源均自动测速选取）
 #     → server/server.py
 #         → server_env.check_environment（解释器版本 + 主依赖）
-#         → server_env.verify_window_integrity（window.py sha256 校验，
-#            不一致弹窗，可跳过；--no-verify 静默）
 #         → HTTP 服务 + 按需拉起 service/window/window.py 与各服务
 
 # ---------------------------------------------------------------------------

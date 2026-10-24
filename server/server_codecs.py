@@ -16,7 +16,7 @@ import tempfile
 
 import spec
 from tokens import image_codec, audio_codec, draw_codec
-from tokens.image_to_primitives import image_to_primitives
+from prims.image_to_primitives import image_to_primitives
 from server_media import (MAX_AUDIO_TOKENS, MAX_PATCHES_TOTAL, b64_to_pil,
                           decode_audio_any, extract_video_audio,
                           extract_video_frames)

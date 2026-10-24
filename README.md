@@ -64,9 +64,9 @@ Compression, sliding-window eviction and the causal mask are all **time-step ato
 Choose it three ways (all validated, all landing in the same `config.json` contract):
 
 ```bash
-python init.py --name alpha --ctx-full 2048 --ctx-compress 8192 \
+python service/init/init.py --name alpha --ctx-full 2048 --ctx-compress 8192 \
     --csa-ratio 8 --hca-ratio 64 --csa-window 1024   # total 10240
-python run.py --init alpha --ctx-full 2048            # same flags via launcher
+# 或走 Web UI 的建模表单 / POST /api/model/init（同一套参数）
 ```
 
 or in the web UI's model-creation form (five number inputs, defaults shown), or `POST /api/model/init` with `ctx_full` / `ctx_compress` / `csa_ratio` / `hca_ratio` / `csa_local_window` (omitted = spec default, illegal value = 400). `GET /api/status` and `GET /api/system` return the active model's real configuration (`ctx` + `kv_note`), so the UI never shows a stale spec constant.
@@ -98,12 +98,13 @@ only ever looks up the two visible ones:
   new tokens consume reserved tail slots of their category, so the model
   output dimension never changes. User additions persist in `vocab.json`
   (`meta["user_added"]`) and are replayed on rebuild.
-- **enctok** (`python tokens/enctok.py "text"`): word segments `[A-Za-z]+`
+- **enctok** (`python service/tokens/enctok.py "text"`): word segments `[A-Za-z]+`
   hit the word list (`<caps>` + word for `Hello`; ALL-CAPS/mixed case is
   spelled letter-by-letter with `<caps>` per capital — lossless); other chars
   look up regular tokens, then fallback letters; unmapped chars are skipped
   and reported. Output: hex string or `.tokens` binary.
-- **dectok** (`python tokens/dectok.py stream.tokens`): `{ } |` render as
+  `--vocab <vocab.txt|模型目录>` 可用指定词表编码（见「每模型词表」）。
+- **dectok** (`python service/tokens/dectok.py stream.tokens`): `{ } |` render as
   literals, everything else as 8-hex IDs; `--text` renders surface text.
 
 ### Time-Step Format (.gts / { } |)
@@ -169,16 +170,17 @@ Within a single time-step (e.g., one video frame), all patches and audio tokens 
 ## Primitive Pipeline (image → primitive tokens)
 
 Adopted from [wonderfulearth/primitive-operation-painter](https://github.com/wonderfulearth/primitive-operation-painter)
-(vendored verbatim under `third_party/primitive-operation-painter/`).
+(vendored **verbatim** under `service/prims/` — the converter is copied
+byte-for-byte, never modified; the rest of the upstream repo is kept under
+`service/prims/upstream/` for reference).
 **Languages**: the image→sequence converter (`fast_shape_render/`) is
 **Rust + wgpu** (GPU compute; Metal on macOS, DirectX 12 on Windows,
-Vulkan on Linux); the model / training / generation code is **Python +
-PyTorch**.
+Vulkan on Linux); the driver + CPU fallback is **Python + numpy**.
 
 - **Converter (照搬第三方代码)**: reads images, fits a sequence of
   rectangle/ellipse operations on the GPU (275 search steps), and writes
   CSV (`image_name,cx,cy,w,h,shape_type,theta,r,g,b`; first row per image
-  is the background). Driven by `tokens/image_to_primitives.py`
+  is the background). Driven by `service/prims/image_to_primitives.py`
   (`convert_with_renderer`, subprocess).
 - **CPU fallback**: the same greedy algorithm in pure numpy (no GPU
   required), outputting the identical primitive schema.
@@ -186,7 +188,8 @@ PyTorch**.
   in field order `cx, cy, theta, w, h, shape, r, g, b`, each field an
   independent bin range (token ID = `DRAW_BEGIN + field offset + bin`);
   canvas 256×256; a step-first token in the special bin range ends the
-  sequence. See `spec.py` (DRAW_*) and `tokens/draw_codec.py`.
+  sequence. See `server/spec.py` (DRAW_*) and
+  `service/tokens/draw_codec.py`.
 - **Quality modes** (CPU path): `fast` = 20 candidates/step, no
   hill-climbing (~2–5s/100 steps); `slow` = 50 candidates + short
   hill-climbing (~30–60s/100 steps).
@@ -196,17 +199,20 @@ PyTorch**.
 ### Startup dependencies
 
 ```sh
-sh third_party/primitive-operation-painter/setup.sh
+sh service/prims/setup.sh
 ```
 
-installs the Rust toolchain (rustup), builds the GPU converter
-(`cargo build --release`, first run ~5–15 min), and pip-installs the
-Python-side deps (`pandas`, `matplotlib`; torch/numpy come from the
-GARGANTUA venv). Without the build the pipeline automatically falls back
-to the CPU fitter; `GARGANTUA_SHAPE_RENDERER` overrides the binary path.
-Converter env vars (`SHAPE_RENDERER_INPUT_DIR`, `_OUTPUT_DIR`,
-`_NUM_VERSIONS`, `_MAX_OUTPUT_STEPS`) are documented in
-`third_party/primitive-operation-painter/fast_shape_render/README.md`.
+installs the Rust toolchain **into `environment/rust/`** (fully isolated
+from the system: `RUSTUP_HOME`/`CARGO_HOME` are redirected, `--no-modify-path`
+keeps your shell config untouched), then builds the GPU converter
+(`cargo build --release`, first run ~5–15 min). Download mirrors are
+auto-selected by live speed test (USTC → TUNA → official; override with
+`RUSTUP_DIST_SERVER` / `CARGO_CRATES_MIRROR`). macOS needs Xcode Command
+Line Tools for the linker/Metal SDK. Without the build the pipeline
+automatically falls back to the CPU fitter; `GARGANTUA_SHAPE_RENDERER`
+overrides the binary path. Converter env vars (`SHAPE_RENDERER_INPUT_DIR`,
+`_OUTPUT_DIR`, `_NUM_VERSIONS`, `_MAX_OUTPUT_STEPS`) are documented in
+`service/prims/fast_shape_render/README.md`.
 
 ## Training
 
@@ -224,13 +230,13 @@ Or object arrays / JSONL (one object per line).
 
 ### Training Script
 ```bash
-python train.py --model models/my_model --data data/
+python service/train/train.py --model models/my_model --data data/
 ```
 
 ## Inference
 
 ```bash
-python infer.py --model models/my_model --prompt "Hello"
+python service/infer/infer.py --model models/my_model --prompt "Hello"
 ```
 
 The decoder stops immediately when `<stop>` (ID 27) is sampled.
@@ -250,27 +256,46 @@ A built-in web UI provides:
 
 ### Launch
 
-One `run.py` holds every bit of logic; the per-platform entry points only
-locate the system Python and delegate to it:
+终端脚本只负责「把隔离环境准备好，然后让位给 server」；环境检查、窗口
+拉起、服务调度全部由 server 自己做：
 
 ```bash
-./run.sh          # macOS / Linux
-./run.command     # macOS: double-click in Finder (opens Terminal, then the app window)
-run.bat           # Windows (double-click)
-python run.py     # any platform, direct
+./start/terminal/start.sh        # macOS / Linux
+./start/terminal/start.command   # macOS: double-click in Finder (Terminal → app window)
+start\terminal\start.bat         # Windows (double-click)
 ```
 
-On first launch `run.py` creates `.venv/`, installs `requirements.txt`,
-and verifies the imports before starting anything. torch 2.2.2 has no wheel
-above Python 3.12, so a newer interpreter is refused with an actionable
-message instead of a 20-minute source build.
+首次启动 `setup.sh` / `setup.bat` 会：
+
+1. 从 python-build-standalone 发现并下载 **3.12 系列最新版**（atom feed
+   取最新 release tag + HEAD 探测补 patch 号），**镜像自动测速选取**
+   （对 gh-proxy / GitHub 直连 / SJTU 镜像并行发 Range 请求前 2MB 比速率，
+   选最快的下载；也可用 `GARGANTUA_PY_BASE_URL` 手动指定）；
+2. 解包到 `environment/python/`，用它建虚拟环境 `environment/venv/`
+   （**不碰系统 Python**；项目目录被移动后符号链接悬空会自动重建）；
+3. 按分类装依赖 `start/requirements/{core,window,dev}.txt`（core 必装，
+   window 桌面环境才装，dev 仅测试需要；pip 源同样测速选取：
+   TUNA vs PyPI 官方，默认快者）；
+4. 写依赖清单哈希 stamp——之后启动秒过，只有清单变了才重装。
+
+随后 `server/server.py` 启动：先做环境预检（解释器 ≥3.12 且 ≤3.12 系列、
+主依赖可导入——torch 2.2.2 没有 3.13 预编译轮子，版本不对会给可执行提示
+而不是 20 分钟源码编译），再起 HTTP 服务与独立桌面窗口。
+
+所有依赖与工具链（Python / venv / Rust）统一放在 `environment/`，与系统
+完全隔离——契约见 `environment/README.md`。
 
 | Flag | Effect |
 | --- | --- |
 | `--port N` | Port for the HTTP server (default 8712) |
 | `--no-window` | Server only — no GUI window (SSH / servers / CI) |
-| `--test` | Full regression, one process per suite |
-| `--init NAME` / `--train NAME` / `--infer NAME` | CLI shortcuts, no server |
+| `--idle-timeout S` | Service subprocess idle self-exit (default 300s) |
+| `--model-dir` / `--data-dir` / `--log-file` | Override default paths |
+
+环境变量：`GARGANTUA_PY_RELEASE` / `GARGANTUA_PY_VERSION`（锁定
+python-build-standalone 版本）、`GARGANTUA_PY_BASE_URL`（指定 Python
+下载镜像）、`GARGANTUA_NO_WINDOW=1` / `GARGANTUA_INSTALL_DEV=1`（setup
+阶段）、`PIP_INDEX_URL`（自定义 pip 源）。
 
 ### The window is not a browser
 
@@ -280,28 +305,43 @@ The UI opens in a **standalone desktop window** via
 engine. Chrome/Firefox spend 300–800 MB per tab on renderer processes,
 extensions and their own GPU pipeline; that budget belongs to training here
 (model + optimizer state + KV cache). The window dependency is deliberately
-**not** in `requirements.txt`:
+**not** in the core requirements:
 
 ```bash
-pip install -r requirements-window.txt   # ~18 MB, optional
+pip install -r start/requirements/window.txt   # ~18 MB, optional
 ```
 
-Without it `run.py` still starts the server and prints the URL — you can
-open it in a browser by hand.
+Without it the server still starts and prints the URL — you can open it in
+a browser by hand.
 
 Process model (deliberate, Steam-like):
 
 ```
-run.py ──┬── server.py    training + inference + HTTP  (closing the window does not stop it)
-         └── window.py    the UI window               (crash/kill does not stop training)
+server.py ──┬── infer/train/init 服务子进程   按需拉起，空闲自行退出
+            └── window.py                    UI 窗口（崩了不影响 server）
 ```
 
 - Closing or crashing the window leaves the server running; the log prints
   the command to reopen the UI.
-- Exiting the server takes the window down with it (no orphan pointing at a
-  dead port). Ctrl-C is forwarded to both.
-- `PYTHONUNBUFFERED=1` is forced on children so startup logs appear
-  immediately instead of after 8 KB of buffering.
+- Exiting the server takes the window and all service subprocesses down
+  with it (no orphans pointing at a dead port). Ctrl-C / SIGTERM both go
+  through the cleanup path.
+
+### Services start on demand (memory)
+
+推理 / 训练 / 建模是重活（模型权重单个 safetensors 可达数 GB），全部以
+**独立子进程**按需拉起，server 本体只做 HTTP 路由 + 记账，常驻不带权重：
+
+- 协议 = JSON-lines over stdin/stdout（请求 `{"id","op",...}` → 响应
+  `{"id","ok",result|error}`；服务 stdout 只准写 JSON 行，人肉日志走
+  stderr）；服务退出条件 = `shutdown` / stdin EOF（server 死了）/ 空闲超时。
+- infer 服务：请求带 `model_dir`，换了模型才重载；空闲 300s 自行退出。
+- train 服务：`start` 下发模型/队列/日志路径与 block_size/steps/optimizer；
+  启动时从 `logs/auto_train.jsonl` 回填 loss 曲线；训练进行中（队列有文件）
+  绝不因空闲退出。
+- init 是一次性重活：`run_oneshot` 起进程、`--json` 末行协议拿结果、跑完即退。
+- PyTorch 的 CPU 分配器在进程内不向 OS 归还内存——所以「按需」必须是
+  进程级的，进程退出才是真省内存。
 
 ### HTTP contract
 
@@ -322,85 +362,127 @@ Long-running work (inference, model init, image→primitives, **drawing render**
 
 ```
 .
-├── spec.py              # Frozen architecture contract (single source of truth)
-├── common.py            # Shared checkpoint I/O + validation (config.json contract,
-│                        #   incl. context-length config: validate/read_ctx_config)
-├── model.py             # Gargantua model (KDA, MLA, FastWeight, SharedKV)
-├── train.py             # Training loop with Muon/AdamW optimizer routing
-├── infer.py             # Autoregressive generation
-├── init.py              # Model initialization
-├── auto_train.py        # Trainer class with queue support
-├── server.py            # HTTP layer only: App assembly + routing + Handler
-├── server_models.py     # ModelManager / TaskPool / step_to_json / ConflictError
-├── server_media.py      # Uploaded-media decode + size guards (b64_to_pil / ffmpeg)
-├── server_codecs.py     # CodecApi mixin — all /api/codec/* endpoints
-├── server_train.py      # TrainApi mixin — all /api/train/* endpoints
-├── server_tokens.py     # TokensApi mixin — /api/tokens/* + /api/vocab/add
-├── server_util.py       # num_param (explicit 0 is never swallowed by a default)
-├── window.py            # Standalone desktop window (pywebview, no browser)
-├── run.py               # Cross-platform launcher: venv, deps, server + window
-├── run.sh               # Linux/macOS entry — finds system Python, delegates
-├── run.command          # macOS double-click entry (Finder → Terminal → window)
-├── run.bat              # Windows entry — finds system Python, delegates
-├── muon.py              # Muon optimizer implementation
-├── requirements.txt     # Pinned runtime dependencies (single source)
-├── requirements-window.txt  # Optional: pywebview only (~18 MB, OS webview)
-├── tokens/              # Codecs for all modalities
-│   ├── tok32.py         # tok-32 interpreter: .tokens binary ↔ IDs ↔ hex
-│   ├── enctok.py        # Text → token ID stream (regular first, fallback next)
-│   ├── dectok.py        # Token ID stream → readable ({ } | + hex / surface text)
-│   ├── timestep.py      # { } | time-step structure (wrap/unwrap/render)
-│   ├── tokenvector.py   # .tokenvector vector archive format (dim+precision)
-│   ├── text_codec.py    # Text ↔ List[Step] (one token per step)
-│   ├── audio_codec.py   # Audio → wave tokens (+ .tokenvector export)
-│   ├── image_codec.py   # Image/Video → patch tokens (+ .tokenvector export)
-│   ├── draw_codec.py    # Primitive sequence ↔ drawing tokens + PNG/SVG render
-│   ├── image_to_primitives.py  # Image → primitive sequence (fast_shape_render)
-│   ├── build_vocab.py   # vocab.json generator (layout from spec.py)
-│   ├── vocab.py         # Vocab view: 4-category maps + add_token
-│   ├── vocab.json       # Built vocabulary (88,704 slots)
-│   └── words_en.txt     # 30K English word list (frequency order)
-├── web/                 # Frontend
-│   ├── index_source.html  # Single-page app source (11 pages)
-│   ├── index.html        # Minified artifact (regenerate via web/minify.py)
-│   └── minify.py         # Safe minifier with --check self-test
-└── tests/               # Unit + integration tests
-    ├── test_model.py
-    ├── test_codecs.py
-    ├── test_tokens.py
-    ├── test_image2prim.py
-    ├── test_server.py
-    ├── test_fixes.py    # Regression tests for the 2026-10-20 audit
-    └── test_audit_20261023.py  # 2026-10-23 audit fixes + context-length feature
+├── start/                     # 启动链：终端脚本 + 分类依赖 + 路径引导
+│   ├── boot.py                # Path bootstrap: server/ + service/* onto sys.path
+│   ├── terminal/              # Terminal entry points
+│   │   ├── setup.sh / .bat    # Isolated Python 3.12.x + venv + deps (idempotent,
+│   │   │                      #   mirrors auto-selected by live speed test)
+│   │   └── start.sh / .bat / .command   # setup → exec server.py
+│   └── requirements/          # Categorized dependencies
+│       ├── core.txt           # torch / numpy / pillow / safetensors (required)
+│       ├── window.txt         # pywebview — standalone window (~18 MB, optional)
+│       └── dev.txt            # pytest (tests only)
+├── environment/               # ALL dependencies & toolchains (system-isolated)
+│   ├── python/                # standalone CPython 3.12.x (downloaded by setup)
+│   ├── venv/                  # virtual env on the above interpreter
+│   ├── rust/                  # Rust toolchain (installed by service/prims/setup.sh)
+│   └── README.md              # the contract (see it before touching this dir)
+├── server/                    # All server files
+│   ├── spec.py                # Frozen architecture contract (single source of truth)
+│   ├── common.py              # Shared checkpoint I/O + validation (config.json
+│   │                          #   contract, incl. vocab.txt reader)
+│   ├── model.py               # Gargantua model (KDA, MLA, FastWeight, SharedKV)
+│   ├── muon.py                # Muon optimizer implementation
+│   ├── server.py              # App assembly + routing + startup orchestration
+│   ├── server_env.py          # Env precheck + subprocess helpers
+│   ├── server_services.py     # ServiceSupervisor: on-demand subprocesses (JSON-lines)
+│   ├── server_models.py       # ModelManager (registry, no weights) / TaskPool
+│   ├── server_media.py        # Uploaded-media decode + size guards (b64_to_pil / ffmpeg)
+│   ├── server_codecs.py       # CodecApi mixin — all /api/codec/* endpoints
+│   ├── server_train.py        # TrainApi mixin — all /api/train/* endpoints
+│   ├── server_tokens.py       # TokensApi mixin — /api/tokens/* + /api/vocab/add
+│   └── server_util.py         # num_param / pip source / optional-install command
+├── service/                   # One folder per service (started on demand)
+│   ├── infer/infer.py         # Autoregressive generation (CLI + --serve mode)
+│   ├── train/train.py         # Training loop with Muon/AdamW optimizer routing
+│   ├── train/auto_train.py    # Queue trainer daemon (CLI + --serve mode)
+│   ├── init/init.py           # Model initialization (CLI + --json one-shot mode)
+│   ├── tokens/                # Codecs for all modalities
+│   │   ├── tok32.py           # tok-32 interpreter: .tokens binary ↔ IDs ↔ hex
+│   │   ├── enctok.py          # Text → token ID stream (regular first, fallback next)
+│   │   ├── dectok.py          # Token ID stream → readable ({ } | + hex / surface text)
+│   │   ├── timestep.py        # { } | time-step structure (wrap/unwrap/render)
+│   │   ├── tokenvector.py     # .tokenvector vector archive format (dim+precision)
+│   │   ├── text_codec.py      # Text ↔ List[Step] (one token per step)
+│   │   ├── audio_codec.py     # Audio → wave tokens (+ .tokenvector export)
+│   │   ├── image_codec.py     # Image/Video → patch tokens (+ .tokenvector export)
+│   │   ├── draw_codec.py      # Primitive sequence ↔ drawing tokens + PNG/SVG render
+│   │   ├── build_vocab.py     # vocab.json generator (layout from spec.py)
+│   │   ├── vocab.py           # Vocab view: global + per-model (vocab.txt) + add_token
+│   │   ├── vocab.json         # Built global vocabulary (88,704 slots)
+│   │   └── words_en.txt       # 30K English word list (frequency order)
+│   ├── prims/                 # Primitive pipeline (image → primitive sequence)
+│   │   ├── image_to_primitives.py  # Driver: GPU subprocess + CPU fallback fitter
+│   │   ├── setup.sh           # Build GPU converter (Rust into environment/rust/)
+│   │   ├── fast_shape_render/ # ★ vendored Rust/wgpu converter, verbatim
+│   │   └── upstream/          # the rest of the upstream repo, verbatim (reference)
+│   ├── web/                   # Frontend
+│   │   ├── index_source.html  # Single-page app source (11 pages)
+│   │   ├── index.html         # Minified artifact (regenerate via web/minify.py)
+│   │   └── minify.py          # Safe minifier with --check self-test
+│   ├── window/window.py       # Standalone desktop window (pywebview, no browser)
+│   └── test/                  # Unit + integration tests
+│       ├── test_model.py
+│       ├── test_codecs.py
+│       ├── test_tokens.py
+│       ├── test_image2prim.py
+│       ├── test_server.py
+│       ├── test_fixes.py      # Regression tests for the 2026-10-20 audit
+│       ├── test_audit_20261023.py  # 2026-10-23 audit fixes + context-length feature
+│       ├── test_services.py   # 2026-10-24: supervisor / vocab.txt / env precheck
+│       ├── verify_formats.py  # Format round-trip verifier
+│       └── run_tests.py       # Full regression, one process per suite
+├── models/                    # models/NAME/{model.safetensors, config.json, vocab.txt?}
+├── data/                      # data/queue/ (pending) + data/done/ (trained)
+└── logs/                      # auto_train.jsonl and friends
 ```
 
-`server.py` used to be one 986-line file holding the HTTP layer, the model
-manager, the task pool, the ffmpeg plumbing and every API handler. It is now
-366 lines of routing plus six focused modules (`server_models`,
+`server.py` is routing + startup orchestration (~600 lines) plus focused
+modules: `server_env` (env precheck + window integrity), `server_services`
+(on-demand service supervision), `server_models` (registry + task pool),
 `server_media`, `server_codecs`, `server_train`, `server_tokens`,
-`server_util`); `App` composes the three API mixins. All previous `from server import X` paths still
-work through re-exports, and `tests/test_server.py` passes unchanged.
+`server_util`; `App` composes the three API mixins. All previous
+`from server import X` paths still work through re-exports.
 
 ### Model directory contract
 
 Every model lives in `models/NAME/` with `model.safetensors` (weights) and
 `config.json` (records `n_enc_blocks` / `n_dec_blocks` and more). All entry
-points (`init.py`, `train.py`, `infer.py`, `auto_train.py`, `server.py`)
-construct and load models through `common.build_model()` so a model created
-with custom block counts loads identically everywhere.
+points (`service/init/init.py`, `service/train/train.py`,
+`service/infer/infer.py`, `service/train/auto_train.py`) construct and load
+models through `common.build_model()` so a model created with custom block
+counts loads identically everywhere.
+
+**Per-model vocabulary** (optional): drop a `vocab.txt` into the model
+directory and that model gets its own token↔ID mapping — one token per
+line, line *N* → ID `INVISIBLE_END + N` (the invisible region below
+`INVISIBLE_END` holds the fixed special/system/modal tokens: `<stop>`,
+`<caps>`, `{ } |`, draw tokens — their IDs are an architectural contract and
+a custom vocab never occupies them). Empty lines are skipped; duplicates are
+rejected; at most `VOCAB_SIZE_PADDED - INVISIBLE_END` entries. Models
+without `vocab.txt` use the global vocabulary
+`service/tokens/vocab.json`. When the active model changes, the server and
+the infer/train service processes each call `set_model_vocab()`, so
+`/api/tokens/*`, `/api/vocab`, training and inference all speak that
+model's vocabulary. Export a starting point with
+`python service/tokens/build_vocab.py --export-txt models/NAME/vocab.txt`.
 
 ## Testing
 
 ```bash
-python run.py --test          # all suites, one process per suite
-python -m unittest tests.test_model -v   # a single suite
+python service/test/run_tests.py                    # all suites, one process per suite
+python service/test/run_tests.py --list             # list suites
+python service/test/run_tests.py --suite test_model # a single suite
+python -m unittest service.test.test_model -v       # unittest directly
 ```
 
-Suites run in **separate processes** on purpose: a full `Gargantua()` is
-~527.9M params (~2.1 GB fp32), and PyTorch's CPU allocator keeps freed blocks
-in its own pool, so RSS never drops within a process — running every suite
-under one `unittest discover` gets SIGKILLed (exit 137) partway through
-`test_model`.
+`run_tests.py` first runs static gates (`py_compile` on every `.py`,
+`bash -n` on every `.sh`, `minify.py --check`), then each suite in its own
+subprocess. Suites run in **separate processes** on purpose: a full
+`Gargantua()` is ~527.9M params (~2.1 GB fp32), and PyTorch's CPU allocator
+keeps freed blocks in its own pool, so RSS never drops within a process —
+running every suite under one `unittest discover` gets SIGKILLed (exit 137)
+partway through `test_model`.
 
 ## Technical References
 

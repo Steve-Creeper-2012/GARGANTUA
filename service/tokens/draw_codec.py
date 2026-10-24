@@ -1,7 +1,8 @@
 # ===========================================================================
 # GARGANTUA v1 — 绘图输出 codec（图元序列 ↔ 绘图 token + 纯 Python 渲染）
 # ---------------------------------------------------------------------------
-# 契约来源：ROOT/spec.py（冻结）+ third_party/primitive-operation-painter
+# 契约来源：ROOT/spec.py（冻结）+ service/prims/fast_shape_render
+# （逐字照搬第三方布局，geometrize_256_v1）
 # （wonderfulearth，geometrize_256_v1 布局照搬）。
 #   - 每个图元 9 个 token，字段序 cx, cy, theta, w, h, shape, r, g, b；
 #     各字段独立 bin 区间（token ID = spec.DRAW_BEGIN + offset + bin）。
