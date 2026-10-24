@@ -27,6 +27,19 @@ import spec
 CKPT_NAME = "model.safetensors"
 CONFIG_NAME = "config.json"
 
+# 每模型词表文件（2026-10-24，steve：每个模型可以有不同的 vocab 词表）。
+# 语义：一行一个 token，第 N 行 → token ID = INVISIBLE_END + N（不可见区
+# [0, INVISIBLE_END) 是 special/system/modal 固定 token 的架构契约，
+# 自定义词表不占用）；空行跳过；不允许重复（反查歧义）。条目数上限
+# VOCAB_SIZE_PADDED - INVISIBLE_END。没有 vocab.txt 的模型用全局词表
+# service/tokens/vocab.json。
+VOCAB_TXT_NAME = "vocab.txt"
+
+# 推理 API/CLI 层硬上限：CPU 上单步是全序列重解码，2048 已是宽松保护值。
+# 定义在 common（server 与服务进程共用），避免 server 为拿一个常量去
+# import 重量级的 infer 模块。
+MAX_NEW_TOKENS = 2048
+
 # block 数合法范围（与 server.py 的 Web 表单 clamp 一致）
 MAX_BLOCKS = 64
 
@@ -132,6 +145,46 @@ def _ctx_from_cfg(cfg: dict) -> dict:
 def read_ctx_config(model_dir: str) -> dict:
     """模型目录的上下文长度配置（config.json 驱动，缺失即默认）。 """
     return _ctx_from_cfg(read_config(model_dir))
+
+
+def model_vocab_path(model_dir: str) -> str:
+    """模型目录的 vocab.txt 路径（不一定存在）。"""
+    return os.path.join(model_dir, VOCAB_TXT_NAME)
+
+
+def read_model_vocab(model_dir: str) -> Optional[list]:
+    """读模型目录的 vocab.txt → token 列表（第 N 行 → ID = INVISIBLE_END + N）；
+    不存在返回 None。
+
+    规则（契约，写进 spec.py 第 9 节）：
+      - 一行一个 token，第 N 行的 ID 是 INVISIBLE_END + N；
+      - 空行跳过（不占 ID）；行尾 \r 剥掉（兼容 CRLF）；
+      - 重复 token 直接拒绝：反查会有歧义；
+      - 条目数不得超过 VOCAB_SIZE_PADDED - INVISIBLE_END（不可见区是
+        special/system/modal 固定 token 的契约，不得占用）。
+    """
+    path = model_vocab_path(model_dir)
+    if not os.path.exists(path):
+        return None
+    tokens = []
+    seen = set()
+    with open(path, encoding="utf-8") as f:
+        for lineno, raw in enumerate(f, 1):
+            tok = raw.rstrip("\n").rstrip("\r")
+            if not tok:
+                continue                    # 空行跳过，不占 ID
+            if tok in seen:
+                raise ValueError(
+                    f"{path}:{lineno} token 重复: {tok!r}"
+                    f"（反查歧义，拒绝加载）")
+            seen.add(tok)
+            tokens.append(tok)
+    limit = spec.VOCAB_SIZE_PADDED - spec.INVISIBLE_END
+    if len(tokens) > limit:
+        raise ValueError(
+            f"{path}: {len(tokens)} 个 token 超过上限 {limit}"
+            f"（VOCAB_SIZE_PADDED - INVISIBLE_END）")
+    return tokens
 
 
 def _warn(msg: str) -> None:

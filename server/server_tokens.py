@@ -94,11 +94,21 @@ class TokensApi:
                 f"category 必须是 {list(CATEGORIES)} 之一: {category!r}")
         v = get_vocab()
         tid = v.add_token(token, category)
+        if getattr(v, "flat", False):
+            # 每模型词表（models/NAME/vocab.txt）：直接落盘到该文件，
+            # 没有 build_vocab 重放机制
+            src = getattr(v, "_path", None)
+            note = (f"已写入 {src}；该模型的 token 即用即生效"
+                    if src else "已写入模型词表")
+            free = {"regular": v.free_slots(CAT_REGULAR)}
+        else:
+            note = "已写入 vocab.json；重新运行 build_vocab.py 会自动重放"
+            free = {c: v.free_slots(c) for c in CATEGORIES}
         return 200, {
             "token": token,
             "category": category,
             "id": tid,
             "vocab_size": len(v),
-            "free_slots": {c: v.free_slots(c) for c in CATEGORIES},
-            "note": "已写入 vocab.json；重新运行 build_vocab.py 会自动重放",
+            "free_slots": free,
+            "note": note,
         }

@@ -58,6 +58,8 @@ def _is_wordish(v, tid: int) -> bool:
     tok = v.id_to_token[tid]
     if not tok or not tok.isascii() or not tok.isalpha():
         return False
+    if getattr(v, "flat", False):
+        return True                    # 扁平词表：可见的 ascii 字母词即可
     if spec.ENGLISH_BEGIN <= tid < spec.ENGLISH_BEGIN + spec.ENGLISH_SIZE:
         return True
     if spec.FALLBACK_BEGIN <= tid < spec.FALLBACK_BEGIN + spec.FALLBACK_SIZE:

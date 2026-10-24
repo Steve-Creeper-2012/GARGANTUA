@@ -1,37 +1,48 @@
 # ===========================================================================
-# GARGANTUA v1 — server.py：HTTP 层（仅标准库 http.server）
+# GARGANTUA v1 — server.py：HTTP 层 + 启动编排（仅标准库 http.server）
 # ---------------------------------------------------------------------------
-# 用法：python server.py [--port 8712] [--model-dir models] [--data-dir data]
-# 绑定 127.0.0.1；内存中同一时刻一个活动模型；models/ 下唯一模型自动加载
-# （后台线程）；所有模型操作走一把全局锁，训练与推理互斥。
-# 重计算（推理 / 新建模型）一律异步任务：202 + task_id，GET /api/task/{id}
-# 长轮询取结果。
+# 用法：python server.py [--port 8712] [--host 127.0.0.1] [--model-dir models]
+#                     [--data-dir data] [--log-file logs/auto_train.jsonl]
+#                     [--no-window] [--no-verify] [--idle-timeout 300]
 #
-# 2026-10-23 拆分（server.py 从 986 行降到 ~300 行，每层只干一件事）：
-#   server_models.py   ModelManager / TaskPool / step_to_json / ConflictError
+# 2026-10-24 重构（steve 的启动链要求）——server 是唯一入口之后的「管家」：
+#   1. 环境预检（解释器版本 + 主依赖）——server_env.check_environment；
+#   2. window.py 完整性校验（sha256 不一致弹窗，可跳过）并拉起独立窗口
+#      ——server_env.verify_window_integrity；
+#   3. HTTP 服务（本文件：路由 + Handler + App 装配）；
+#   4. 按需调度 infer / train 服务子进程（server_services.ServiceSupervisor）：
+#      有请求才起进程，空闲超时自行退出，模型权重不常驻 server。
+#
+# 本进程永不 import torch 加载权重——重活全在服务子进程里，server 本身
+# 只路由 + 记账，常驻内存 ~百 MB 级（codec 用的 numpy/PIL 除外）。
+#
+# 2026-10-23 拆分（每层只干一件事，server.py 主体只留装配与路由）：
+#   server_env.py      环境预检 + 窗口完整性 + 弹窗 + 子进程工具
+#   server_services.py 服务监督器（按需子进程 + JSON-lines 协议）
+#   server_models.py   ModelManager（注册表，不含权重）+ TaskPool
 #   server_media.py    上传媒体解码与尺寸守卫（b64_to_pil / ffmpeg / 抽帧）
 #   server_codecs.py   CodecApi   —— /api/codec/* 全部端点
-#   server_train.py    TrainApi   —— /api/train/* 全部端点
+#   server_train.py    TrainApi   —— /api/train/* 全部端点（走训练服务）
 #   server_tokens.py   TokensApi  —— /api/tokens/* 与 /api/vocab/add
-#                        （tok-32 离散 token 编解码与词表扩充）
-#   server_util.py     num_param  —— 数值入参取值（零值不被默认值吞掉）
-# App 以 mixin 组合上面几个 Api；本文件只留：应用装配 + 路由 + HTTP 细节。
-# 原 `from server import X` 的路径全部通过文件末尾的 re-export 保持可用。
+#   server_util.py     num_param / pip 源 / 可选依赖安装命令
+# App 以 mixin 组合上面几个 Api；原 `from server import X` 的路径全部通过
+# 文件末尾的 re-export 保持可用。
 #
 # HTTP 错误契约（README「HTTP contract」）：
 #   400 入参非法   404 路径/任务不存在   409 状态冲突
 #   411 需 Content-Length（拒 chunked）   413 请求体 > 512MB
 # ===========================================================================
 import argparse
-import base64
 import glob
 import json
 import os
+import signal
+import subprocess
 import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
-
-import torch
 
 # ---- GARGANTUA 路径引导（目录树重构：把 server/ 与 service/* 放上 path）----
 import sys as _sys
@@ -44,13 +55,10 @@ else:
     raise SystemExit("找不到 GARGANTUA 项目根（start/boot.py）")
 import boot as _boot
 _boot.bootstrap()
-from common import (CKPT_NAME, MAX_BLOCKS, read_config, save_checkpoint,
-                    valid_model_name, validate_ctx_config)
-from infer import MAX_NEW_TOKENS, generate
-from tokens.text_codec import decode as text_decode, encode as text_encode
-from tokens.vocab import CATEGORIES, get_vocab
-
-# 拆出去的模块在这里 re-export：调用方无需知道内部怎么分文件
+from common import (CKPT_NAME, MAX_BLOCKS, MAX_NEW_TOKENS, read_config,
+                    save_checkpoint, valid_model_name, validate_ctx_config)
+from server_env import (ROOT, check_environment, kill_proc,
+                        verify_window_integrity, wait_port, wait_status)
 from server_models import (ConflictError, ModelManager, TaskPool,
                            step_to_json)
 from server_media import (MAX_IMAGE_DIM, MAX_PATCHES_TOTAL, b64_to_pil,
@@ -59,58 +67,69 @@ from server_media import (MAX_IMAGE_DIM, MAX_PATCHES_TOTAL, b64_to_pil,
 from server_codecs import CodecApi
 from server_train import TrainApi
 from server_tokens import TokensApi
+from server_services import ServiceError, ServiceSupervisor
 from server_util import num_param, optional_install_cmd, pip_index_args
 
-WEB_INDEX = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "web", "index.html")
+WINDOW_PY = os.path.join(ROOT, "service", "window", "window.py")
+WEB_INDEX = os.path.join(ROOT, "service", "web", "index.html")
 
 # 请求体硬上限（base64 后的视频/音频可能上百 MB，512MB 是宽松保护值）
 MAX_BODY_BYTES = 512 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
-# 应用装配：把模型/任务/训练/编解码四块拼成可路由的对象
+# 训练状态代理：app.trainer.running 反映训练服务进程是否在训练
+# ---------------------------------------------------------------------------
+class _TrainStatusProxy:
+    """App.trainer 的轻量替身（2026-10-24：训练搬到服务子进程后，
+    server 不再持有 Trainer 实例）。只有 .running 被 409 冲突检查与
+    /api/status 读取；查询走 supervisor（服务没起 = 没在训练）。
+    测试仍可整体替换 app.trainer 打桩。"""
+
+    def __init__(self, supervisor: ServiceSupervisor):
+        self._sup = supervisor
+
+    @property
+    def running(self) -> bool:
+        st = self._sup.query("train", "status", timeout=10)
+        return bool(st and st.get("running"))
+
+
+# ---------------------------------------------------------------------------
+# 应用装配：注册表 + 任务池 + 服务监督器 + 三个 API mixin
 # ---------------------------------------------------------------------------
 class App(TrainApi, CodecApi, TokensApi):
-    def __init__(self, model_dir, data_dir, log_path):
+    def __init__(self, model_dir, data_dir, log_path, idle_timeout=300):
         self.mgr = ModelManager(model_dir)
         self.pool = TaskPool()
         self.data_dir = data_dir
         self.queue_dir = os.path.join(data_dir, "queue")
         os.makedirs(self.queue_dir, exist_ok=True)
-        from auto_train import Trainer
-        self.trainer = Trainer(
-            get_model=lambda: self.mgr.model,
-            save_fn=self._save_ckpt,
-            lock=self.mgr.lock,
-            queue_dir=self.queue_dir,
-            done_dir=os.path.join(data_dir, "done"),
-            log_path=log_path,
-        )
+        self.log_path = log_path
+        self.supervisor = ServiceSupervisor(ROOT, idle_timeout=idle_timeout)
+        self.trainer = _TrainStatusProxy(self.supervisor)
 
-    def _save_ckpt(self, model):
+    def apply_model_vocab(self) -> None:
+        """活动模型的词表覆盖（每模型可有自己的 vocab.txt，2026-10-24）。
+        没有 vocab.txt 就用全局词表（service/tokens/vocab.json）。"""
         if self.mgr.name is None:
-            raise RuntimeError("无活动模型，无法落盘")
-        # 原子写 + 保留既有 config.json（block 数等），仅刷新 params
-        d = os.path.join(self.mgr.model_dir, self.mgr.name)
-        # 纵深防御：即便名字校验被绕过，落盘路径也不得越出 model_dir
-        real_d = os.path.realpath(d)
-        real_root = os.path.realpath(self.mgr.model_dir)
-        if os.path.commonpath([real_d, real_root]) != real_root:
-            raise RuntimeError(f"拒绝越权落盘: {d}")
-        cfg = dict(read_config(d))
-        cfg["params"] = sum(p.numel() for p in model.parameters())
-        save_checkpoint(d, model, cfg)
+            return
+        try:
+            from tokens.vocab import set_model_vocab
+            set_model_vocab(os.path.join(self.mgr.model_dir, self.mgr.name))
+        except Exception as e:
+            print(f"[server] 模型词表加载警告: {e}")
 
     # ---------------- status / models / infer ----------------
     def api_status(self):
         n_queued = sum(1 for p in glob.glob(os.path.join(self.queue_dir, "*"))
                        if os.path.isfile(p))
+        train_st = self.supervisor.query("train", "status", timeout=10)
         return {
             "model": self.mgr.name,
-            "loading": self.mgr.loading,
+            "loading": False,               # 注册表模式：切模型是瞬时的
             "params": self.mgr.params,
-            "training": self.trainer.running,
+            "training": bool(train_st and train_st.get("running")),
             "queue": n_queued,
             "ctx": self.mgr.ctx,
             "kv_note": self.mgr.ctx_note(),
@@ -145,10 +164,28 @@ class App(TrainApi, CodecApi, TokensApi):
             csa_ratio=body.get("csa_ratio"),
             hca_ratio=body.get("hca_ratio"),
             csa_local_window=body.get("csa_local_window"))
-        tid = self.pool.submit(
-            lambda: self.mgr.init_new(name, enc, dec,
-                                      overwrite=bool(body.get("overwrite")),
-                                      ctx=ctx))
+
+        def work():
+            # 建模是罕见的重活（默认 4+6 blocks ≈ 527M 参数、2.1GB
+            # safetensors）：一次性子进程跑完即退，server 内存零增长。
+            argv = ["--name", name, "--out", self.mgr.model_dir]
+            if enc is not None:
+                argv += ["--enc-blocks", str(enc)]
+            if dec is not None:
+                argv += ["--dec-blocks", str(dec)]
+            if body.get("overwrite"):
+                argv += ["--force"]
+            # ctx 已在本进程校验过，原样下发（服务端不再解释默认值）
+            argv += ["--ctx-full", str(ctx["ctx_full"]),
+                     "--ctx-compress", str(ctx["ctx_compress"]),
+                     "--csa-ratio", str(ctx["csa_ratio"]),
+                     "--hca-ratio", str(ctx["hca_ratio"]),
+                     "--csa-window", str(ctx["csa_local_window"])]
+            return self.supervisor.run_oneshot(
+                os.path.join("service", "init", "init.py"), argv,
+                timeout=900)
+
+        tid = self.pool.submit(work)
         return 202, {"task_id": tid}
 
     @staticmethod
@@ -184,7 +221,9 @@ class App(TrainApi, CodecApi, TokensApi):
             # 训练中热替换模型会令 Trainer 的优化器绑定旧参数（已防，但
             # 从源头禁止更稳）：加载与训练互斥
             raise ConflictError("训练进行中，请先停止训练再切换模型")
-        return 200, self.mgr.load(name)
+        res = self.mgr.load(name)          # 注册表登记：不读权重，瞬时完成
+        self.apply_model_vocab()           # 活动模型的 vocab.txt 覆盖
+        return 200, res
 
     def api_infer(self, body):
         prompt = body.get("prompt")
@@ -196,7 +235,7 @@ class App(TrainApi, CodecApi, TokensApi):
         if body.get("media_b64") or body.get("media_name"):
             raise ValueError("当前版本推理仅支持文本 prompt；媒体输入"
                              "（image/audio/video）尚未接入生成路径")
-        if self.mgr.model is None:
+        if self.mgr.name is None:
             raise ValueError("无活动模型，请先加载模型")
         max_new = num_param(body, "max_new_tokens", 32, int)
         if not (1 <= max_new <= MAX_NEW_TOKENS):
@@ -210,11 +249,13 @@ class App(TrainApi, CodecApi, TokensApi):
             raise ValueError(f"top_p 必须在 (0, 1]: {top_p}")
 
         def work():
-            with self.mgr.lock:                     # 推理与训练互斥
-                steps = generate(self.mgr.model, prompt, max_new,
-                                 temperature, top_p)
-            return {"text": text_decode(steps),
-                    "token_ids": [s["token_ids"][0] for s in steps]}
+            # 推理服务按需拉起（首次含建模加载，之后复用；空闲自行退出）。
+            # 服务返回的 text 已用该模型的词表解码。
+            return self.supervisor.call(
+                "infer", "infer", timeout=600,
+                model_dir=os.path.join(self.mgr.model_dir, self.mgr.name),
+                prompt=prompt, max_new=max_new,
+                temperature=temperature, top_p=top_p)
 
         tid = self.pool.submit(work)
         return 202, {"task_id": tid}
@@ -235,7 +276,12 @@ class App(TrainApi, CodecApi, TokensApi):
 
     def api_system(self):
         import importlib.metadata as _md
-        import torch
+        # 延迟 import torch：server 本体不依赖 torch（重活都在服务进程），
+        # 只有这个「环境与依赖」端点需要报版本号
+        try:
+            import torch
+        except Exception:
+            torch = None
         deps = []
         for mod in ["torch", "numpy", "PIL", "safetensors", "cv2", "soundfile"]:
             entry = {"name": mod, "ok": False}
@@ -257,14 +303,16 @@ class App(TrainApi, CodecApi, TokensApi):
                     entry["why"] = opt["why"]
                 else:                      # 主依赖缺失是真问题，保留原因
                     entry["note"] = str(sys.exc_info()[1])
-            deps.append(entry)
-        device = "cpu"
-        if torch.cuda.is_available():
-            device = f"cuda ({torch.cuda.get_device_name(0)})"
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = "mps"
+        deps.append(entry)
+        device = "unknown"
+        if torch is not None:
+            device = "cpu"
+            if torch.cuda.is_available():
+                device = f"cuda ({torch.cuda.get_device_name(0)})"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
         return 200, {
-            "torch": torch.__version__,
+            "torch": getattr(torch, "__version__", None),
             "device": device,
             "dependencies": deps,
             "optional_missing": [d["name"] for d in deps
@@ -277,7 +325,7 @@ class App(TrainApi, CodecApi, TokensApi):
         """ 在 UI 里补装可选依赖（cv2 / soundfile），异步任务。
 
         装进的是当前跑 server 的解释器；已 import 的模块不会热更新，所以返回
-        里明确要求重启。主依赖不在这里装——那是 run.py 的职责。 """
+        里明确要求重启。主依赖不在这里装——那是 setup 脚本的职责。 """
         names = body.get("names") or []
         if isinstance(names, str):
             names = [names]
@@ -294,7 +342,6 @@ class App(TrainApi, CodecApi, TokensApi):
             return 200, {"installed": [], "note": "都已安装，无需操作"}
 
         def work():
-            import subprocess
             req = os.path.join(boot.project_root(), "start",
                                "requirements", "core.txt")
             cmd = optional_install_cmd(sys.executable, pkgs, req)
@@ -311,6 +358,7 @@ class App(TrainApi, CodecApi, TokensApi):
         return 202, {"task_id": tid}
 
     def api_vocab(self, query):
+        from tokens.vocab import get_vocab
         q = (query.get("q", [""])[0] or "").lower()
         v = get_vocab()
         hits = []
@@ -321,8 +369,9 @@ class App(TrainApi, CodecApi, TokensApi):
                 if q in tok.lower():
                     hits.append({"id": i, "token": tok,
                                  "category": v.category_of(i)})
-                    if len(hits) >= 50:
-                        break
+                if len(hits) >= 50:
+                    break
+        from tokens.vocab import CATEGORIES
         return 200, {"q": q, "hits": hits, "vocab_size": len(v),
                      "categories": list(CATEGORIES)}
 
@@ -476,32 +525,101 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error_json(500, str(e))
 
 
-def main():
-    ap = argparse.ArgumentParser()
+# ---------------------------------------------------------------------------
+# 窗口：拉起 + 看护（窗口崩了不影响 server；server 退出带走窗口）
+# ---------------------------------------------------------------------------
+def _window_env() -> dict:
+    env = dict(os.environ)
+    try:
+        env["PYTHONPATH"] = boot.pythonpath()
+    except Exception:
+        pass
+    return env
+
+
+def spawn_window(port: int, host: str):
+    cmd = [sys.executable, WINDOW_PY, "--port", str(port), "--host", host]
+    print(f"[server] 启动窗口：{' '.join(cmd)}")
+    return subprocess.Popen(cmd, env=_window_env())
+
+
+def _watch_window(proc, port: int, host: str) -> None:
+    """窗口退出只打印重开提示——server 是老大，不跟着退（Steam 语义）。"""
+    proc.wait()
+    print(f"[server] 窗口已退出（server 继续运行）。重开界面：")
+    print(f"  {sys.executable} {WINDOW_PY} --port {port} --host {host}")
+
+
+# ---------------------------------------------------------------------------
+# 主流程：环境检查 → 窗口校验/拉起 → HTTP → 收尸
+# ---------------------------------------------------------------------------
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="GARGANTUA server")
     ap.add_argument("--port", type=int, default=8712)
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--model-dir", default="models")
-    ap.add_argument("--data-dir", default="data")
-    ap.add_argument("--log-file", default="logs/auto_train.jsonl")
-    args = ap.parse_args()
+    ap.add_argument("--model-dir", default=os.path.join(ROOT, "models"))
+    ap.add_argument("--data-dir", default=os.path.join(ROOT, "data"))
+    ap.add_argument("--log-file",
+                    default=os.path.join(ROOT, "logs", "auto_train.jsonl"))
+    ap.add_argument("--no-window", action="store_true",
+                    help="不起独立窗口（仅 HTTP server，SSH/CI 用）")
+    ap.add_argument("--no-verify", action="store_true",
+                    help="跳过 window.py 完整性弹窗（CI / 无 GUI）")
+    ap.add_argument("--idle-timeout", type=int, default=300,
+                    help="服务子进程空闲多少秒后自行退出（默认 300）")
+    args = ap.parse_args(argv)
 
-    torch.manual_seed(0)
-    app = App(args.model_dir, args.data_dir, args.log_file)
+    # 1) 环境预检：解释器版本 + 主依赖（缺了给可执行提示，不黑屏）
+    if not check_environment(sys.executable):
+        return 1
+
+    app = App(args.model_dir, args.data_dir, args.log_file,
+              idle_timeout=args.idle_timeout)
     app.mgr.auto_load_unique()
+    app.apply_model_vocab()
 
+    # 2) 窗口完整性校验（sha256 不一致 → 弹窗，可跳过）。
+    #    放在绑定端口之前：弹窗阻塞时不存在「起了一半」的状态。
+    launch_window = not args.no_window
+    if launch_window and not args.no_verify:
+        launch_window = verify_window_integrity(ROOT)
+
+    # 3) HTTP 服务
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.app = app
     srv.daemon_threads = True
     print(f"[server] http://{args.host}:{args.port}  "
           f"model_dir={args.model_dir}  data_dir={args.data_dir}")
+
+    window_proc = None
+    if launch_window:
+        try:
+            window_proc = spawn_window(args.port, args.host)
+            threading.Thread(target=_watch_window,
+                             args=(window_proc, args.port, args.host),
+                             daemon=True).start()
+        except Exception as e:
+            print(f"[server] 窗口启动失败（不影响 server）：{e}")
+
+    # SIGTERM 也走 finally 收尸（默认动作会直接杀掉进程，不给清理机会）
+    def _sigterm(sig, frame):
+        raise SystemExit(0)
+    try:
+        signal.signal(signal.SIGTERM, _sigterm)
+    except Exception:
+        pass
+
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        app.trainer.stop()
+        print("[server] 正在关闭：服务子进程 → 窗口 → HTTP ……")
+        app.supervisor.shutdown_all()
+        kill_proc(window_proc)
         srv.server_close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

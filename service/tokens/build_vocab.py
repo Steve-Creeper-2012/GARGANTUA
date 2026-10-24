@@ -449,12 +449,23 @@ def main(argv=None):
         default=None,
         help="meta 中记录的英文词来源描述（默认按实际获取途径记录）",
     )
+    ap.add_argument(
+        "--export-txt",
+        default=None,
+        help="顺便把词表导出为 vocab.txt（一行一个 token，行号即 ID；"
+             "可直接当作 models/NAME/vocab.txt 的起点）",
+    )
     args = ap.parse_args(argv)
     vocab = build_vocab(args.words_file, args.source_desc)
     OUT_PATH.write_text(
         json.dumps(vocab, ensure_ascii=False, separators=(",", ":")),
         encoding="utf-8",
     )
+    if args.export_txt:
+        out = Path(args.export_txt)
+        out.write_text(
+            "\n".join(vocab["id_to_token"]) + "\n", encoding="utf-8")
+        print(f"  导出 vocab.txt : {out}（{len(vocab['id_to_token'])} 行）")
     m = vocab["meta"]
     print(f"已写出 {OUT_PATH}")
     print(f"  总槽位        : {len(vocab['id_to_token'])}")

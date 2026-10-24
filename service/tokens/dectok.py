@@ -39,6 +39,7 @@ import boot as _boot
 _boot.bootstrap()
 import spec  # noqa: E402
 from tokens.tok32 import hex_to_ids, read_tokens_file  # noqa: E402
+from tokens.vocab import set_vocab_source  # noqa: E402
 
 
 def decode_ids(ids, mode: str = "ids") -> str:
@@ -83,7 +84,13 @@ def main(argv=None):
     src.add_argument("--file", default=None, help=".tokens 二进制文件")
     ap.add_argument("--text", action="store_true",
                     help="输出表面文本（默认只展开 { } |，其余为十六进制 ID）")
+    ap.add_argument("--vocab", default=None,
+                    help="用指定的 vocab.txt（或含它的模型目录）解码；"
+                         "缺省用全局词表")
     args = ap.parse_args(argv)
+
+    if args.vocab:
+        set_vocab_source(args.vocab)
 
     mode = "text" if args.text else "ids"
     if args.file is not None:

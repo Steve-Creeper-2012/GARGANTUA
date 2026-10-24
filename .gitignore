@@ -3,7 +3,9 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
-# 本地虚拟环境（run.py 自动创建；依赖清单以 requirements.txt 为准）
+# 隔离运行时（start/terminal/setup.sh 构建：独立 Python + venv，全部本地产物）
+start/.python/
+start/.venv/
 .venv/
 
 # 运行产物：模型权重（单个 safetensors 可达数 GB）、数据集、日志

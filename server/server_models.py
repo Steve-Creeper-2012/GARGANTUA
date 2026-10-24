@@ -1,11 +1,16 @@
 # ===========================================================================
-# GARGANTUA v1 — server_models.py：模型生命周期 + 异步任务池
+# GARGANTUA v1 — server_models.py：模型注册表 + 异步任务池
 # ---------------------------------------------------------------------------
-# 从臃肿的 server.py（986 行）拆出，HTTP 层不再夹带这两块职责：
-#   ModelManager   同一时刻一个活动模型；所有模型操作走 self.lock（训练/推理互斥）
+# 2026-10-24 重构（steve：服务按需启动，省内存）：
+#   ModelManager 从「权重加载器」降级为「注册表」——只跟踪哪个模型是活动
+#   模型、它的 config.json 里有什么。模型权重（单个 safetensors 可达数 GB）
+#   只存在于 infer/train 服务进程里（见 server_services.py）；server 本体
+#   永不加载权重，切模型从「读 2.1GB」变成「改个名字」。
+#
+#   ModelManager   同一时刻一个活动模型（登记簿，不含权重）
 #   TaskPool       有界异步任务池（202 + task_id 长轮询的执行体）
 #   step_to_json   codec 产物 Step → JSON（bytes 字段 base64）
-#   ConflictError  状态冲突（训练中切模型 / 加载被更新的请求取代）→ HTTP 409
+#   ConflictError  状态冲突（训练中切模型/覆盖活动模型）→ HTTP 409
 # server.py 继续 re-export 这些符号，老 import 路径全部保持可用。
 # ===========================================================================
 import base64
@@ -13,14 +18,12 @@ import glob
 import json
 import os
 import threading
-import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import spec
-from common import (CKPT_NAME, build_model, save_checkpoint,
-                    valid_model_name, validate_ctx_config)
-from model import Gargantua
+from common import (CKPT_NAME, read_config, read_ctx_config,
+                    valid_model_name)
 
 
 class ConflictError(RuntimeError):
@@ -28,17 +31,21 @@ class ConflictError(RuntimeError):
 
 
 class ModelManager:
-    """同一时刻一个活动模型；所有模型操作走 self.lock（训练/推理互斥）。"""
+    """同一时刻一个活动模型——但只登记「名字 + config」，不持有权重。
+
+    权重在服务进程里（infer/train 按需拉起）。因此：
+      load()      即时返回（读 config.json，不读 safetensors）；
+      self.model  恒为 None（保留属性是为兼容旧代码/测试打桩）；
+      切模型不再与正在跑的服务抢内存。
+    """
 
     def __init__(self, model_dir):
         self.model_dir = model_dir
         self.lock = threading.RLock()
-        self.model = None
-        self.name = None
-        self.params = 0
+        self.model = None                 # 恒为 None：权重不在本进程
+        self.name = None                  # 活动模型名（登记簿）
+        self.params = 0                   # 来自 config.json（非实测）
         self.ctx = None                   # 活动模型的上下文长度配置
-        self.loading = None                 # 正在后台加载的模型名
-        self._load_gen = 0                  # 加载代号：并发加载时仅最新者生效
         os.makedirs(model_dir, exist_ok=True)
 
     def ctx_note(self) -> str:
@@ -84,85 +91,29 @@ class ModelManager:
         ckpt = os.path.join(d, CKPT_NAME)
         if not os.path.exists(ckpt):
             raise FileNotFoundError(f"模型不存在: {name}")
+        # 只读 config.json（block 数/上下文/params 都在里面）——权重留给
+        # 服务进程按需加载。config 缺失/损坏时 read_config 返回 {}，
+        # params=None、ctx 回退 spec 默认（与旧行为一致）。
+        cfg = read_config(d)
+        params = cfg.get("params")
+        if not isinstance(params, int):
+            params = None
         with self.lock:
-            self._load_gen += 1              # 占号：构造期间若有更新的
-            gen = self._load_gen             # 加载请求，本次结果作废
-        # 统一入口：按 config.json 的 block 数构造后加载权重（锁外构造）
-        m = build_model(d)
-        m.eval()
-        params = sum(p.numel() for p in m.parameters())
-        ctx = {k: getattr(m, k) for k in
-               ("ctx_full", "ctx_compress", "csa_ratio", "hca_ratio",
-                "csa_local_window")}
-        with self.lock:
-            if gen != self._load_gen:
-                raise ConflictError(
-                    f"加载 {name} 被更新的加载请求取代，请重试")
-            self.model, self.name, self.params = m, name, params
-            self.ctx = ctx
+            self.name = name
+            self.params = params
+            self.ctx = read_ctx_config(d)
         return {"model": name, "params": params}
 
-    def init_new(self, name, n_enc_blocks=None, n_dec_blocks=None,
-                 overwrite=False, ctx=None):
-        """新建随机初始化模型并落盘（config.json + safetensors，原子写）。
-
-        2026-10-20：同名模型默认拒绝覆盖（防误抹训练成果），overwrite=True
-        才允许；模型名走 common.valid_model_name 统一校验（含 Windows
-        反斜杠/保留设备名）。
-        2026-10-23：ctx 为 common.validate_ctx_config 的产物（或 None →
-        spec 默认），记录进 config.json——上下文长度（完整/压缩容量 +
-        CSA/HCA 压缩比）从此是建模期可选项。 """
-        bad = valid_model_name(name)
-        if bad:
-            raise ValueError(f"非法模型名: {bad}")
-        ctx = ctx or validate_ctx_config()
-        d = os.path.join(self.model_dir, name)
-        if (os.path.exists(os.path.join(d, CKPT_NAME))
-                and not overwrite):
-            raise FileExistsError(f"模型已存在: {name}（ overwrite 才可覆盖）")
-        m = Gargantua(n_enc_blocks=n_enc_blocks, n_dec_blocks=n_dec_blocks,
-                      **ctx)
-        params = sum(p.numel() for p in m.parameters())
-        config = {
-            "name": name,
-            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "params": params,
-            "d_model": spec.D_MODEL, "head_dim": spec.HEAD_DIM,
-            "n_enc_blocks": (n_enc_blocks if n_enc_blocks is not None
-                             else spec.N_ENC_BLOCKS),
-            "n_dec_blocks": (n_dec_blocks if n_dec_blocks is not None
-                             else spec.N_DEC_BLOCKS),
-            "vocab_size_padded": spec.VOCAB_SIZE_PADDED,
-            "ctx_full": ctx["ctx_full"],
-            "ctx_compress": ctx["ctx_compress"],
-            "csa_ratio": ctx["csa_ratio"],
-            "hca_ratio": ctx["hca_ratio"],
-            "csa_local_window": ctx["csa_local_window"],
-            "csa_ratio_note": "CSA/HCA 是同一段压缩区内容的两个视图",
-            "optimizer": spec.OPTIMIZER,
-        }
-        with self.lock:      # 与训练落盘/模型加载互斥（覆盖同名模型时）
-            save_checkpoint(d, m, config)
-        return {"name": name, "params": params}
-
     def auto_load_unique(self):
-        """models/ 下唯一模型 → 后台线程自动加载。"""
+        """models/ 下唯一模型 → 直接设为活动模型（登记，秒回）。"""
         models = self.list_models()
         if len(models) != 1:
             return
-        name = models[0]["name"]
-
-        def work():
-            self.loading = name
-            try:
-                self.load(name)
-                print(f"[server] 自动加载模型 {name}")
-            except Exception as e:
-                print(f"[server] 自动加载失败: {e}")
-            finally:
-                self.loading = None
-
-        threading.Thread(target=work, daemon=True).start()
+        try:
+            self.load(models[0]["name"])
+            print(f"[server] 活动模型：{self.name}（权重按需加载）")
+        except Exception as e:
+            print(f"[server] 自动加载失败: {e}")
 
 
 # ---------------------------------------------------------------------------

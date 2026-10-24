@@ -8,8 +8,18 @@
 # 空队列 1s 空转轮询；stop() 后当前 step 完成、落盘后退。
 #
 # 两种用法：
-#   1) server.py 内嵌线程：Trainer(get_model=..., save_fn=..., lock=...)
-#   2) 独立运行：python auto_train.py --model models/alpha --block-size 16
+#   1) 独立运行：python auto_train.py --model models/alpha --block-size 16
+#   2) --serve（server 按需拉起的常驻模式，2026-10-24）：
+#        python auto_train.py --serve [--idle-timeout 300]
+#      stdin/stdout 走 JSON-lines 协议（见 server_services.py 文件头）：
+#        请求 {"id","op","model_dir","queue_dir","done_dir","log_path",
+#              "block_size","steps_per_file","optimizer"}
+#        响应 {"id","ok",result|error}
+#      op：start / stop / status / shutdown。
+#      进程退出条件：shutdown / stdin EOF（server 死了）/ 空闲超时。
+#      「空闲」= 一段时间没有协议请求，且（未在训练 或 队列已空）——
+#      训练进行中（队列有文件）绝不退出，那是用户明确要的重活；
+#      训练停止后模型不再常驻，内存归还 OS（server 本体零权重）。
 #
 # 2026-10-20 修复（审查结论）：
 #   1. main() 改用 common.build_model：非默认 block 数的模型可加载。
@@ -18,7 +28,8 @@
 #      令前向崩溃 / 触发 _loss_tail[-1] IndexError）。
 #   3. 训练中模型被热替换（server 加载其他模型）时，按实例标识重建优化
 #      器——否则 opts 仍绑定旧模型参数，新模型只算梯度不被更新，落盘的
-#      是未训练的新模型。
+#      是未训练的新模型。（serve 模式下模型热替换被 server 409 禁止，
+#      该防御保留。）
 #   4. stop 早停 / 0 步文件不再触发 _loss_tail[-1] IndexError。
 #   5. 窗口切分统一走 common.make_batch，与 train.py 零漂移。
 # ===========================================================================
@@ -26,7 +37,9 @@ import argparse
 import glob
 import json
 import os
+import queue
 import random
+import sys
 import threading
 import time
 from collections import deque
@@ -50,6 +63,7 @@ from common import (CKPT_NAME, build_model, make_batch, read_config,
                     save_checkpoint, validate_block_size, validate_steps)
 from muon import build_optimizers
 from tokens.text_codec import encode as text_encode
+from tokens.vocab import set_model_vocab
 
 _OPTIMIZERS = ("muon", "adamw")
 
@@ -180,7 +194,9 @@ class Trainer:
     def _log(self, msg):
         line = f'{time.strftime("%H:%M:%S")} {msg}'
         self._log_tail.append(line)
-        print(line, flush=True)
+        # stderr：stdout 是 --serve 模式的 JSON-lines 协议通道，
+        # 人肉日志混进去会污染响应流（2026-10-24 实测踩过）
+        print(line, file=sys.stderr, flush=True)
 
     def _run(self):
         self._running = True
@@ -284,17 +300,200 @@ class Trainer:
             self._log(f"[auto_train] step={self._step} 已落盘（无有效 step）")
 
 
+def _prefill_from_log(trainer: Trainer) -> None:
+    """serve 模式启动时从 loss jsonl 回填 step 计数与 loss 尾部
+    （2026-10-24）：服务进程按需退出后，前端 loss 曲线不应清零——
+    日志是持久的，回填即延续。log_tail 不持久化，留空。"""
+    try:
+        with open(trainer.log_path, encoding="utf-8") as f:
+            lines = f.readlines()[-500:]
+    except OSError:
+        return
+    last_step = 0
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        trainer._loss_tail.append(rec)
+        if isinstance(rec.get("step"), int):
+            last_step = max(last_step, rec["step"])
+    trainer._step = last_step
+
+
+# ---------------------------------------------------------------------------
+# --serve：JSON-lines 常驻模式（server_services 协议）
+# ---------------------------------------------------------------------------
+def _emit(obj: dict) -> None:
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+class _ServeState:
+    def __init__(self):
+        self.trainer = None
+        self.model_dir = None
+
+
+def _serve_handle(req: dict, st: _ServeState) -> dict:
+    rid = req.get("id")
+    op = req.get("op")
+    try:
+        if op == "start":
+            if st.trainer is not None and st.trainer.running:
+                return {"id": rid, "ok": False,
+                        "error": "训练进行中，请先 stop 再 start"}
+            model_dir = req["model_dir"]
+            if not os.path.exists(os.path.join(model_dir, CKPT_NAME)):
+                raise ValueError(f"模型目录无 {CKPT_NAME}: {model_dir}")
+            m = build_model(model_dir)
+            m.eval()
+            set_model_vocab(model_dir)
+            lock = threading.RLock()
+
+            def _save(mod):
+                # 保留既有 config.json（block 数等），仅刷新 params
+                cfg = dict(read_config(model_dir))
+                cfg["params"] = sum(p.numel() for p in mod.parameters())
+                save_checkpoint(model_dir, mod, cfg)
+
+            trainer = Trainer(
+                get_model=lambda: m,
+                save_fn=_save,
+                lock=lock,
+                queue_dir=req["queue_dir"],
+                done_dir=req["done_dir"],
+                log_path=req["log_path"],
+                block_size=(req["block_size"]
+                            if req.get("block_size") is not None else 32),
+                steps_per_file=(req["steps_per_file"]
+                                if req.get("steps_per_file") is not None
+                                else 50),
+            )
+            if req.get("optimizer"):
+                trainer.optimizer = req["optimizer"]   # 属性带校验
+            _prefill_from_log(trainer)
+            started = trainer.start()
+            st.trainer, st.model_dir = trainer, model_dir
+            return {"id": rid, "ok": True,
+                    "result": {"started": started, **trainer.status(),
+                               "model_dir": model_dir}}
+        if op == "stop":
+            if st.trainer is None:
+                return {"id": rid, "ok": True,
+                        "result": {"stopping": False, "running": False}}
+            st.trainer.stop()
+            return {"id": rid, "ok": True,
+                    "result": {"stopping": True, **st.trainer.status()}}
+        if op == "status":
+            if st.trainer is None:
+                return {"id": rid, "ok": True,
+                        "result": {"running": False, "model_dir": None}}
+            return {"id": rid, "ok": True,
+                    "result": {**st.trainer.status(),
+                               "model_dir": st.model_dir}}
+        if op == "shutdown":
+            return {"id": rid, "ok": True, "result": {"bye": True}}
+        return {"id": rid, "ok": False, "error": f"未知 op: {op!r}"}
+    except Exception as e:
+        return {"id": rid, "ok": False, "error": str(e)}
+
+
+def _queue_empty(queue_dir: str) -> bool:
+    try:
+        return not any(f.endswith(".txt")
+                       for f in os.listdir(queue_dir))
+    except OSError:
+        return True
+
+
+def serve(idle_timeout: int = 300) -> int:
+    """常驻模式。退出条件：shutdown / stdin EOF / 空闲超时。
+    空闲 = 无协议请求超过 idle_timeout，且（未在训练 或 队列已空）。"""
+    st = _ServeState()
+    q: "queue.Queue" = queue.Queue()
+
+    def _reader():
+        try:
+            for line in sys.stdin:
+                line = line.strip()
+                if line:
+                    q.put(("line", line))
+        except Exception:
+            pass
+        finally:
+            q.put(("eof", None))
+
+    threading.Thread(target=_reader, daemon=True,
+                     name="train-reader").start()
+    print(f"[auto_train] serve 模式就绪（idle-timeout={idle_timeout}s）",
+          file=sys.stderr)
+
+    last_req = time.time()
+    while True:
+        try:
+            kind, payload = q.get(timeout=1.0)
+        except queue.Empty:
+            kind = None
+        if kind == "eof":
+            print("[auto_train] stdin EOF，退出", file=sys.stderr)
+            break
+        if kind == "line":
+            last_req = time.time()
+            try:
+                req = json.loads(payload)
+                if not isinstance(req, dict):
+                    raise ValueError("请求必须是 JSON 对象")
+            except Exception as e:
+                _emit({"id": None, "ok": False,
+                       "error": f"请求解析失败: {e}"})
+                continue
+            resp = _serve_handle(req, st)
+            _emit(resp)
+            if req.get("op") == "shutdown":
+                print("[auto_train] 收到 shutdown，退出", file=sys.stderr)
+                break
+            continue
+
+        # 空闲判定：没请求超过 idle_timeout，且没有「正在进行」的训练
+        # （队列有文件 = 用户在等训练结果，绝不退）
+        if time.time() - last_req >= idle_timeout:
+            training_live = (st.trainer is not None and st.trainer.running
+                             and not _queue_empty(st.trainer.queue_dir))
+            if not training_live:
+                print("[auto_train] 空闲超时，退出（模型内存已释放）",
+                      file=sys.stderr)
+                break
+
+    # 收尾：训练中的话优雅停止（当前 step 完成 + 落盘）
+    if st.trainer is not None and st.trainer.running:
+        print("[auto_train] 停止中的训练……", file=sys.stderr)
+        st.trainer.stop()
+        st.trainer.join(timeout=120)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True, help="模型目录（含 model.safetensors）")
+    ap.add_argument("--model", help="模型目录（含 model.safetensors）")
     ap.add_argument("--data", default="data", help="数据根目录（queue/done 在其下）")
     ap.add_argument("--log", default="logs/auto_train.jsonl")
     ap.add_argument("--block-size", type=int, default=32)
     ap.add_argument("--steps-per-file", type=int, default=50)
+    ap.add_argument("--serve", action="store_true",
+                    help="JSON-lines 常驻模式（server 按需拉起）")
+    ap.add_argument("--idle-timeout", type=int, default=300,
+                    help="serve 模式空闲多少秒后自行退出（默认 300）")
     args = ap.parse_args()
 
+    if args.serve:
+        return serve(idle_timeout=args.idle_timeout)
+
+    if not args.model:
+        ap.error("CLI 模式需要 --model（或用 --serve）")
     m = build_model(args.model)
     m.eval()
+    set_model_vocab(args.model)
 
     def _save(mod):
         # 保留既有 config.json（block 数等），仅刷新 params——不可写空配置
@@ -324,4 +523,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

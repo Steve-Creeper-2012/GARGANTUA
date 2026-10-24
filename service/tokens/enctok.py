@@ -50,7 +50,7 @@ import boot as _boot
 _boot.bootstrap()
 import spec  # noqa: E402
 from tokens.tok32 import (ids_to_hex, write_tokens_file)  # noqa: E402
-from tokens.vocab import get_vocab  # noqa: E402
+from tokens.vocab import get_vocab, set_vocab_source  # noqa: E402
 
 CAPS_ID = spec.SPECIAL_BEGIN + spec.SPECIAL_TOKENS.index("<caps>")
 
@@ -59,22 +59,35 @@ def _is_upper(ch: str) -> bool:
     return "A" <= ch <= "Z"
 
 
-def _emit_word(word: str, v) -> list:
-    """[A-Za-z]+ 连续段 → token ID 列表（见模块 docstring 规则 2）。"""
+def _emit_word(word: str, v):
+    """[A-Za-z]+ 连续段 → (token ID 列表, 未收录字符列表)。
+
+    整词命中 → 直接出（首字母大写加 <caps> 标记）；未命中逐字母拼写
+    （fallback 区）。扁平词表（models/NAME/vocab.txt）没有 fallback
+    字母——拼不出的字母跳过并报告，而不是 KeyError 崩掉整次编码。
+    <caps> 标记只在「至少还有一个字母能映射」时保留，避免给纯垃圾
+    输入打光头标记。"""
     lower = word.lower()
     wid = v.regular_ids.get(lower)
     if wid is not None:
         if word == lower:                       # 全小写命中
-            return [wid]
+            return [wid], []
         if word == lower[0].upper() + lower[1:]:  # 首字母大写
-            return [CAPS_ID, wid]
+            return [CAPS_ID, wid], []
         # 全大写 / 混合大小写：逐字母 fallback（无损）
     out: list = []
+    skipped: list = []
     for ch in word:
         if _is_upper(ch):
             out.append(CAPS_ID)
-        out.append(v.fallback_ids[ch.lower()])
-    return out
+        fid = v.fallback_ids.get(ch.lower())
+        if fid is None:
+            skipped.append(ch)
+            if out and out[-1] == CAPS_ID:      # 字母没映射，标记也无意义
+                out.pop()
+            continue
+        out.append(fid)
+    return out, skipped
 
 
 def encode_text(text: str):
@@ -82,6 +95,8 @@ def encode_text(text: str):
     if not isinstance(text, str):
         raise ValueError(f"输入必须是字符串，得到 {type(text).__name__}")
     v = get_vocab()
+    flat = getattr(v, "flat", False)
+    max_match = getattr(v, "_max_match", 1) if flat else 1
     ids: list = []
     skipped: list = []
     i, n = 0, len(text)
@@ -92,9 +107,24 @@ def encode_text(text: str):
             while j < n and (("a" <= text[j] <= "z")
                              or ("A" <= text[j] <= "Z")):
                 j += 1
-            ids.extend(_emit_word(text[i:j], v))
+            wids, wskip = _emit_word(text[i:j], v)
+            ids.extend(wids)
+            skipped.extend(wskip)
             i = j
             continue
+        if flat and max_match > 1:
+            # 扁平词表：贪心最长匹配——多字符 token（中文词/短语）才能
+            # 被文本编码产出；全局词表无此分支（单字符 + 英文词段策略）
+            hit = None
+            for L in range(min(max_match, n - i), 1, -1):
+                tid = v.regular_ids.get(text[i:i + L])
+                if tid is not None:
+                    hit = (tid, L)
+                    break
+            if hit is not None:
+                ids.append(hit[0])
+                i += hit[1]
+                continue
         tid = v.regular_ids.get(ch)
         if tid is not None:
             ids.append(tid)
@@ -121,7 +151,13 @@ def main(argv=None):
     ap.add_argument("--out", default=None,
                     help="输出文件：.tokens 为二进制，否则为十六进制文本；"
                          "缺省打印十六进制到 stdout")
+    ap.add_argument("--vocab", default=None,
+                    help="用指定的 vocab.txt（或含它的模型目录）编码；"
+                         "缺省用全局词表")
     args = ap.parse_args(argv)
+
+    if args.vocab:
+        set_vocab_source(args.vocab)
 
     if args.file is not None:
         text = Path(args.file).read_text(encoding="utf-8")

@@ -284,9 +284,64 @@ MUON_LR = 2e-2
 # ---------------------------------------------------------------------------
 # 7. 运行环境
 # ---------------------------------------------------------------------------
-# Python 3.12.14（standalone，x86_64）+ torch 2.2.2（macOS x86_64 最后官方轮子）
-# venv：~/.workbuddy/binaries/python/envs/gargantua
+# Python 3.12 系列最新版（standalone，项目内隔离安装；steve 2026-10-24：
+# 用 latest 不锁 patch）+ torch 2.2.2（macOS x86_64 最后官方轮子）。
+# 隔离运行时全部装在项目里，不碰系统 Python：
+#   start/.python/   python-build-standalone 解包（setup.sh 自动下载）
+#   start/.venv/     以上述解释器建的虚拟环境（core/window/dev 依赖）
+# torch 2.2.2 最高支持 Python 3.12（3.13 无预编译轮子）——所以锁 3.12
+# 系列而不是 latest overall。
 DTYPE = "float32"            # 训练/推理默认 FP32（x86_64 mac 无 CUDA）
+
+# ---------------------------------------------------------------------------
+# 9. 项目目录树与服务架构（2026-10-24 重构，steve 定的结构）
+# ---------------------------------------------------------------------------
+# 目录树（契约，新增文件必须归位）：
+#   start/
+#     terminal/    终端脚本：setup.{sh,bat}（装隔离环境）+ start.{sh,bat,command}
+#     requirements/ 分类依赖：core（必装）/ window（GUI）/ dev（测试）
+#     boot.py      路径引导（把 server/ 与 service/* 放上 sys.path）
+#     window.sha256  window.py 完整性基准（server 启动时校验）
+#   server/        全部 server 文件：spec / common / model / muon +
+#                  server.py（装配+路由+启动编排）+ server_env（环境检查/
+#                  窗口校验/弹窗）+ server_services（服务监督器）+
+#                  server_models / media / codecs / train / tokens / util
+#   service/       每个服务一个目录：infer / train / init / tokens / web /
+#                  window / test（按需启动，见下）
+#   models/        models/NAME/{model.safetensors, config.json, vocab.txt?}
+#   data/          data/queue/（待训练）+ data/done/（已训练归档）
+#   logs/          auto_train.jsonl 等运行日志
+#
+# 服务按需启动（省内存的关键设计）：
+#   infer / train 是重活（模型权重单个 safetensors 可达数 GB），以**独立
+#   子进程**按需拉起，协议 = JSON-lines over stdin/stdout（请求
+#   {"id","op",...} → 响应 {"id","ok",result|error}；服务的 stdout 只准
+#   写 JSON 行，人类日志走 stderr）。server 本体只路由 + 记账，不持权重。
+#   退出条件：shutdown / stdin EOF（server 死了）/ 空闲超时
+#   （--idle-timeout，默认 300s）。init 是罕见一次性重活，走
+#   run_oneshot（--json 末行协议），跑完即退。
+#   PyTorch CPU 分配器在进程内不向 OS 归还内存——所以「按需」必须是
+#   进程级的，进程退出才是真省内存。
+#
+# 每模型词表（vocab.txt）：
+#   models/NAME/vocab.txt 一行一个 token，第 N 行 → token ID =
+#   INVISIBLE_END + N（不可见区 [0, INVISIBLE_END) 是 special/system/
+#   modal 固定 token 的架构契约——<stop>/<caps>/{ } |/图元输出 token 的
+#   ID 由上面的常量按 ID 定位，decode 的停止/大小写逻辑靠它们，自定义
+#   词表不得占用）；空行跳过；重复拒绝（反查歧义）；条目数上限
+#   VOCAB_SIZE_PADDED - INVISIBLE_END。扁平词表的可见部分全部按
+#   regular 处理（special/system 不可见、不参与文本编码查表）。没有
+#   vocab.txt 的模型用全局词表 service/tokens/vocab.json。
+#   切换活动模型时，server / infer / train 进程各自 set_model_vocab()。
+#
+# 启动链（唯一入口）：
+#   start/terminal/start.{sh,bat,command}
+#     → setup.{sh,bat}（幂等：装/复用 start/.python + start/.venv）
+#     → server/server.py
+#         → server_env.check_environment（解释器版本 + 主依赖）
+#         → server_env.verify_window_integrity（window.py sha256 校验，
+#            不一致弹窗，可跳过；--no-verify 静默）
+#         → HTTP 服务 + 按需拉起 service/window/window.py 与各服务
 
 # ---------------------------------------------------------------------------
 # 8. 输入流约定（所有模块遵守）

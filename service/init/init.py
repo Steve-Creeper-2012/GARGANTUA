@@ -4,6 +4,12 @@
 #       [--enc-blocks N] [--dec-blocks N]
 #       [--ctx-full N] [--ctx-compress N]
 #       [--csa-ratio N] [--hca-ratio N] [--csa-window N]
+#       [--json]                    # 末行输出 JSON 结果（server 用）
+#
+# 2026-10-24：--json 模式——server 的 /api/model/init 把建模当作一次性
+# 子进程调度（server_services.run_oneshot）：stdout 最后一行必须是
+# {"ok": true, "result": {...}} 或 {"ok": false, "error": "..."}。
+# 人类可读的摘要照常打印（在 JSON 行之前），互不干扰。
 #
 # 2026-10-20 修复（审查结论）：
 #   1. 落盘改走 common.save_checkpoint（临时文件 + replace 原子写），
@@ -15,7 +21,9 @@
 #   缺省即 spec 默认（1024/3072/4/32/512），与旧行为逐位一致。
 # ===========================================================================
 import argparse
+import json
 import os
+import sys
 import time
 
 import torch
@@ -37,34 +45,7 @@ from common import (MAX_BLOCKS, save_checkpoint, valid_model_name,
 from model import Gargantua
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--name", required=True, help="模型名（目录名）")
-    ap.add_argument("--out", default="models", help="模型根目录")
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--enc-blocks", type=int, default=None,
-                    help=f"encoder block 数（默认 {spec.N_ENC_BLOCKS}）")
-    ap.add_argument("--dec-blocks", type=int, default=None,
-                    help=f"decoder block 数（默认 {spec.N_DEC_BLOCKS}）")
-    ap.add_argument("--force", action="store_true",
-                    help="允许覆盖已存在的同名模型")
-    # ---- 上下文长度（2026-10-23 新功能）----
-    ap.add_argument("--ctx-full", type=int, default=None,
-                    help=f"完整 KV 区容量，token（默认 {spec.CTX_FULL}）")
-    ap.add_argument("--ctx-compress", type=int, default=None,
-                    help=f"压缩区容量（原始 token 计，默认 "
-                         f"{spec.CTX_COMPRESS}；CSA/HCA 是它的两个视图）")
-    ap.add_argument("--csa-ratio", type=int, default=None,
-                    help=f"CSA 压缩比 N:1（默认 {spec.CSA_RATIO}，"
-                         f"局部滑窗注意力）")
-    ap.add_argument("--hca-ratio", type=int, default=None,
-                    help=f"HCA 压缩比 N:1（默认 {spec.HCA_RATIO}，"
-                         f"全局注意力；须 ≥ csa-ratio）")
-    ap.add_argument("--csa-window", type=int, default=None,
-                    help=f"CSA 在完整区尾部的局部窗（默认 "
-                         f"{spec.CSA_LOCAL_WINDOW}，≤ ctx-full）")
-    args = ap.parse_args()
-
+def _run(args) -> dict:
     bad = valid_model_name(args.name)
     if bad:
         raise SystemExit(f"[init] 非法模型名 {args.name!r}: {bad}")
@@ -113,12 +94,67 @@ def main():
     }
     save_checkpoint(d, m, config)
     total_ctx = ctx["ctx_full"] + ctx["ctx_compress"]
-    print(f"[init] {d}  params={n/1e6:.1f}M  ({time.time()-t0:.1f}s)")
-    print(f"[init] 上下文: full={ctx['ctx_full']} + compress="
-          f"{ctx['ctx_compress']} = {total_ctx}；"
-          f"CSA {ctx['csa_ratio']}:1(窗 {ctx['csa_local_window']}) · "
-          f"HCA {ctx['hca_ratio']}:1")
+    # --json 模式：人类摘要走 stderr，stdout 只留最后的 JSON 结果行
+    _say = (lambda s: print(s, file=sys.stderr)) if args.json else print
+    _say(f"[init] {d}  params={n/1e6:.1f}M  ({time.time()-t0:.1f}s)")
+    _say(f"[init] 上下文: full={ctx['ctx_full']} + compress="
+         f"{ctx['ctx_compress']} = {total_ctx}；"
+         f"CSA {ctx['csa_ratio']}:1(窗 {ctx['csa_local_window']}) · "
+         f"HCA {ctx['hca_ratio']}:1")
+    return {"name": args.name, "dir": d, "params": n,
+            "total_ctx": total_ctx, **ctx}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--name", required=True, help="模型名（目录名）")
+    ap.add_argument("--out", default="models", help="模型根目录")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--enc-blocks", type=int, default=None,
+                    help=f"encoder block 数（默认 {spec.N_ENC_BLOCKS}）")
+    ap.add_argument("--dec-blocks", type=int, default=None,
+                    help=f"decoder block 数（默认 {spec.N_DEC_BLOCKS}）")
+    ap.add_argument("--force", action="store_true",
+                    help="允许覆盖已存在的同名模型")
+    # ---- 上下文长度（2026-10-23 新功能）----
+    ap.add_argument("--ctx-full", type=int, default=None,
+                    help=f"完整 KV 区容量，token（默认 {spec.CTX_FULL}）")
+    ap.add_argument("--ctx-compress", type=int, default=None,
+                    help=f"压缩区容量（原始 token 计，默认 "
+                         f"{spec.CTX_COMPRESS}；CSA/HCA 是它的两个视图）")
+    ap.add_argument("--csa-ratio", type=int, default=None,
+                    help=f"CSA 压缩比 N:1（默认 {spec.CSA_RATIO}，"
+                         f"局部滑窗注意力）")
+    ap.add_argument("--hca-ratio", type=int, default=None,
+                    help=f"HCA 压缩比 N:1（默认 {spec.HCA_RATIO}，"
+                         f"全局注意力；须 ≥ csa-ratio）")
+    ap.add_argument("--csa-window", type=int, default=None,
+                    help=f"CSA 在完整区尾部的局部窗（默认 "
+                         f"{spec.CSA_LOCAL_WINDOW}，≤ ctx-full）")
+    ap.add_argument("--json", action="store_true",
+                    help="末行输出 JSON 结果（server run_oneshot 协议）")
+    args = ap.parse_args()
+
+    try:
+        result = _run(args)
+    except SystemExit as e:
+        if args.json:
+            msg = e.code if isinstance(e.code, str) else f"退出码 {e.code}"
+            print(json.dumps({"ok": False, "error": msg},
+                             ensure_ascii=False))
+            return 1
+        raise
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)},
+                             ensure_ascii=False))
+            return 1
+        raise
+    if args.json:
+        # 必须是 stdout 的【最后】一行——run_oneshot 只解析末行
+        print(json.dumps({"ok": True, "result": result}, ensure_ascii=False))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
