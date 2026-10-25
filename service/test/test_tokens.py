@@ -627,5 +627,58 @@ class AddTokenTest(unittest.TestCase):
                          {"regular", "fallback", "special", "system"})
 
 
+class GtsAndTokensetTest(unittest.TestCase):
+    """2026-10-25：Token 编辑器文本 ↔ .tokens 导出 + 训练流读取。"""
+
+    def test_gts_roundtrip(self):
+        from tokens import gts
+        src = "{<user>}{hello}{ }{world}{<user/>}"
+        ids = gts.parse_gts(src)
+        # 结构：每步都被 { } 包裹，步内 | 分隔
+        self.assertEqual(timestep.count_steps(ids), 5)
+        steps = timestep.unwrap(ids)
+        self.assertEqual(len(steps), 5)
+        self.assertEqual(steps[0], [spec.SPECIAL_TOKENS.index("<user>")])
+        # 导出二进制再读回，ID 完全一致
+        data = tok32.encode_ids(ids)
+        self.assertEqual(tok32.decode_ids(data), ids)
+
+    def test_gts_rejects_bad_structure(self):
+        from tokens import gts
+        for bad in ("{a", "{}{a}", "{a}}", "a{b}"):
+            with self.assertRaises(gts.GtsError, msg=bad):
+                gts.parse_gts(bad)
+
+    def test_gts_rejects_unmapped_chars(self):
+        from tokens import gts
+        with self.assertRaises(gts.GtsError):
+            gts.parse_gts("{\U00020000}")     # 扩展 B 未收录
+
+    def test_tokenset_read_stream(self):
+        from tokens import gts, tokenset
+        ids = gts.parse_gts("{<user>}{hello}{<user/>}")
+        tmp = tempfile.NamedTemporaryFile(suffix=".tokens", delete=False)
+        try:
+            tmp.write(tok32.encode_ids(ids))
+            tmp.close()
+            flat, steps = tokenset.read_stream(tmp.name)
+            # read_stream 只返回步内内容 token（{ } | 由 step_ids 承载）
+            self.assertEqual(flat, [1, 50994, 2])
+            self.assertEqual(steps, [0, 1, 2])   # 三步，一步一 token
+        finally:
+            Path(tmp.name).unlink(missing_ok=True)
+
+    def test_tokenset_requires_structure(self):
+        from tokens import tokenset
+        tmp = tempfile.NamedTemporaryFile(suffix=".tokens", delete=False)
+        try:
+            tmp.write(tok32.encode_ids([100, 101, 102]))   # 无 { }
+            tmp.close()
+            with self.assertRaises(tokenset.TokensetError):
+                tokenset.read_stream(tmp.name)
+        finally:
+            Path(tmp.name).unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     unittest.main()

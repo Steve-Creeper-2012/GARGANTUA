@@ -3,7 +3,7 @@
 # 用法：python init.py --name alpha [--out models/] [--force]
 #       [--enc-blocks N] [--dec-blocks N]
 #       [--ctx-full N] [--ctx-compress N]
-#       [--csa-ratio N] [--hca-ratio N] [--csa-window N]
+#       [--csa-ratio N] [--hca-ratio N]
 #       [--json]                    # 末行输出 JSON 结果（server 用）
 #
 # 2026-10-24：--json 模式——server 的 /api/model/init 把建模当作一次性
@@ -15,10 +15,11 @@
 #   1. 落盘改走 common.save_checkpoint（临时文件 + replace 原子写），
 #      与 server.py / train.py 的 config.json 格式完全同构。
 #   2. 默认拒绝覆盖已存在模型（防止误操作抹掉训练成果），--force 才允许。
-# 2026-10-23：新增上下文长度选项（完整/压缩容量 + CSA/HCA 压缩比与
-#   局部窗）。语义：KV = 完整区（ctx_full 个原始 token）｜压缩区
+# 2026-10-23：新增上下文长度选项（完整/压缩容量 + CSA/HCA 压缩比）。
+#   语义：KV = 完整区（ctx_full 个原始 token）｜压缩区
 #   （ctx_compress 容量，对外有 CSA/HCA 两个同源视图，压缩比分别可配）。
-#   缺省即 spec 默认（1024/3072/4/32/512），与旧行为逐位一致。
+#   缺省即 spec 默认（1024/3072/4/32）。
+# 2026-10-25：删除 CSA 局部窗选项——CSA 的保留区就是完整 KV 区。
 # ===========================================================================
 import argparse
 import json
@@ -61,8 +62,7 @@ def _run(args) -> dict:
         ctx = validate_ctx_config(ctx_full=args.ctx_full,
                                   ctx_compress=args.ctx_compress,
                                   csa_ratio=args.csa_ratio,
-                                  hca_ratio=args.hca_ratio,
-                                  csa_local_window=args.csa_window)
+                                  hca_ratio=args.hca_ratio)
     except ValueError as e:
         raise SystemExit(f"[init] {e}")
 
@@ -106,7 +106,6 @@ def _run(args) -> dict:
         "ctx_compress": ctx["ctx_compress"],
         "csa_ratio": ctx["csa_ratio"],
         "hca_ratio": ctx["hca_ratio"],
-        "csa_local_window": ctx["csa_local_window"],
         "optimizer": spec.OPTIMIZER,
         # 2026-10-25：模型精度 + 词表预设来源（build_model 据此施加）
         "dtype": dtype_name,
@@ -120,8 +119,8 @@ def _run(args) -> dict:
     _say(f"[init] {d}  params={n/1e6:.1f}M  ({time.time()-t0:.1f}s)")
     _say(f"[init] 上下文: full={ctx['ctx_full']} + compress="
          f"{ctx['ctx_compress']} = {total_ctx}；"
-         f"CSA {ctx['csa_ratio']}:1(窗 {ctx['csa_local_window']}) · "
-         f"HCA {ctx['hca_ratio']}:1")
+         f"CSA {ctx['csa_ratio']}:1 · HCA {ctx['hca_ratio']}:1"
+         f"（两视图都读完整区）")
     return {"name": args.name, "dir": d, "params": n,
             "total_ctx": total_ctx, **ctx}
 
@@ -144,14 +143,10 @@ def main():
                     help=f"压缩区容量（原始 token 计，默认 "
                          f"{spec.CTX_COMPRESS}；CSA/HCA 是它的两个视图）")
     ap.add_argument("--csa-ratio", type=int, default=None,
-                    help=f"CSA 压缩比 N:1（默认 {spec.CSA_RATIO}，"
-                         f"局部滑窗注意力）")
+                    help=f"CSA 压缩比 N:1（默认 {spec.CSA_RATIO}，检索视图）")
     ap.add_argument("--hca-ratio", type=int, default=None,
                     help=f"HCA 压缩比 N:1（默认 {spec.HCA_RATIO}，"
-                         f"全局注意力；须 ≥ csa-ratio）")
-    ap.add_argument("--csa-window", type=int, default=None,
-                    help=f"CSA 在完整区尾部的局部窗（默认 "
-                         f"{spec.CSA_LOCAL_WINDOW}，≤ ctx-full）")
+                         f"全局概括视图；须 ≥ csa-ratio）")
     ap.add_argument("--json", action="store_true",
                     help="末行输出 JSON 结果（server run_oneshot 协议）")
     # ---- 词表预设 + 精度（2026-10-25）----

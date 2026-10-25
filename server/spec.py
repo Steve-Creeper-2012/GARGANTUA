@@ -39,6 +39,24 @@
 #   - 图元（draw）token 布局照搬 wonderfulearth/primitive-operation-painter
 #     的 geometrize_256_v1（service/prims/ 内 vendored，转换器为 Rust/wgpu）；
 #     MIDI 输出 token 暂时删除。
+#
+# 定案记录（2026-10-25，steve 拍板，内部流程对齐）：
+#   - block 内顺序改为 KDA → KDA → KDA → MLA-CSA → MLA-HCA → FFN → AttnRes
+#     （三个 KDA 连续，CSA 在前、HCA 在后）。
+#   - AttnRes = Kimi/Moonshot《Attention Residuals》(arXiv 2603.15031) 的
+#     Block AttnRes：每个子层前对「token embedding + 已完成的 block 表示 +
+#     当前 partial sum」做 softmax 注意力聚合；块内仍用标准残差累加。
+#     block 末尾再保留一个零初始化标量门（两者互补，steve 定）。
+#   - 删除 CSA 局部窗选项：CSA 的保留区域就是完整 KV 区，两个视图都读
+#     【压缩段 + 全部完整段】；处理完整未压缩 KV 时就是标准 MLA 逻辑。
+#   - 压缩目标值 = 压缩比：每组凑够 ratio 个原始 token → 1 个压缩 token；
+#     整步凑不满/会超出时取误差最小的整步组合（允许略超），绝不跨步拆分。
+#   - fast weight 结构 = 一个 KDA 层（同参数化），区别只是状态跨调用持久。
+#   - 标识 = 类型嵌入（type_emb）：user 段内所有 token 带 user 标识、model 段
+#     带 model 标识，不分段首段尾；边界 token 本身不进 KV、不进 loss。
+#   - KV 超出上下文上限：丢 KV，保留原始 token id 存档（不保留向量）。
+#   - 训练数据 = .tokens（tok-32，必须带 { } | 时间步结构），不再用 JSON。
+#   - Token 编辑器导出 .tokens；词表操作全部归「词表」页。
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
@@ -193,8 +211,8 @@ N_HEADS = D_MODEL // HEAD_DIM                      # 8
 
 N_ENC_BLOCKS = 4
 N_DEC_BLOCKS = 6
-# block 内顺序（冻结）：KDA, MLA-HCA, KDA, MLA-CSA, KDA, FFN
-BLOCK_ORDER = ["kda", "mla_hca", "kda", "mla_csa", "kda", "ffn"]
+# block 内顺序（冻结，2026-10-25）：KDA×3 → MLA-CSA → MLA-HCA → FFN → AttnRes
+BLOCK_ORDER = ["kda", "kda", "kda", "mla_csa", "mla_hca", "ffn", "attnres"]
 
 # KDA（Kimi Linear 式：channel-wise 门控 delta 递推）
 KDA_HEAD_DIM = 128
@@ -211,7 +229,11 @@ MLA_V_LORA_RANK = 512
 # FFN（每 block 一个，GLU 结构：SiLU 门控）
 FFN_HIDDEN = 4096
 
-# Block Attention Residual（moonshot attnRes：块级残差混合，零初始化门控）
+# Block Attention Residual（Moonshot AttnRes, arXiv 2603.15031）
+# 每个子层（KDA / MLA / FFN）之前做一次 block_attn_res：
+#   V = [已完成的 block 表示..., 当前 block 的 partial sum]
+#   h = softmax(norm(V)·w)ᵀ V
+# block 末尾另有一个零初始化标量门把块输入混回输出（两种残差互补）。
 ATTNRES_ENABLED = True
 
 # ---------------------------------------------------------------------------
@@ -222,26 +244,39 @@ CTX_COMPRESS = 3072          # 第二层：被压缩的原始 token 容量
 CTX_TOTAL = CTX_FULL + CTX_COMPRESS      # 4096
 KV_BUFFER = 128              # 完整区与压缩区之间的缓冲区（吸收图元/音元
                              # 10:1 就地压缩带来的长度差）
-CSA_RATIO = 4                # CSA：4:1 可学习压缩 + 局部滑窗 attention
-CSA_LOCAL_WINDOW = 512       # CSA 局部 attention 窗口（原始 token 计）
-HCA_RATIO = 32               # HCA：32:1 可学习压缩 + 全局 attention
-# 压缩器：可学习 MLP（NSA 式），以时间步为原子单位；
-# 一个时间步内部 token 多时允许步内压缩，绝不跨步合并。
+CSA_RATIO = 4                # CSA：4:1 可学习压缩（检索视图）
+HCA_RATIO = 32               # HCA：32:1 可学习压缩（全局概括视图）
+# KV 分两段（2026-10-25 冻结）：
+#   第一段 完整 KV：不压缩，原样保留；
+#   第二段 压缩 KV：同一段内容的两份不同压法——
+#     CSA 检索视图（MLA-CSA 处理）与 HCA 全局概括视图（MLA-HCA 处理）。
+#   两个视图都读【压缩段 + 全部完整段】：处理完整未压缩 KV 时就是标准
+#   MLA 逻辑，没有额外的局部窗限制（旧 csa_local_window 已删除）。
+# 压缩器：可学习 MLP（NSA 式），以时间步为原子单位。
+#   目标值 = 压缩比：一个压缩组凑够 ratio 个原始 token → 1 个压缩 token；
+#   整步凑不齐时取误差 |组内 token 数 − ratio| 最小的整步组合（可略超），
+#   绝不把同一步拆到不同组；单步 token 数 ≥ ratio 时允许步内切分成多个
+#   压缩 token（它们仍属同一个时间步）。
 # decoder 输出的图元（9 token/个）与音元（n 参数/个）写满一个后
 # 在 KV 中就地压成 1 个向量（10:1 / n:1，CSA 打包摘要）。
 
-# 滑动窗口：以整个时间步为原子溢出即弃；原始 token json 全量存档。
+# 滑动窗口：以整个时间步为原子溢出即弃；被丢弃条目的原始 token id
+# 全量存档（SharedKV.archive），只丢 KV 向量不丢 id。
 
 # ---------------------------------------------------------------------------
-# 4. fast weight（全局型，KDA 结构，带遗忘门）
+# 4. fast weight（全局型，与一个 KDA 层完全同构，状态持久）
 # ---------------------------------------------------------------------------
-FW_N_HEAD = 4
-FW_KEY_DIM = 128
-FW_VALUE_DIM = 128
-FW_CHUNK = 64
+# 2026-10-25：不再是简化的 4 头 bank——直接复用 KDAAttention 的参数化
+# （q/k/v 投影 + 因果短卷积 + L2 归一化 + channel-wise 遗忘门 + 输出门控
+# + RMSNorm），唯一区别是状态 S 作为成员变量跨调用推进（实时写入 + 遗忘）。
+FW_N_HEAD = N_HEADS              # 与 KDA 层同构（8 头）
+FW_KEY_DIM = KDA_HEAD_DIM        # 128
+FW_VALUE_DIM = KDA_HEAD_DIM      # 128
+FW_CHUNK = KDA_CHUNK_SIZE
 # 语义：enc/dec 各自在第一个 block 之后调用同一个全局 bank：
 # 先用当前状态读出（当作权重层用），用后按 KDA 门控 delta 规则更新，
-# 状态跨调用推进。enc 与 dec 共享同一个 bank 实例。
+# 状态跨调用推进。enc 与 dec 共享同一个 bank 实例。当前为无差别写入
+# （序列里所有 token 都写进状态，不做选择性筛选）。
 
 # ---------------------------------------------------------------------------
 # 5. 模态参数
@@ -371,3 +406,13 @@ DTYPE = "float32"            # 训练/推理默认 FP32（x86_64 mac 无 CUDA）
 #   承载）；图片 = 一步（内部多 patch token）；音频每 533 采样 = 一个
 #   token = 一步；视频每帧 = 一步。KDA 循环状态递归 / 逻辑并行以
 #   时间步为原子：每处理完一个时间步内的 token，KDA 状态递归一次。
+#
+# 训练数据（2026-10-25 起）：.tokens 文件（tok-32 大端 uint32 流），
+#   内容必须带 { } | 时间步结构（timestep.unwrap 可解析）；训练侧
+#   读取后按 Step 展开成「扁平 token_ids + 并行 step_ids」。JSON/JSONL
+#   训练数据已废弃。Token 编辑器导出同一格式，训练与编辑器共用一套流。
+#
+# 标识（2026-10-25）：段类型用类型嵌入表达——user 段内所有 token 都加
+#   type_emb(TYPE_USER)，model 段都加 type_emb(TYPE_MODEL)，不分段首
+#   段尾。<user>/<user/>/<model>/<model/> 这类边界 token 是系统级标记，
+#   不进入共享 KV、不作为普通 token 参与 loss。

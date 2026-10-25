@@ -54,12 +54,12 @@ class ModelManager:
         c = self.ctx or {"ctx_full": spec.CTX_FULL,
                          "ctx_compress": spec.CTX_COMPRESS,
                          "csa_ratio": spec.CSA_RATIO,
-                         "hca_ratio": spec.HCA_RATIO,
-                         "csa_local_window": spec.CSA_LOCAL_WINDOW}
+                         "hca_ratio": spec.HCA_RATIO}
         return (f"KV: {c['ctx_full']} full + {c['ctx_compress']} compress = "
                 f"{c['ctx_full'] + c['ctx_compress']}；"
-                f"CSA {c['csa_ratio']}:1(窗 {c['csa_local_window']}) · "
-                f"HCA {c['hca_ratio']}:1；时间步为原子单位"
+                f"CSA {c['csa_ratio']}:1（检索视图）· "
+                f"HCA {c['hca_ratio']}:1（全局概括）；两视图都读完整区；"
+                f"时间步为原子单位"
                 f"（文本 1 token/步，图片 1 步，音频 533 采样/步，视频 1 帧/步）")
 
     def list_models(self):

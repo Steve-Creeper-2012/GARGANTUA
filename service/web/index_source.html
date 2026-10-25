@@ -351,9 +351,8 @@
             <label title="默认 6">dec blocks <input type="number" id="model-dec" value="6" min="1" max="64"></label>
             <label title="完整 KV 区容量（原始 token），默认 1024">完整上下文 <input type="number" id="model-ctx-full" value="1024" min="1" max="65536" style="width:92px"></label>
             <label title="压缩区容量（原始 token 计），默认 3072；填 0 表示不压缩">压缩上下文 <input type="number" id="model-ctx-compress" value="3072" min="0" max="1048576" style="width:92px"></label>
-            <label title="CSA 轻压缩比 N:1 + 完整区尾部局部窗，默认 4">CSA 比 <input type="number" id="model-csa-ratio" value="4" min="2" max="256" style="width:64px"></label>
-            <label title="HCA 重压缩比 N:1 + 全局注意力，默认 32（须 ≥ CSA 比）">HCA 比 <input type="number" id="model-hca-ratio" value="32" min="2" max="256" style="width:64px"></label>
-            <label title="CSA 在完整区尾部保留的局部窗（token），默认 512，≤ 完整上下文">CSA 窗 <input type="number" id="model-csa-window" value="512" min="1" style="width:72px"></label>
+            <label title="CSA 检索视图的压缩比 N:1，默认 4（与 HCA 同读完整区）">CSA 比 <input type="number" id="model-csa-ratio" value="4" min="2" max="256" style="width:64px"></label>
+            <label title="HCA 全局概括视图的压缩比 N:1，默认 32（须 ≥ CSA 比）">HCA 比 <input type="number" id="model-hca-ratio" value="32" min="2" max="256" style="width:64px"></label>
             <label title="词表预设：每个模型的 vocab.txt 从该预设派生（独立副本），默认 base">词表预设 <select id="model-vocab"></select></label>
             <label title="模型精度：fp64/32/16/bf16 走 torch 原生；fp8/fp4/int16/int8/int4/int2 在 CPU 上以 fp32 容器+权重量化模拟（有损耗）">精度
               <select id="model-dtype">
@@ -371,7 +370,7 @@
             <button class="act" id="model-create">创建并初始化</button>
             <span class="hint" id="model-create-msg"></span>
           </div>
-          <div class="hint">总上下文 = 完整 + 压缩（默认 1024+3072=4096 token）。CSA 与 HCA 是同一段压缩区内容的两个视图：CSA 轻压缩 + 局部滑窗，HCA 重压缩 + 全局。压缩、滑窗驱逐与因果掩码均以时间步为原子，绝不跨步。上下文长度随 config.json 固化，加载时按同一份配置重建。</div>
+          <div class="hint">总上下文 = 完整 + 压缩（默认 1024+3072=4096 token）。KV 分两段：完整段不压缩；压缩段是同一段内容的两份压法——CSA 检索视图（4:1）与 HCA 全局概括视图（32:1），两者都读【压缩段 + 全部完整段】（处理未压缩 KV 时就是标准 MLA）。压缩分组以时间步为原子：组内 token 数尽量等于压缩比，凑不齐取误差最小的整步组合，绝不跨步拆分。上下文长度随 config.json 固化，加载时按同一份配置重建。</div>
         </div>
         <div class="card">
           <div class="card-head"><span class="card-title">已有模型</span>
@@ -396,6 +395,29 @@
           </table>
         </div>
         <div class="card">
+          <div class="card-head"><span class="card-title">全局词表：查询 / 添加 token</span></div>
+          <div class="row">
+            <input class="grow" id="vocab-q" type="search" autocomplete="off"
+                   placeholder="搜索词表 token（如 hello / 你 / cx / shape）">
+            <button class="act sec" id="vocab-search">搜索</button>
+            <span class="hint" id="vocab-msg"></span>
+          </div>
+          <div class="hint" id="vocab-hits"></div>
+          <div class="row">
+            <input class="grow" id="vocab-add-token" type="text" autocomplete="off"
+                   placeholder="新 token 文本（如 𠀀 / <mood> / { ）">
+            <select id="vocab-add-cat" title="四类：regular 常规可见 / fallback 可见 / special 特殊 / system 系统">
+              <option value="regular">regular 常规可见</option>
+              <option value="fallback">fallback 可见</option>
+              <option value="special">special 特殊</option>
+              <option value="system">system 系统</option>
+            </select>
+            <button class="act" id="vocab-add">添加 token</button>
+            <span class="hint" id="vocab-add-msg"></span>
+          </div>
+          <div class="hint">添加前全局查重（同文本已存在即拒绝）；新 token 占用该类预留槽位，写入词表文件，模型维度不变。</div>
+        </div>
+        <div class="card">
           <div class="card-head"><span class="card-title">词表预设（每个从基础词表 fork，独立隔离、可增删）</span></div>
           <div class="row">
             <input type="text" id="vocab-new-name" placeholder="新预设名（字母/数字/_-）" style="max-width:240px">
@@ -412,17 +434,17 @@
           <div class="card-head"><span class="card-title">预设内增删 token（软删保留 ID 位置）</span></div>
           <div class="row">
             <label>预设 <select id="vocab-token-preset"></select></label>
-            <input class="grow" id="vocab-add-token" type="text" autocomplete="off" placeholder="新增 token 文本">
-            <select id="vocab-add-cat" title="四类任选">
+            <input class="grow" id="preset-add-token" type="text" autocomplete="off" placeholder="新增 token 文本">
+            <select id="preset-add-cat" title="四类任选">
               <option value="regular">regular 常规可见</option>
               <option value="fallback">fallback 可见</option>
               <option value="special">special 特殊</option>
               <option value="system">system 系统</option>
             </select>
-            <button class="act" id="vocab-add">添加</button>
-            <input class="grow" id="vocab-remove-token" type="text" autocomplete="off" placeholder="删除 token 文本">
-            <button class="act sec" id="vocab-remove">删除</button>
-            <span class="hint" id="vocab-token-msg"></span>
+            <button class="act" id="preset-add">添加</button>
+            <input class="grow" id="preset-remove-token" type="text" autocomplete="off" placeholder="删除 token 文本">
+            <button class="act sec" id="preset-remove">删除</button>
+            <span class="hint" id="preset-token-msg"></span>
           </div>
         </div>
       </section>
@@ -433,8 +455,8 @@
         <div class="train-top">
           <div class="card">
             <div class="card-head"><span class="card-title">创建训练任务</span></div>
-            <div class="hint">上传训练数据 JSON 文件：单个对象 {"text":"..."}、对象数组，或 JSONL 每行一个对象，均必须含 text 字段</div>
-            <div class="row"><label class="file-pick" for="train-file"><input type="file" id="train-file" accept=".json,.jsonl">
+            <div class="hint">上传 .tokens 训练数据（tok-32 二进制，必须带 { } | 时间步结构；Token 编辑器可直接导出）。一次上传 = 一条 token 流</div>
+            <div class="row"><label class="file-pick" for="train-file"><input type="file" id="train-file" accept=".tokens">
             <span class="file-btn">选择文件</span>
             <span class="file-name" id="train-file-name">未选择</span></label></div>
             <div class="row">
@@ -616,37 +638,18 @@
         <pre id="prims-out" style="flex-shrink:0;max-height:200px;">—</pre>
       </section>
 
-      <!-- JSON 编辑器 -->
+      <!-- Token 编辑器 -->
       <section class="page" id="p-json">
         <h2>Token 编辑器</h2>
-        <div class="hint">GARGANTUA token stream（.gts）：{} 为时间步原子，{} 内多 token 以 | 分隔；&lt;...&gt; 为特殊 token，裸字符为可见 token。特殊 token（&lt;user&gt;/&lt;model&gt; 等）各自独占一个时间步。同时间步多 token 用于图像/视频帧。</div>
+        <div class="hint">GARGANTUA token stream（.gts）：{} 为时间步原子，{} 内多 token 以 | 分隔；&lt;...&gt; 为特殊 token，裸字符为可见 token。特殊 token（&lt;user&gt;/&lt;model&gt; 等）各自独占一个时间步。同时间步多 token 用于图像/视频帧。词表查询与增删统一在「词表」页。</div>
         <div class="row">
           <button class="act" id="json-format">格式化</button>
           <button class="act sec" id="json-minify">压缩</button>
           <button class="act sec" id="json-copy">复制</button>
+          <button class="act" id="json-export">导出 .tokens</button>
           <span class="hint" id="json-msg"></span>
         </div>
         <div class="token-palette" id="json-palette"></div>
-        <div class="row">
-          <input class="grow" id="vocab-q" type="search" autocomplete="off"
-                 placeholder="搜索词表 token（如 hello / 你 / cx / shape）">
-          <button class="act sec" id="vocab-search">搜索</button>
-          <span class="hint" id="vocab-msg"></span>
-        </div>
-        <div class="hint" id="vocab-hits"></div>
-        <div class="row">
-          <input class="grow" id="vocab-add-token" type="text" autocomplete="off"
-                 placeholder="新 token 文本（如 𠀀 / <mood> / { ）">
-          <select id="vocab-add-cat" title="四类：regular 常规可见 / fallback 可见 / special 特殊 / system 系统">
-            <option value="regular">regular 常规可见</option>
-            <option value="fallback">fallback 可见</option>
-            <option value="special">special 特殊</option>
-            <option value="system">system 系统</option>
-          </select>
-          <button class="act" id="vocab-add">添加 token</button>
-          <span class="hint" id="vocab-add-msg"></span>
-        </div>
-        <div class="hint">添加前全局查重（同文本已存在即拒绝）；新 token 占用该类预留槽位，写入 vocab.json，模型维度不变。</div>
         <div id="json-editor" contenteditable="true" spellcheck="false">{<user>}{h}{e}{l}{l}{o}{<user/>}</div>
       </section>
 
@@ -995,7 +998,6 @@ async function createModel(name, overwrite) {
     ctx_compress: intOrUndef($("model-ctx-compress").value),
     csa_ratio: intOrUndef($("model-csa-ratio").value),
     hca_ratio: intOrUndef($("model-hca-ratio").value),
-    csa_local_window: intOrUndef($("model-csa-window").value),
     vocab: $("model-vocab").value || "base",
     dtype: $("model-dtype").value || "fp32",
   });
@@ -1024,13 +1026,14 @@ $("model-refresh").onclick = refreshModels;
 $("train-enqueue").onclick = async () => {
   const file = $("train-file").files[0];
   const msg = $("train-enqueue-msg");
-  if (!file) { msg.textContent = "请先选择 JSON / JSONL 训练数据文件"; return; }
+  if (!file) { msg.textContent = "请先选择 .tokens 训练数据文件"; return; }
   try {
     const r = await api("/api/train/enqueue", {
-      json_b64: await fileToB64(file), filename: file.name,
+      tokens_b64: await fileToB64(file),
       optimizer: $("train-mode").value,
     });
-    msg.textContent = `已入队 ${r.queued.length} 个训练任务（共 ${r.n_samples} 条样本）`;
+    msg.textContent = `已入队 ${r.queued[0]}（${r.n_tokens} tokens / ` +
+      `${r.n_steps} 时间步）`;
     $("train-file").value = "";
     refreshQueue(); refreshStatus();
   } catch (e) { msg.textContent = "错误: " + e.message; }
@@ -1186,7 +1189,9 @@ $("send-btn").onclick = async () => {
       const t = await api("/api/task/" + task_id);
       if (t.status === "done") {
         addMsg("model", esc(t.result.text || "（无文本输出）"));
-        st.textContent = "";
+        // 本次推理的 token id 存档（.tokens，悬停看路径）
+        st.textContent = t.result.archive ? "已存档 id" : "";
+        st.title = t.result.archive || "";
         $("attach-preview").style.display = "none";
         $("attach-preview").innerHTML = "";
         $("infer-media").value = "";
@@ -1312,18 +1317,36 @@ function insertAtCursor(text, back) {
   }
 }
 $("json-format").onclick = () => {
-  // 每个 {} 时间步独占一行
-  const t = $("json-editor").innerText.replace(/\s+/g, "");
+  // 每个 {} 时间步独占一行；只清排版空白（\n\r\t），空格是合法 token 要保留
+  const t = $("json-editor").innerText.replace(/[\n\r\t]+/g, "");
   $("json-editor").textContent = t.replace(/\}\{/g, "}\n{");
   $("json-msg").textContent = "";
 };
 $("json-minify").onclick = () => {
-  $("json-editor").textContent = $("json-editor").innerText.replace(/\s+/g, "");
+  $("json-editor").textContent =
+    $("json-editor").innerText.replace(/[\n\r\t]+/g, "");
   $("json-msg").textContent = "";
 };
 $("json-copy").onclick = () => {
   navigator.clipboard.writeText($("json-editor").innerText)
     .then(() => $("json-msg").textContent = "已复制");
+};
+$("json-export").onclick = async () => {
+  const msg = $("json-msg");
+  msg.textContent = "导出中…";
+  try {
+    const r = await api("/api/tokens/export",
+                        {text: $("json-editor").innerText});
+    const bytes = b64ToBytes(r.tokens_b64);
+    const blob = new Blob([bytes], {type: "application/octet-stream"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `stream_${r.n_tokens}tok.tokens`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+    msg.textContent = `已导出 ${r.n_tokens} tokens / ${r.n_steps} 时间步`;
+  } catch (e) { msg.textContent = "错误: " + e.message; }
 };
 
 /* ---------- 词表搜索（/api/vocab，GET ?q=） ---------- */
@@ -1354,9 +1377,10 @@ $("vocab-add").onclick = async () => {
   msg.textContent = "添加中…";
   try {
     const r = await api("/api/vocab/add", {token, category});
+    const fs = Object.entries(r.free_slots || {})
+      .map(([k, v]) => `${k}=${v}`).join(" ");
     msg.textContent = `已添加 ${r.token} → #${r.id}（${r.category}）；` +
-      `剩余槽位 regular=${r.free_slots.regular} fallback=${r.free_slots.fallback} ` +
-      `special=${r.free_slots.special} system=${r.free_slots.system}`;
+      (fs ? `剩余槽位 ${fs}` : "已写入词表");
     $("vocab-add-token").value = "";
     vocabSearch();
   } catch (e) { msg.textContent = "错误: " + e.message; }
@@ -1448,32 +1472,32 @@ window.deletePreset = async name => {
         refreshVocab(); }
   catch (e) { alert(e.message); }
 };
-$("vocab-add").onclick = async () => {
+$("preset-add").onclick = async () => {
   const name = $("vocab-token-preset").value;
-  const token = $("vocab-add-token").value;
-  if (!token) { $("vocab-token-msg").textContent = "请输入 token"; return; }
-  $("vocab-token-msg").textContent = "添加中…";
+  const token = $("preset-add-token").value;
+  if (!token) { $("preset-token-msg").textContent = "请输入 token"; return; }
+  $("preset-token-msg").textContent = "添加中…";
   try {
     const r = await api("/api/vocab/preset/token",
-      {name, action:"add", token, category: $("vocab-add-cat").value});
-    $("vocab-token-msg").textContent =
+      {name, action:"add", token, category: $("preset-add-cat").value});
+    $("preset-token-msg").textContent =
       `已添加 ${r.token} → #${r.id}（${r.category}）；剩余可见槽 ${r.used}`;
-    $("vocab-add-token").value = "";
+    $("preset-add-token").value = "";
     refreshVocab();
-  } catch (e) { $("vocab-token-msg").textContent = "错误: " + e.message; }
+  } catch (e) { $("preset-token-msg").textContent = "错误: " + e.message; }
 };
-$("vocab-remove").onclick = async () => {
+$("preset-remove").onclick = async () => {
   const name = $("vocab-token-preset").value;
-  const token = $("vocab-remove-token").value;
-  if (!token) { $("vocab-token-msg").textContent = "请输入 token"; return; }
-  $("vocab-token-msg").textContent = "删除中…";
+  const token = $("preset-remove-token").value;
+  if (!token) { $("preset-token-msg").textContent = "请输入 token"; return; }
+  $("preset-token-msg").textContent = "删除中…";
   try {
     const r = await api("/api/vocab/preset/token",
       {name, action:"remove", token});
-    $("vocab-token-msg").textContent = `已软删 ${r.token}（原 #${r.id}）`;
-    $("vocab-remove-token").value = "";
+    $("preset-token-msg").textContent = `已软删 ${r.token}（原 #${r.id}）`;
+    $("preset-remove-token").value = "";
     refreshVocab();
-  } catch (e) { $("vocab-token-msg").textContent = "错误: " + e.message; }
+  } catch (e) { $("preset-token-msg").textContent = "错误: " + e.message; }
 };
 </script>
 </body>

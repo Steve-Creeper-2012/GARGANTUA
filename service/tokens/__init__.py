@@ -14,6 +14,8 @@
 # 脚本（均可 `python tokens/X.py` 或 `python -m tokens.X`）：
 #   enctok  文本 → token ID 流（hex / .tokens）
 #   dectok  token ID 流 → 可读形式（{ } | + hex / 表面文本）
+#   gts     Token 编辑器文本（.gts）→ token ID 流（导出 .tokens 用）
+#   tokenset .tokens 训练流 → (ids, step_ids)（强制 { } | 结构）
 #   build_vocab / add_token（Vocab.add_token）  词表构建与扩充
 #
 # 子模块按需自动导入（`from tokens import tok32` 即可），避免

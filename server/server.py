@@ -153,14 +153,13 @@ class App(TrainApi, CodecApi, TokensApi):
         dec = (self._clamp_int(body["n_dec_blocks"], 1, MAX_BLOCKS,
                                "n_dec_blocks")
                if body.get("n_dec_blocks") is not None else None)
-        # 上下文长度（完整/压缩容量 + CSA/HCA 压缩比与局部窗）；
+        # 上下文长度（完整/压缩容量 + CSA/HCA 压缩比）；
         # 缺省项取 spec 默认，非法值 → ValueError（→400）
         ctx = validate_ctx_config(
             ctx_full=body.get("ctx_full"),
             ctx_compress=body.get("ctx_compress"),
             csa_ratio=body.get("csa_ratio"),
-            hca_ratio=body.get("hca_ratio"),
-            csa_local_window=body.get("csa_local_window"))
+            hca_ratio=body.get("hca_ratio"))
 
         # 2026-10-25：词表预设 + 精度提前校验（非法 → 400，避免提交失败任务）
         if body.get("vocab"):
@@ -195,8 +194,7 @@ class App(TrainApi, CodecApi, TokensApi):
             argv += ["--ctx-full", str(ctx["ctx_full"]),
                      "--ctx-compress", str(ctx["ctx_compress"]),
                      "--csa-ratio", str(ctx["csa_ratio"]),
-                     "--hca-ratio", str(ctx["hca_ratio"]),
-                     "--csa-window", str(ctx["csa_local_window"])]
+                     "--hca-ratio", str(ctx["hca_ratio"])]
             return self.supervisor.run_oneshot(
                 os.path.join("service", "init", "init.py"), argv,
                 timeout=900)
@@ -266,12 +264,15 @@ class App(TrainApi, CodecApi, TokensApi):
 
         def work():
             # 推理服务按需拉起（首次含建模加载，之后复用；空闲自行退出）。
-            # 服务返回的 text 已用该模型的词表解码。
+            # 服务返回的 text 已用该模型的词表解码；archive 是本次推理的
+            # token id 存档（.tokens，随 logs 目录走）。
             return self.supervisor.call(
                 "infer", "infer", timeout=600,
                 model_dir=os.path.join(self.mgr.model_dir, self.mgr.name),
                 prompt=prompt, max_new=max_new,
-                temperature=temperature, top_p=top_p)
+                temperature=temperature, top_p=top_p,
+                archive_dir=os.path.join(os.path.dirname(self.log_path),
+                                         "infer_archive"))
 
         tid = self.pool.submit(work)
         return 202, {"task_id": tid}
@@ -521,6 +522,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/codec/image2prims": app.api_codec_image2prims,
             "/api/tokens/encode": app.api_tokens_encode,
             "/api/tokens/decode": app.api_tokens_decode,
+            "/api/tokens/export": app.api_tokens_export,
             "/api/vocab/add": app.api_vocab_add,
             "/api/vocab/presets": app.api_vocab_presets,
             "/api/vocab/preset/token": app.api_vocab_preset_token,

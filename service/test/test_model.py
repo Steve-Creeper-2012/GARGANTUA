@@ -90,18 +90,39 @@ class TestStepCausalMask(unittest.TestCase):
 
 
 class TestGroupByStep(unittest.TestCase):
-    """ 压缩分组：以时间步为原子，允许步内切分，绝不跨步超 ratio。"""
+    """ 压缩分组：以时间步为原子，组内 token 数向 ratio 靠拢（误差最小）。"""
 
     def test_grouping(self):
         ss = torch.tensor([0, 0, 0, 1, 1, 2, 3, 3, 3, 3, 3])
         g = model.group_by_step(ss, 4)
         self.assertEqual(g, [(0, 3), (3, 6), (6, 10), (10, 11)])
 
-    def test_never_split_across(self):
-        ss = torch.tensor([0, 0, 1, 1, 1, 2])
+    def test_nearest_fit_allows_overshoot(self):
+        # [2,3,1] ratio 4：2 差 2、2+3=5 差 1 → 取 5（略超）
+        self.assertEqual(model.group_by_step(torch.tensor([0, 0, 1, 1, 1, 2]), 4),
+                         [(0, 5), (5, 6)])
+
+    def test_step_never_split_across_groups(self):
+        ss = torch.tensor([0, 0, 1, 1, 1, 2, 3, 3])
+        vals = ss.tolist()
         for ratio in (2, 3, 4, 32):
-            for (s, e) in model.group_by_step(ss, ratio):
-                self.assertLessEqual(e - s, ratio)
+            g = model.group_by_step(ss, ratio)
+            self.assertEqual(g[0][0], 0)
+            self.assertEqual(g[-1][1], len(vals))
+            for (s, e) in g:
+                self.assertGreater(e, s)
+            for a, b in zip(g, g[1:]):
+                self.assertEqual(a[1], b[0])
+            # 长度 < ratio 的步绝不被拆到两个组（超长步允许步内切块）
+            for sid in set(vals):
+                idx = [i for i, v in enumerate(vals) if v == sid]
+                if len(idx) >= ratio:
+                    continue
+                owner = [k for k, (s, e) in enumerate(g)
+                         if s <= idx[0] < e]
+                self.assertEqual(len(owner), 1, f"步 {sid} 被拆到多个组: {g}")
+                s, e = g[owner[0]]
+                self.assertTrue(all(s <= i < e for i in idx))
 
 
 class TestFastWeight(unittest.TestCase):
@@ -121,6 +142,43 @@ class TestFastWeight(unittest.TestCase):
         bank(torch.randn(1, 4, spec.D_MODEL))
         bank.reset()
         self.assertIsNone(bank._state)
+
+
+class TestAttnResAndBlockOrder(unittest.TestCase):
+    """ 2026-10-25：block 顺序 + Kimi Block AttnRes（子层级 + 块末标量门）。"""
+
+    def test_block_order_contract(self):
+        self.assertEqual(spec.BLOCK_ORDER,
+                         ["kda", "kda", "kda", "mla_csa", "mla_hca",
+                          "ffn", "attnres"])
+
+    def test_block_forward_returns_updated_blocks(self):
+        torch.manual_seed(7)
+        b = model.Block(is_decoder=True)
+        x = torch.randn(1, 5, spec.D_MODEL)
+        steps = torch.arange(5).unsqueeze(0)
+        out, blocks = b(x, (None, None), (None, None), steps, [x])
+        self.assertEqual(out.shape, x.shape)
+        self.assertEqual(len(blocks), 2)
+        self.assertTrue(torch.equal(blocks[-1], out))
+
+    def test_attn_res_aggregates_depth(self):
+        # 两个 block 表示 + partial：输出必须是三者的凸组合（softmax 权重）
+        torch.manual_seed(8)
+        b1 = torch.randn(1, 3, spec.D_MODEL)
+        b2 = torch.randn(1, 3, spec.D_MODEL)
+        p = torch.randn(1, 3, spec.D_MODEL)
+        proj = torch.nn.Linear(spec.D_MODEL, 1, bias=False)
+        norm = model.RMSNorm(spec.D_MODEL)
+        h = model.block_attn_res([b1, b2], p, proj, norm)
+        V = torch.stack([b1, b2, p], 0)
+        K = norm(V)
+        logits = torch.einsum('d,nbtd->nbt', proj.weight.squeeze(0), K)
+        w = logits.softmax(0)
+        self.assertTrue(torch.allclose(h, (w.unsqueeze(-1) * V).sum(0),
+                                       atol=1e-6))
+        self.assertTrue(torch.allclose(w.sum(0), torch.ones_like(w[0]),
+                                       atol=1e-6))
 
 
 class TestSharedKV(unittest.TestCase):
@@ -152,9 +210,21 @@ class TestSharedKV(unittest.TestCase):
         # HCA：1024 完整 + 3072/32≈96 压缩（步边界效应有少量余量）
         self.assertGreater(vh.shape[1], spec.CTX_FULL)
         self.assertLess(vh.shape[1], spec.CTX_FULL + 200)
-        # CSA：局部窗口 512 + 4:1 压缩（步内切分有 padding 余量）
-        self.assertGreater(vc.shape[1], spec.CSA_LOCAL_WINDOW)
-        self.assertLess(vc.shape[1], spec.CSA_LOCAL_WINDOW + 1200)
+        # CSA：1024 完整 + 压缩（10-token 步 ≥ ratio 4 → 每步切 3 块，
+        # 3072 token ≈ 922 个压缩向量；2026-10-25：无局部窗，
+        # 保留区就是完整 KV 区）
+        self.assertGreater(vc.shape[1], spec.CTX_FULL + 800)
+        self.assertLess(vc.shape[1], spec.CTX_FULL + 1000)
+
+    def test_archive_keeps_token_ids(self):
+        kv = self._mk()
+        for i in range(spec.CTX_TOTAL + 3):
+            kv.append(torch.randn(1, spec.D_MODEL), step_id=i, type_id=0,
+                      source="enc", token_ids=[500 + i])
+        # 超出上下文上限：丢 KV，但原始 token id 全量留在 archive
+        self.assertEqual(len(kv.entries), spec.CTX_TOTAL)
+        self.assertEqual([a.token_id for a in kv.archive], [500, 501, 502])
+        self.assertEqual([a.step_id for a in kv.archive], [0, 1, 2])
 
     def test_primitive_packing(self):
         kv = self._mk()

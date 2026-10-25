@@ -78,7 +78,7 @@ from server_codecs import CodecApi, MAX_PRIMITIVES
 from server_media import (MAX_AUDIO_TOKENS, MAX_IMAGE_DIM, MAX_PATCHES_TOTAL,
                           extract_video_frames, find_ffmpeg, size_guard_pil)
 from server_models import ConflictError, ModelManager, TaskPool
-from server_train import MAX_ENQUEUE_SAMPLES, TrainApi
+from server_train import MAX_ENQUEUE_BYTES, TrainApi
 from server_util import num_param
 from auto_train import Trainer
 
@@ -369,26 +369,24 @@ class TestCodecContracts(unittest.TestCase):
         self.assertEqual(t["status"], "done", t.get("error"))
 
     def test_enqueue_caps(self):
-        # 修复前：入队无数量/体积上限
-        with mock.patch.object(server_train, "MAX_ENQUEUE_SAMPLES", 2):
-            body = {"json_b64": base64.b64encode(
-                json.dumps([{"text": "a"}, {"text": "b"},
-                            {"text": "c"}]).encode()).decode(),
-                "filename": "many.json"}
+        # 修复前：入队无体积上限（2026-10-25 起数据格式 = .tokens）
+        from tokens import gts, tok32
+        stream = tok32.encode_ids(gts.parse_gts("{a}{b}{c}"))
+        b64 = base64.b64encode(stream).decode()
+        with mock.patch.object(server_train, "MAX_ENQUEUE_BYTES", 8):
             with self.assertRaises(ValueError) as cm:
-                self.host.api_train_enqueue(body)
+                self.host.api_train_enqueue({"tokens_b64": b64})
             self.assertIn("超限", str(cm.exception))
-        raw = base64.b64encode(b'[{"text": "hi"}]').decode()
-        code, obj = self.host.api_train_enqueue(
-            {"json_b64": raw, "filename": "ok.json"})
+        code, obj = self.host.api_train_enqueue({"tokens_b64": b64})
         self.assertEqual(code, 200)
         self.assertEqual(len(obj["queued"]), 1)
+        self.assertEqual(obj["n_steps"], 3)
 
     def test_queue_getsize_race_tolerated(self):
         # 修复前：glob 与 getsize 之间文件被归档/删除 → FileNotFoundError
         # 逃逸 → 500（训练期间前端轮询概率性触发）
-        open(os.path.join(self.host.queue_dir, "20261024_120000_muon_ab.txt"),
-             "w").close()
+        open(os.path.join(self.host.queue_dir,
+                          "20261024_120000_muon_ab.tokens"), "w").close()
         with mock.patch("os.path.getsize", side_effect=FileNotFoundError):
             code, obj = self.host.api_train_queue()      # 不得抛
         self.assertEqual(code, 200)
@@ -396,7 +394,7 @@ class TestCodecContracts(unittest.TestCase):
 
     def test_queue_reports_optimizer(self):
         # 修复前：队列项不含 optimizer，UI 无从判断 muon/adamw 是否生效
-        name = "20261024_120000_adamw_ab12cd34.txt"
+        name = "20261024_120000_adamw_ab12cd34.tokens"
         open(os.path.join(self.host.queue_dir, name), "w").close()
         code, obj = self.host.api_train_queue()
         self.assertEqual(code, 200)
@@ -487,22 +485,16 @@ class TestContextLength(unittest.TestCase):
         self.assertEqual(cfg, {"ctx_full": spec.CTX_FULL,
                                "ctx_compress": spec.CTX_COMPRESS,
                                "csa_ratio": spec.CSA_RATIO,
-                               "hca_ratio": spec.HCA_RATIO,
-                               "csa_local_window": spec.CSA_LOCAL_WINDOW})
+                               "hca_ratio": spec.HCA_RATIO})
         custom = validate_ctx_config(ctx_full=512, ctx_compress=1024,
-                                     csa_ratio=8, hca_ratio=16,
-                                     csa_local_window=128)
+                                     csa_ratio=8, hca_ratio=16)
         self.assertEqual(custom, {"ctx_full": 512, "ctx_compress": 1024,
-                                  "csa_ratio": 8, "hca_ratio": 16,
-                                  "csa_local_window": 128})
+                                  "csa_ratio": 8, "hca_ratio": 16})
 
     def test_validate_cross_field_rules(self):
         # HCA 是重压缩视图：比例不得低于 CSA
         with self.assertRaises(ValueError):
             validate_ctx_config(csa_ratio=8, hca_ratio=4)
-        # 局部窗不得越过完整区
-        with self.assertRaises(ValueError):
-            validate_ctx_config(ctx_full=64, csa_local_window=128)
         for kw in ({"ctx_full": 0}, {"ctx_full": common.CTX_FULL_MAX + 1},
                    {"csa_ratio": 1},
                    {"hca_ratio": common.CTX_RATIO_MAX + 1},
@@ -515,16 +507,19 @@ class TestContextLength(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="garg_audit_ctx_")
         try:
             cfg = {"ctx_full": 2048, "ctx_compress": 0, "csa_ratio": 4,
-                   "hca_ratio": 32, "csa_local_window": 256}
+                   "hca_ratio": 32}
             with open(os.path.join(tmp, "config.json"), "w") as f:
                 json.dump(cfg, f)
             self.assertEqual(read_ctx_config(tmp), cfg)
+            # 旧配置里的 csa_local_window 直接忽略（2026-10-25 删除该选项）
+            with open(os.path.join(tmp, "config.json"), "w") as f:
+                json.dump({**cfg, "csa_local_window": 256}, f)
+            self.assertEqual(read_ctx_config(tmp), cfg)
             # 坏值 → 告警回退默认（不让模型加载崩）
             with open(os.path.join(tmp, "config.json"), "w") as f:
-                json.dump({"ctx_full": "bad", "csa_local_window": 99999}, f)
+                json.dump({"ctx_full": "bad"}, f)
             got = read_ctx_config(tmp)
             self.assertEqual(got["ctx_full"], spec.CTX_FULL)
-            self.assertEqual(got["csa_local_window"], spec.CSA_LOCAL_WINDOW)
             # 空目录 → 全默认
             self.assertEqual(read_ctx_config(tmp + "_empty"),
                              validate_ctx_config())
@@ -539,7 +534,7 @@ class TestContextLength(unittest.TestCase):
                           os.path.join(tmp, "logs", "auto_train.jsonl"))
             app.mgr.ctx = validate_ctx_config(
                 ctx_full=4096, ctx_compress=8192, csa_ratio=8,
-                hca_ratio=64, csa_local_window=1024)
+                hca_ratio=64)
             note = app.mgr.ctx_note()
             for frag in ("4096", "8192", "CSA 8:1", "HCA 64:1"):
                 self.assertIn(frag, note)
@@ -558,8 +553,7 @@ class TestContextLength(unittest.TestCase):
                 app.api_model_init({"name": "m", "csa_ratio": 8,
                                     "hca_ratio": 4})
             with self.assertRaises(ValueError):
-                app.api_model_init({"name": "m", "ctx_full": 64,
-                                    "csa_local_window": 128})
+                app.api_model_init({"name": "m", "ctx_full": 0})
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

@@ -3,9 +3,11 @@
 # ---------------------------------------------------------------------------
 # 架构（冻结契约见 spec.py）：
 #   encoder-decoder，共享统一 KV 序列流，无 cross attention；
-#   block = KDA → MLA-HCA → KDA → MLA-CSA → KDA → FFN；
-#   fast weight = 全局 KDA 结构 bank（带遗忘门），enc/dec 各调一次；
-#   双层 KV：完整区(1K)｜缓冲区｜压缩区(3K)，CSA 4:1 局部 / HCA 32:1 全局；
+#   block = KDA → KDA → KDA → MLA-CSA → MLA-HCA → FFN → AttnRes；
+#   AttnRes = Kimi Block AttnRes（每个子层前做深度注意力聚合）
+#             + block 末尾零初始化标量门；
+#   fast weight = 一个 KDA 层（同参数化，状态跨调用持久），enc/dec 各调一次；
+#   双层 KV：完整区(1K)｜压缩区(3K)，CSA 4:1 检索视图 / HCA 32:1 全局视图；
 #   时间步为全局原子单位：压缩/滑窗/因果掩码均不拆分时间步。
 #
 # 技术参考：
@@ -15,6 +17,8 @@
 #       S = (I - βkkᵀ)Diag(α)S + βkvᵀ, o = Sᵀq
 #   [3] DeepSeek NSA (arXiv 2502.11089) 可学习 MLP 压缩器（CSA/HCA 形态）
 #   [4] Schmidhuber 1991 (FKI-147-91)   fast weight（外积加性更新）
+#   [5] Kimi Attention Residuals (arXiv 2603.15031)  Block AttnRes：
+#       h_l = Σ_i α_{i→l} v_i，α 由每层伪 query 对 norm(v_i) 做 softmax
 # ===========================================================================
 from __future__ import annotations
 
@@ -247,9 +251,14 @@ class StepCompressor(nn.Module):
             nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
 
     def forward(self, vecs: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """ vecs: [G, ratio, D]（padding 区可为任意值），mask: [G, ratio] bool
-        返回 [G, D]：组内加相对位置嵌入 → mask 加权平均 → MLP + 残差。 """
-        v = vecs + self.pos_emb.unsqueeze(0)
+        """ vecs: [G, L, D]（padding 区可为任意值），mask: [G, L] bool
+        返回 [G, D]：组内加相对位置嵌入 → mask 加权平均 → MLP + 残差。
+
+        2026-10-25：L 允许大于 ratio（压缩分组按「误差最小」可能略超），
+        位置索引 clamp 到 ratio-1——L ≤ ratio 时与旧行为逐位一致。 """
+        L = vecs.shape[1]
+        idx = torch.arange(L, device=vecs.device).clamp_(max=self.ratio - 1)
+        v = vecs + self.pos_emb[idx].unsqueeze(0)
         m = mask.unsqueeze(-1).float()
         pooled = (v * m).sum(1) / m.sum(1).clamp(min=1.0)      # [G, D]
         return self.mlp(pooled) + pooled                        # 残差
@@ -258,11 +267,18 @@ class StepCompressor(nn.Module):
 def group_by_step(step_ids: torch.Tensor, ratio: int
                   ) -> List[Tuple[int, int]]:
     """ 把一段位置按时间步聚成「压缩组」，返回 (start, end) 切片列表。
-    规则：整步合并，组内 token 数达到 ratio 即封组；
-    单步 token 数 ≥ ratio 时步内按 ratio 切多组（步内压缩，允许）；
-    绝不把不同步的 token 与超过 ratio 的组合并。
+
+    规则（2026-10-25 冻结，spec 第 3 节）：
+      - 压缩的原子单位是时间步：同一步的 token 绝不拆到不同组；
+      - 目标值 = ratio：组内 token 数尽量等于 ratio，误差
+        |组内 token 数 − ratio| 最小；凑不出精确值时取误差最小的整步
+        组合（允许略超），平局取不超过 ratio 的一侧；
+      - 单步 token 数 ≥ ratio：步内按 ratio 切块（块仍属同一个时间步，
+        时间步边界不破）。
     2026-10-20：步边界检测改为张量运算 + 单次 tolist()，消除逐 token
-    .item() 的 GPU 同步（CPU 上亦少一次解释器往返）。 """
+    .item() 的 GPU 同步（CPU 上亦少一次解释器往返）。
+    2026-10-25：从「累加到不超过 ratio」改为「误差最小的整步组合」。
+    """
     n = step_ids.numel()
     if n == 0:
         return []
@@ -274,39 +290,43 @@ def group_by_step(step_ids: torch.Tensor, ratio: int
     ends = starts[1:] + [n]                        # 每个时间步的结束下标（开）
     lens = [e - s for s, e in zip(starts, ends)]
     n_steps = len(lens)
-    groups = []
-    i, si = 0, 0                                   # token 指针 / step 指针
-    while i < n:
-        prev_i = i
+
+    groups: List[Tuple[int, int]] = []
+    si = 0
+    while si < n_steps:
         if lens[si] >= ratio:
-            j = ends[si]                           # 单步就够 ratio：步内切分
-            for s in range(i, j, ratio):
-                groups.append((s, min(s + ratio, j)))
-            i = j
+            # 单步就够/超过 ratio：步内切块，块共享同一个 step id
+            for cs in range(starts[si], ends[si], ratio):
+                groups.append((cs, min(cs + ratio, ends[si])))
             si += 1
-        else:
-            # 整步累加到 ratio：能吃下下一步就吃，吃不下就封组。
-            # 封组后 si 必须再进一格——否则下一轮会重复处理已消费的步，
-            # 产出 (x, x) 空组并使 i 停滞（实测：无限循环直到被 OOM kill）
-            count = lens[si]
-            while si + 1 < n_steps and count + lens[si + 1] <= ratio:
-                count += lens[si + 1]
-                si += 1
-            groups.append((i, ends[si]))
-            i = ends[si]
-            si += 1
-        if i <= prev_i:                            # 兜底：绝不静默死循环
-            raise RuntimeError(
-                f"group_by_step 指针未前进（i={i}, si={si}, ratio={ratio}）")
+            continue
+        # 整步累加：先尽量吃到不超过 ratio，再比较「欠一点」与「超一点」
+        k = si
+        total = lens[si]
+        while k + 1 < n_steps:
+            nxt = lens[k + 1]
+            if total + nxt <= ratio:
+                total += nxt
+                k += 1
+                continue
+            # 再吃一步会越过目标：欠侧误差 ≤ 超侧误差就停（平局取欠）
+            if (ratio - total) <= (total + nxt - ratio):
+                break
+            total += nxt
+            k += 1
+            break
+        groups.append((starts[si], ends[k]))
+        si = k + 1
     return groups
 
 
 # ===========================================================================
-# 统一 KV 序列流（双层：完整区｜缓冲区｜CSA/HCA 压缩区）
+# 统一 KV 序列流（两段：完整区｜CSA/HCA 两个压缩视图）
 # ---------------------------------------------------------------------------
-# 存：词向量 [D]、step_id、type_id、来源（enc/dec）。
-# 约束：压缩/丢弃全部以时间步为原子；缓冲区吸收图元/音元就地压缩的长度差；
-# 原始 token json 全量存档（archive），溢出仅丢 KV 视图不丢存档。
+# 存：词向量 [D]、step_id、type_id、来源（enc/dec）、可选原始 token id。
+# 约束：压缩/丢弃全部以时间步为原子；原始 token id 全量存档（archive），
+#       溢出只丢 KV 视图、不丢 id（2026-10-25：超出 KV 上限时「抛掉 KV，
+#       只留 tokenid 原数据」）。
 # ===========================================================================
 @dataclass
 class KVEntry:
@@ -314,17 +334,26 @@ class KVEntry:
     step_id: int
     type_id: int
     source: str                # "enc" | "dec"
+    token_id: Optional[int] = None   # 离散 token 的原始 id（向量类为 None）
+
+
+@dataclass
+class KVArchiveEntry:
+    """ 被滑窗丢弃条目的原始数据（只留 id，不保留 KV 向量）。 """
+    step_id: int
+    type_id: int
+    source: str
+    token_id: Optional[int] = None
 
 
 class SharedKV:
-    """ 统一 KV 序列流。负责：追加、双层视图（完整/CSA/HCA）、
-    时间步原子滑窗、图元 9:1 就地压缩、json 存档。 """
+    """ 统一 KV 序列流。负责：追加、两段视图（完整/CSA/HCA）、
+    时间步原子滑窗、图元 9:1 就地压缩、token id 存档。 """
 
     def __init__(self, csa_compressor: StepCompressor, hca_compressor: StepCompressor,
                  draw_packer: Optional[StepCompressor] = None,
                  ctx_full: int | None = None,
-                 ctx_compress: int | None = None,
-                 csa_local_window: int | None = None):
+                 ctx_compress: int | None = None):
         self.entries: List[KVEntry] = []
         self.csa = csa_compressor
         self.hca = hca_compressor
@@ -333,19 +362,25 @@ class SharedKV:
         self.ctx_full = spec.CTX_FULL if ctx_full is None else int(ctx_full)
         self.ctx_compress = (spec.CTX_COMPRESS if ctx_compress is None
                              else int(ctx_compress))
-        self.csa_local_window = (spec.CSA_LOCAL_WINDOW
-                                 if csa_local_window is None
-                                 else int(csa_local_window))
         self.ctx_total = self.ctx_full + self.ctx_compress
         # 图元 9:1 打包器（CSA 打包摘要语义，但 ratio=9，与 CSA 4:1 不同模块）
         self.draw_packer = draw_packer or StepCompressor(spec.DRAW_KV_COMPRESS)
-        self.archive: List[dict] = []        # 原始数据全量存档（溢出不丢）
+        # 被丢弃条目的原始 token id（2026-10-25：丢 KV 不丢 id）
+        self.archive: List[KVArchiveEntry] = []
         self._pending_draw: List[int] = []   # dec 侧图元 token 计数（9:1 压缩）
 
     # ---- 写入 ----
-    def append(self, vec: torch.Tensor, step_id: int, type_id: int, source: str):
-        for i in range(vec.shape[0]):
-            self.entries.append(KVEntry(vec[i].detach(), step_id, type_id, source))
+    def append(self, vec: torch.Tensor, step_id: int, type_id: int,
+               source: str, token_ids=None):
+        """ vec: [n, D]；token_ids: 可选，长度 n 的离散 id 列表（向量类传 None）。 """
+        n = vec.shape[0]
+        if token_ids is not None and len(token_ids) != n:
+            raise ValueError(
+                f"token_ids 长度 {len(token_ids)} != vec 行数 {n}")
+        for i in range(n):
+            tid = None if token_ids is None else int(token_ids[i])
+            self.entries.append(
+                KVEntry(vec[i].detach(), step_id, type_id, source, tid))
         self._evict()
 
     def mark_primitive_token(self):
@@ -367,7 +402,7 @@ class SharedKV:
             packed = self.draw_packer(vs.unsqueeze(0), m.unsqueeze(0))[0]
             e0 = self.entries[idx[0]]
             self.entries[idx[0]] = KVEntry(packed.detach(), e0.step_id,
-                                           e0.type_id, e0.source)
+                                           e0.type_id, e0.source, None)
             for i in reversed(idx[1:]):
                 del self.entries[i]
             self._pending_draw.clear()
@@ -378,7 +413,10 @@ class SharedKV:
         while len(self.entries) > self.ctx_total:
             sid = self.entries[0].step_id
             while self.entries and self.entries[0].step_id == sid:
-                self.entries.pop(0)          # 整步丢弃
+                e = self.entries.pop(0)          # 整步丢弃
+                # 2026-10-25：丢 KV 不丢原始 token id（spec 第 3 节）
+                self.archive.append(KVArchiveEntry(
+                    e.step_id, e.type_id, e.source, e.token_id))
             evicted = True
         if evicted:
             # 滑窗可能丢掉尚未打包满 9 个的图元 token → 计数作废，防止用
@@ -393,17 +431,20 @@ class SharedKV:
 
     def view(self, kind: str, device=None) -> Tuple[torch.Tensor, torch.Tensor]:
         """ kind ∈ {"full", "csa", "hca"}。
-        full：完整区原样。csa：压缩区 4:1 + 完整区尾部局部窗口。
-        hca：压缩区 32:1 全局 + 完整区。返回 (vecs [1, T, D], step_ids [1, T])。 """
+        full：完整区原样。
+        csa ：压缩区 4:1（检索视图）+ 全部完整区。
+        hca ：压缩区 32:1（全局概括视图）+ 全部完整区。
+        两个压缩视图都读完整区——处理未压缩 KV 时就是标准 MLA 逻辑
+        （2026-10-25 删除局部窗：CSA 的保留区 = 完整 KV 区）。
+        返回 (vecs [1, T, D], step_ids [1, T])。 """
         n = len(self.entries)
-        full_n = min(n, spec.CTX_FULL)
+        full_n = min(n, self.ctx_full)
         full, comp = self.entries[n - full_n:], self.entries[:n - full_n]
         if kind == "full":
             vs, ss = self._stack(full) if full else (None, None)
         elif kind == "csa":
-            out_e = self._compress_entries(comp, self.csa)
-            keep = out_e + full[-min(len(full), self.csa_local_window):]
-            vs, ss = self._stack(keep) if keep else (None, None)
+            out_e = self._compress_entries(comp, self.csa) + full
+            vs, ss = self._stack(out_e) if out_e else (None, None)
         else:  # hca
             out_e = self._compress_entries(comp, self.hca) + full
             vs, ss = self._stack(out_e) if out_e else (None, None)
@@ -425,7 +466,7 @@ class SharedKV:
             g = vs[s:e]
             m = torch.ones(e - s, dtype=torch.bool, device=vs.device)
             pad = ratio - (e - s)
-            if pad:
+            if pad > 0:
                 g = torch.cat([g, g.new_zeros(pad, g.shape[-1])])
                 m = torch.cat([m, m.new_zeros(pad)])
             vec = comp(g.unsqueeze(0), m.unsqueeze(0))[0]
@@ -433,35 +474,30 @@ class SharedKV:
             # 若取首步，组内后续步的 token 会透过掩码泄漏给更早的查询
             # （2026-10-20 审查实测复现，见 tests/test_model.py 泄漏回归）
             out.append(KVEntry(vec.detach(), entries[e - 1].step_id,
-                               entries[e - 1].type_id, entries[e - 1].source))
+                               entries[e - 1].type_id, entries[e - 1].source,
+                               None))
         return out
 
 
 # ===========================================================================
-# [4] fast weight —— 全局型，KDA 结构带遗忘门，enc/dec 共享
+# [4] fast weight —— 全局型，结构 = 一个 KDA 层，enc/dec 共享
 # ---------------------------------------------------------------------------
 # 语义（spec 定案）：enc/dec 各自在第一个 block 之后调用同一个 bank；
 # 先用当前状态读出（当权重层用），用后按 KDA 门控 delta 规则更新；
-# 状态跨调用推进。仅全局型：所有内容都写入。
+# 状态跨调用推进。当前为无差别写入（序列里所有 token 都写）。
+# 2026-10-25：参数化与 KDAAttention 完全一致（含短卷积 / 低秩遗忘门 /
+# 输出门控 / RMSNorm），不再维护一份简化的平行实现。
 # ===========================================================================
 class FastWeightBank(nn.Module):
-    """ 结构与 KDAAttention 相同，区别在于状态 S 跨调用持久（成员变量），
-    且每次调用都执行「读出 → 更新」两步。 """
+    """ 内嵌一个 KDAAttention 作为「层」，区别只在状态 S 跨调用持久。 """
 
     def __init__(self, d_model: int = spec.D_MODEL):
         super().__init__()
-        self.H = spec.FW_N_HEAD
-        self.dk = spec.FW_KEY_DIM
-        self.dv = spec.FW_VALUE_DIM
-        kd, vd = self.H * self.dk, self.H * self.dv
-        self.w_q = nn.Linear(d_model, kd, bias=False)
-        self.w_k = nn.Linear(d_model, kd, bias=False)
-        self.w_v = nn.Linear(d_model, vd, bias=False)
-        self.w_alpha = nn.Linear(d_model, kd, bias=False)
-        self.w_beta = nn.Linear(d_model, self.H, bias=False)
-        self.o_norm = RMSNorm(self.dv)
-        self.w_o = nn.Linear(vd, d_model, bias=False)
-        self._state: Optional[torch.Tensor] = None   # [B?, H, dk, dv]，B=1 持久
+        self.layer = KDAAttention(d_model)
+        self.H = self.layer.H
+        self.dk = self.layer.dk
+        self.dv = self.layer.dv
+        self._state: Optional[torch.Tensor] = None   # [B, H, dk, dv]，B=1 持久
 
     def reset(self):
         self._state = None
@@ -470,26 +506,37 @@ class FastWeightBank(nn.Module):
                 detach_state: bool = True) -> torch.Tensor:
         """ x: [B, T, D]。先读后写（同一序列先以旧状态读出，再逐 token 推进）。
         detach_state=True：样本边界处截断状态梯度（状态ful 训练惯例）。 """
-        B, T, _ = x.shape
-        q = F.normalize(self.w_q(x).view(B, T, self.H, self.dk), p=2, dim=-1)
-        k = F.normalize(self.w_k(x).view(B, T, self.H, self.dk), p=2, dim=-1)
-        v = self.w_v(x).view(B, T, self.H, self.dv)
-        alpha = torch.exp(-F.softplus(self.w_alpha(x).view(B, T, self.H, self.dk)))
-        beta = torch.sigmoid(self.w_beta(x)).unsqueeze(-1)
         state = self._state
-        if state is not None and state.shape[0] != B:
+        if state is not None and state.shape[0] != x.shape[0]:
             state = None                              # batch 变化则重置
         if state is not None and state.device != x.device:
             state = state.to(x.device)                # 设备迁移守卫（.to() 后）
-        out, new_state = kda_recurrence(q, k, v, alpha, beta, state)
+        out, new_state = self.layer(x, state=state)
         if write:
             self._state = new_state.detach() if detach_state else new_state
-        out = self.o_norm(out)                            # [B, T, H, dv]
-        return self.w_o(out.reshape(B, T, self.H * self.dv))
+        return out
 
 
 # ===========================================================================
-# Block = KDA → MLA-HCA → KDA → MLA-CSA → KDA → FFN（+ attnRes）
+# [5] AttnRes —— Kimi/Moonshot Block Attention Residuals
+# ---------------------------------------------------------------------------
+# 论文（arXiv 2603.15031）的块间聚合：
+#   V = [已完成的 block 表示…, 当前 block 的 partial sum]     [N+1, B, T, D]
+#   h = softmax(norm(V) · w)ᵀ V
+# 每个子层前做一次（attention 组与 MLP 组各一套 proj/norm），块内仍用
+# 标准残差累加；block 末尾再加一个零初始化标量门（两种残差互补）。
+# ===========================================================================
+def block_attn_res(blocks: List[torch.Tensor], partial: torch.Tensor,
+                   proj: nn.Linear, norm: "RMSNorm") -> torch.Tensor:
+    """ blocks: N 个 [B, T, D] 已完成 block 表示；partial: [B, T, D]。 """
+    V = torch.stack(list(blocks) + [partial], 0)          # [N+1, B, T, D]
+    K = norm(V)
+    logits = torch.einsum('d,nbtd->nbt', proj.weight.squeeze(0), K)
+    return torch.einsum('nbt,nbtd->btd', logits.softmax(0), V)
+
+
+# ===========================================================================
+# Block = KDA → KDA → KDA → MLA-CSA → MLA-HCA → FFN → AttnRes
 # ---------------------------------------------------------------------------
 # encoder block：KDA 天然因果，靠 forward/backward 两个 KDA 子层 + 双向
 # MLA 保证双向信息流；decoder block：全部因果（步内双向由 MLA mask 负责）。
@@ -500,15 +547,20 @@ class Block(nn.Module):
         self.is_decoder = is_decoder
         # 5 个注意力/递推子层 + 1 个 FFN，顺序见 spec.BLOCK_ORDER
         self.kda1 = KDAAttention()
-        self.mla_hca = MLAAttention(causal=is_decoder)
         self.kda2 = KDAAttention()
-        self.mla_csa = MLAAttention(causal=is_decoder)
         self.kda3 = KDAAttention()
+        self.mla_csa = MLAAttention(causal=is_decoder)
+        self.mla_hca = MLAAttention(causal=is_decoder)
         # GLU-FFN：w1 投影到 2×hidden，chunk 后 silu(a)⊙b，再 w2 降维
         self.ffn_up = nn.Linear(spec.D_MODEL, spec.FFN_HIDDEN * 2, bias=False)
         self.ffn_down = nn.Linear(spec.FFN_HIDDEN, spec.D_MODEL, bias=False)
         self.norms = nn.ModuleList([RMSNorm(spec.D_MODEL) for _ in range(6)])
-        # attnRes：块级注意力残差（moonshot）：块输入经零初始化标量门混回输出
+        # AttnRes：子层级深度注意力（论文 attn / mlp 两套 proj+norm）
+        # + 块末零初始化标量门（两种残差互补，2026-10-25 steve 定）
+        self.attn_res_proj = nn.Linear(spec.D_MODEL, 1, bias=False)
+        self.attn_res_norm = RMSNorm(spec.D_MODEL)
+        self.mlp_res_proj = nn.Linear(spec.D_MODEL, 1, bias=False)
+        self.mlp_res_norm = RMSNorm(spec.D_MODEL)
         self.attn_res_gate = nn.Parameter(torch.zeros(1))
 
     def _ffn(self, x: torch.Tensor) -> torch.Tensor:
@@ -517,26 +569,45 @@ class Block(nn.Module):
 
     def forward(self, x: torch.Tensor, kv_view_hca, kv_view_csa,
                 x_step_ids: Optional[torch.Tensor] = None,
-                ) -> torch.Tensor:
+                blocks: Optional[List[torch.Tensor]] = None,
+                ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """ kv_view_*: (vecs [1, Tk, D], step_ids [1, Tk]) 共享 KV 流视图；
-        encoder 段传 (None, None) 时 MLA 退化为对自身 hidden 的双向注意力。 """
+        encoder 段传 (None, None) 时 MLA 退化为对自身 hidden 的双向注意力。
+        blocks: 已完成的 block 表示（AttnRes 用；含 token embedding）。
+        返回 (block 输出, 更新后的 blocks)。 """
         x0 = x
-        h, _ = self.kda1(self.norms[0](x))
-        x = x + h
-        kv_v, kv_s = kv_view_hca if kv_view_hca[0] is not None else (x, x_step_ids)
-        x = x + self.mla_hca(self.norms[1](x), kv_v, kv_s, x_step_ids)
-        # encoder 的中间 KDA 反向递推：天然因果的 KDA 在 encoder 里靠
-        # 正/反两个方向获得双向信息流（decoder 全因果，不反向）。
-        h, _ = self.kda2(self.norms[2](x), reverse=not self.is_decoder)
-        x = x + h
-        kv_v, kv_s = kv_view_csa if kv_view_csa[0] is not None else (x, x_step_ids)
-        x = x + self.mla_csa(self.norms[3](x), kv_v, kv_s, x_step_ids)
-        h, _ = self.kda3(self.norms[4](x))
-        x = x + h
-        x = x + self._ffn(self.norms[5](x))
+        partial = x
+        blocks = list(blocks) if blocks else [x]
+
+        def _res(cur):
+            if not spec.ATTNRES_ENABLED:
+                return cur
+            return block_attn_res(blocks, cur,
+                                  self.attn_res_proj, self.attn_res_norm)
+
+        h, _ = self.kda1(self.norms[0](_res(partial)))
+        partial = partial + h
+        h, _ = self.kda2(self.norms[1](_res(partial)),
+                         reverse=not self.is_decoder)
+        partial = partial + h
+        h, _ = self.kda3(self.norms[2](_res(partial)))
+        partial = partial + h
+        kv_v, kv_s = (kv_view_csa if kv_view_csa[0] is not None
+                      else (partial, x_step_ids))
+        partial = partial + self.mla_csa(self.norms[3](_res(partial)),
+                                         kv_v, kv_s, x_step_ids)
+        kv_v, kv_s = (kv_view_hca if kv_view_hca[0] is not None
+                      else (partial, x_step_ids))
+        partial = partial + self.mla_hca(self.norms[4](_res(partial)),
+                                         kv_v, kv_s, x_step_ids)
+        ffn_in = (block_attn_res(blocks, partial, self.mlp_res_proj,
+                                 self.mlp_res_norm)
+                  if spec.ATTNRES_ENABLED else partial)
+        partial = partial + self._ffn(self.norms[5](ffn_in))
         if spec.ATTNRES_ENABLED:
-            return x + torch.tanh(self.attn_res_gate) * x0   # attnRes（零初始化门）
-        return x
+            partial = partial + torch.tanh(self.attn_res_gate) * x0
+        blocks.append(partial)
+        return partial, blocks
 
 
 # ===========================================================================
@@ -551,8 +622,7 @@ class Gargantua(nn.Module):
                  ctx_full: int | None = None,
                  ctx_compress: int | None = None,
                  csa_ratio: int | None = None,
-                 hca_ratio: int | None = None,
-                 csa_local_window: int | None = None):
+                 hca_ratio: int | None = None):
         super().__init__()
         D = spec.D_MODEL
         n_enc = n_enc_blocks if n_enc_blocks is not None else spec.N_ENC_BLOCKS
@@ -567,9 +637,6 @@ class Gargantua(nn.Module):
                           else int(csa_ratio))
         self.hca_ratio = (spec.HCA_RATIO if hca_ratio is None
                           else int(hca_ratio))
-        self.csa_local_window = (spec.CSA_LOCAL_WINDOW
-                                 if csa_local_window is None
-                                 else int(csa_local_window))
         # —— 词表 embedding（不绑定；查表类，可放 CPU）——
         self.wte = nn.Embedding(spec.VOCAB_SIZE_PADDED, D)
         self.type_emb = nn.Embedding(spec.NUM_TYPES, D)
@@ -620,19 +687,25 @@ class Gargantua(nn.Module):
 
     # ---- encoder：输入段 → 词向量（双向）----
     def encode(self, x: torch.Tensor, step_ids: torch.Tensor) -> torch.Tensor:
+        blocks = [x]                       # AttnRes：token embedding 也算一块
         for i, blk in enumerate(self.enc_blocks):
-            x = blk(x, (None, None), (None, None), x_step_ids=step_ids)
+            x, blocks = blk(x, (None, None), (None, None),
+                            x_step_ids=step_ids, blocks=blocks)
             if i == 0:   # fast weight：第一个 block 之后调用一次（先用后更新）
                 x = x + self.fast_weight(x)
+                blocks[-1] = x             # 提交块表示与实际流一致
         return self.enc_final_norm(x)
 
     # ---- decoder：读共享 KV，自回归（步间因果 + 步内双向）----
     def decode(self, x: torch.Tensor, step_ids: torch.Tensor,
                kv_hca, kv_csa) -> torch.Tensor:
+        blocks = [x]                       # decoder 栈独立的 block 表示列表
         for i, blk in enumerate(self.dec_blocks):
-            x = blk(x, kv_hca, kv_csa, x_step_ids=step_ids)
+            x, blocks = blk(x, kv_hca, kv_csa, x_step_ids=step_ids,
+                            blocks=blocks)
             if i == 0:   # fast weight：与 encoder 共享同一 bank，状态继续推进
                 x = x + self.fast_weight(x)
+                blocks[-1] = x
         return self.dec_final_norm(x)
 
     def build_views(self, vecs: torch.Tensor, step_ids: torch.Tensor):
@@ -640,15 +713,16 @@ class Gargantua(nn.Module):
         vecs: [1, N, D]，step_ids: [1, N]。
 
         2026-10-20 修复（审查结论）：
-        1. CSA 视图与推理路径 SharedKV.view("csa") 对齐：压缩区（可空）
-           + 完整区尾部 CSA_LOCAL_WINDOW。此前 n ≤ CTX_FULL 时 CSA 直接
-           返回全量 n，而推理同长度只保留尾部 512，train/infer 不一致
-           （实测 n=600 时差异 4.06，已回归测试固定）。
+        1. CSA 视图与推理路径 SharedKV.view("csa") 对齐（此前 n ≤ CTX_FULL
+           时 CSA 直接返回全量 n，而推理同长度只保留尾部 512，train/infer
+           不一致）。
         2. 压缩区按整步截断到 ctx_compress：此前 n > 4096 时压缩区
            无界增长，压缩注意力 O((n-1024)²) 爆炸；现在与 SharedKV
            的滑窗语义一致（超出部分按整步原子丢弃）。
         2026-10-23：容量/比例全部读实例属性（建模时可配），默认即
-        spec 常量，行为与此前逐位一致。
+        spec 常量。
+        2026-10-25：删除 CSA 局部窗——CSA 的保留区就是完整 KV 区，
+        两个视图都 = 压缩段 + 全部完整段。
         """
         n = vecs.shape[1]
         full_n = min(n, self.ctx_full)
@@ -663,16 +737,13 @@ class Gargantua(nn.Module):
                       torch.cat([hca_c[1], full_s], 1))
         else:
             kv_hca = (full, full_s)
-        # CSA：轻压缩区 + 完整区尾部局部窗口
-        tail_n = min(full_n, self.csa_local_window)
-        csa_tail = full[:, full_n - tail_n:]
-        csa_tail_s = full_s[:, full_n - tail_n:]
+        # CSA：轻压缩区 + 完整区（2026-10-25：无局部窗）
         if comp.shape[1] > 0:
             csa_c = self._compress_live(comp, comp_s, self.csa_compressor)
-            kv_csa = (torch.cat([csa_c[0], csa_tail], 1),
-                      torch.cat([csa_c[1], csa_tail_s], 1))
+            kv_csa = (torch.cat([csa_c[0], full], 1),
+                      torch.cat([csa_c[1], full_s], 1))
         else:
-            kv_csa = (csa_tail, csa_tail_s)
+            kv_csa = (full, full_s)
         return kv_hca, kv_csa
 
     def _cap_comp(self, comp: torch.Tensor, comp_s: torch.Tensor):

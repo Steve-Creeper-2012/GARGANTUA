@@ -35,6 +35,8 @@ import queue
 import sys
 import threading
 import time
+import uuid
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -52,15 +54,116 @@ import boot
 boot.bootstrap()
 import spec
 from common import CKPT_NAME, MAX_NEW_TOKENS, build_model
+from tokens import tok32
 from tokens.text_codec import encode as text_encode, decode as text_decode
 from tokens.vocab import set_model_vocab
 
 
+# ===========================================================================
+# 推理侧 token id 存档（2026-10-25，steve：KV 可丢，id 必须落盘）
+# ---------------------------------------------------------------------------
+# 每次推理一个 .tokens 文件（tok-32，每个 token 包成一个 { id } 时间步），
+# prompt 与生成 token 边产边写并 flush——KV 超出上下文上限只丢 KV 向量，
+# 原始 id 已经在磁盘上；进程崩溃 / 空闲退出也不丢。
+# 目录：server 传入 logs/infer_archive（随 log_path 走，测试用临时目录）；
+# CLI 缺省用 <项目根>/logs/infer_archive。
+# 存档失败绝不阻断推理：打印到 stderr 并自动降级为「不存档」。
+# ===========================================================================
+class IdArchive:
+    """一次推理的 token id 存档（.tokens + .json 元数据）。 """
+
+    def __init__(self, model_dir: str = "", root: str | None = None):
+        self.model_dir = model_dir or ""
+        self.root = Path(root) if root else (
+            Path(boot.project_root()) / "logs" / "infer_archive")
+        self.path: Path | None = None
+        self._fh = None
+        self._disabled = False
+        self.n_tokens = 0
+
+    def _ensure(self) -> bool:
+        if self._fh is not None:
+            return True
+        if self._disabled:
+            return False
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            name = (f"{time.strftime('%Y%m%d_%H%M%S')}_"
+                    f"{uuid.uuid4().hex[:8]}.tokens")
+            self.path = self.root / name
+            self._fh = open(self.path, "wb")
+            return True
+        except OSError as e:
+            print(f"[infer] id 存档不可用（不影响推理）: {e}", file=sys.stderr)
+            self._disabled = True
+            return False
+
+    def add(self, ids) -> None:
+        """把一批 token id 以「一 token 一步」写入存档并 flush。 """
+        ids = [int(i) for i in ids]
+        if not ids or not self._ensure():
+            return
+        try:
+            flat = []
+            for i in ids:
+                flat.extend((spec.TS_OPEN_ID, i, spec.TS_CLOSE_ID))
+            self._fh.write(tok32.encode_ids(flat))
+            self._fh.flush()
+            self.n_tokens += len(ids)
+        except OSError as e:
+            print(f"[infer] id 存档写入失败（不影响推理）: {e}", file=sys.stderr)
+            self._disabled = True
+
+    def close(self, n_prompt: int = 0, n_generated: int = 0,
+              ctx_total: int | None = None) -> None:
+        if self._fh is None:
+            return
+        try:
+            self._fh.close()
+        except OSError:
+            pass
+        self._fh = None
+        if self.path is None:
+            return
+        # 元数据：说明这次推理有多少 token、KV 窗口多大、多少条已不在 KV
+        meta = {
+            "model": os.path.basename(os.path.normpath(self.model_dir))
+            if self.model_dir else "",
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "n_prompt_tokens": int(n_prompt),
+            "n_generated_tokens": int(n_generated),
+            "n_tokens": int(self.n_tokens),
+            "ctx_total": None if ctx_total is None else int(ctx_total),
+            "n_evicted": (max(0, self.n_tokens - int(ctx_total))
+                          if ctx_total is not None else 0),
+        }
+        try:
+            side = self.path.with_suffix(".json")
+            side.write_text(json.dumps(meta, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+        except OSError as e:
+            print(f"[infer] 存档元数据写入失败: {e}", file=sys.stderr)
+
+    def rel_path(self) -> str | None:
+        """存档路径（相对项目根；给 API / 日志用）。 """
+        if self.path is None:
+            return None
+        try:
+            return os.path.relpath(self.path, boot.project_root())
+        except ValueError:              # 跨盘（Windows）时退回绝对路径
+            return str(self.path)
+
+
 @torch.no_grad()
 def generate(m, prompt: str, max_new: int = 32,
-             temperature: float = 0.8, top_p: float = 0.95):
+             temperature: float = 0.8, top_p: float = 0.95,
+             archive_dir: str | None = None, model_dir: str | None = None):
     """ 编码 prompt → encoder → KV；decoder 逐步生成并回写共享 KV。
-    返回生成的时间步序列（List[Step]，text codec 可直接 decode）。 """
+
+    返回 (生成的时间步序列, id 存档路径)。时间步序列是 List[Step]，
+    text codec 可直接 decode；存档路径是本次推理的 .tokens 文件
+    （相对项目根），存档不可用时为 None。
+    """
     max_new = int(max_new)
     if not (1 <= max_new <= MAX_NEW_TOKENS):
         raise ValueError(f"max_new 必须在 [1, {MAX_NEW_TOKENS}]: {max_new}")
@@ -74,48 +177,63 @@ def generate(m, prompt: str, max_new: int = 32,
     if not ids:
         raise ValueError("prompt 编码为空")
 
-    # 新生成序列：fast weight 状态从零开始；encode 写入的状态由 decode 继续推进
-    m.fast_weight.reset()
-    x_in = torch.tensor([ids])
-    s_in = torch.arange(len(ids)).unsqueeze(0)
-    emb_in = m.embed_text(x_in, torch.full_like(x_in, spec.TYPE_USER))
-    enc_out = m.encode(emb_in, s_in)
+    # 2026-10-25：prompt 与生成 token 边产边落盘（.tokens），KV 溢出只丢
+    # KV 向量、不丢 id；存档失败自动降级，不影响推理本身。
+    archive = IdArchive(model_dir or "", archive_dir)
+    out_ids: list = []
+    try:
+        archive.add(ids)
 
-    # 共享 KV 初始 = encoder 输出；decoder 每步把当前输入 emb 拼进视图，
-    # decode 后持久化进 KV（与 forward_train 的 KV 流逐位置同构）
-    kv_vecs = enc_out.detach()
-    kv_steps = s_in
-    cur = ids[-1]                            # 用 prompt 尾 token 播种
-    cur_step = len(ids)                      # 即将预测的 token 的时间步
-    out_ids = []
-    for _ in range(max_new):
-        # 输入 token 的 embedding 放在其预测步上（s_dec = cur_step），
-        # 与训练 make_batch 的 s_dec=arange(half, …) 约定一致
-        s_dec = torch.tensor([[cur_step]])
-        dec_in = torch.tensor([[cur]])
-        emb = m.embed_text(dec_in, torch.full_like(dec_in, spec.TYPE_MODEL))
-        kv_hca, kv_csa = m.build_views(
-            torch.cat([kv_vecs, emb], 1),
-            torch.cat([kv_steps, s_dec], 1))
-        dec_out = m.decode(emb, s_dec, kv_hca, kv_csa)
-        logits = m.logits(dec_out)[0, -1].float() / max(temperature, 1e-5)
-        # top-p 核采样
-        probs = F.softmax(logits, dim=-1)
-        sorted_p, sorted_i = torch.sort(probs, descending=True)
-        cum = torch.cumsum(sorted_p, dim=0)
-        keep = cum - sorted_p < top_p
-        sorted_p = sorted_p * keep
-        sorted_p = sorted_p / sorted_p.sum().clamp(min=1e-9)
-        nxt = sorted_i[torch.multinomial(sorted_p, 1)].item()
-        if nxt == spec.STOP_ID:             # 模型输出停止 token → 立即停止
-            break
-        out_ids.append(nxt)
-        # 持久化【当前输入】的 emb（训练 KV 流同构）；下一轮输入即 nxt
-        kv_vecs = torch.cat([kv_vecs, emb.detach()], 1)
-        kv_steps = torch.cat([kv_steps, s_dec], 1)
-        cur, cur_step = nxt, cur_step + 1
-    return [{"token_ids": [i], "type": spec.TYPE_MODEL,
-             "modality": "text", "meta": {}} for i in out_ids]
+        # 新生成序列：fast weight 状态从零开始；encode 写入的状态由 decode 继续推进
+        m.fast_weight.reset()
+        x_in = torch.tensor([ids])
+        s_in = torch.arange(len(ids)).unsqueeze(0)
+        emb_in = m.embed_text(x_in, torch.full_like(x_in, spec.TYPE_USER))
+        enc_out = m.encode(emb_in, s_in)
+
+        # 共享 KV 初始 = encoder 输出；decoder 每步把当前输入 emb 拼进视图，
+        # decode 后持久化进 KV（与 forward_train 的 KV 流逐位置同构）。
+        # 超出上下文上限时 build_views 只按整步丢弃 KV 视图，原始 id 已在
+        # archive 落盘（丢 KV 不丢 id）。
+        kv_vecs = enc_out.detach()
+        kv_steps = s_in
+        cur = ids[-1]                            # 用 prompt 尾 token 播种
+        cur_step = len(ids)                      # 即将预测的 token 的时间步
+        for _ in range(max_new):
+            # 输入 token 的 embedding 放在其预测步上（s_dec = cur_step），
+            # 与训练 make_batch 的 s_dec=arange(half, …) 约定一致
+            s_dec = torch.tensor([[cur_step]])
+            dec_in = torch.tensor([[cur]])
+            emb = m.embed_text(dec_in, torch.full_like(dec_in, spec.TYPE_MODEL))
+            kv_hca, kv_csa = m.build_views(
+                torch.cat([kv_vecs, emb], 1),
+                torch.cat([kv_steps, s_dec], 1))
+            dec_out = m.decode(emb, s_dec, kv_hca, kv_csa)
+            logits = m.logits(dec_out)[0, -1].float() / max(temperature, 1e-5)
+            # top-p 核采样
+            probs = F.softmax(logits, dim=-1)
+            sorted_p, sorted_i = torch.sort(probs, descending=True)
+            cum = torch.cumsum(sorted_p, dim=0)
+            keep = cum - sorted_p < top_p
+            sorted_p = sorted_p * keep
+            sorted_p = sorted_p / sorted_p.sum().clamp(min=1e-9)
+            nxt = sorted_i[torch.multinomial(sorted_p, 1)].item()
+            if nxt == spec.STOP_ID:             # 模型输出停止 token → 立即停止
+                break
+            out_ids.append(nxt)
+            archive.add([nxt])
+            # 持久化【当前输入】的 emb（训练 KV 流同构）；下一轮输入即 nxt
+            kv_vecs = torch.cat([kv_vecs, emb.detach()], 1)
+            kv_steps = torch.cat([kv_steps, s_dec], 1)
+            cur, cur_step = nxt, cur_step + 1
+        out_steps = [{"token_ids": [i], "type": spec.TYPE_MODEL,
+                      "modality": "text", "meta": {}} for i in out_ids]
+        return out_steps, archive.rel_path()
+    finally:
+        archive.close(
+            n_prompt=len(ids), n_generated=len(out_ids),
+            ctx_total=(getattr(m, "ctx_full", spec.CTX_FULL)
+                       + getattr(m, "ctx_compress", spec.CTX_COMPRESS)))
 
 
 def _load_model(model_dir: str):
@@ -159,14 +277,17 @@ def _serve_handle(req: dict, state: dict) -> dict:
             if state["model"] is None or state["dir"] != model_dir:
                 m = _load_model(model_dir)
                 state["model"], state["dir"] = m, model_dir
-            steps = generate(state["model"], req["prompt"],
-                             req.get("max_new", 32),
-                             req.get("temperature", 0.8),
-                             req.get("top_p", 0.95))
+            steps, archive = generate(state["model"], req["prompt"],
+                                      req.get("max_new", 32),
+                                      req.get("temperature", 0.8),
+                                      req.get("top_p", 0.95),
+                                      archive_dir=req.get("archive_dir"),
+                                      model_dir=model_dir)
             return {"id": rid, "ok": True,
                     "result": {"text": text_decode(steps),
                                "token_ids": [s["token_ids"][0]
-                                             for s in steps]}}
+                                             for s in steps],
+                               "archive": archive}}
         if op == "status":
             return {"id": rid, "ok": True,
                     "result": {"loaded": state["dir"]}}
@@ -237,6 +358,8 @@ def main():
                     help="JSON-lines 常驻模式（server 按需拉起）")
     ap.add_argument("--idle-timeout", type=int, default=300,
                     help="serve 模式空闲多少秒后自行退出（默认 300）")
+    ap.add_argument("--archive-dir", default=None,
+                    help="id 存档目录（默认 <项目根>/logs/infer_archive）")
     args = ap.parse_args()
 
     if args.serve:
@@ -245,9 +368,13 @@ def main():
     if not args.model or not args.prompt:
         ap.error("CLI 模式需要 --model 与 --prompt（或用 --serve）")
     m = _load_model(args.model)
-    steps = generate(m, args.prompt, args.max_new_tokens,
-                     args.temperature, args.top_p)
+    steps, archive = generate(m, args.prompt, args.max_new_tokens,
+                              args.temperature, args.top_p,
+                              archive_dir=args.archive_dir,
+                              model_dir=args.model)
     print(text_decode(steps))
+    if archive:
+        print(f"[infer] id 存档: {archive}", file=sys.stderr)
     return 0
 
 

@@ -48,14 +48,13 @@ MAX_BLOCKS = 64
 # ---------------------------------------------------------------------------
 # 语义（spec 第 3 节）：KV 序列流 = 完整区（未压缩，ctx_full 个原始
 # token）｜压缩区（ctx_compress 个原始 token 的容量）。压缩区对外有两个
-# 【同源视图】：CSA（csa_ratio:1 可学习压缩 + 完整区尾部 csa_local_window
-# 局部窗）与 HCA（hca_ratio:1 可学习压缩 + 全局）。两层压缩的是同一段
-# 内容，只是压缩率与注意力范围不同。压缩/滑窗/因果均以时间步为原子。
+# 【同源视图】：CSA（csa_ratio:1 检索视图）与 HCA（hca_ratio:1 全局概括
+# 视图），两者都读【压缩段 + 全部完整段】——处理未压缩 KV 时就是标准
+# MLA 逻辑（2026-10-25 删除 CSA 局部窗）。压缩/滑窗/因果均以时间步为原子。
 CTX_FULL_MAX = 65536             # 完整区容量上限（token）
 CTX_COMPRESS_MAX = 1 << 20       # 压缩区容量上限（原始 token）
 CTX_RATIO_MAX = 256              # 压缩比上限
-CTX_KEYS = ("ctx_full", "ctx_compress", "csa_ratio", "hca_ratio",
-            "csa_local_window")
+CTX_KEYS = ("ctx_full", "ctx_compress", "csa_ratio", "hca_ratio")
 
 
 def _ctx_int(v, name: str) -> int:
@@ -76,11 +75,15 @@ def _ctx_int(v, name: str) -> int:
 
 
 def validate_ctx_config(ctx_full=None, ctx_compress=None, csa_ratio=None,
-                        hca_ratio=None, csa_local_window=None) -> dict:
+                        hca_ratio=None) -> dict:
     """校验并规范化上下文长度配置；None 的项取 spec 默认值。
 
-    返回可直接写进 config.json 的 dict（五个键齐全）。
-    非法值抛 ValueError（HTTP 层映射为 400）。 """
+    返回可直接写进 config.json 的 dict（四个键齐全）。
+    非法值抛 ValueError（HTTP 层映射为 400）。
+
+    2026-10-25：csa_local_window 已删除——CSA 的保留区就是完整 KV 区，
+    不再有独立的局部窗参数。旧 config.json 里的该键被忽略。
+    """
     cf = (spec.CTX_FULL if ctx_full is None
           else _ctx_int(ctx_full, "ctx_full"))
     cc = (spec.CTX_COMPRESS if ctx_compress is None
@@ -89,8 +92,6 @@ def validate_ctx_config(ctx_full=None, ctx_compress=None, csa_ratio=None,
           else _ctx_int(csa_ratio, "csa_ratio"))
     hr = (spec.HCA_RATIO if hca_ratio is None
           else _ctx_int(hca_ratio, "hca_ratio"))
-    cw = (spec.CSA_LOCAL_WINDOW if csa_local_window is None
-          else _ctx_int(csa_local_window, "csa_local_window"))
     if not (1 <= cf <= CTX_FULL_MAX):
         raise ValueError(f"ctx_full 必须在 [1, {CTX_FULL_MAX}]: {cf}")
     if not (0 <= cc <= CTX_COMPRESS_MAX):
@@ -103,16 +104,14 @@ def validate_ctx_config(ctx_full=None, ctx_compress=None, csa_ratio=None,
         # HCA 是「重压缩」视图，压缩比不应低于 CSA，否则两层语义倒挂
         raise ValueError(f"hca_ratio({hr}) 不能小于 csa_ratio({cr})："
                          f"HCA 是重压缩视图")
-    if not (1 <= cw <= cf):
-        raise ValueError(f"csa_local_window 必须在 [1, ctx_full={cf}]: {cw}")
     return {"ctx_full": cf, "ctx_compress": cc, "csa_ratio": cr,
-            "hca_ratio": hr, "csa_local_window": cw}
+            "hca_ratio": hr}
 
 
 def _ctx_from_cfg(cfg: dict) -> dict:
     """从 config.json 读上下文配置：逐字段容错（坏值告警 + 回退默认），
-    与 _block_count 的策略一致；跨字段约束（hca≥csa、window≤full）
-    不满足时两个比例一起回退 spec 默认。 """
+    与 _block_count 的策略一致；跨字段约束（hca≥csa）不满足时两个比例
+    一起回退 spec 默认。旧配置里的 csa_local_window 直接忽略。 """
     def _get(key, default, lo, hi):
         v = cfg.get(key)
         if v is None:
@@ -131,15 +130,12 @@ def _ctx_from_cfg(cfg: dict) -> dict:
     cc = _get("ctx_compress", spec.CTX_COMPRESS, 0, CTX_COMPRESS_MAX)
     cr = _get("csa_ratio", spec.CSA_RATIO, 2, CTX_RATIO_MAX)
     hr = _get("hca_ratio", spec.HCA_RATIO, 2, CTX_RATIO_MAX)
-    cw = _get("csa_local_window", spec.CSA_LOCAL_WINDOW, 1, cf)
-    if hr < cr or cw > cf:
+    if hr < cr:
         _warn(f"config.json 上下文跨字段约束不满足"
-              f"（hca={hr} < csa={cr} 或 window={cw} > full={cf}），"
-              f"压缩比与窗口回退 spec 默认")
+              f"（hca={hr} < csa={cr}），压缩比回退 spec 默认")
         cr, hr = spec.CSA_RATIO, spec.HCA_RATIO
-        cw = min(spec.CSA_LOCAL_WINDOW, cf)
     return {"ctx_full": cf, "ctx_compress": cc, "csa_ratio": cr,
-            "hca_ratio": hr, "csa_local_window": cw}
+            "hca_ratio": hr}
 
 
 def read_ctx_config(model_dir: str) -> dict:
@@ -326,7 +322,7 @@ def validate_steps(steps) -> int:
     return s
 
 
-def make_batch(ids, i: int, block_size: int):
+def make_batch(ids, i: int, block_size: int, step_ids=None):
     """训练窗口切分——train.py 与 auto_train.py 共用的唯一实现。
 
     返回 (x_in, s_in, dec_in, s_dec, y)：
@@ -334,12 +330,30 @@ def make_batch(ids, i: int, block_size: int):
       model 段  = ids[i+half : i+B]      （decoder 预测目标）
       dec_in    = model 段左移一位，首 token 用 user 段尾 token 播种
     调用方保证 len(ids) >= B + 2 且 0 <= i <= len(ids) - B - 2。
+
+    step_ids（2026-10-25）：与 ids 等长的「每 token 时间步编号」，由
+    .tokens 流 unwrap 得到；缺省时退化为每 token 一步（旧行为）。
+    窗口内的步号会重映射成 0..K（不同文件的绝对步号无关），并把
+    decoder 首 token 的步设为「输入段最大步 + 1」——种子必须能看到
+    完整输入段。
     """
     half = block_size // 2
     x_in = torch.tensor([ids[i:i + half]])
-    s_in = torch.arange(half).unsqueeze(0)
     y = torch.tensor([ids[i + half:i + block_size]])
-    dec_in = torch.tensor([[ids[i + half - 1]] + ids[i + half:i + block_size - 1]])
-    s_dec = torch.arange(half, half + half).unsqueeze(0)
+    dec_ids = [ids[i + half - 1]] + ids[i + half:i + block_size - 1]
+    dec_in = torch.tensor([dec_ids])
+    if step_ids is None:
+        s_in = torch.arange(half).unsqueeze(0)
+        s_dec = torch.arange(half, half + half).unsqueeze(0)
+        return x_in, s_in, dec_in, s_dec, y
+    # 窗口内重映射（保序）：rank 只用于本窗口，跨文件不冲突
+    rank = {}
+    for t in range(i, i + block_size):
+        v = step_ids[t]
+        if v not in rank:
+            rank[v] = len(rank)
+    s_in = torch.tensor([[rank[step_ids[i + t]] for t in range(half)]])
+    s_dec = torch.tensor(
+        [[rank[step_ids[i + half - 1 + t]] + 1 for t in range(half)]])
     return x_in, s_in, dec_in, s_dec, y
 

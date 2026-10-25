@@ -267,8 +267,10 @@
 </style></head><body><div id="statusbar"><span class="title"><svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
     GARGANTUA v1
   </span><span class="pill" id="sb-model">模型: —</span><span class="pill" id="sb-params">参数量: —</span><span class="pill" id="sb-train">训练: 空闲</span><span class="pill" id="sb-queue">队列: 0</span><span class="pill" id="sb-kv" title="">KV</span></div><div id="app"><nav id="sidebar"><div class="top"><span class="logo-text">控制台</span><button id="toggle-nav" title="折叠/展开"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button></div><div id="nav"></div></nav><main id="main"><div id="pages"><section class="page scroll active" id="p-home"><h2>主页</h2><div class="metric-grid"><div class="metric"><div class="k">活动模型</div><div class="v" id="home-model">—</div></div><div class="metric"><div class="k">参数量</div><div class="v" id="home-params">—</div></div><div class="metric"><div class="k">训练状态</div><div class="v" id="home-train">空闲</div></div><div class="metric"><div class="k">队列长度</div><div class="v" id="home-queue">0</div></div></div><div class="card"><div class="card-head"><span class="card-title">环境与依赖</span><span class="hint" id="home-env-note"></span><button class="act sec xs" id="home-opt-install"
-                    style="display:none" title="cv2 / soundfile 是可选加速项，缺失不影响主流程">安装可选依赖</button></div><div class="env-grid"><div class="env-cell"><div class="k">PyTorch</div><div class="v" id="home-torch2">—</div></div><div class="env-cell"><div class="k">设备</div><div class="v" id="home-device2">—</div></div></div><div class="dep-list" id="home-deps">加载中…</div><div class="hint" id="home-opt-msg" style="margin-top:8px"></div></div><div class="card"><div class="card-head"><span class="card-title">KV 架构</span></div><div class="hint" id="home-kv" style="line-height:1.7">加载中…</div></div></section><section class="page scroll" id="p-models"><h2>模型</h2><div class="card"><div class="card-head"><span class="card-title">创建新模型</span></div><div class="row"><input type="text" id="model-name" placeholder="模型目录名，如 beta" style="max-width:260px"><label title="默认 4">enc blocks <input type="number" id="model-enc" value="4" min="1" max="64"></label><label title="默认 6">dec blocks <input type="number" id="model-dec" value="6" min="1" max="64"></label><label title="完整 KV 区容量（原始 token），默认 1024">完整上下文 <input type="number" id="model-ctx-full" value="1024" min="1" max="65536" style="width:92px"></label><label title="压缩区容量（原始 token 计），默认 3072；填 0 表示不压缩">压缩上下文 <input type="number" id="model-ctx-compress" value="3072" min="0" max="1048576" style="width:92px"></label><label title="CSA 轻压缩比 N:1 + 完整区尾部局部窗，默认 4">CSA 比 <input type="number" id="model-csa-ratio" value="4" min="2" max="256" style="width:64px"></label><label title="HCA 重压缩比 N:1 + 全局注意力，默认 32（须 ≥ CSA 比）">HCA 比 <input type="number" id="model-hca-ratio" value="32" min="2" max="256" style="width:64px"></label><label title="CSA 在完整区尾部保留的局部窗（token），默认 512，≤ 完整上下文">CSA 窗 <input type="number" id="model-csa-window" value="512" min="1" style="width:72px"></label><label title="词表预设：每个模型的 vocab.txt 从该预设派生（独立副本），默认 base">词表预设 <select id="model-vocab"></select></label><label title="模型精度：fp64/32/16/bf16 走 torch 原生；fp8/fp4/int16/int8/int4/int2 在 CPU 上以 fp32 容器+权重量化模拟（有损耗）">精度
-              <select id="model-dtype"><option value="fp32" selected>fp32</option><option value="fp64">fp64</option><option value="fp16">fp16</option><option value="bf16">bf16</option><option value="fp8">fp8</option><option value="fp4">fp4</option><option value="int16">int16</option><option value="int8">int8</option><option value="int4">int4</option><option value="int2">int2</option></select></label><button class="act" id="model-create">创建并初始化</button><span class="hint" id="model-create-msg"></span></div><div class="hint">总上下文 = 完整 + 压缩（默认 1024+3072=4096 token）。CSA 与 HCA 是同一段压缩区内容的两个视图：CSA 轻压缩 + 局部滑窗，HCA 重压缩 + 全局。压缩、滑窗驱逐与因果掩码均以时间步为原子，绝不跨步。上下文长度随 config.json 固化，加载时按同一份配置重建。</div></div><div class="card"><div class="card-head"><span class="card-title">已有模型</span><button class="act sec xs" id="model-refresh">刷新</button></div><table><thead><tr><th>名称</th><th>参数量</th><th>操作</th></tr></thead><tbody id="model-tbody"></tbody></table></div></section><section class="page scroll" id="p-vocab"><h2>词表</h2><div class="card"><div class="card-head"><span class="card-title">ID 区间占用（自动归类）</span><span class="hint" id="vocab-bar-note"></span></div><canvas class="chart" id="vocab-bar" width="1200" height="44"></canvas><table id="vocab-regions"><thead><tr><th>子区</th><th>大类</th><th>ID 区间</th><th>容量</th><th>已用</th><th>占用率</th></tr></thead><tbody></tbody></table></div><div class="card"><div class="card-head"><span class="card-title">词表预设（每个从基础词表 fork，独立隔离、可增删）</span></div><div class="row"><input type="text" id="vocab-new-name" placeholder="新预设名（字母/数字/_-）" style="max-width:240px"><label>源预设 <select id="vocab-new-source"></select></label><button class="act" id="vocab-create-preset">创建预设</button><span class="hint" id="vocab-create-msg"></span></div><table id="vocab-presets"><thead><tr><th>名称</th><th>已用/容量</th><th>操作</th></tr></thead><tbody></tbody></table></div><div class="card"><div class="card-head"><span class="card-title">预设内增删 token（软删保留 ID 位置）</span></div><div class="row"><label>预设 <select id="vocab-token-preset"></select></label><input class="grow" id="vocab-add-token" type="text" autocomplete="off" placeholder="新增 token 文本"><select id="vocab-add-cat" title="四类任选"><option value="regular">regular 常规可见</option><option value="fallback">fallback 可见</option><option value="special">special 特殊</option><option value="system">system 系统</option></select><button class="act" id="vocab-add">添加</button><input class="grow" id="vocab-remove-token" type="text" autocomplete="off" placeholder="删除 token 文本"><button class="act sec" id="vocab-remove">删除</button><span class="hint" id="vocab-token-msg"></span></div></div></section><section class="page" id="p-train"><h2>训练</h2><div class="train-top"><div class="card"><div class="card-head"><span class="card-title">创建训练任务</span></div><div class="hint">上传训练数据 JSON 文件：单个对象 {"text":"..."}、对象数组，或 JSONL 每行一个对象，均必须含 text 字段</div><div class="row"><label class="file-pick" for="train-file"><input type="file" id="train-file" accept=".json,.jsonl"><span class="file-btn">选择文件</span><span class="file-name" id="train-file-name">未选择</span></label></div><div class="row"><label>优化器（Muon：隐藏层矩阵；AdamW：embedding/输出头/RMSNorm）
+                    style="display:none" title="cv2 / soundfile 是可选加速项，缺失不影响主流程">安装可选依赖</button></div><div class="env-grid"><div class="env-cell"><div class="k">PyTorch</div><div class="v" id="home-torch2">—</div></div><div class="env-cell"><div class="k">设备</div><div class="v" id="home-device2">—</div></div></div><div class="dep-list" id="home-deps">加载中…</div><div class="hint" id="home-opt-msg" style="margin-top:8px"></div></div><div class="card"><div class="card-head"><span class="card-title">KV 架构</span></div><div class="hint" id="home-kv" style="line-height:1.7">加载中…</div></div></section><section class="page scroll" id="p-models"><h2>模型</h2><div class="card"><div class="card-head"><span class="card-title">创建新模型</span></div><div class="row"><input type="text" id="model-name" placeholder="模型目录名，如 beta" style="max-width:260px"><label title="默认 4">enc blocks <input type="number" id="model-enc" value="4" min="1" max="64"></label><label title="默认 6">dec blocks <input type="number" id="model-dec" value="6" min="1" max="64"></label><label title="完整 KV 区容量（原始 token），默认 1024">完整上下文 <input type="number" id="model-ctx-full" value="1024" min="1" max="65536" style="width:92px"></label><label title="压缩区容量（原始 token 计），默认 3072；填 0 表示不压缩">压缩上下文 <input type="number" id="model-ctx-compress" value="3072" min="0" max="1048576" style="width:92px"></label><label title="CSA 检索视图的压缩比 N:1，默认 4（与 HCA 同读完整区）">CSA 比 <input type="number" id="model-csa-ratio" value="4" min="2" max="256" style="width:64px"></label><label title="HCA 全局概括视图的压缩比 N:1，默认 32（须 ≥ CSA 比）">HCA 比 <input type="number" id="model-hca-ratio" value="32" min="2" max="256" style="width:64px"></label><label title="词表预设：每个模型的 vocab.txt 从该预设派生（独立副本），默认 base">词表预设 <select id="model-vocab"></select></label><label title="模型精度：fp64/32/16/bf16 走 torch 原生；fp8/fp4/int16/int8/int4/int2 在 CPU 上以 fp32 容器+权重量化模拟（有损耗）">精度
+              <select id="model-dtype"><option value="fp32" selected>fp32</option><option value="fp64">fp64</option><option value="fp16">fp16</option><option value="bf16">bf16</option><option value="fp8">fp8</option><option value="fp4">fp4</option><option value="int16">int16</option><option value="int8">int8</option><option value="int4">int4</option><option value="int2">int2</option></select></label><button class="act" id="model-create">创建并初始化</button><span class="hint" id="model-create-msg"></span></div><div class="hint">总上下文 = 完整 + 压缩（默认 1024+3072=4096 token）。KV 分两段：完整段不压缩；压缩段是同一段内容的两份压法——CSA 检索视图（4:1）与 HCA 全局概括视图（32:1），两者都读【压缩段 + 全部完整段】（处理未压缩 KV 时就是标准 MLA）。压缩分组以时间步为原子：组内 token 数尽量等于压缩比，凑不齐取误差最小的整步组合，绝不跨步拆分。上下文长度随 config.json 固化，加载时按同一份配置重建。</div></div><div class="card"><div class="card-head"><span class="card-title">已有模型</span><button class="act sec xs" id="model-refresh">刷新</button></div><table><thead><tr><th>名称</th><th>参数量</th><th>操作</th></tr></thead><tbody id="model-tbody"></tbody></table></div></section><section class="page scroll" id="p-vocab"><h2>词表</h2><div class="card"><div class="card-head"><span class="card-title">ID 区间占用（自动归类）</span><span class="hint" id="vocab-bar-note"></span></div><canvas class="chart" id="vocab-bar" width="1200" height="44"></canvas><table id="vocab-regions"><thead><tr><th>子区</th><th>大类</th><th>ID 区间</th><th>容量</th><th>已用</th><th>占用率</th></tr></thead><tbody></tbody></table></div><div class="card"><div class="card-head"><span class="card-title">全局词表：查询 / 添加 token</span></div><div class="row"><input class="grow" id="vocab-q" type="search" autocomplete="off"
+                   placeholder="搜索词表 token（如 hello / 你 / cx / shape）"><button class="act sec" id="vocab-search">搜索</button><span class="hint" id="vocab-msg"></span></div><div class="hint" id="vocab-hits"></div><div class="row"><input class="grow" id="vocab-add-token" type="text" autocomplete="off"
+                   placeholder="新 token 文本（如 𠀀 / <mood> / { ）"><select id="vocab-add-cat" title="四类：regular 常规可见 / fallback 可见 / special 特殊 / system 系统"><option value="regular">regular 常规可见</option><option value="fallback">fallback 可见</option><option value="special">special 特殊</option><option value="system">system 系统</option></select><button class="act" id="vocab-add">添加 token</button><span class="hint" id="vocab-add-msg"></span></div><div class="hint">添加前全局查重（同文本已存在即拒绝）；新 token 占用该类预留槽位，写入词表文件，模型维度不变。</div></div><div class="card"><div class="card-head"><span class="card-title">词表预设（每个从基础词表 fork，独立隔离、可增删）</span></div><div class="row"><input type="text" id="vocab-new-name" placeholder="新预设名（字母/数字/_-）" style="max-width:240px"><label>源预设 <select id="vocab-new-source"></select></label><button class="act" id="vocab-create-preset">创建预设</button><span class="hint" id="vocab-create-msg"></span></div><table id="vocab-presets"><thead><tr><th>名称</th><th>已用/容量</th><th>操作</th></tr></thead><tbody></tbody></table></div><div class="card"><div class="card-head"><span class="card-title">预设内增删 token（软删保留 ID 位置）</span></div><div class="row"><label>预设 <select id="vocab-token-preset"></select></label><input class="grow" id="preset-add-token" type="text" autocomplete="off" placeholder="新增 token 文本"><select id="preset-add-cat" title="四类任选"><option value="regular">regular 常规可见</option><option value="fallback">fallback 可见</option><option value="special">special 特殊</option><option value="system">system 系统</option></select><button class="act" id="preset-add">添加</button><input class="grow" id="preset-remove-token" type="text" autocomplete="off" placeholder="删除 token 文本"><button class="act sec" id="preset-remove">删除</button><span class="hint" id="preset-token-msg"></span></div></div></section><section class="page" id="p-train"><h2>训练</h2><div class="train-top"><div class="card"><div class="card-head"><span class="card-title">创建训练任务</span></div><div class="hint">上传 .tokens 训练数据（tok-32 二进制，必须带 { } | 时间步结构；Token 编辑器可直接导出）。一次上传 = 一条 token 流</div><div class="row"><label class="file-pick" for="train-file"><input type="file" id="train-file" accept=".tokens"><span class="file-btn">选择文件</span><span class="file-name" id="train-file-name">未选择</span></label></div><div class="row"><label>优化器（Muon：隐藏层矩阵；AdamW：embedding/输出头/RMSNorm）
                 <select id="train-mode"><option value="muon" selected>muon + adamw（分工）</option><option value="adamw">全部 adamw</option></select></label><label>目标模型 <select id="train-target"><option value="">当前活动模型</option></select></label></div><div class="row"><label title="每次训练从文本中随机截取的连续 token 窗口长度">上下文窗口 block_size
                 <input type="number" id="train-block" value="16" min="4" step="2"></label><label>steps/文件 <input type="number" id="train-steps" value="20" min="1"></label><button class="act" id="train-enqueue">提交训练任务</button><span class="hint" id="train-enqueue-msg"></span></div></div><div class="card"><div class="card-head"><span class="card-title">训练队列</span><button class="act sec xs" id="queue-refresh">刷新</button></div><div id="train-queue"><span class="hint">加载中…</span></div></div></div><div class="train-bottom"><div class="card" id="train-log-card"><div class="card-head"><span class="card-title">训练日志</span><span><button class="act xs" id="train-start">开始训练</button><button class="act danger xs" id="train-stop">停止</button><span class="hint" id="train-state" style="margin-left:8px;"></span></span></div><pre id="train-log">—</pre></div><div class="card" id="train-loss-card"><div class="card-head"><span class="card-title">Loss 曲线</span><span class="hint">每步 = 单个样本随机窗口的独立 loss；悬停查看数值，点与点之间无平均，波动为样本难度差异，非回升</span></div><canvas class="chart" id="loss-canvas" width="1200" height="240"></canvas></div></div></section><section class="page" id="p-infer"><div id="infer-wrap"><div id="infer-main"><div id="chat-history"><div id="chat-empty"><div class="big">GARGANTUA</div><div>尽管问（当前版本推理仅支持文本 prompt）</div></div></div><div id="input-dock"><div id="input-box"><div id="attach-preview"></div><textarea id="infer-prompt" rows="2" placeholder="输入消息…"></textarea><div id="input-tools"><label class="act sec xs" style="cursor:pointer;margin:0;" title="媒体输入尚未接入生成路径（当前仅文本）">＋ 附件
                     <input type="file" id="infer-media" accept="image/*,video/*,.wav,.mp3,.flac,.ogg" style="display:none"></label><label title="最多生成多少个新 token">max_new
@@ -276,9 +278,7 @@
             <select id="text-bound"><option value="user">用户输入 &lt;user&gt;</option><option value="model" selected>模型输出 &lt;model&gt;</option></select></label><button class="act" id="text-encode">编码</button><span class="hint">输出为项目定制 token 时间步格式：{}=一个时间步，{}内 token 以 | 分隔，裸字符/数字不带符号</span></div><div class="codec-io"><textarea id="text-in" placeholder="粘贴文本…">Hello, 世界！</textarea><pre id="text-out">—</pre></div></section><section class="page" id="p-audio"><h2>音频 → token 转换</h2><div class="hint">支持 wav / mp3 / flac / ogg（ffmpeg 解码后重采样到 16kHz 单声道）；533 个采样点平铺为一条向量 = 1 个音元（≈30 tok/s），每个音元是一个时间步；音频 token 是投影向量（无离散 ID），存档用 .tokenvector 格式</div><div class="row"><label>谁的输入/输出
             <select id="audio-bound"><option value="user" selected>用户输入 &lt;user&gt;</option><option value="model">模型输出 &lt;model&gt;</option></select></label><label class="file-pick" for="audio-file"><input type="file" id="audio-file" accept=".wav,.mp3,.flac,.ogg,audio/*"><span class="file-btn">选择文件</span><span class="file-name" id="audio-file-name">未选择</span></label><button class="act" id="audio-encode">编码</button></div><div id="audio-preview" class="row"></div><pre id="audio-out" style="flex:1;">—</pre></section><section class="page" id="p-image"><h2>图片 → token 转换（单帧）</h2><div class="hint">图片拆 32×32 patches，patch 内部平铺成一条向量，embedding 时乘矩阵投影，所有 patch 放在同一个时间步内；视觉 token 是投影向量（无离散 ID），存档用 .tokenvector 格式</div><div class="row"><label>谁的输入/输出
             <select id="image-bound"><option value="user" selected>用户输入 &lt;user&gt;</option><option value="model">模型输出 &lt;model&gt;</option></select></label><label class="file-pick" for="image-file"><input type="file" id="image-file" accept="image/*"><span class="file-btn">选择文件</span><span class="file-name" id="image-file-name">未选择</span></label><button class="act" id="image-encode">编码</button></div><div class="codec-io" style="margin-top:10px;"><div><img id="image-preview" style="max-width:100%;max-height:320px;border-radius:6px;border:1px solid var(--border);" alt=""></div><pre id="image-out">—</pre></div></section><section class="page" id="p-video"><h2>视频 → token 转换（含声音）</h2><div class="hint">导入视频（mp4/mov/webm/mkv/gif，ffmpeg 抽帧 30fps、提取音轨）；每帧 = 一个时间步，该 {} 内平铺该帧全部 patch token 与该帧音频 token（全部投影到同一个 d_model）</div><div class="row"><label>谁的输入/输出
-            <select id="video-bound"><option value="user" selected>用户输入 &lt;user&gt;</option><option value="model">模型输出 &lt;model&gt;</option></select></label><label class="file-pick" for="video-file"><input type="file" id="video-file" accept="video/*,.gif,.webp"><span class="file-btn">选择文件</span><span class="file-name" id="video-file-name">未选择</span></label><button class="act" id="video-encode">编码</button></div><div class="row"><video id="video-preview" controls style="max-height:180px;border-radius:6px;display:none;"></video></div><div id="video-stats" class="hint"></div><pre id="video-out" style="flex:1;">—</pre></section><section class="page" id="p-prims"><h2>图像 → 图元转换（可视化）</h2><div class="hint">上传图片，转换为图元序列并渲染。优先调用 vendored 的 Rust/wgpu GPU 转换器（service/prims/fast_shape_render，照搬 wonderfulearth/primitive-operation-painter，用 sh service/prims/setup.sh 构建）；未构建时回退 CPU 贪心拟合。token 布局照搬仓库 geometrize_256_v1：每图元 9 token（cx,cy,theta,w,h,shape,r,g,b），画布 256×256。</div><div class="row"><label class="file-pick" for="prims-file"><input type="file" id="prims-file" accept="image/*"><span class="file-btn">选择文件</span><span class="file-name" id="prims-file-name">未选择</span></label><label class="hint" for="prims-steps">步数上限</label><input type="number" id="prims-steps" value="100" min="1" max="1000" step="1" title="默认 100，服务端上限 1000；越大质量越高，耗时线性增长"><label class="hint" for="prims-quality">模式</label><select id="prims-quality" title="fast=快，20候选/步；slow=慢，50候选/步+短爬山"><option value="fast">fast</option><option value="slow">slow</option></select><button class="act" id="prims-convert">转换</button><span class="hint" id="prims-msg"></span></div><div class="codec-io" style="margin-top:10px;"><div><div class="hint">原图</div><img id="prims-src" style="max-width:100%;max-height:320px;border-radius:6px;border:1px solid var(--border);" alt=""></div><div><div class="hint">图元渲染（SVG）</div><div id="prims-render" class="svg-out"></div></div></div><pre id="prims-out" style="flex-shrink:0;max-height:200px;">—</pre></section><section class="page" id="p-json"><h2>Token 编辑器</h2><div class="hint">GARGANTUA token stream（.gts）：{} 为时间步原子，{} 内多 token 以 | 分隔；&lt;...&gt; 为特殊 token，裸字符为可见 token。特殊 token（&lt;user&gt;/&lt;model&gt; 等）各自独占一个时间步。同时间步多 token 用于图像/视频帧。</div><div class="row"><button class="act" id="json-format">格式化</button><button class="act sec" id="json-minify">压缩</button><button class="act sec" id="json-copy">复制</button><span class="hint" id="json-msg"></span></div><div class="token-palette" id="json-palette"></div><div class="row"><input class="grow" id="vocab-q" type="search" autocomplete="off"
-                 placeholder="搜索词表 token（如 hello / 你 / cx / shape）"><button class="act sec" id="vocab-search">搜索</button><span class="hint" id="vocab-msg"></span></div><div class="hint" id="vocab-hits"></div><div class="row"><input class="grow" id="vocab-add-token" type="text" autocomplete="off"
-                 placeholder="新 token 文本（如 𠀀 / <mood> / { ）"><select id="vocab-add-cat" title="四类：regular 常规可见 / fallback 可见 / special 特殊 / system 系统"><option value="regular">regular 常规可见</option><option value="fallback">fallback 可见</option><option value="special">special 特殊</option><option value="system">system 系统</option></select><button class="act" id="vocab-add">添加 token</button><span class="hint" id="vocab-add-msg"></span></div><div class="hint">添加前全局查重（同文本已存在即拒绝）；新 token 占用该类预留槽位，写入 vocab.json，模型维度不变。</div><div id="json-editor" contenteditable="true" spellcheck="false">{<user>}{h}{e}{l}{l}{o}{<user/>}</div></section></div></main></div><script>
+            <select id="video-bound"><option value="user" selected>用户输入 &lt;user&gt;</option><option value="model">模型输出 &lt;model&gt;</option></select></label><label class="file-pick" for="video-file"><input type="file" id="video-file" accept="video/*,.gif,.webp"><span class="file-btn">选择文件</span><span class="file-name" id="video-file-name">未选择</span></label><button class="act" id="video-encode">编码</button></div><div class="row"><video id="video-preview" controls style="max-height:180px;border-radius:6px;display:none;"></video></div><div id="video-stats" class="hint"></div><pre id="video-out" style="flex:1;">—</pre></section><section class="page" id="p-prims"><h2>图像 → 图元转换（可视化）</h2><div class="hint">上传图片，转换为图元序列并渲染。优先调用 vendored 的 Rust/wgpu GPU 转换器（service/prims/fast_shape_render，照搬 wonderfulearth/primitive-operation-painter，用 sh service/prims/setup.sh 构建）；未构建时回退 CPU 贪心拟合。token 布局照搬仓库 geometrize_256_v1：每图元 9 token（cx,cy,theta,w,h,shape,r,g,b），画布 256×256。</div><div class="row"><label class="file-pick" for="prims-file"><input type="file" id="prims-file" accept="image/*"><span class="file-btn">选择文件</span><span class="file-name" id="prims-file-name">未选择</span></label><label class="hint" for="prims-steps">步数上限</label><input type="number" id="prims-steps" value="100" min="1" max="1000" step="1" title="默认 100，服务端上限 1000；越大质量越高，耗时线性增长"><label class="hint" for="prims-quality">模式</label><select id="prims-quality" title="fast=快，20候选/步；slow=慢，50候选/步+短爬山"><option value="fast">fast</option><option value="slow">slow</option></select><button class="act" id="prims-convert">转换</button><span class="hint" id="prims-msg"></span></div><div class="codec-io" style="margin-top:10px;"><div><div class="hint">原图</div><img id="prims-src" style="max-width:100%;max-height:320px;border-radius:6px;border:1px solid var(--border);" alt=""></div><div><div class="hint">图元渲染（SVG）</div><div id="prims-render" class="svg-out"></div></div></div><pre id="prims-out" style="flex-shrink:0;max-height:200px;">—</pre></section><section class="page" id="p-json"><h2>Token 编辑器</h2><div class="hint">GARGANTUA token stream（.gts）：{} 为时间步原子，{} 内多 token 以 | 分隔；&lt;...&gt; 为特殊 token，裸字符为可见 token。特殊 token（&lt;user&gt;/&lt;model&gt; 等）各自独占一个时间步。同时间步多 token 用于图像/视频帧。词表查询与增删统一在「词表」页。</div><div class="row"><button class="act" id="json-format">格式化</button><button class="act sec" id="json-minify">压缩</button><button class="act sec" id="json-copy">复制</button><button class="act" id="json-export">导出 .tokens</button><span class="hint" id="json-msg"></span></div><div class="token-palette" id="json-palette"></div><div id="json-editor" contenteditable="true" spellcheck="false">{<user>}{h}{e}{l}{l}{o}{<user/>}</div></section></div></main></div><script>
 const $ = id => document.getElementById(id);
 const $$ = (sel, el=document) => el.querySelectorAll(sel);
 
@@ -619,7 +619,6 @@ async function createModel(name, overwrite) {
     ctx_compress: intOrUndef($("model-ctx-compress").value),
     csa_ratio: intOrUndef($("model-csa-ratio").value),
     hca_ratio: intOrUndef($("model-hca-ratio").value),
-    csa_local_window: intOrUndef($("model-csa-window").value),
     vocab: $("model-vocab").value || "base",
     dtype: $("model-dtype").value || "fp32",
   });
@@ -648,13 +647,14 @@ $("model-refresh").onclick = refreshModels;
 $("train-enqueue").onclick = async () => {
   const file = $("train-file").files[0];
   const msg = $("train-enqueue-msg");
-  if (!file) { msg.textContent = "请先选择 JSON / JSONL 训练数据文件"; return; }
+  if (!file) { msg.textContent = "请先选择 .tokens 训练数据文件"; return; }
   try {
     const r = await api("/api/train/enqueue", {
-      json_b64: await fileToB64(file), filename: file.name,
+      tokens_b64: await fileToB64(file),
       optimizer: $("train-mode").value,
     });
-    msg.textContent = `已入队 ${r.queued.length} 个训练任务（共 ${r.n_samples} 条样本）`;
+    msg.textContent = `已入队 ${r.queued[0]}（${r.n_tokens} tokens / ` +
+      `${r.n_steps} 时间步）`;
     $("train-file").value = "";
     refreshQueue(); refreshStatus();
   } catch (e) { msg.textContent = "错误: " + e.message; }
@@ -810,7 +810,9 @@ $("send-btn").onclick = async () => {
       const t = await api("/api/task/" + task_id);
       if (t.status === "done") {
         addMsg("model", esc(t.result.text || "（无文本输出）"));
-        st.textContent = "";
+        // 本次推理的 token id 存档（.tokens，悬停看路径）
+        st.textContent = t.result.archive ? "已存档 id" : "";
+        st.title = t.result.archive || "";
         $("attach-preview").style.display = "none";
         $("attach-preview").innerHTML = "";
         $("infer-media").value = "";
@@ -936,18 +938,36 @@ function insertAtCursor(text, back) {
   }
 }
 $("json-format").onclick = () => {
-  // 每个 {} 时间步独占一行
-  const t = $("json-editor").innerText.replace(/\s+/g, "");
+  // 每个 {} 时间步独占一行；只清排版空白（\n\r\t），空格是合法 token 要保留
+  const t = $("json-editor").innerText.replace(/[\n\r\t]+/g, "");
   $("json-editor").textContent = t.replace(/\}\{/g, "}\n{");
   $("json-msg").textContent = "";
 };
 $("json-minify").onclick = () => {
-  $("json-editor").textContent = $("json-editor").innerText.replace(/\s+/g, "");
+  $("json-editor").textContent =
+    $("json-editor").innerText.replace(/[\n\r\t]+/g, "");
   $("json-msg").textContent = "";
 };
 $("json-copy").onclick = () => {
   navigator.clipboard.writeText($("json-editor").innerText)
     .then(() => $("json-msg").textContent = "已复制");
+};
+$("json-export").onclick = async () => {
+  const msg = $("json-msg");
+  msg.textContent = "导出中…";
+  try {
+    const r = await api("/api/tokens/export",
+                        {text: $("json-editor").innerText});
+    const bytes = b64ToBytes(r.tokens_b64);
+    const blob = new Blob([bytes], {type: "application/octet-stream"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `stream_${r.n_tokens}tok.tokens`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+    msg.textContent = `已导出 ${r.n_tokens} tokens / ${r.n_steps} 时间步`;
+  } catch (e) { msg.textContent = "错误: " + e.message; }
 };
 
 /* ---------- 词表搜索（/api/vocab，GET ?q=） ---------- */
@@ -978,9 +998,10 @@ $("vocab-add").onclick = async () => {
   msg.textContent = "添加中…";
   try {
     const r = await api("/api/vocab/add", {token, category});
+    const fs = Object.entries(r.free_slots || {})
+      .map(([k, v]) => `${k}=${v}`).join(" ");
     msg.textContent = `已添加 ${r.token} → #${r.id}（${r.category}）；` +
-      `剩余槽位 regular=${r.free_slots.regular} fallback=${r.free_slots.fallback} ` +
-      `special=${r.free_slots.special} system=${r.free_slots.system}`;
+      (fs ? `剩余槽位 ${fs}` : "已写入词表");
     $("vocab-add-token").value = "";
     vocabSearch();
   } catch (e) { msg.textContent = "错误: " + e.message; }
@@ -1072,31 +1093,31 @@ window.deletePreset = async name => {
         refreshVocab(); }
   catch (e) { alert(e.message); }
 };
-$("vocab-add").onclick = async () => {
+$("preset-add").onclick = async () => {
   const name = $("vocab-token-preset").value;
-  const token = $("vocab-add-token").value;
-  if (!token) { $("vocab-token-msg").textContent = "请输入 token"; return; }
-  $("vocab-token-msg").textContent = "添加中…";
+  const token = $("preset-add-token").value;
+  if (!token) { $("preset-token-msg").textContent = "请输入 token"; return; }
+  $("preset-token-msg").textContent = "添加中…";
   try {
     const r = await api("/api/vocab/preset/token",
-      {name, action:"add", token, category: $("vocab-add-cat").value});
-    $("vocab-token-msg").textContent =
+      {name, action:"add", token, category: $("preset-add-cat").value});
+    $("preset-token-msg").textContent =
       `已添加 ${r.token} → #${r.id}（${r.category}）；剩余可见槽 ${r.used}`;
-    $("vocab-add-token").value = "";
+    $("preset-add-token").value = "";
     refreshVocab();
-  } catch (e) { $("vocab-token-msg").textContent = "错误: " + e.message; }
+  } catch (e) { $("preset-token-msg").textContent = "错误: " + e.message; }
 };
-$("vocab-remove").onclick = async () => {
+$("preset-remove").onclick = async () => {
   const name = $("vocab-token-preset").value;
-  const token = $("vocab-remove-token").value;
-  if (!token) { $("vocab-token-msg").textContent = "请输入 token"; return; }
-  $("vocab-token-msg").textContent = "删除中…";
+  const token = $("preset-remove-token").value;
+  if (!token) { $("preset-token-msg").textContent = "请输入 token"; return; }
+  $("preset-token-msg").textContent = "删除中…";
   try {
     const r = await api("/api/vocab/preset/token",
       {name, action:"remove", token});
-    $("vocab-token-msg").textContent = `已软删 ${r.token}（原 #${r.id}）`;
-    $("vocab-remove-token").value = "";
+    $("preset-token-msg").textContent = `已软删 ${r.token}（原 #${r.id}）`;
+    $("preset-remove-token").value = "";
     refreshVocab();
-  } catch (e) { $("vocab-token-msg").textContent = "错误: " + e.message; }
+  } catch (e) { $("preset-token-msg").textContent = "错误: " + e.message; }
 };
 </script></body></html>

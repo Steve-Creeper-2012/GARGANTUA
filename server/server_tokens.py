@@ -9,6 +9,7 @@
 # 端点：
 #   POST /api/tokens/encode  文本 → token ID 流（hex / .tokens 二进制 b64）
 #   POST /api/tokens/decode  token ID 流 → 可读形式（{ } | + hex / 表面文本）
+#   POST /api/tokens/export  Token 编辑器文本（.gts）→ .tokens 二进制 b64
 #   POST /api/vocab/add      添加 token（regular/fallback/special/system
 #                            四类任选，全局查重，无冲突则入词表）
 #
@@ -16,7 +17,7 @@
 # ===========================================================================
 import base64
 
-from tokens import dectok, enctok, tok32
+from tokens import dectok, enctok, gts, timestep, tok32
 from tokens.vocab import CATEGORIES, get_vocab
 
 # 入参守卫（与 codec 端点的尺寸守卫同思路）
@@ -82,6 +83,32 @@ class TokensApi:
                 f"token 数超限: {len(ids)} > {MAX_DECODE_TOKENS}")
         return 200, {"text": dectok.decode_ids(ids, mode),
                      "n_tokens": len(ids)}
+
+    # ---------------- Token 编辑器 → .tokens 导出 ----------------
+    def api_tokens_export(self, body):
+        """把编辑器里的 .gts 文本解析成 token ID 流，返回 .tokens 二进制。
+
+        结构非法（括号不配对 / 空步 / 未收录字符）→ 400，不产出坏文件。
+        """
+        text = body.get("text")
+        if text is None:
+            raise ValueError("缺少 text")
+        if not isinstance(text, str):
+            raise ValueError(f"text 必须是字符串: {type(text).__name__}")
+        if len(text) > MAX_ENCODE_CHARS:
+            raise ValueError(
+                f"text 过长: {len(text)} > {MAX_ENCODE_CHARS} 字符")
+        try:
+            ids = gts.parse_gts(text)
+        except gts.GtsError as e:
+            raise ValueError(str(e))
+        if len(ids) > MAX_DECODE_TOKENS:
+            raise ValueError(f"token 数超限: {len(ids)} > {MAX_DECODE_TOKENS}")
+        return 200, {
+            "tokens_b64": base64.b64encode(tok32.encode_ids(ids)).decode(),
+            "n_tokens": len(ids),
+            "n_steps": len(timestep.unwrap(ids)),
+        }
 
     # ---------------- 添加 token ----------------
     def api_vocab_add(self, body):

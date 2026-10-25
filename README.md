@@ -10,40 +10,43 @@ GARGANTUA is a next-generation AI framework built from the ground up for **multi
 
 - **Encoder-Decoder**: Standard encoder-decoder with shared KV cache. The encoder processes user input bidirectionally; the decoder generates autoregressively.
 - **Early Fusion**: All modalities (text, image, video, audio) are embedded into the same `d_model=1024` dimensional space before entering the transformer, but each modality uses its own projection mechanism.
-- **Shared KV**: A unified KV sequence stream with dual-layer compression — full-resolution KV + compressed CSA/HCA views.
-- **No Cross-Attention**: The decoder reads the shared KV directly without cross-attention layers.
+- **Shared KV**: A unified KV sequence stream split into two segments — full-resolution KV + a compressed segment that carries two independent compressions (CSA retrieval view, HCA global-summary view).
+- **No Cross-Attention / No Prefill**: The encoder writes the input into the shared KV; the decoder reads it directly and starts from the last input token. There is no cross-attention and no separate prefill pass.
 
 ### Block Structure
 
 Each block follows the order:
 
 ```
-KDA → MLA-HCA → KDA → MLA-CSA → KDA → FFN(GLU)
+KDA → KDA → KDA → MLA-CSA → MLA-HCA → FFN(GLU) → AttnRes
 ```
 
-- **KDA** (Kimi-style Delta Attention): Gated linear recurrence with delta-state updates, inspired by Moonshot AI.
+- **KDA** (Kimi-style Delta Attention): Gated linear recurrence with delta-state updates, inspired by Moonshot AI. Three consecutive KDA layers carry the recurrent/positional path.
 - **MLA** (Multi-head Latent Attention): Low-rank joint KV compression, NoPE (no RoPE branch), inspired by DeepSeek-V2.
-  - **MLA-HCA**: Heavily compressed (32:1) with global attention.
-  - **MLA-CSA**: Lightly compressed (4:1) with local sliding-window attention.
+  - **MLA-CSA**: the retrieval view — 4:1 compressed segment + the whole full-KV segment.
+  - **MLA-HCA**: the global-summary view — 32:1 compressed segment + the whole full-KV segment.
+  - Both layers are plain MLA when the KV they read is uncompressed; the difference is which compressed segment they see.
 - **FFN**: GLU variant, `d_ff=4096`.
+- **AttnRes** (Kimi/Moonshot, [Attention Residuals](https://github.com/MoonshotAI/Attention-Residuals), arXiv 2603.15031): before every sub-layer, the block aggregates the token embedding, all completed block representations and the current partial sum with a softmax pseudo-query (`h = softmax(norm(V)·w)ᵀV`); block-internal accumulation stays standard residual. A zero-initialized scalar gate at the block end mixes the block input back in (both residual forms are kept, complementarily).
 
 ### Fast Weight Memory
 
-A global `FastWeightBank` serves as long-term memory, structured identically to a KDA layer but with persistent state. It is invoked once after the first block in both encoder and decoder, updating its weights token-by-token. Based on Schmidhuber's 1991 fast weight paper.
+A global `FastWeightBank` serves as long-term memory. It is **structurally one KDA layer** (same q/k/v projections, causal short conv, L2 norm, channel-wise forget gate, output gate, RMSNorm); the only difference is that its state persists across calls. It is invoked once after the first block in both encoder and decoder, reading with the old state and then writing every token (no selective filtering yet). Based on Schmidhuber's 1991 fast weight paper.
 
 ### KV Cache Design
 
 ```
-MLA1/2: [Full KV] | [Buffer] | [CSA]
-MLA1/2: [Full KV] | [Buffer] | [HCA]
+Full KV (uncompressed) | Compressed KV
+                       ├── CSA view  (4:1, retrieval)      → MLA-CSA
+                       └── HCA view  (32:1, global summary) → MLA-HCA
 ```
 
-- **Full KV**: Uncompressed, first layer.
-- **CSA**: Small compression + local attention (4:1 ratio).
-- **HCA**: Heavy compression + global attention (32:1 ratio).
-- **Compression Rule**: Compression happens within time-steps, never across time-step boundaries.
-- **Sliding Window**: Eviction happens at time-step granularity (whole steps discarded together).
-- **Buffer**: Compensates for length changes when primitive/audio tokens are compressed.
+- **Full KV**: uncompressed, the most recent `ctx_full` tokens.
+- **Compressed KV**: everything older, kept as **two independent compressions of the same content** — CSA and HCA.
+- Both views read **the compressed segment + the entire full segment**; when the input is still inside the full region there is nothing to compress and the layers behave as standard MLA (the old `csa_local_window` knob was removed on 2026-10-25).
+- **Compression Rule**: a time step is atomic. A group never straddles a step boundary, and an oversized step may be compressed internally into several tokens that all keep that step's id. Each group targets the compression ratio (4 or 32) tokens; when whole steps cannot hit it exactly, the grouping with the smallest error wins (a slight overshoot is allowed, ties prefer the smaller side).
+- **Eviction**: at time-step granularity (whole steps discarded together). Evicted KV vectors are dropped, but their **original token ids are archived** (`SharedKV.archive`) — context overflow loses the KV view, never the raw ids.
+- **Buffer**: compensates for length changes when primitive/audio tokens are compressed.
 
 ### Context Length (model-creation-time option)
 
@@ -56,20 +59,20 @@ The unified KV stream is split into two regions, and the split is chosen when th
 
 Total context = `ctx_full + ctx_compress` (default 4096). The compressed region is served by **two views over the same content** — this is the "two compression layers" of the spec:
 
-- **CSA** (`csa_ratio`:1, default 4): learnable step-grouped compression + a local sliding window (`csa_local_window`, default 512) over the tail of the full region.
-- **HCA** (`hca_ratio`:1, default 32): heavier compression + global attention.
+- **CSA** (`csa_ratio`:1, default 4): the retrieval view — learnable step-grouped compression of the compressed segment, then standard MLA over the whole full segment.
+- **HCA** (`hca_ratio`:1, default 32): the global-summary view — heavier compression of the same segment, then the same whole full segment.
 
-Compression, sliding-window eviction and the causal mask are all **time-step atomic** — a group never straddles a step boundary, and eviction discards whole steps. `csa_ratio` is an architectural parameter (the compressor's position embedding is `[ratio, d_model]`), so changing it changes the checkpoint layout; `hca_ratio ≥ csa_ratio` and `csa_local_window ≤ ctx_full` are enforced.
+Compression, eviction and the causal mask are all **time-step atomic** — a group never straddles a step boundary, and eviction discards whole steps. `csa_ratio` is an architectural parameter (the compressor's position embedding is `[ratio, d_model]`), so changing it changes the checkpoint layout; `hca_ratio ≥ csa_ratio` is enforced. There is no separate CSA window: the retained region of CSA **is** the full-KV region.
 
 Choose it three ways (all validated, all landing in the same `config.json` contract):
 
 ```bash
 python service/init/init.py --name alpha --ctx-full 2048 --ctx-compress 8192 \
-    --csa-ratio 8 --hca-ratio 64 --csa-window 1024   # total 10240
+    --csa-ratio 8 --hca-ratio 64                      # total 10240
 # 或走 Web UI 的建模表单 / POST /api/model/init（同一套参数）
 ```
 
-or in the web UI's model-creation form (five number inputs, defaults shown), or `POST /api/model/init` with `ctx_full` / `ctx_compress` / `csa_ratio` / `hca_ratio` / `csa_local_window` (omitted = spec default, illegal value = 400). `GET /api/status` and `GET /api/system` return the active model's real configuration (`ctx` + `kv_note`), so the UI never shows a stale spec constant.
+or in the web UI's model-creation form (four number inputs, defaults shown), or `POST /api/model/init` with `ctx_full` / `ctx_compress` / `csa_ratio` / `hca_ratio` (omitted = spec default, illegal value = 400). `GET /api/status` and `GET /api/system` return the active model's real configuration (`ctx` + `kv_note`), so the UI never shows a stale spec constant.
 
 ## Token System
 
@@ -106,6 +109,14 @@ only ever looks up the two visible ones:
   `--vocab <vocab.txt|模型目录>` 可用指定词表编码（见「每模型词表」）。
 - **dectok** (`python service/tokens/dectok.py stream.tokens`): `{ } |` render as
   literals, everything else as 8-hex IDs; `--text` renders surface text.
+- **gts** (`tokens/gts.py`): parses the editor's `.gts` text back into IDs
+  (special tokens matched whole-word against the vocabulary, everything else
+  through `enctok`), validates the `{ } |` structure, and backs
+  `POST /api/tokens/export` — the Token editor's **Export .tokens** button.
+  Formatting whitespace (`\n\r\t`) is ignored; a literal space is a real token.
+- **tokenset** (`tokens/tokenset.py`): the only reader used by training —
+  `.tokens` → `(ids, step_ids)`, rejecting files without a valid time-step
+  structure.
 
 ### Time-Step Format (.gts / { } |)
 
@@ -133,12 +144,19 @@ tokens inside one step are separated by `|`:
 
 Embedding is **not unified** — each modality has its own projection path to `d_model=1024`:
 
-| Modality | Projection | Position Info | Type Embedding |
-|---|---|---|---|
-| Text | `wte` lookup table | None | `type_emb(TYPE_TEXT)` |
-| Visual | `visual_proj` (4096 → 1024) | `visual_coord_x` + `visual_coord_y` (2D absolute) | `type_emb(TYPE_VISUAL)` |
-| Audio | `audio_proj` (533 → 1024) | None | `type_emb(TYPE_AUDIO)` |
-| Drawing | `wte` (in-vocab IDs) | None | `type_emb(TYPE_DRAW)` |
+| Modality | Projection | Position Info |
+|---|---|---|
+| Text | `wte` lookup table | None |
+| Visual | `visual_proj` (4096 → 1024) | `visual_coord_x` + `visual_coord_y` (2D absolute) |
+| Audio | `audio_proj` (533 → 1024) | None |
+| Drawing | `wte` (in-vocab IDs) | None |
+
+**Segment marker = type embedding.** `type_emb` is a learned table with one
+entry per segment kind (user / model / none), applied to **every token inside
+that segment** — there is no start/end distinction. It plays the same role as
+a position embedding (a learned additive vector), not a token. The boundary
+tokens `<user>`, `<user/>`, `<model>`, `<model/>` are system-level markers:
+they do not enter the shared KV and are not ordinary tokens in the loss.
 
 Within a single time-step (e.g., one video frame), all patches and audio tokens share the same `step_id` and receive bidirectional attention (no causal mask within the step).
 
@@ -222,11 +240,20 @@ overrides the binary path. Converter env vars (`SHAPE_RENDERER_INPUT_DIR`,
 - Muon can be disabled — falls back to full AdamW.
 
 ### Data Format
-Training data must be uploaded as JSON files with one of these formats:
-```json
-{"text": "hello world"}
+Training data is a **`.tokens` file** — the tok-32 binary stream, with the
+`{ } |` time-step structure written out explicitly. The Token editor exports
+exactly this format (Export .tokens), and it is the only accepted training
+input; JSON/JSONL uploads are rejected with `400`.
+
+```bash
+# queue one stream (CLI side, same file the editor produces)
+cp stream.tokens data/queue/
 ```
-Or object arrays / JSONL (one object per line).
+
+Each file is one token stream. The trainer expands it into flat `token_ids`
+plus a parallel `step_ids` array (`tokens/tokenset.py`), and appends a `<stop>`
+step at the end of the document. Files without a valid `{ } |` structure are
+rejected before training starts.
 
 ### Training Script
 ```bash
@@ -239,20 +266,39 @@ python service/train/train.py --model models/my_model --data data/
 python service/infer/infer.py --model models/my_model --prompt "Hello"
 ```
 
-The decoder stops immediately when `<stop>` (ID 27) is sampled.
+The decoder stops immediately when `<stop>` (ID 5) is sampled.
+
+### Token-id archive (inference)
+
+Every inference call persists its token ids before/while generating:
+
+```
+logs/infer_archive/<YYYYmmdd_HHMMSS>_<id>.tokens   # tok-32, one { id } step per token
+logs/infer_archive/<...>.json                      # model / counts / ctx_total / n_evicted
+```
+
+The `.tokens` file receives the prompt at start and each generated token as it
+is sampled (flushed per token), so a crash, an idle exit or KV eviction can
+never lose ids — only KV *vectors* are dropped when the context overflows.
+The sidecar records `n_tokens`, `n_prompt_tokens`, `n_generated_tokens`,
+`ctx_total` and `n_evicted`. `--archive-dir` overrides the location; the
+server passes `<log dir>/infer_archive` and returns the path as `archive` in
+the inference result. Archiving failure is logged to stderr and degrades to
+"no archive" — it never blocks inference.
 
 ## Web Interface
 
 A built-in web UI provides:
 - **Model Management**: Create models with configurable encoder/decoder block counts **and context length** (full / compressed capacity + CSA/HCA compression ratios — see "Context Length" above).
-- **Training Queue**: Upload JSON datasets, queue training tasks with automatic execution.
+- **Training Queue**: Upload `.tokens` streams, queue training tasks with automatic execution.
 - **Inference Chat**: Standard AI chat interface with collapsible debug panel (temperature, top-p, max_new_tokens).
 - **Codec Visualizers**:
   - Text → Token conversion
   - Audio → Wave token conversion
   - Image/Video → Patch token conversion
   - Image → Primitive sequence conversion
-  - Token editor with spec-aligned token panel and vocab search
+  - Token editor with a spec-aligned palette and **Export .tokens** (writes the same tok-32 stream training consumes)
+  - **Vocabulary page**: ID-region occupancy, presets, plus global search / add-token (the editor itself no longer carries vocabulary operations)
 
 ### Launch
 
@@ -399,6 +445,8 @@ Long-running work (inference, model init, image→primitives, **drawing render**
 │   ├── init/init.py           # Model initialization (CLI + --json one-shot mode)
 │   ├── tokens/                # Codecs for all modalities
 │   │   ├── tok32.py           # tok-32 interpreter: .tokens binary ↔ IDs ↔ hex
+│   │   ├── gts.py             # editor text (.gts) → IDs, backs Export .tokens
+│   │   ├── tokenset.py        # .tokens training streams → (ids, step_ids)
 │   │   ├── enctok.py          # Text → token ID stream (regular first, fallback next)
 │   │   ├── dectok.py          # Token ID stream → readable ({ } | + hex / surface text)
 │   │   ├── timestep.py        # { } | time-step structure (wrap/unwrap/render)
@@ -489,6 +537,7 @@ partway through `test_model`.
 - **MLA**: DeepSeek-V2 — low-rank joint KV compression, NoPE.
 - **KDA**: Moonshot AI / Kimi — linear gated delta recurrence.
 - **CSA/HCA Compression**: DeepSeek NSA — learnable MLP compression within time-steps.
+- **AttnRes**: Moonshot AI / Kimi — [Attention Residuals](https://github.com/MoonshotAI/Attention-Residuals) (arXiv 2603.15031), Block AttnRes over depth plus a block-level scalar gate.
 - **Fast Weight**: Schmidhuber 1991 — persistent associative memory layer.
 - **Primitive Rendering**: [wonderfulearth/primitive-operation-painter](https://github.com/wonderfulearth/primitive-operation-painter) — GPU image-to-sequence converter with hill-climbing shape fitting.
 

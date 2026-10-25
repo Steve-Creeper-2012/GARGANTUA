@@ -20,7 +20,6 @@
 # ===========================================================================
 import base64
 import glob
-import json
 import os
 import time
 import uuid
@@ -29,11 +28,25 @@ import spec
 from common import validate_block_size, validate_steps
 from server_models import ConflictError
 
-# 2026-10-23 审计修复（P3）：入队此前无任何数量/体积上限——512MB 的
-# JSON 数组可拆出数百万个 .txt 小文件（inode 耗尽），且 json.loads 本身
-# 就要吃掉数倍内存。设样本数与总字符双上限。
-MAX_ENQUEUE_SAMPLES = 10_000        # 单次入队样本数上限
-MAX_ENQUEUE_CHARS = 64 * 1024 * 1024   # 单次入队总字符上限（64M）
+# 2026-10-25（steve）：训练数据改为 .tokens（tok-32，必须带 { } | 时间步
+# 结构），不再接受 JSON/JSONL——与 Token 编辑器导出的格式完全一致。
+# 一次上传 = 一个 token 流文件（不再拆成多条样本）。
+# ===========================================================================
+import base64
+import glob
+import os
+import time
+import uuid
+
+import spec
+from common import validate_block_size, validate_steps
+from server_models import ConflictError
+from tokens import timestep, tok32
+
+# 2026-10-23 审计修复（P3）：入队此前无任何数量/体积上限。改成字节上限
+# （.tokens 4 字节/token）与 token 数上限双保险。
+MAX_ENQUEUE_BYTES = 64 * 1024 * 1024     # 单次上传 64MB（≈16M tokens）
+MAX_ENQUEUE_TOKENS = MAX_ENQUEUE_BYTES // 4
 
 # 训练服务未启动时 /api/train/status 的默认态（与服务内默认值一致）
 _DEFAULT_STATUS = {
@@ -47,61 +60,48 @@ class TrainApi:
     """ /api/train/* 全部端点。 """
 
     def api_train_enqueue(self, body):
-        """训练数据：json_b64 上传。内容必须是
-        {"text": "..."} 对象 / 对象数组 / JSONL 每行一个对象。"""
-        json_b64 = body.get("json_b64")
-        if not json_b64:
-            raise ValueError("缺少 json_b64（仅支持上传 JSON/JSONL 训练数据）")
-        raw = base64.b64decode(json_b64).decode("utf-8")
-        filename = body.get("filename") or ""
-        samples = []
-        # 大小写不敏感：Data.TXT 此前不走 JSONL 分支被当 JSON 解析失败
-        if filename.lower().endswith(".jsonl"):
-            for i, line in enumerate(raw.splitlines()):
-                if not line.strip():
-                    continue
-                obj = json.loads(line)
-                # 2026-10-23 审计修复（P2）：{"text": 123}/{"text": null}
-                # 此前通过「键存在」检查，直到写盘 f.write() 才抛
-                # TypeError → HTTP 500，违反 400 入参契约
-                if not isinstance(obj, dict) or "text" not in obj:
-                    raise ValueError(f"第 {i+1} 行缺少 text 字段，"
-                                     f"训练数据必须为 {{\"text\": \"...\"}}")
-                if not isinstance(obj["text"], str):
-                    raise ValueError(f"第 {i+1} 行 text 必须是字符串: "
-                                     f"{obj['text']!r}")
-                samples.append(obj["text"])
-        else:
-            obj = json.loads(raw)
-            items = obj if isinstance(obj, list) else [obj]
-            for it in items:
-                if not isinstance(it, dict) or "text" not in it:
-                    raise ValueError("每条训练数据必须为 "
-                                     "{\"text\": \"...\"} 对象")
-                if not isinstance(it["text"], str):
-                    raise ValueError(f"text 必须是字符串: {it['text']!r}")
-                samples.append(it["text"])
-        if not samples:
+        """训练数据：tokens_b64 上传（.tokens 二进制，tok-32）。
+
+        文件内容必须带 { } | 时间步结构（timestep.unwrap 可解析），
+        所有 ID 必须 < VOCAB_SIZE_PADDED。JSON/JSONL 已废弃。"""
+        if body.get("json_b64") is not None:
+            raise ValueError("训练数据已改为 .tokens 格式（tok-32 二进制，"
+                             "必须带 { } | 时间步结构）；不再接受 JSON/JSONL")
+        tokens_b64 = body.get("tokens_b64")
+        if not tokens_b64:
+            raise ValueError("缺少 tokens_b64（训练数据必须是 .tokens 文件）")
+        if not isinstance(tokens_b64, str):
+            raise ValueError("tokens_b64 必须是字符串")
+        try:
+            data = base64.b64decode(tokens_b64, validate=True)
+        except Exception as e:
+            raise ValueError(f"tokens_b64 不是合法 base64: {e}")
+        if not data:
             raise ValueError("训练数据为空")
-        if len(samples) > MAX_ENQUEUE_SAMPLES:
-            raise ValueError(f"样本数超限: {len(samples)} > "
-                             f"{MAX_ENQUEUE_SAMPLES}，请分批上传")
-        total_chars = sum(len(t) for t in samples)
-        if total_chars > MAX_ENQUEUE_CHARS:
-            raise ValueError(f"总字符数超限: {total_chars} > "
-                             f"{MAX_ENQUEUE_CHARS}，请分批上传")
+        if len(data) > MAX_ENQUEUE_BYTES:
+            raise ValueError(f"训练数据超限: {len(data)} 字节 > "
+                             f"{MAX_ENQUEUE_BYTES}，请拆分后上传")
+        ids = tok32.decode_ids(data)            # 长度非 4 倍数 → 400
+        if len(ids) > MAX_ENQUEUE_TOKENS:
+            raise ValueError(f"token 数超限: {len(ids)} > {MAX_ENQUEUE_TOKENS}")
+        try:
+            steps = timestep.unwrap(ids)
+        except timestep.TimestepError as e:
+            raise ValueError(f"时间步结构非法（.tokens 必须带 {{ }} | 结构）: {e}")
+        bad = next((t for t in ids if not (0 <= t < spec.VOCAB_SIZE_PADDED)), None)
+        if bad is not None:
+            raise ValueError(f"token ID {bad} 超出词表"
+                             f"（< {spec.VOCAB_SIZE_PADDED}）")
         optimizer = body.get("optimizer", spec.OPTIMIZER)
         if optimizer not in ("muon", "adamw"):
             raise ValueError(f"未知优化器: {optimizer}")
-        queued = []
-        for text in samples:
-            fn = f"{time.strftime('%Y%m%d_%H%M%S')}_{optimizer}_" \
-                 f"{uuid.uuid4().hex[:8]}.txt"
-            path = os.path.join(self.queue_dir, fn)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(text)
-            queued.append(fn)
-        return 200, {"queued": queued, "n_samples": len(samples)}
+        fn = f"{time.strftime('%Y%m%d_%H%M%S')}_{optimizer}_" \
+             f"{uuid.uuid4().hex[:8]}.tokens"
+        path = os.path.join(self.queue_dir, fn)
+        with open(path, "wb") as f:
+            f.write(data)
+        return 200, {"queued": [fn], "n_tokens": len(ids),
+                     "n_steps": len(steps), "bytes": len(data)}
 
     # ------------------------------------------------------------------
     # 训练服务生命周期（supervisor 调用；服务没起就返回默认态）

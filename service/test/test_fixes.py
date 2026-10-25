@@ -184,7 +184,8 @@ class TestFastWeightContract(unittest.TestCase):
         model.FastWeightBank.forward = fw_spy
         try:
             torch.manual_seed(11)
-            generate(self.m, "你好", max_new=2)
+            with tempfile.TemporaryDirectory() as ad:
+                generate(self.m, "你好", max_new=2, archive_dir=ad)
         finally:
             model.FastWeightBank.reset = orig_reset
             model.FastWeightBank.forward = orig_fw
@@ -213,7 +214,8 @@ class TestFastWeightContract(unittest.TestCase):
         model.Gargantua.build_views = spy
         try:
             torch.manual_seed(12)
-            generate(self.m, "你好世界", max_new=2)
+            with tempfile.TemporaryDirectory() as ad:
+                generate(self.m, "你好世界", max_new=2, archive_dir=ad)
         finally:
             model.Gargantua.build_views = orig
         n = 4                                    # prompt token 数
@@ -256,13 +258,13 @@ class TestCompressionCausality(unittest.TestCase):
 
     def test_csa_view_matches_inference_semantics(self):
         torch.manual_seed(4)
-        n = 600                       # 512 < n ≤ 1024：旧 bug 触发区间
+        n = 600                       # ≤ ctx_full：无压缩区
         vecs = torch.randn(1, n, spec.D_MODEL)
         steps = torch.arange(n).unsqueeze(0)
         kv_hca, kv_csa = self.m.build_views(vecs, steps)
-        # 训练路径 CSA 视图 = 尾部 CSA_LOCAL_WINDOW（与 SharedKV.view 一致）
-        self.assertEqual(kv_csa[0].shape[1], min(n, spec.CSA_LOCAL_WINDOW))
-        # HCA 无压缩区 → 全量
+        # 2026-10-25：CSA 的保留区就是完整 KV 区（无局部窗），
+        # 未超完整区时两个视图都是全量
+        self.assertEqual(kv_csa[0].shape[1], n)
         self.assertEqual(kv_hca[0].shape[1], n)
 
     def test_build_views_equiv_sharedkv_long(self):
@@ -567,6 +569,7 @@ class TestInferCliCustomBlocks(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="garg_cli_")
         try:
             md = os.path.join(tmp, "models", "small")
+            arch = os.path.join(tmp, "arch")
             m = small_model()
             save_checkpoint(md, m, {"n_enc_blocks": 1, "n_dec_blocks": 1})
             r = subprocess.run(
@@ -574,19 +577,62 @@ class TestInferCliCustomBlocks(unittest.TestCase):
                  os.path.join(boot.project_root(), "service", "infer",
                               "infer.py"),
                  "--model", md,
-                 "--prompt", "你好", "--max-new-tokens", "1"],
+                 "--prompt", "你好", "--max-new-tokens", "1",
+                 "--archive-dir", arch],
                 cwd=boot.project_root(), capture_output=True, text=True,
                 timeout=600)
             self.assertEqual(r.returncode, 0,
                              f"CLI 推理失败:\n{r.stderr[-800:]}")
+            # 2026-10-25：推理侧 id 存档（.tokens + .json 元数据）
+            names = os.listdir(arch)
+            self.assertTrue(any(n.endswith(".tokens") for n in names), names)
+            self.assertTrue(any(n.endswith(".json") for n in names), names)
+            self.assertIn("id 存档", r.stderr)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestInferIdArchive(unittest.TestCase):
+    """ 推理侧 id 存档：KV 可丢，原始 token id 必须落盘且可读回。 """
+
+    def test_archive_roundtrip_and_metadata(self):
+        import json as _json
+        from infer import IdArchive
+        from tokens import timestep, tok32
+        tmp = tempfile.mkdtemp(prefix="garg_arch_")
+        try:
+            a = IdArchive("models/demo", tmp)
+            a.add([100, 101])
+            a.add([102])
+            self.assertTrue(a.path is not None)
+            a.close(n_prompt=2, n_generated=1, ctx_total=2)
+            ids = tok32.read_tokens_file(a.path)
+            steps = timestep.unwrap(ids)          # 必须是合法 { } 结构
+            self.assertEqual([s[0] for s in steps], [100, 101, 102])
+            meta = _json.loads(
+                a.path.with_suffix(".json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["n_tokens"], 3)
+            self.assertEqual(meta["n_prompt_tokens"], 2)
+            self.assertEqual(meta["n_generated_tokens"], 1)
+            self.assertEqual(meta["ctx_total"], 2)
+            self.assertEqual(meta["n_evicted"], 1)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_archive_failure_does_not_raise(self):
+        from infer import IdArchive
+        # 目录不可写 → 静默降级（推理不能因为存档挂掉）
+        a = IdArchive("m", "/dev/null/not-a-dir")
+        a.add([1, 2, 3])
+        a.close(n_prompt=3, n_generated=0, ctx_total=8)
+        self.assertIsNone(a.rel_path())
+
+
 class TestGroupByStepContract(unittest.TestCase):
     """ group_by_step：向量化重写后曾出现「产出空组 + 指针不前进」的
-    无限循环（内存暴涨直到被 kill）。这里做全覆盖不变量检查 + 与原实现
-    随机对拍。 """
+    无限循环（内存暴涨直到被 kill）。这里做全覆盖不变量检查 + 与参考
+    实现随机对拍。2026-10-25 起语义 = 「组内 token 数向 ratio 靠拢，
+    误差最小（允许略超）」，不再要求 ≤ ratio。 """
 
     def _invariants(self, ss, ratio):
         g = model.group_by_step(torch.tensor(ss), ratio)
@@ -594,9 +640,26 @@ class TestGroupByStepContract(unittest.TestCase):
         self.assertEqual(g[-1][1], len(ss))
         for (s, e) in g:
             self.assertGreater(e, s, f"空组: {g} (ratio={ratio}, ss={ss})")
-            self.assertLessEqual(e - s, ratio)
         for (s1, e1), (s2, e2) in zip(g, g[1:]):
             self.assertEqual(e1, s2, f"组不连续: {g}")
+        # 长度 < ratio 的步不得被拆到两个组（超长步允许步内切块）
+        runs = []
+        pos = 0
+        for v in ss:
+            if runs and runs[-1][0] == v:
+                runs[-1][2] += 1
+            else:
+                runs.append([v, pos, 1])
+            pos += 1
+        for _v, start, ln in runs:
+            if ln >= ratio:
+                continue
+            owner = [k for k, (s, e) in enumerate(g) if s <= start < e]
+            self.assertEqual(len(owner), 1, f"步被拆分: {g} (ss={ss})")
+            s, e = g[owner[0]]
+            # 整步必须完整落在该组内（组可以包含更早的步）
+            self.assertLessEqual(s, start)
+            self.assertGreaterEqual(e, start + ln)
         return g
 
     def test_no_empty_group_and_full_coverage(self):
@@ -609,43 +672,48 @@ class TestGroupByStepContract(unittest.TestCase):
     def test_random_matches_reference(self):
         import random
 
-        def orig(step_ids, ratio):
-            """ 重写前的实现（逐 token .item()），作为语义基准。 """
-            groups, n, i = [], step_ids.numel(), 0
-            while i < n:
-                sid = step_ids[i].item()
-                j = i
-                while j < n and step_ids[j].item() == sid:
-                    j += 1
-                if j - i >= ratio:
-                    for s in range(i, j, ratio):
-                        groups.append((s, min(s + ratio, j)))
+        def ref(ss, ratio):
+            """ 独立参考实现：整步向 ratio 靠拢，误差最小、平局取欠。 """
+            runs = []                       # [step, 长度]
+            for v in ss:
+                if runs and runs[-1][0] == v:
+                    runs[-1][1] += 1
                 else:
-                    g_start, count, k = i, j - i, j
-                    while k < n and count < ratio:
-                        nid = step_ids[k].item()
-                        e = k
-                        while e < n and step_ids[e].item() == nid:
-                            e += 1
-                        if count + (e - k) > ratio:
-                            break
-                        count += e - k
-                        k = e
-                    groups.append((g_start, k))
-                    i = k
+                    runs.append([v, 1])
+            groups, pos, k = [], 0, 0
+            while k < len(runs):
+                ln = runs[k][1]
+                if ln >= ratio:
+                    for cs in range(pos, pos + ln, ratio):
+                        groups.append((cs, min(cs + ratio, pos + ln)))
+                    pos += ln
+                    k += 1
                     continue
-                i = j
+                total, j = ln, k
+                while j + 1 < len(runs):
+                    nxt = runs[j + 1][1]
+                    if total + nxt <= ratio:
+                        total += nxt
+                        j += 1
+                        continue
+                    if (ratio - total) <= (total + nxt - ratio):
+                        break
+                    total += nxt
+                    j += 1
+                    break
+                groups.append((pos, pos + total))
+                pos += total
+                k = j + 1
             return groups
 
         rnd = random.Random(0)
         for _ in range(500):
             n = rnd.randint(1, 40)
-            ss = torch.tensor(
-                sorted(rnd.randint(0, 8) for _ in range(n)))   # 非降序
+            ss = sorted(rnd.randint(0, 8) for _ in range(n))   # 非降序
             ratio = rnd.choice([1, 2, 3, 4, 5, 8, 32])
-            self.assertEqual(model.group_by_step(ss, ratio),
-                             orig(ss, ratio))
-            self._invariants(ss.tolist(), ratio)
+            self.assertEqual(model.group_by_step(torch.tensor(ss), ratio),
+                             ref(ss, ratio))
+            self._invariants(ss, ratio)
 
 
 class TestServerEnvLauncher(unittest.TestCase):

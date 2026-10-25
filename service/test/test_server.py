@@ -274,25 +274,41 @@ class TestServer(unittest.TestCase):
 
     def test_09_train_flow(self):
         # enqueue → queue 文件出现
-        # 当前契约：仅支持 json_b64 上传（{"text": ...} 对象 / 对象数组 /
-        # JSONL），queued 返回裸文件名，落盘在 <data_dir>/queue 下
-        # （与前端 train-file 上传走同一通道）
-        def enqueue(obj, filename="t.json"):
-            raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        # 2026-10-25 契约：只接受 tokens_b64（.tokens 二进制，必须带
+        # { } | 时间步结构）；一次上传 = 一条 token 流；JSON 上传被拒。
+        from tokens import timestep, tok32
+        from tokens.text_codec import encode as text_encode
+
+        def make_tokens(text):
+            steps = text_encode(text)
+            ids = timestep.wrap_steps([st["token_ids"] for st in steps])
+            return base64.b64encode(tok32.encode_ids(ids)).decode()
+
+        def enqueue(text):
             return http("POST", self.port, "/api/train/enqueue",
-                        {"json_b64": base64.b64encode(raw).decode(),
-                         "filename": filename})
-        code, j = enqueue({"text": "你好世界 " * 40})
+                        {"tokens_b64": make_tokens(text)})
+        code, j = enqueue("你好世界 " * 40)
         self.assertEqual(code, 200)
         queued = j["queued"]
         self.assertEqual(len(queued), 1)
+        self.assertTrue(queued[0].endswith(".tokens"))
         qpath = os.path.join(self.data_dir, "queue", queued[0])
         self.assertTrue(os.path.exists(qpath))
         self.assertIn("queue", qpath)
-        # enqueue 多文本（JSON 数组）
-        code, j = enqueue([{"text": "甲"}, {"text": "乙"}])
+        # 第二条流
+        code, j = enqueue("甲乙丙丁" * 20)
         self.assertEqual(code, 200)
-        self.assertEqual(len(j["queued"]), 2)
+        self.assertEqual(len(j["queued"]), 1)
+        # JSON 上传已废弃 → 400
+        code, j = http("POST", self.port, "/api/train/enqueue",
+                       {"json_b64": base64.b64encode(
+                           b'{"text": "x"}').decode()})
+        self.assertEqual(code, 400)
+        # 缺 { } 结构的裸 ID 流 → 400
+        code, j = http("POST", self.port, "/api/train/enqueue",
+                       {"tokens_b64": base64.b64encode(
+                           tok32.encode_ids([100, 101, 102])).decode()})
+        self.assertEqual(code, 400)
         # start → running
         code, j = http("POST", self.port, "/api/train/start",
                        {"steps": 1, "block_size": 16})
@@ -343,6 +359,24 @@ class TestServer(unittest.TestCase):
         if result is not None:      # 若已完成则校验结果结构
             self.assertIn("text", result)
             self.assertEqual(len(result["token_ids"]), 1)
+            # 2026-10-25：推理侧 token id 存档（.tokens 落盘）
+            self.assertTrue(result.get("archive"), "缺少 archive 路径")
+            apath = os.path.join(ROOT, result["archive"])
+            self.assertTrue(os.path.exists(apath), apath)
+            self.assertIn("infer_archive", apath)
+            # 存档能按 .tokens 结构读回（prompt + 1 个生成 token）
+            from tokens import tok32, timestep
+            ids = tok32.read_tokens_file(apath)
+            steps = timestep.unwrap(ids)
+            meta_path = apath[:-7] + ".json"
+            self.assertTrue(os.path.exists(meta_path))
+            import json as _json
+            with open(meta_path, encoding="utf-8") as f:
+                meta = _json.load(f)
+            self.assertEqual(meta["n_tokens"], len(steps))
+            self.assertEqual(meta["n_generated_tokens"], 1)
+            self.assertGreaterEqual(meta["n_prompt_tokens"], 1)
+            self.assertEqual(meta["n_evicted"], 0)
         # 不存在的任务 → 404
         code, j = http("GET", self.port, "/api/task/" + "0" * 32)
         self.assertEqual(code, 404)
@@ -497,6 +531,20 @@ class TestServer(unittest.TestCase):
         self.assertEqual(code, 400)
         code, j9 = http("POST", self.port, "/api/tokens/decode",
                         {"hex": "zz"})
+        self.assertEqual(code, 400)
+        # 2026-10-25：Token 编辑器 → .tokens 导出
+        from tokens import tok32
+        code, je = http("POST", self.port, "/api/tokens/export",
+                        {"text": "{<user>}{Hello}{<user/>}"})
+        self.assertEqual(code, 200)
+        self.assertEqual(je["n_steps"], 3)
+        ids = tok32.decode_ids(base64.b64decode(je["tokens_b64"]))
+        self.assertEqual(len(ids), je["n_tokens"])
+        # 结构非法 / 空流 → 400（不产出坏 .tokens）
+        code, _ = http("POST", self.port, "/api/tokens/export",
+                       {"text": "{a"})
+        self.assertEqual(code, 400)
+        code, _ = http("POST", self.port, "/api/tokens/export", {"text": ""})
         self.assertEqual(code, 400)
 
     def test_15_vocab_add(self):

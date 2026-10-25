@@ -1,7 +1,8 @@
 # ===========================================================================
 # GARGANTUA v1 — train.py：文本预训练（教师强制，B=1，FP32）
 # ---------------------------------------------------------------------------
-# 数据：data/ 下所有 .txt 文件，text_codec 编码为时间步序列；
+# 数据：data/ 下所有 .tokens 文件（tok-32，必须带 { } | 时间步结构），
+# 由 tokens/tokenset 展开成「扁平 token_ids + 并行 step_ids」；
 # 每个窗口切成 user 段（encoder）+ model 段（decoder 预测目标）。
 # 优化器：Muon（隐藏层 2D）+ AdamW（embedding/head/norm），--optimizer 可关。
 # 用法：
@@ -13,6 +14,7 @@
 #   2. block_size 经 common.validate_block_size 校验（偶数 ≥2）——奇数会
 #      令 s_dec 与 dec_in 长度不一致，forward_train 必崩（已实测复现）。
 #   3. 删除死变量 tgt（与 y 完全相同）。
+# 2026-10-25：训练数据改为 .tokens（不再读 .txt / JSON）。
 # ===========================================================================
 import argparse
 import glob
@@ -38,21 +40,18 @@ import spec
 from common import (CKPT_NAME, build_model, make_batch, read_config,
                     save_checkpoint, validate_block_size)
 from muon import build_optimizers
-from tokens.text_codec import encode as text_encode
+from tokens.tokenset import load_corpus
 from tokens.vocab import set_model_vocab
 
 
 def load_corpus_ids(data_dir: str):
-    """ data/ 下全部 .txt → 拼接的 token id 流（每 token 一个时间步）。 """
-    ids = []
-    for path in sorted(glob.glob(os.path.join(data_dir, "**", "*.txt"),
-                                 recursive=True)):
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
-        for st in text_encode(text):
-            ids.extend(st["token_ids"])
-        ids.append(spec.STOP_ID)            # 文档结束 → 停止 token，教模型学会终止
-    return ids
+    """ data/ 下全部 .tokens → (扁平 ids, 每 token 的 step_ids)。 """
+    paths = sorted(glob.glob(os.path.join(data_dir, "**", "*.tokens"),
+                             recursive=True))
+    if not paths:
+        raise SystemExit(f"{data_dir} 下没有 .tokens 训练文件"
+                         f"（训练数据必须带 {{ }} | 时间步结构）")
+    return load_corpus(paths)
 
 
 def main():
@@ -80,7 +79,7 @@ def main():
 
     opts = build_optimizers(m, args.optimizer, args.lr, args.muon_lr,
                             spec.MUON_MOMENTUM)
-    ids = load_corpus_ids(args.data)
+    ids, step_ids = load_corpus_ids(args.data)
     assert len(ids) > B + 1, f"语料太少：{len(ids)} tokens < {B + 2}"
     print(f"[train] corpus={len(ids)} tokens  steps={args.steps}  "
           f"block={B}  optimizer={args.optimizer}")
@@ -88,7 +87,7 @@ def main():
     t0 = time.time()
     for step in range(1, args.steps + 1):
         i = random.randint(0, len(ids) - B - 2)
-        x_in, s_in, dec_in, s_dec, y = make_batch(ids, i, B)
+        x_in, s_in, dec_in, s_dec, y = make_batch(ids, i, B, step_ids)
 
         logits = m.forward_train(x_in, s_in, dec_in, s_dec)
         loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), y.view(-1))

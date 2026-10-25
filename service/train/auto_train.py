@@ -1,10 +1,10 @@
 # ===========================================================================
 # GARGANTUA v1 — auto_train.py：训练队列守护
 # ---------------------------------------------------------------------------
-# 监控 data/queue/*.txt（按文件名序），逐个文件：text_codec 编码 → 按
-# common.make_batch 统一的窗口切分 / forward_train / Muon+AdamW step 逻辑
-# 训练 steps_per_file 步 → 检查点落盘 → 文件移入 data/done/。
-# 每步把 {"step", "loss", "ts"} 追加到 logs/auto_train.jsonl。
+# 监控 data/queue/*.tokens（按文件名序），逐个文件：tokenset 展开成
+# 「ids + step_ids」→ 按 common.make_batch 统一的窗口切分 / forward_train
+# / Muon+AdamW step 逻辑训练 steps_per_file 步 → 检查点落盘 → 文件移入
+# data/done/。每步把 {"step", "loss", "ts"} 追加到 logs/auto_train.jsonl。
 # 空队列 1s 空转轮询；stop() 后当前 step 完成、落盘后退。
 #
 # 两种用法：
@@ -62,7 +62,7 @@ import spec
 from common import (CKPT_NAME, build_model, make_batch, read_config,
                     save_checkpoint, validate_block_size, validate_steps)
 from muon import build_optimizers
-from tokens.text_codec import encode as text_encode
+from tokens.tokenset import read_stream
 from tokens.vocab import set_model_vocab
 
 _OPTIMIZERS = ("muon", "adamw")
@@ -203,7 +203,7 @@ class Trainer:
         self._log("[auto_train] 守护启动")
         try:
             while not self._stop.is_set():
-                files = sorted(glob.glob(os.path.join(self.queue_dir, "*.txt")))
+                files = sorted(glob.glob(os.path.join(self.queue_dir, "*.tokens")))
                 if not files:
                     time.sleep(1)
                     continue
@@ -236,10 +236,11 @@ class Trainer:
             self._log("[auto_train] 守护退出")
 
     def _train_file(self, path):
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
-        ids = [t for st in text_encode(text) for t in st["token_ids"]]
+        ids, step_ids = read_stream(path)
+        ids = list(ids)
+        step_ids = list(step_ids)
         ids.append(spec.STOP_ID)            # 文档结束 → 停止 token，教模型学会终止
+        step_ids.append((max(step_ids) + 1) if step_ids else 0)
         B = self._block_size
         if len(ids) < B + 2:
             self._log(f"[auto_train] {os.path.basename(path)} 仅 {len(ids)} "
@@ -264,7 +265,7 @@ class Trainer:
                                         spec.MUON_LR, spec.MUON_MOMENTUM)
                 self._log("[auto_train] 检测到模型热替换，优化器已重建")
             i = random.randint(0, len(ids) - B - 2)
-            x_in, s_in, dec_in, s_dec, y = make_batch(ids, i, B)
+            x_in, s_in, dec_in, s_dec, y = make_batch(ids, i, B, step_ids)
 
             with self.lock:                          # 训练与推理互斥
                 m.train()
@@ -410,7 +411,7 @@ def _serve_handle(req: dict, st: _ServeState) -> dict:
 
 def _queue_empty(queue_dir: str) -> bool:
     try:
-        return not any(f.endswith(".txt")
+        return not any(f.endswith(".tokens")
                        for f in os.listdir(queue_dir))
     except OSError:
         return True
