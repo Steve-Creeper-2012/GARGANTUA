@@ -162,6 +162,20 @@ class App(TrainApi, CodecApi, TokensApi):
             hca_ratio=body.get("hca_ratio"),
             csa_local_window=body.get("csa_local_window"))
 
+        # 2026-10-25：词表预设 + 精度提前校验（非法 → 400，避免提交失败任务）
+        if body.get("vocab"):
+            from vocab_presets import validate_preset
+            try:
+                validate_preset(body["vocab"])
+            except ValueError as e:
+                raise ValueError(f"vocab: {e}")
+        if body.get("dtype"):
+            from precision import validate_dtype
+            try:
+                validate_dtype(body["dtype"])
+            except ValueError as e:
+                raise ValueError(f"dtype: {e}")
+
         def work():
             # 建模是罕见的重活（默认 4+6 blocks ≈ 527M 参数、2.1GB
             # safetensors）：一次性子进程跑完即退，server 内存零增长。
@@ -172,6 +186,11 @@ class App(TrainApi, CodecApi, TokensApi):
                 argv += ["--dec-blocks", str(dec)]
             if body.get("overwrite"):
                 argv += ["--force"]
+            # 2026-10-25：词表预设 + 精度下发给 init 子进程
+            if body.get("vocab"):
+                argv += ["--vocab", str(body["vocab"])]
+            if body.get("dtype"):
+                argv += ["--dtype", str(body["dtype"])]
             # ctx 已在本进程校验过，原样下发（服务端不再解释默认值）
             argv += ["--ctx-full", str(ctx["ctx_full"]),
                      "--ctx-compress", str(ctx["ctx_compress"]),
@@ -469,6 +488,12 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/vocab":
                 _code, obj = app.api_vocab(query)
                 self._send_json(obj, _code)
+            elif path == "/api/vocab/ranges":
+                _code, obj = app.api_vocab_ranges(query)
+                self._send_json(obj, _code)
+            elif path == "/api/vocab/presets":
+                _code, obj = app.api_vocab_presets({})
+                self._send_json(obj, _code)
             else:
                 self._send_error_json(404, f"未知路径: {path}")
         except BrokenPipeError:
@@ -497,6 +522,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/tokens/encode": app.api_tokens_encode,
             "/api/tokens/decode": app.api_tokens_decode,
             "/api/vocab/add": app.api_vocab_add,
+            "/api/vocab/presets": app.api_vocab_presets,
+            "/api/vocab/preset/token": app.api_vocab_preset_token,
             "/api/system/install-optional": app.api_system_install_optional,
         }
         fn = routes.get(path)

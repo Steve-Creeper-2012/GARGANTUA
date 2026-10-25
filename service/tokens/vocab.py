@@ -47,6 +47,12 @@ CATEGORIES = (CAT_REGULAR, CAT_FALLBACK, CAT_SPECIAL, CAT_SYSTEM)
 
 _RESERVED_PREFIX = "<reserved:"
 
+# 软删占位符前缀（2026-10-25）：扁平词表（每模型 / 词表预设）里被删除的
+# token 原地替换为 <del:N>（N=行号），既保留 ID 位置（不令后续 token 漂移）
+# 又不可被文本编码查到。from_tokens / read_model_vocab 仍把它留在 id_to_token
+# 以维持行号→ID 映射，但不再登记进 token_to_id / regular_ids。
+DEL_MARKER = "<del:"
+
 # 用户新增 token 的分配区间：各类的 reserved 尾段（基础 token 之后）
 _ALLOC_RANGES = {
     CAT_REGULAR: (spec.EXTRA_BEGIN, spec.EXTRA_BEGIN + spec.EXTRA_SIZE),
@@ -178,14 +184,20 @@ class Vocab:
         v.token_to_id = {t: i for i, t in enumerate(head)
                          if not _is_reserved(t)}
         for i, t in enumerate(tokens):
+            # 软删占位符 <del:N> 保留行号→ID 映射，但不登记可查表
+            if t.startswith(DEL_MARKER):
+                continue
             v.token_to_id[t] = base + i
         v.meta = {"source": "vocab.txt", "n_tokens": len(tokens)}
         v._n_user = len(tokens)
         # 扁平词表的最长 token 长度（encode_text 贪心匹配用）
-        v._max_match = max((len(t) for t in tokens), default=1)
+        v._max_match = max((len(t) for t in tokens if not t.startswith(DEL_MARKER)),
+                           default=1)
         # 扁平词表的可见部分全部按 regular 处理；fallback/special/system
-        # 的查表映射为空（不可见 token 不参与文本编码查表）
-        v.regular_ids = {t: base + i for i, t in enumerate(tokens)}
+        # 的查表映射为空（不可见 token 不参与文本编码查表）；
+        # <del:N> 软删占位符既不入查表也不计最长匹配
+        v.regular_ids = {t: base + i for i, t in enumerate(tokens)
+                         if not t.startswith(DEL_MARKER)}
         v.fallback_ids = {}
         v.special_ids = {}
         v.system_ids = {}
@@ -297,6 +309,23 @@ class Vocab:
                     {"text": text, "category": category, "id": slot})
             self._persist()
         return slot
+
+    def remove_token(self, text: str) -> int:
+        """扁平词表软删一个可见 token：原地替换为 <del:N> 占位符，保留 ID
+        位置（不令后续 token 漂移）。返回被删 token 的原 ID；其文本不再可被
+        文本编码查到。非扁平（全局 json）词表不支持（走 build_vocab 重建）。"""
+        if not self.flat:
+            raise ValueError("remove_token 仅支持扁平（每模型/词表预设）词表")
+        tid = self.regular_ids.get(text)
+        if tid is None:
+            raise ValueError(f"token 未收录于词表: {text!r}")
+        idx = tid - spec.INVISIBLE_END
+        with _LOCK:
+            self.id_to_token[tid] = f"{DEL_MARKER}{idx}>"
+            self.regular_ids.pop(text, None)
+            self.token_to_id.pop(text, None)
+            self._persist()
+        return tid
 
     def _persist(self) -> None:
         """原子写回加载时的来源文件（json → vocab.json / txt → vocab.txt）。"""

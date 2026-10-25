@@ -112,3 +112,50 @@ class TokensApi:
             "free_slots": free,
             "note": note,
         }
+
+    # ---------------- 词表区间占用（前端「词表」页面） ----------------
+    def api_vocab_ranges(self, query):
+        from vocab_presets import (global_ranges, preset_occupancy,
+                                   list_presets)
+        preset = (query.get("preset", [""])[0] or None)
+        data = global_ranges()
+        data["presets"] = list_presets()
+        if preset:
+            data["selected_preset"] = preset_occupancy(preset)
+        return 200, data
+
+    # ---------------- 词表预设 CRUD ----------------
+    def api_vocab_presets(self, body):
+        from vocab_presets import (create_preset, delete_preset,
+                                   list_presets)
+        action = body.get("action")
+        if action == "create":
+            name = body.get("name")
+            source = body.get("source") or "base"
+            if not name:
+                raise ValueError("缺少 name")
+            return 200, create_preset(name, source)
+        if action == "delete":
+            delete_preset(body.get("name"))
+            return 200, {"presets": list_presets()}
+        # 默认：列出全部预设
+        return 200, {"presets": list_presets()}
+
+    # ---------------- 预设内增删 token ----------------
+    def api_vocab_preset_token(self, body):
+        from vocab_presets import add_token, remove_token
+        action = body.get("action")
+        name = body.get("name")
+        token = body.get("token")
+        if not name:
+            raise ValueError("缺少 name")
+        if action == "add":
+            if not token:
+                raise ValueError("缺少 token")
+            category = body.get("category", "regular")
+            return 200, add_token(name, token, category)
+        if action == "remove":
+            if not token:
+                raise ValueError("缺少 token")
+            return 200, remove_token(name, token)
+        raise ValueError(f"action 必须是 add/remove: {action!r}")

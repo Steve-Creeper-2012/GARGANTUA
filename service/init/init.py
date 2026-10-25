@@ -46,6 +46,8 @@ from model import Gargantua
 
 
 def _run(args) -> dict:
+    # --json 模式：人类摘要走 stderr，stdout 只留最后的 JSON 结果行
+    _say = (lambda s: print(s, file=sys.stderr)) if args.json else print
     bad = valid_model_name(args.name)
     if bad:
         raise SystemExit(f"[init] 非法模型名 {args.name!r}: {bad}")
@@ -61,6 +63,21 @@ def _run(args) -> dict:
                                   csa_ratio=args.csa_ratio,
                                   hca_ratio=args.hca_ratio,
                                   csa_local_window=args.csa_window)
+    except ValueError as e:
+        raise SystemExit(f"[init] {e}")
+
+    # 2026-10-25：模型精度（fp64/32/16/8/4 + int16/8/4/2）；非法名 → 拒绝
+    from precision import validate_dtype
+    if args.dtype is not None:
+        try:
+            validate_dtype(args.dtype)
+        except ValueError as e:
+            raise SystemExit(f"[init] {e}")
+    dtype_name = args.dtype or "fp32"
+    # 2026-10-25：词表预设（每个模型从选定预设 seed 出 vocab.txt）
+    from vocab_presets import validate_preset, seed_model_vocab
+    try:
+        preset_name = validate_preset(args.vocab)
     except ValueError as e:
         raise SystemExit(f"[init] {e}")
 
@@ -91,11 +108,15 @@ def _run(args) -> dict:
         "hca_ratio": ctx["hca_ratio"],
         "csa_local_window": ctx["csa_local_window"],
         "optimizer": spec.OPTIMIZER,
+        # 2026-10-25：模型精度 + 词表预设来源（build_model 据此施加）
+        "dtype": dtype_name,
+        "vocab_preset": preset_name,
     }
     save_checkpoint(d, m, config)
+    # 2026-10-25：把选定词表预设的 vocab.txt 复制进模型目录（独立副本）
+    seed_model_vocab(d, preset_name)
+    _say(f"[init] 词表预设: {preset_name}  dtype: {dtype_name}")
     total_ctx = ctx["ctx_full"] + ctx["ctx_compress"]
-    # --json 模式：人类摘要走 stderr，stdout 只留最后的 JSON 结果行
-    _say = (lambda s: print(s, file=sys.stderr)) if args.json else print
     _say(f"[init] {d}  params={n/1e6:.1f}M  ({time.time()-t0:.1f}s)")
     _say(f"[init] 上下文: full={ctx['ctx_full']} + compress="
          f"{ctx['ctx_compress']} = {total_ctx}；"
@@ -133,6 +154,12 @@ def main():
                          f"{spec.CSA_LOCAL_WINDOW}，≤ ctx-full）")
     ap.add_argument("--json", action="store_true",
                     help="末行输出 JSON 结果（server run_oneshot 协议）")
+    # ---- 词表预设 + 精度（2026-10-25）----
+    ap.add_argument("--vocab", default=None,
+                    help="词表预设名（默认 base，从 vocabs/ 派生）")
+    ap.add_argument("--dtype", default=None,
+                    help="模型精度：fp64/fp32/fp16/bf16/fp8/int8/int4/int2"
+                         "（默认 fp32）")
     args = ap.parse_args()
 
     try:

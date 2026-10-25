@@ -354,6 +354,20 @@
             <label title="CSA 轻压缩比 N:1 + 完整区尾部局部窗，默认 4">CSA 比 <input type="number" id="model-csa-ratio" value="4" min="2" max="256" style="width:64px"></label>
             <label title="HCA 重压缩比 N:1 + 全局注意力，默认 32（须 ≥ CSA 比）">HCA 比 <input type="number" id="model-hca-ratio" value="32" min="2" max="256" style="width:64px"></label>
             <label title="CSA 在完整区尾部保留的局部窗（token），默认 512，≤ 完整上下文">CSA 窗 <input type="number" id="model-csa-window" value="512" min="1" style="width:72px"></label>
+            <label title="词表预设：每个模型的 vocab.txt 从该预设派生（独立副本），默认 base">词表预设 <select id="model-vocab"></select></label>
+            <label title="模型精度：fp64/32/16/bf16 走 torch 原生；fp8/fp4/int16/int8/int4/int2 在 CPU 上以 fp32 容器+权重量化模拟（有损耗）">精度
+              <select id="model-dtype">
+                <option value="fp32" selected>fp32</option>
+                <option value="fp64">fp64</option>
+                <option value="fp16">fp16</option>
+                <option value="bf16">bf16</option>
+                <option value="fp8">fp8</option>
+                <option value="fp4">fp4</option>
+                <option value="int16">int16</option>
+                <option value="int8">int8</option>
+                <option value="int4">int4</option>
+                <option value="int2">int2</option>
+              </select></label>
             <button class="act" id="model-create">创建并初始化</button>
             <span class="hint" id="model-create-msg"></span>
           </div>
@@ -366,6 +380,50 @@
             <thead><tr><th>名称</th><th>参数量</th><th>操作</th></tr></thead>
             <tbody id="model-tbody"></tbody>
           </table>
+        </div>
+      </section>
+
+      <!-- 词表 -->
+      <section class="page scroll" id="p-vocab">
+        <h2>词表</h2>
+        <div class="card">
+          <div class="card-head"><span class="card-title">ID 区间占用（自动归类）</span>
+            <span class="hint" id="vocab-bar-note"></span></div>
+          <canvas class="chart" id="vocab-bar" width="1200" height="44"></canvas>
+          <table id="vocab-regions">
+            <thead><tr><th>子区</th><th>大类</th><th>ID 区间</th><th>容量</th><th>已用</th><th>占用率</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <div class="card-head"><span class="card-title">词表预设（每个从基础词表 fork，独立隔离、可增删）</span></div>
+          <div class="row">
+            <input type="text" id="vocab-new-name" placeholder="新预设名（字母/数字/_-）" style="max-width:240px">
+            <label>源预设 <select id="vocab-new-source"></select></label>
+            <button class="act" id="vocab-create-preset">创建预设</button>
+            <span class="hint" id="vocab-create-msg"></span>
+          </div>
+          <table id="vocab-presets">
+            <thead><tr><th>名称</th><th>已用/容量</th><th>操作</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <div class="card-head"><span class="card-title">预设内增删 token（软删保留 ID 位置）</span></div>
+          <div class="row">
+            <label>预设 <select id="vocab-token-preset"></select></label>
+            <input class="grow" id="vocab-add-token" type="text" autocomplete="off" placeholder="新增 token 文本">
+            <select id="vocab-add-cat" title="四类任选">
+              <option value="regular">regular 常规可见</option>
+              <option value="fallback">fallback 可见</option>
+              <option value="special">special 特殊</option>
+              <option value="system">system 系统</option>
+            </select>
+            <button class="act" id="vocab-add">添加</button>
+            <input class="grow" id="vocab-remove-token" type="text" autocomplete="off" placeholder="删除 token 文本">
+            <button class="act sec" id="vocab-remove">删除</button>
+            <span class="hint" id="vocab-token-msg"></span>
+          </div>
         </div>
       </section>
 
@@ -752,6 +810,7 @@ function stepsToGts(steps, bound) {
 const NAV = [
   {id:"home", label:"主页", icon:"M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"},
   {id:"models", label:"模型", icon:"M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"},
+  {id:"vocab", label:"词表", icon:"M4 19.5A2.5 2.5 0 0 1 6.5 17H20M4 19.5A2.5 2.5 0 0 0 6.5 22H20V2H6.5A2.5 2.5 0 0 0 4 4.5v15z"},
   {id:"train", label:"训练", icon:"M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"},
   {id:"infer", label:"推理", icon:"M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"},
   {id:"text", label:"文本→token", icon:"M4 6h16M4 12h16M4 18h7"},
@@ -775,6 +834,7 @@ function switchPage(id) {
   $$(".page").forEach(x => x.classList.toggle("active", x.id === "p-" + id));
   if (id === "models") refreshModels();
   if (id === "train") refreshQueue();
+  if (id === "vocab") refreshVocab();
 }
 $("toggle-nav").onclick = () => $("sidebar").classList.toggle("collapsed");
 
@@ -876,6 +936,7 @@ async function refreshHome() {
   }
 }
 refreshHome();
+refreshVocab();
 
 /* ---------- 模型 ---------- */
 async function refreshModels() {
@@ -935,6 +996,8 @@ async function createModel(name, overwrite) {
     csa_ratio: intOrUndef($("model-csa-ratio").value),
     hca_ratio: intOrUndef($("model-hca-ratio").value),
     csa_local_window: intOrUndef($("model-csa-window").value),
+    vocab: $("model-vocab").value || "base",
+    dtype: $("model-dtype").value || "fp32",
   });
   const t0 = Date.now();
   while (Date.now() - t0 < 120000) {
@@ -1301,6 +1364,117 @@ $("vocab-add").onclick = async () => {
 $("vocab-add-token").addEventListener("keydown", e => {
   if (e.key === "Enter") $("vocab-add").onclick();
 });
+
+/* ---------- 词表页面（区间占用 + 预设管理） ---------- */
+function catColor(cat) {
+  return {regular:"#58a6ff", fallback:"#a371f7",
+          special:"#d29922", system:"#3fb950"}[cat] || "#6e7681";
+}
+async function refreshVocab() {
+  try {
+    const r = await api("/api/vocab/ranges");
+    drawVocabBar(r);
+    renderVocabRegions(r.regions);
+    renderVocabPresets(r.presets);
+    populateVocabSelects(r.presets);
+    const ct = r.category_totals || {};
+    $("vocab-bar-note").textContent =
+      `总槽位 ${r.vocab_size_padded}　已用 ` +
+      `regular=${ct.regular||0} fallback=${ct.fallback||0} ` +
+      `special=${ct.special||0} system=${ct.system||0}`;
+  } catch (e) {}
+}
+function drawVocabBar(r) {
+  const cv = $("vocab-bar"), ctx = cv.getContext("2d");
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  const total = r.vocab_size_padded;
+  let x = 0;
+  // 不可见头 [0, invisible_end)：special/system 固定契约，画一段灰底
+  const headW = r.invisible_end / total * W;
+  ctx.fillStyle = "#30363d";
+  ctx.fillRect(0, 0, headW, H);
+  x = headW;
+  for (const reg of r.regions) {
+    const w = reg.size / total * W;
+    ctx.fillStyle = catColor(reg.category);
+    ctx.fillRect(x, 0, Math.max(w, 0.5), H);
+    x += w;
+  }
+}
+function renderVocabRegions(regions) {
+  const tb = $("vocab-regions").querySelector("tbody");
+  tb.innerHTML = regions.map(rg => {
+    const pct = rg.padded ? (rg.used / rg.padded * 100).toFixed(1) : "0";
+    return `<tr><td>${rg.region}</td><td>${rg.category}</td>` +
+      `<td>${rg.begin}–${rg.begin + rg.size - 1}</td>` +
+      `<td>${rg.size}</td><td>${rg.used}</td><td>${pct}%</td></tr>`;
+  }).join("");
+}
+function renderVocabPresets(presets) {
+  const tb = $("vocab-presets").querySelector("tbody");
+  tb.innerHTML = presets.map(p => {
+    const pct = p.capacity ? (p.used / p.capacity * 100).toFixed(1) : "0";
+    const del = p.is_base ? "" :
+      `<button class="act danger xs" onclick="deletePreset('${esc(p.name)}')">删除</button>`;
+    return `<tr><td>${esc(p.name)} ` +
+      `${p.is_base ? '<span class="badge on">基础</span>' : ""}</td>` +
+      `<td>${p.used}/${p.capacity}（${pct}%）</td><td>${del}</td></tr>`;
+  }).join("");
+}
+function populateVocabSelects(presets) {
+  const opts = presets.map(p =>
+    `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
+  $("vocab-new-source").innerHTML = opts;
+  $("vocab-token-preset").innerHTML = opts;
+  const mc = $("model-vocab");
+  if (mc) mc.innerHTML = opts;
+}
+$("vocab-create-preset").onclick = async () => {
+  const name = $("vocab-new-name").value.trim();
+  if (!name) { $("vocab-create-msg").textContent = "请输入预设名"; return; }
+  $("vocab-create-msg").textContent = "创建中…";
+  try {
+    await api("/api/vocab/presets", {action:"create", name,
+                                    source: $("vocab-new-source").value});
+    $("vocab-create-msg").textContent = "已创建 " + name;
+    $("vocab-new-name").value = "";
+    refreshVocab();
+  } catch (e) { $("vocab-create-msg").textContent = "错误: " + e.message; }
+};
+window.deletePreset = async name => {
+  if (!confirm("删除词表预设 " + name + "？（其 vocab.txt 将被移除）")) return;
+  try { await api("/api/vocab/presets", {action:"delete", name});
+        refreshVocab(); }
+  catch (e) { alert(e.message); }
+};
+$("vocab-add").onclick = async () => {
+  const name = $("vocab-token-preset").value;
+  const token = $("vocab-add-token").value;
+  if (!token) { $("vocab-token-msg").textContent = "请输入 token"; return; }
+  $("vocab-token-msg").textContent = "添加中…";
+  try {
+    const r = await api("/api/vocab/preset/token",
+      {name, action:"add", token, category: $("vocab-add-cat").value});
+    $("vocab-token-msg").textContent =
+      `已添加 ${r.token} → #${r.id}（${r.category}）；剩余可见槽 ${r.used}`;
+    $("vocab-add-token").value = "";
+    refreshVocab();
+  } catch (e) { $("vocab-token-msg").textContent = "错误: " + e.message; }
+};
+$("vocab-remove").onclick = async () => {
+  const name = $("vocab-token-preset").value;
+  const token = $("vocab-remove-token").value;
+  if (!token) { $("vocab-token-msg").textContent = "请输入 token"; return; }
+  $("vocab-token-msg").textContent = "删除中…";
+  try {
+    const r = await api("/api/vocab/preset/token",
+      {name, action:"remove", token});
+    $("vocab-token-msg").textContent = `已软删 ${r.token}（原 #${r.id}）`;
+    $("vocab-remove-token").value = "";
+    refreshVocab();
+  } catch (e) { $("vocab-token-msg").textContent = "错误: " + e.message; }
+};
 </script>
 </body>
 </html>

@@ -274,6 +274,15 @@ def build_model(model_dir: str):
             raise ValueError(
                 f"模型目录的 config.json 与权重不匹配"
                 f"（block 数或上下文配置被修改过）: {first}")
+    # 2026-10-25：按 config["dtype"] 施加模型精度（fp64/32/16/bf16 原生；
+    # fp8/int8/int4/int2 在 CPU 上以 fp32 容器 + 权重量化模拟——损耗但能跑）。
+    # 坏值防御性回退 fp32 并告警，不让单个错 dtype 把服务进程打崩。
+    dtype_name = cfg.get("dtype") or "fp32"
+    try:
+        from precision import apply_precision
+        apply_precision(m, dtype_name)
+    except Exception as e:
+        _warn(f"config dtype={dtype_name!r} 施加失败，回退 fp32: {e}")
     return m
 
 
