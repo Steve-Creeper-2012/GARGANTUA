@@ -543,7 +543,7 @@ partway through `test_model`.
 
 ## License
 
-MIT
+GPLv3.0
 
 ---
 
