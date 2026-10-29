@@ -669,7 +669,14 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     # 1) 环境预检：解释器版本 + 主依赖（缺了给可执行提示，不黑屏）
-    if not check_environment(sys.executable):
+    #    经由 launcher（启动.sh / 启动.command）启动时，它已做轻量预检
+    #    （只确认隔离 Python + pywebview）并设置 GARGANTUA_NO_DEPCHECK=1，
+    #    故此处跳过——torch 导入在弱网/首次会拖很久，不应阻塞启动。
+    #    直接 `python server.py` 时仍会做完整预检作为兜底。
+    if os.environ.get("GARGANTUA_NO_DEPCHECK") == "1":
+        print("[server] 跳过主依赖预检（由 launcher 轻量预检接管："
+              "GARGANTUA_NO_DEPCHECK=1）")
+    elif not check_environment(sys.executable):
         return 1
 
     app = App(args.model_dir, args.data_dir, args.log_file,
