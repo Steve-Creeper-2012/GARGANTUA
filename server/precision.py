@@ -123,18 +123,25 @@ _FP4_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
 def _sim_fp4(x: torch.Tensor) -> torch.Tensor:
-    """fp4(e2m1) 最近邻网格量化→反量化（返回 fp32）。
+    """fp4(e2m1) 逐张量 scale 网格量化→反量化（返回 fp32）。
 
-    CPU 无 fp4 计算内核，按权重-only 模拟：把权重绝对值映射到 e2m1 网格
-    的最近邻、带符号写回，再保持 fp32 容器承载。
-    """
-    grid = torch.tensor(_FP4_GRID, dtype=x.dtype, device=x.device)
+    CPU 无 fp4 计算内核，按权重-only 模拟：先算 scale = amax|x| / 6，
+    把 x/scale 映射到 e2m1 网格 {0,0.5,…,6} 的最近邻、带符号写回，
+    再乘回 scale。scale 归一化保证任意量级的权重都铺满整个网格——
+    不做归一化时初始权重（std≈0.02）会全部量化为 0（2026-10-27 审计
+    实测：10000 个采样权重零值比例 100%，embedding/投影/lm_head 同时
+    失效）。 """
+    grid = torch.tensor(_FP4_GRID, dtype=torch.float32, device=x.device)
     sign = torch.sign(x)
     ax = x.abs()
-    # 最近邻：对每个元素在 8 点网格里取距离最小者（向量化）。
-    d = (ax.unsqueeze(-1) - grid.view(1, -1)).abs()      # [N, 8]
-    nearest = grid.view(1, -1)[0][d.argmin(dim=-1)]     # [N]
-    return (sign * nearest).to(torch.float32)
+    amax = ax.amax()
+    if amax == 0:
+        return torch.zeros_like(x, dtype=torch.float32)
+    scale = amax / _FP4_GRID[-1]            # 网格最大可表示值 = 6
+    q = (ax / scale).unsqueeze(-1)
+    d = (q - grid.view(1, -1)).abs()        # [N, 8]
+    nearest = grid[d.argmin(dim=-1)]        # [N]
+    return (sign * nearest * scale).to(torch.float32)
 
 
 # ---------------------------------------------------------------------------

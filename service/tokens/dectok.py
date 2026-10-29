@@ -38,8 +38,9 @@ else:
 import boot
 boot.bootstrap()
 import spec  # noqa: E402
-from tokens.tok32 import hex_to_ids, read_tokens_file  # noqa: E402
-from tokens.vocab import set_vocab_source  # noqa: E402
+from tokens import tok5  # noqa: E402
+from tokens.tok32 import hex_to_ids  # noqa: E402
+from tokens.vocab import get_vocab, set_vocab_source  # noqa: E402
 
 
 def decode_ids(ids, mode: str = "ids") -> str:
@@ -57,6 +58,11 @@ def decode_ids(ids, mode: str = "ids") -> str:
         return _text_decode(ids)
     out: list = []
     for i in ids:
+        # 2026-10-27 审计修复：token ID 是 uint32，越界值此前会被
+        # "%08x" 静默格式化错（-1 → "-0000001"，2**32 → 九位十六进制）
+        if (not isinstance(i, int)) or isinstance(i, bool) \
+                or not (0 <= i < 2 ** 32):
+            raise ValueError(f"token ID 非法（需 uint32 整数）: {i!r}")
         if i == spec.TS_OPEN_ID:
             out.append("{")
         elif i == spec.TS_CLOSE_ID:
@@ -77,7 +83,8 @@ def decode_hex(text: str, mode: str = "ids") -> str:
 # CLI
 # ---------------------------------------------------------------------------
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="dectok：tok-32 token 流 → 可读形式")
+    ap = argparse.ArgumentParser(
+        description="dectok：token-5 .tokens / 历史 hex 流 → 可读形式")
     src = ap.add_mutually_exclusive_group()
     src.add_argument("hexish", nargs="?", default=None,
                      help="8 位十六进制/token 的文本，或 .tokens 文件路径")
@@ -93,14 +100,23 @@ def main(argv=None):
         set_vocab_source(args.vocab)
 
     mode = "text" if args.text else "ids"
-    if args.file is not None:
-        ids = read_tokens_file(args.file)
-    elif args.hexish is not None:
-        p = Path(args.hexish)
-        if p.is_file():
-            ids = read_tokens_file(p)
+    # 文件输入 = token-5 位流（现行格式）
+    path = args.file
+    if path is None and args.hexish is not None and Path(args.hexish).is_file():
+        path = args.hexish
+    if path is not None:
+        items = tok5.read_file(path)
+        if mode == "text":
+            ids = [e["id"] for it in items if it["kind"] == "step"
+                   for e in it["elements"] if e["kind"] == "text"]
+            print(decode_ids(ids, "text"))
         else:
-            ids = hex_to_ids(args.hexish)
+            print(tok5.to_display(
+                items, name_of=tok5.vocab_name_of(get_vocab())))
+        return
+    # 其余：历史 hex 文本（8 位/token）
+    if args.hexish is not None:
+        ids = hex_to_ids(args.hexish)
     else:
         ids = hex_to_ids(sys.stdin.read())
     print(decode_ids(ids, mode))

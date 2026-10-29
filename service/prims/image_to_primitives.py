@@ -139,7 +139,11 @@ WIDTH_MUTATION_RANGE = 28.0
 HEIGHT_MUTATION_RANGE = 28.0
 ANGLE_MUTATION_RANGE_DEG = 16.0
 MIN_HALF_SIZE = 1.0
-MAX_HALF_SIZE = 128.0
+# 2026-10-27 审计修复：半尺寸上限与绘图 token 的可表示范围共享同一上界——
+# w/h token bin = px*4、512 bins，最大可表示 (512-1)/4 = 127.75 px（全尺寸）。
+# 旧值 128（半尺寸）→ 全尺寸 256，token 化时被 draw_codec clamp 到 127.75，
+# 返回的 primitives/SVG 与 tokens 几何不一致（实测 256 → 127.75）。
+MAX_HALF_SIZE = (spec.DRAW_W_BINS - 1) / spec.SIZE_BINS_PER_PIXEL / 2.0
 HISTORY_WINDOW = 50           # 早停比较窗口（步）：必须 < max_steps 才可能触发
                               # （2026-10-20：原 1000 > max_steps=100，早停是死代码）
 EARLY_STOP_THRESHOLD = 0.0005

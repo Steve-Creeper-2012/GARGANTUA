@@ -1,7 +1,7 @@
 # ===========================================================================
 # GARGANTUA v1 — train.py：文本预训练（教师强制，B=1，FP32）
 # ---------------------------------------------------------------------------
-# 数据：data/ 下所有 .tokens 文件（tok-32，必须带 { } | 时间步结构），
+# 数据：data/ 下所有 .tokens 文件（token-5 位流，必须带 { } 时间步结构），
 # 由 tokens/tokenset 展开成「扁平 token_ids + 并行 step_ids」；
 # 每个窗口切成 user 段（encoder）+ model 段（decoder 预测目标）。
 # 优化器：Muon（隐藏层 2D）+ AdamW（embedding/head/norm），--optimizer 可关。
@@ -23,7 +23,6 @@ import random
 import time
 
 import torch
-import torch.nn.functional as F
 
 # ---- GARGANTUA 路径引导（目录树重构：把 server/ 与 service/* 放上 path）----
 import sys as _sys
@@ -37,15 +36,16 @@ else:
 import boot
 boot.bootstrap()
 import spec
-from common import (CKPT_NAME, build_model, make_batch, read_config,
-                    save_checkpoint, validate_block_size)
+from common import (CKPT_NAME, build_model, read_config, save_checkpoint,
+                    validate_block_size)
 from muon import build_optimizers
 from tokens.tokenset import load_corpus
 from tokens.vocab import set_model_vocab
+from train_step import forward_window, window_index, window_loss
 
 
 def load_corpus_ids(data_dir: str):
-    """ data/ 下全部 .tokens → (扁平 ids, 每 token 的 step_ids)。 """
+    """ data/ 下全部 .tokens → 按文档分组的 [(ids, step_ids), ...]。 """
     paths = sorted(glob.glob(os.path.join(data_dir, "**", "*.tokens"),
                              recursive=True))
     if not paths:
@@ -79,18 +79,31 @@ def main():
 
     opts = build_optimizers(m, args.optimizer, args.lr, args.muon_lr,
                             spec.MUON_MOMENTUM)
-    ids, step_ids = load_corpus_ids(args.data)
-    assert len(ids) > B + 1, f"语料太少：{len(ids)} tokens < {B + 2}"
-    print(f"[train] corpus={len(ids)} tokens  steps={args.steps}  "
-          f"block={B}  optimizer={args.optimizer}")
+    docs = load_corpus_ids(args.data)
+    # 文档边界保留：窗口只在单个文档内采样，绝不跨 <stop>（2026-10-27
+    # 审计修复）；过短（装不下一个完整窗口）的文档跳过。
+    usable = [d for d in docs if len(d["pos_ids"]) >= B + 2]
+    if not usable:
+        raise SystemExit(f"语料不足：所有文档都 < {B + 2} tokens")
+    total = sum(len(d["pos_ids"]) for d in usable)
+    n_mm = sum(1 for d in usable if d["multimodal"])
+    print(f"[train] corpus={total} tokens/{len(usable)} docs"
+          f"（多模态 {n_mm}）  steps={args.steps}  block={B}  "
+          f"optimizer={args.optimizer}")
 
     t0 = time.time()
+    skipped = 0
     for step in range(1, args.steps + 1):
-        i = random.randint(0, len(ids) - B - 2)
-        x_in, s_in, dec_in, s_dec, y = make_batch(ids, i, B, step_ids)
-
-        logits = m.forward_train(x_in, s_in, dec_in, s_dec)
-        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), y.view(-1))
+        doc = random.choice(usable)                # 先选文档，再在文档内开窗
+        i = window_index(doc, B, random, force_last=(step == 1))
+        if i is None:
+            skipped += 1
+            continue
+        logits, y, n_valid = forward_window(m, doc, i, B)
+        if n_valid == 0:                           # 整窗都是媒体，无目标可训
+            skipped += 1
+            continue
+        loss = window_loss(logits, y)
         for o in opts:
             o.zero_grad(set_to_none=True)
         loss.backward()
@@ -102,7 +115,8 @@ def main():
         if step % 10 == 0 or step == 1:
             el = time.time() - t0
             print(f"[train] step {step:4d}/{args.steps}  "
-                  f"loss {loss.item():.4f}  {el/step:.2f}s/it")
+                  f"loss {loss.item():.4f}  {el/step:.2f}s/it"
+                  + (f"  (跳过 {skipped} 窗)" if skipped else ""))
         if step % args.save_every == 0:
             save_checkpoint(args.model, m, _config_dict(args, m))
             print(f"[train] saved {os.path.join(args.model, CKPT_NAME)}")
@@ -129,8 +143,9 @@ def _config_dict(args, m) -> dict:
         "ctx_compress": getattr(m, "ctx_compress", spec.CTX_COMPRESS),
         "csa_ratio": getattr(m, "csa_ratio", spec.CSA_RATIO),
         "hca_ratio": getattr(m, "hca_ratio", spec.HCA_RATIO),
-        "csa_local_window": getattr(m, "csa_local_window",
-                                    spec.CSA_LOCAL_WINDOW),
+        # 2026-10-27 审计修复：CSA 局部窗参数已删除，此前此处 getattr 回退
+        # 读取该字段必抛 AttributeError，任何周期保存/最终保存都让训练
+        # 结果无法落盘
         "optimizer": args.optimizer,
     })
     cfg.setdefault("created", time.strftime("%Y-%m-%d %H:%M:%S"))

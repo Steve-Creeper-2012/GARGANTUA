@@ -36,10 +36,13 @@ class TestShapes(unittest.TestCase):
     def test_kda_shapes(self):
         kda = model.KDAAttention()
         x = torch.randn(1, 16, spec.D_MODEL)
-        out, s = kda(x)
+        # 2026-10-27（S2）：KDA 额外返回短卷积 cache，供增量推理续接
+        out, s, conv = kda(x)
         self.assertEqual(out.shape, (1, 16, spec.D_MODEL))
         self.assertEqual(s.shape, (1, spec.N_HEADS, spec.KDA_HEAD_DIM,
                                    int(spec.KDA_HEAD_DIM * spec.KDA_EXPAND_V)))
+        self.assertIsInstance(conv, dict)
+        self.assertIn("q", conv)
 
     def test_forward_train_and_backward(self):
         torch.manual_seed(0)
@@ -62,16 +65,28 @@ class TestShapes(unittest.TestCase):
 
 
 class TestStepCausalMask(unittest.TestCase):
-    """ 时间步因果掩码：步间因果 + 步内双向，绝不泄露未来步。 """
+    """ 时间步因果掩码：步间因果 + 步内 token 级因果，绝不泄露未来 token。
+
+    2026-10-27 审计修复（S1）：旧契约是「步内双向」，而训练标签是逐 token
+    左移的——同一步内后一个 token 会看到自己的标签。现在掩码细化到 token：
+    可见 ⟺ kv_step < x_step，或 kv_step == x_step 且 0 ≤ kv_pos ≤ x_pos；
+    整步压缩聚合条目（pos = -1）只在严格过去可见。
+    """
 
     def test_mask_rule(self):
         x_s = torch.tensor([[2, 2, 3, 3]])
+        x_p = torch.tensor([[0, 1, 0, 1]])
         kv_s = torch.tensor([[0, 1, 2, 2, 3, 4]])
-        mask = kv_s.unsqueeze(1) <= x_s.unsqueeze(2)
-        expect = torch.tensor([[[1, 1, 1, 1, 0, 0],
-                                [1, 1, 1, 1, 0, 0],
-                                [1, 1, 1, 1, 1, 0],
-                                [1, 1, 1, 1, 1, 0]]], dtype=torch.bool)
+        kv_p = torch.tensor([[0, 0, 0, 1, 0, 0]])
+        # 可见 ⟺ 步更早，或同一步且步内序号不晚于查询
+        same_step_ok = (kv_s.unsqueeze(1) == x_s.unsqueeze(2)) & (
+            kv_p.unsqueeze(1) <= x_p.unsqueeze(2))
+        mask = (kv_s.unsqueeze(1) < x_s.unsqueeze(2)) | same_step_ok
+        expect = torch.tensor([[[1, 1, 1, 0, 0, 0],   # 步2 pos0：同步只看 pos0
+                                [1, 1, 1, 1, 0, 0],   # 步2 pos1：同步 pos0..1
+                                [1, 1, 1, 1, 1, 0],   # 步3 pos0
+                                [1, 1, 1, 1, 1, 0]]], # 步3 pos1（步3 只有 pos0）
+                               dtype=torch.bool)
         self.assertTrue(torch.equal(mask, expect))
 
     def test_no_future_leak_in_attention(self):
@@ -81,11 +96,14 @@ class TestStepCausalMask(unittest.TestCase):
         kv = torch.randn(1, 4, spec.D_MODEL)
         x_s = torch.tensor([[0, 1]])
         kv_s = torch.tensor([[0, 1, 2, 3]])
-        out1 = mla(x, kv, kv_s, x_s)
+        # 每步一个 token → 步内序号全 0
+        x_p = torch.zeros(1, 2, dtype=torch.long)
+        kv_p = torch.zeros(1, 4, dtype=torch.long)
+        out1 = mla(x, kv, kv_s, x_s, kv_pos=kv_p, x_pos=x_p)
         # 篡改未来位置的 kv，输出不应变化（未来不可见）
         kv2 = kv.clone()
         kv2[0, 2:] = torch.randn(2, spec.D_MODEL)
-        out2 = mla(x, kv2, kv_s, x_s)
+        out2 = mla(x, kv2, kv_s, x_s, kv_pos=kv_p, x_pos=x_p)
         self.assertTrue(torch.allclose(out1, out2, atol=1e-5))
 
 
@@ -133,9 +151,10 @@ class TestFastWeight(unittest.TestCase):
         bank = model.FastWeightBank()
         x = torch.randn(1, 8, spec.D_MODEL)
         bank(x)
-        s1 = bank._state.clone()
+        # 2026-10-27（S2）：状态 = (S, 短卷积 cache)；比较递归状态本体
+        s1 = bank._state[0].clone()
         bank(x)
-        self.assertFalse(torch.allclose(s1, bank._state))
+        self.assertFalse(torch.allclose(s1, bank._state[0]))
 
     def test_reset(self):
         bank = model.FastWeightBank()
@@ -205,8 +224,9 @@ class TestSharedKV(unittest.TestCase):
         big = torch.randn(spec.CTX_TOTAL, spec.D_MODEL)
         for i in range(0, big.shape[0], 10):
             kv.append(big[i:i + 10], step_id=i // 10, type_id=0, source="enc")
-        vh, _ = kv.view("hca")
-        vc, _ = kv.view("csa")
+        # 2026-10-27（S1）：view 返回 (vecs, step_ids, pos)
+        vh = kv.view("hca")[0]
+        vc = kv.view("csa")[0]
         # HCA：1024 完整 + 3072/32≈96 压缩（步边界效应有少量余量）
         self.assertGreater(vh.shape[1], spec.CTX_FULL)
         self.assertLess(vh.shape[1], spec.CTX_FULL + 200)

@@ -27,6 +27,7 @@
 # 定案记录（2026-10-24，steve 拍板，tok-32 词表重构）：
 #   - ID 为 32-bit；.tokens 二进制 = 大端 uint32 流，4 字节/「字符」，
 #     一字符一 token（tok-32 编码，解释器见 tokens/tok32.py）。
+#     【已被 2026-10-28 的 token-5 取代，见下条】
 #   - 词表分四大类：regular 常规可见 / fallback 可见（a–z）/
 #     special 特殊（不可见）/ system 系统（不可见，{ } |）。
 #   - 旧 28 个特殊 token 移除，只保留 <pad> <caps> <user> <model>
@@ -39,6 +40,20 @@
 #   - 图元（draw）token 布局照搬 wonderfulearth/primitive-operation-painter
 #     的 geometrize_256_v1（service/prims/ 内 vendored，转换器为 Rust/wgpu）；
 #     MIDI 输出 token 暂时删除。
+#
+# 定案记录（2026-10-28，steve 拍板，token-5 编码）：
+#   - .tokens 改为 token-5：27 个符号（0-9 { } < > | : w t v A-F x y），
+#     5 bit/字符，位流落盘，末字符后跟终止符码 27。
+#   - {} 内是正常 token（用户 token）：可见、有向量坐标、进 loss。
+#     <id> 是扩展系统 token：有嵌入但没有位置坐标（位置嵌入的职责交给
+#     它们，KDA 自学位置关系），不进 loss、不显示为内容。
+#     { } | 是结构字符，本身不是 token。
+#   - 文本 token 写作 {t:<5 位十进制 ID>}，显示为 {text: 00001}。
+#   - 音频：533 采样 × 16 bit 顺序拼接 → 2132 个 hex 字符，{w:...}；
+#     末尾不足 533 的残段直接丢弃。
+#   - 视觉：patch 32×32，逐行、行内从左到右，每像素 RGBA 各 10 bit
+#     （40 bit），共 40960 bit → 10240 个 hex 字符，写作
+#     {v:<hex>x:<gx>y:<gy>}，同帧多个 patch 用 | 分隔。
 #
 # 定案记录（2026-10-25，steve 拍板，内部流程对齐）：
 #   - block 内顺序改为 KDA → KDA → KDA → MLA-CSA → MLA-HCA → FFN → AttnRes
@@ -299,6 +314,65 @@ AUDIO_SR = 16000             # 16kHz 单声道
 AUDIO_SAMPLES_PER_TOKEN = 533        # 533 采样/token ≈ 30 tok/s
 # 输入 embedding：533 个采样点平铺成一条向量 → 线性投影 → d_model
 
+# ---------------------------------------------------------------------------
+# 5b. token-5 编码（2026-10-28 定案，取代 tok-32 的 .tokens 二进制）
+# ---------------------------------------------------------------------------
+# 动机：tok-32 的 .tokens 只能装「离散 ID」，音频/视觉必须另存 .tokenvector，
+# 训练与存档是两套文件。token-5 把三种模态压进同一个字符流：
+#   {t:<id>}               文本 token（可见、有向量、进 loss）
+#   {w:<hex>}              音频 token（533 采样）
+#   {v:<hex>x:<gx>y:<gy>}  视觉 patch token（32×32 像素）
+#   <id>                   扩展系统 token（有嵌入、不进 loss、不可显示）
+#   { } |                  结构字符（不是独立 token，不占位置、不进 loss）
+#
+# —— 字符集：27 个符号，5 bit/字符 ——
+#   '0'-'9'  十进制数字（ID / 坐标 / 十六进制数字位）
+#   '{' '}'  时间步边界
+#   '<' '>'  扩展系统 token 边界
+#   '|'      步内 token 分隔 / patch 分隔
+#   ':'      字段分隔
+#   'w'      音频载荷标识（wave）
+#   't'      文本载荷标识（text）
+#   'v'      视觉载荷标识（visual）
+#   'A'-'F'  十六进制字母（大写；小写不属于字符集）
+#   'x' 'y'  视觉坐标标识
+#   没有空格，没有其它字母。字符码即上表顺序 0..26；码 27 是流终止符
+#   （不是字符），28..31 保留。
+T5_CHARS = "0123456789{}<>|:wtvABCDEFxy"
+T5_ALPHABET_SIZE = len(T5_CHARS)          # 27
+T5_BITS_PER_CHAR = 5
+T5_END_CODE = 27                          # 终止符：不是字符，解码到此为止
+T5_CHAR_CODE = {c: i for i, c in enumerate(T5_CHARS)}
+T5_HEX_CHARS = "0123456789ABCDEF"
+
+# —— 载荷尺寸（全部定长，解码无需分隔符）——
+# 文本/扩展 token 的 ID：定长 5 位十进制（VOCAB_SIZE_PADDED = 88704 < 10^5）
+T5_ID_DIGITS = 5
+T5_ID_LIMIT = 10 ** T5_ID_DIGITS          # 100000
+
+# 音频：每 token 恰好 533 个采样点，16 bit 有符号 PCM（mp3/flac 解码后的
+# 通用形态），按时间顺序拼接 → 533*16 = 8528 bit = 2132 个十六进制字符。
+AUDIO_SAMPLE_BITS = 16
+T5_WAVE_BITS = AUDIO_SAMPLES_PER_TOKEN * AUDIO_SAMPLE_BITS   # 8528
+T5_WAVE_HEX = T5_WAVE_BITS // 4                              # 2132
+
+# 视觉：一个 patch 32×32 像素，逐行（第 1 行→第 32 行）、行内从左到右，
+# 每个像素 R/G/B/A 各 10 bit 共 40 bit，按 R→G→B→A 拼接。
+# 1024 * 40 = 40960 bit = 10240 个十六进制字符。
+T5_PIXEL_BITS = 4 * 10                    # RGBA 各 10 bit
+T5_PATCH_BITS = PATCH_PIXELS * T5_PIXEL_BITS    # 40960
+T5_PATCH_HEX = T5_PATCH_BITS // 4               # 10240
+T5_CHANNEL_MAX = (1 << 10) - 1            # 1023
+
+# —— 语义 ——
+# {t:} {w:} {v:} 元素：可见 token，有向量坐标（走 embedding / 投影），进 loss。
+# <id> 元素：扩展系统 token，有嵌入但【没有】位置坐标——KDA 让模型自己学
+#   位置关系，标准 Transformer 位置嵌入的职责就交给这类 token；它们不进
+#   loss，也不作为可见内容显示。
+# { } | ：结构字符，本身不是 token（不占 token 位置、不进 loss、无嵌入）。
+# 时间步仍是原子单位：{} 必须至少含一个元素，空步非法。
+# 落盘（.tokens）：5 bit/字符的位流，末字符后跟终止符码 27，再补零到字节。
+
 # 绘图输出（仅输出，token 区间见词表布局；画布照搬仓库 256×256）
 CANVAS_W = 256
 CANVAS_H = 256
@@ -351,7 +425,9 @@ DTYPE = "float32"            # 训练/推理默认 FP32（x86_64 mac 无 CUDA）
 #                  fast_shape_render/（逐字照搬的第三方 Rust/wgpu 转换器，
 #                  未改动；setup.sh 用 environment/rust 隔离构建）+
 #                  upstream/（上游仓库完整留档）
-#   models/        models/NAME/{model.safetensors, config.json, vocab.txt?}
+#   models/        models/NAME/{model.<uuid>.safetensors, config.json, vocab.txt?}
+#                  （config.json 是 manifest：它的 "weights" 指向哪个权重文件，
+#                    读者就加载哪个；发布 = 单文件原子替换）
 #   data/          data/queue/（待训练）+ data/done/（已训练归档）
 #   logs/          auto_train.jsonl 等运行日志
 #
@@ -367,14 +443,18 @@ DTYPE = "float32"            # 训练/推理默认 FP32（x86_64 mac 无 CUDA）
 #   进程级的，进程退出才是真省内存。
 #
 # 每模型词表（vocab.txt）：
-#   models/NAME/vocab.txt 一行一个 token，第 N 行 → token ID =
-#   INVISIBLE_END + N（不可见区 [0, INVISIBLE_END) 是 special/system/
-#   modal 固定 token 的架构契约——<stop>/<caps>/{ } |/图元输出 token 的
-#   ID 由上面的常量按 ID 定位，decode 的停止/大小写逻辑靠它们，自定义
-#   词表不得占用）；空行跳过；重复拒绝（反查歧义）；条目数上限
-#   VOCAB_SIZE_PADDED - INVISIBLE_END。扁平词表的可见部分全部按
-#   regular 处理（special/system 不可见、不参与文本编码查表）。没有
-#   vocab.txt 的模型用全局词表 service/tokens/vocab.json。
+#   models/NAME/vocab.txt 是 v2 扁平词表（2026-10-27 审计修复 H1）：
+#   首行魔数 "#gargantua-vocab-v2"，其后每行 "<ID>\t<JSON 字符串>"，ID
+#   显式给出，落在 [INVISIBLE_END, VOCAB_SIZE_PADDED)（不可见区
+#   [0, INVISIBLE_END) 是 special/system/modal 固定 token 的架构契约——
+#   <stop>/<caps>/{ } |/图元输出 token 的 ID 由上面的常量按 ID 定位，
+#   decode 的停止/大小写逻辑靠它们，自定义词表不得占用）。未列出的 ID
+#   即空位（可被「添加 token」回收）；重复 ID / 重复文本拒绝（反查歧义）。
+#   旧 v1 位置式文件（一行一个 token，第 N 行 → INVISIBLE_END + N）读入
+#   时自动就地升级，ID 映射不变。
+#   扁平词表的可见部分全部按 regular 处理；special/system 查表映射取自
+#   固定 head，单字母 regular token 兼作 fallback（英文拼写兜底）。
+#   没有 vocab.txt 的模型用全局词表 service/tokens/vocab.json。
 #   切换活动模型时，server / infer / train 进程各自 set_model_vocab()。
 #
 # 启动链（唯一入口）：
@@ -400,19 +480,21 @@ DTYPE = "float32"            # 训练/推理默认 FP32（x86_64 mac 无 CUDA）
 # 模型前向输入 = 扁平 token_ids + 并行 step_ids + type_ids；
 # decoder 因果 = 步间因果 + 步内双向（无步内掩码）。
 #
-# 时间步结构（2026-10-24 tok-32 体系，tokens/timestep.py）：
-#   离散 token 流中，每个时间步由系统 token { } 包裹，步内多个 token
-#   由 | 分隔。文本每 token 独占一步（{ } | 不显式出现，由 step 边界
-#   承载）；图片 = 一步（内部多 patch token）；音频每 533 采样 = 一个
-#   token = 一步；视频每帧 = 一步。KDA 循环状态递归 / 逻辑并行以
-#   时间步为原子：每处理完一个时间步内的 token，KDA 状态递归一次。
+# 时间步结构（token-5 体系，2026-10-28 起，tokens/tok5.py）：
+#   流中的每个时间步由字符 { } 包裹，步内多个元素由 | 分隔；元素形态
+#   见第 5b 节（t: 文本 / w: 音频 / v: 视觉）。文本每 token 独占一步；
+#   图片 = 一步（内部多 patch 元素）；音频每 533 采样 = 一个元素 = 一步；
+#   视频每帧 = 一步。KDA 循环状态递归 / 逻辑并行以时间步为原子。
+#   结构字符 { } | 本身不是 token，不占 token 位置、不进 loss、无嵌入。
 #
-# 训练数据（2026-10-25 起）：.tokens 文件（tok-32 大端 uint32 流），
-#   内容必须带 { } | 时间步结构（timestep.unwrap 可解析）；训练侧
-#   读取后按 Step 展开成「扁平 token_ids + 并行 step_ids」。JSON/JSONL
-#   训练数据已废弃。Token 编辑器导出同一格式，训练与编辑器共用一套流。
+# 训练数据（2026-10-28 起）：.tokens 文件（token-5 位流，5 bit/字符）。
+#   内容必须带 { } | 时间步结构；训练侧读取后按 Step 展开成「扁平
+#   token_ids + 并行 step_ids」。旧 tok-32 大端 uint32 流不再生成，
+#   tok32 模块仅作为历史数据的读取/转换工具保留。
+#   Token 编辑器导出同一格式，训练与编辑器共用一套流。
 #
 # 标识（2026-10-25）：段类型用类型嵌入表达——user 段内所有 token 都加
 #   type_emb(TYPE_USER)，model 段都加 type_emb(TYPE_MODEL)，不分段首
-#   段尾。<user>/<user/>/<model>/<model/> 这类边界 token 是系统级标记，
-#   不进入共享 KV、不作为普通 token 参与 loss。
+#   段尾。<user>/<user/>/<model>/<model/> 这类边界 token 是扩展系统级
+#   标记（token-5 写作 <1> / <2> / <3> / <4>），不进入共享 KV、不作为
+#   普通 token 参与 loss。

@@ -655,16 +655,18 @@ class GtsAndTokensetTest(unittest.TestCase):
             gts.parse_gts("{\U00020000}")     # 扩展 B 未收录
 
     def test_tokenset_read_stream(self):
-        from tokens import gts, tokenset
-        ids = gts.parse_gts("{<user>}{hello}{<user/>}")
+        from tokens import tokenset, tok5
+        items = [{"kind": "ext", "id": 1}, tok5.step(tok5.text(50994)),
+                 {"kind": "ext", "id": 2}]
         tmp = tempfile.NamedTemporaryFile(suffix=".tokens", delete=False)
         try:
-            tmp.write(tok32.encode_ids(ids))
+            tmp.write(tok5.dumps(items))
             tmp.close()
             flat, steps = tokenset.read_stream(tmp.name)
-            # read_stream 只返回步内内容 token（{ } | 由 step_ids 承载）
-            self.assertEqual(flat, [1, 50994, 2])
-            self.assertEqual(steps, [0, 1, 2])   # 三步，一步一 token
+            # read_stream 只返回 token（{} 与结构字符由 step_ids 承载）；
+            # read_doc 会在文档末尾追加 <stop> 时间步（教模型学会终止）
+            self.assertEqual(flat, [1, 50994, 2, spec.STOP_ID])
+            self.assertEqual(steps, [0, 1, 2, 3])   # 四步，一步一 token
         finally:
             Path(tmp.name).unlink(missing_ok=True)
 
@@ -672,7 +674,7 @@ class GtsAndTokensetTest(unittest.TestCase):
         from tokens import tokenset
         tmp = tempfile.NamedTemporaryFile(suffix=".tokens", delete=False)
         try:
-            tmp.write(tok32.encode_ids([100, 101, 102]))   # 无 { }
+            tmp.write(b"\x00\x01\x02")        # 不是 token-5 位流
             tmp.close()
             with self.assertRaises(tokenset.TokensetError):
                 tokenset.read_stream(tmp.name)

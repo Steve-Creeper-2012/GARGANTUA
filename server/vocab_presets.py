@@ -5,8 +5,9 @@
 # 出来，彼此独立隔离、可独立增删。创建模型时从选定预设 seed 出
 # models/NAME/vocab.txt。
 #
-# 存储：vocabs/<name>/vocab.txt（扁平可见 token 列表，行 N → ID INVISIBLE_END+N，
-# 与每模型词表同契约）。base 为系统预设，由全局 vocab.json 的可见区派生。
+# 存储：vocabs/<name>/vocab.txt（扁平可见 token 列表，v2 格式带显式 ID；
+# 见 common.VOCAB_FILE_MAGIC）。base 为系统预设，由全局 vocab.json 的
+# 可见区派生——只导出真实 token，reserved 占位符不落盘。
 #
 # 增删：复用 tokens.vocab.Vocab（flat 模式）的 add_token / remove_token；
 # remove_token 走软删（<del:N> 占位符），保留 ID 位置。
@@ -16,10 +17,13 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import threading
 from pathlib import Path
 
 import spec
+from common import (VOCAB_FILE_MAGIC, read_flat_vocab_file,
+                    write_flat_vocab_file)
 from tokens.vocab import DEL_MARKER, Vocab
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -54,37 +58,101 @@ def vocab_txt_path(name: str) -> Path:
     return preset_dir(name) / "vocab.txt"
 
 
-def read_flat_tokens(name: str) -> list:
-    """读预设的扁平 token 列表（跳过空行；保留 <del:N> 占位符）。"""
+def read_flat_entries(name: str) -> list:
+    """读预设的条目 [(id, token)]（v2 显式 ID；旧格式文件就地升级）。"""
     p = vocab_txt_path(name)
     if not p.is_file():
         return []
+    return read_flat_vocab_file(str(p))[0]
+
+
+def read_flat_tokens(name: str) -> list:
+    """读预设的 token 文本列表（按 ID 升序；展示/断言用）。"""
+    return [t for _, t in read_flat_entries(name)]
+
+
+def _used_count(name: str) -> int:
+    """已用槽位：真实 token（排除 reserved 空位与 <del:N> 软删占位）。"""
+    return sum(1 for t in read_flat_tokens(name)
+               if not t.startswith(DEL_MARKER)
+               and not t.startswith("<reserved:"))
+
+
+def _global_visible_entries() -> list:
+    """全局词表可见区的真实 token（排除 reserved 占位符），带全局 ID。"""
+    data = json.loads(GLOBAL_VOCAB_JSON.read_text(encoding="utf-8"))
     out = []
-    for raw in p.read_text(encoding="utf-8").splitlines():
-        t = raw.rstrip("\n").rstrip("\r")
-        if not t:
+    for i in range(spec.INVISIBLE_END, spec.VOCAB_SIZE_PADDED):
+        t = data["id_to_token"][i]
+        if t.startswith("<reserved:"):
             continue
-        out.append(t)
+        out.append((i, t))
     return out
 
 
-def _global_visible_tokens() -> list:
-    data = json.loads(GLOBAL_VOCAB_JSON.read_text(encoding="utf-8"))
-    return data["id_to_token"][spec.INVISIBLE_END:]
+def _write_preset(name: str, entries) -> None:
+    preset_dir(name).mkdir(parents=True, exist_ok=True)
+    write_flat_vocab_file(str(vocab_txt_path(name)), entries)
+
+
+def _is_unmodified_seed(entries) -> bool:
+    """旧文件是否只是「全局可见区 join 出来的副本」（无用户改动）。"""
+    g = _global_visible_entries()
+    gset = {t for _, t in g}
+    toks = [t for _, t in entries]
+    if not toks:
+        return True
+    if len(toks) > len(g):
+        return False                       # 多出来的只能是用户新增
+    if not all(t in gset for t in toks):
+        return False
+    # 旧格式必然丢掉 "\n"/"\r" 这类无法用行表示的 token（数量极少）
+    return len(g) - len(toks) <= 8
+
+
+def _upgrade_preset(name: str) -> bool:
+    """把旧格式（v1）预设升级为 v2；返回是否发生了升级。
+
+    base 与「未编辑过的 fork」按全局可见区重写——它们的 ID 本就应与全局
+    一致，旧文件里被空行吞掉的 "\\n"/"\\r" 与 reserved 占位符一并清掉。
+    用户改过的预设只换表示法、不重排 ID（已训练的权重行对应关系不动）。
+    """
+    txt = vocab_txt_path(name)
+    # 快路径：已是 v2 就只读首行，避免每次列预设都全文解析 6 万条
+    with open(txt, encoding="utf-8") as f:
+        if f.readline().strip() == VOCAB_FILE_MAGIC:
+            return False
+    entries, legacy = read_flat_vocab_file(str(txt))
+    if not legacy:
+        return False
+    real = [(i, t) for i, t in entries if not t.startswith("<reserved:")]
+    if _is_unmodified_seed(real):
+        _write_preset(name, _global_visible_entries())
+    else:
+        print(f"[vocab_presets] {name}: 旧格式词表就地升级（ID 保持不变）",
+              file=sys.stderr)
+        _write_preset(name, real)
+    return True
 
 
 # ---------------------------------------------------------------------------
 # 预设生命周期
 # ---------------------------------------------------------------------------
 def ensure_base() -> None:
-    """确保 base 预设存在：从全局 vocab.json 的可见区派生。幂等。"""
+    """确保 base 预设存在：从全局 vocab.json 的可见区派生。幂等。
+
+    2026-10-27 审计修复（H1）：只导出真实 token（显式 ID + JSON 转义），
+    不再把 9914 个 reserved 占位符写进文件——旧实现让可见区一上来就被
+    占满（free_slots=0），任何「添加 token」都必然失败，且 token 自身的
+    "\\n"/"\\r" 会把整段 ID 顶前 2 位。旧格式文件在首次访问时就地升级。
+    """
     d = preset_dir(BASE)
     txt = vocab_txt_path(BASE)
     if txt.is_file():
+        _upgrade_preset(BASE)
         return
     d.mkdir(parents=True, exist_ok=True)
-    tokens = _global_visible_tokens()
-    txt.write_text("\n".join(tokens) + "\n", encoding="utf-8")
+    _write_preset(BASE, _global_visible_entries())
 
 
 def list_presets() -> list:
@@ -98,11 +166,10 @@ def list_presets() -> list:
             txt = child / "vocab.txt"
             if not txt.is_file():
                 continue
-            used = sum(1 for t in read_flat_tokens(child.name)
-                       if not t.startswith(DEL_MARKER))
+            _upgrade_preset(child.name)
             out.append({
                 "name": child.name,
-                "used": used,
+                "used": _used_count(child.name),
                 "capacity": spec.VOCAB_SIZE_PADDED - spec.INVISIBLE_END,
                 "is_base": child.name == BASE,
             })
@@ -120,11 +187,11 @@ def create_preset(name: str, source: str = BASE) -> dict:
     src = vocab_txt_path(source)
     if not src.is_file():
         raise ValueError(f"源预设不存在: {source}")
+    if source != BASE:
+        _upgrade_preset(source)
     preset_dir(name).mkdir(parents=True, exist_ok=True)
     shutil.copyfile(src, vocab_txt_path(name))
-    used = sum(1 for t in read_flat_tokens(name)
-               if not t.startswith(DEL_MARKER))
-    return {"name": name, "source": source, "used": used,
+    return {"name": name, "source": source, "used": _used_count(name),
             "capacity": spec.VOCAB_SIZE_PADDED - spec.INVISIBLE_END}
 
 
@@ -146,23 +213,18 @@ def delete_preset(name: str) -> None:
 # ---------------------------------------------------------------------------
 def add_token(name: str, text: str, category: str = "regular") -> dict:
     ensure_base()
-    tokens = read_flat_tokens(name)
-    v = Vocab.from_tokens(tokens, vocab_txt_path(name))
+    v = Vocab.from_entries(read_flat_entries(name), vocab_txt_path(name))
     tid = v.add_token(text, category)
     return {"token": text, "id": tid, "category": category,
-            "vocab": name,
-            "used": sum(1 for t in read_flat_tokens(name)
-                       if not t.startswith(DEL_MARKER))}
+            "vocab": name, "used": _used_count(name)}
 
 
 def remove_token(name: str, text: str) -> dict:
     ensure_base()
-    tokens = read_flat_tokens(name)
-    v = Vocab.from_tokens(tokens, vocab_txt_path(name))
+    v = Vocab.from_entries(read_flat_entries(name), vocab_txt_path(name))
     tid = v.remove_token(text)
     return {"token": text, "id": tid, "vocab": name,
-            "used": sum(1 for t in read_flat_tokens(name)
-                       if not t.startswith(DEL_MARKER))}
+            "used": _used_count(name)}
 
 
 # ---------------------------------------------------------------------------
@@ -234,9 +296,8 @@ def global_ranges() -> dict:
 
 
 def preset_occupancy(name: str) -> dict:
-    """某个预设的可见区占用（行号 → ID INVISIBLE_END+N）。"""
-    tokens = read_flat_tokens(name)
-    used = sum(1 for t in tokens if not t.startswith(DEL_MARKER))
+    """某个预设的可见区占用（used = 真实 token 数）。"""
+    used = _used_count(name)
     capacity = spec.VOCAB_SIZE_PADDED - spec.INVISIBLE_END
     return {"name": name, "used": used, "capacity": capacity,
             "free": capacity - used}

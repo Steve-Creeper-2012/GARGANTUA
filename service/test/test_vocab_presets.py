@@ -126,8 +126,9 @@ class PresetLifecycleTest(unittest.TestCase):
         self.assertEqual(res["token"], tok)
         self.assertEqual(res["vocab"], "addp")
         self.assertGreaterEqual(res["id"], spec.INVISIBLE_END)
-        # 文件里确实多了这一行
-        self.assertIn(tok, vp.read_flat_tokens("addp"))
+        # 文件里确实多了这一条（v2 显式 ID 格式）
+        entries = dict((t, i) for i, t in vp.read_flat_entries("addp"))
+        self.assertEqual(entries[tok], res["id"])
 
     def test_remove_token_soft_delete(self):
         vp.ensure_base()
@@ -143,12 +144,12 @@ class PresetLifecycleTest(unittest.TestCase):
         self.assertEqual(used_after, used_before - 1)
 
         # 文件里该 token 被替换为 <del:N> 占位符（保留 ID 位置）
-        flat = vp.read_flat_tokens("remp")
-        self.assertNotIn(tok, flat)
-        self.assertTrue(any(t.startswith(DEL_MARKER) for t in flat))
+        flat = vp.read_flat_entries("remp")
+        self.assertNotIn(tok, [t for _, t in flat])
+        self.assertTrue(any(t.startswith(DEL_MARKER) for _, t in flat))
 
         # 重新构建 Vocab：该 token 不可被查表
-        v = Vocab.from_tokens(flat, vp.vocab_txt_path("remp"))
+        v = Vocab.from_entries(flat, vp.vocab_txt_path("remp"))
         self.assertIsNone(v.lookup(tok))
         self.assertNotIn(tok, v.token_to_id)
         # 但 ID 位置被占位符占着，后续 token 不漂移
@@ -175,17 +176,17 @@ class PresetLifecycleTest(unittest.TestCase):
         vp.ensure_base()
         vp.create_preset("seedp")
         tok = "zzz_seed_token_unique_321"
-        vp.add_token("seedp", tok)
+        res = vp.add_token("seedp", tok)
         model_dir = self.tmp / "models" / "M1"
         vp.seed_model_vocab(str(model_dir), "seedp")
         copied = model_dir / "vocab.txt"
         self.assertTrue(copied.is_file())
-        # seed 合同：逐字节复制预设 vocab.txt（含可能的空行占位，与模型加载
-        # 路径 read_model_vocab 的空行跳过逻辑一致）。
+        # seed 合同：逐字节复制预设 vocab.txt（含 v2 魔数头）
         self.assertEqual(
             vp.vocab_txt_path("seedp").read_text(encoding="utf-8"),
             copied.read_text(encoding="utf-8"))
-        self.assertIn(tok, copied.read_text(encoding="utf-8").splitlines())
+        seeded = dict((t, i) for i, t in vp.read_flat_entries("seedp"))
+        self.assertEqual(seeded.get(tok), res["id"])
 
     def test_seed_default_is_base(self):
         vp.ensure_base()

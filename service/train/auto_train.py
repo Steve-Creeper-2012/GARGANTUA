@@ -2,7 +2,7 @@
 # GARGANTUA v1 — auto_train.py：训练队列守护
 # ---------------------------------------------------------------------------
 # 监控 data/queue/*.tokens（按文件名序），逐个文件：tokenset 展开成
-# 「ids + step_ids」→ 按 common.make_batch 统一的窗口切分 / forward_train
+# 「pos_ids + step_ids」→ 按 train_step 统一的窗口切分 / 前向
 # / Muon+AdamW step 逻辑训练 steps_per_file 步 → 检查点落盘 → 文件移入
 # data/done/。每步把 {"step", "loss", "ts"} 追加到 logs/auto_train.jsonl。
 # 空队列 1s 空转轮询；stop() 后当前 step 完成、落盘后退。
@@ -31,7 +31,7 @@
 #      是未训练的新模型。（serve 模式下模型热替换被 server 409 禁止，
 #      该防御保留。）
 #   4. stop 早停 / 0 步文件不再触发 _loss_tail[-1] IndexError。
-#   5. 窗口切分统一走 common.make_batch，与 train.py 零漂移。
+#   5. 窗口切分与前向统一走 train_step（train.py 同一实现），零漂移。
 # ===========================================================================
 import argparse
 import glob
@@ -45,7 +45,6 @@ import time
 from collections import deque
 
 import torch
-import torch.nn.functional as F
 
 # ---- GARGANTUA 路径引导（目录树重构：把 server/ 与 service/* 放上 path）----
 import sys as _sys
@@ -59,10 +58,12 @@ else:
 import boot
 boot.bootstrap()
 import spec
-from common import (CKPT_NAME, build_model, make_batch, read_config,
-                    save_checkpoint, validate_block_size, validate_steps)
+from common import (CKPT_NAME, build_model, model_exists,
+                    read_config, save_checkpoint, validate_block_size,
+                    validate_steps)
 from muon import build_optimizers
-from tokens.tokenset import read_stream
+from tokens.tokenset import read_doc
+from train_step import forward_window, window_index, window_loss
 from tokens.vocab import set_model_vocab
 
 _OPTIMIZERS = ("muon", "adamw")
@@ -201,6 +202,11 @@ class Trainer:
     def _run(self):
         self._running = True
         self._log("[auto_train] 守护启动")
+        # 异常隔离目录：训练失败的文件移到这里（不归档为「已完成」，
+        # 2026-10-27 审计修复——此前异常文件被当作成功样本归档，且文件中
+        # 已完成的参数更新可能已进入内存但未落盘，状态与执行分裂）
+        failed_dir = os.path.join(os.path.dirname(self.done_dir.rstrip("/")),
+                                  "failed")
         try:
             while not self._stop.is_set():
                 files = sorted(glob.glob(os.path.join(self.queue_dir, "*.tokens")))
@@ -209,7 +215,7 @@ class Trainer:
                     continue
                 path = files[0]
                 try:
-                    self._train_file(path)
+                    status = self._train_file(path)
                 except _NoModelError as e:
                     # 无活动模型：不归档、不消费文件，退避重试（此前文件被
                     # 静默移入 done/，用户以为训练过——审查记录 P2-7）
@@ -218,13 +224,25 @@ class Trainer:
                     time.sleep(2)
                     continue
                 except Exception as e:                  # 单文件失败不崩守护
-                    self._log(f"[auto_train] 训练失败 {os.path.basename(path)}: {e}")
-                # 无论成败都归档，避免同一文件死循环
-                # 2026-10-23 审计修复（P2）：归档的 os.replace 此前在
-                # try 之外——文件被并发删除（UI 删队列项）时
-                # FileNotFoundError 逃逸出 while，守护线程静默死亡、
-                # running 翻 False 且无任何错误日志。现在失败只记日志，
-                # 守护继续运转。
+                    self._log(f"[auto_train] 训练失败 {os.path.basename(path)}: {e}"
+                              f"（已完成的参数更新未落盘，文件隔离到 failed/）")
+                    os.makedirs(failed_dir, exist_ok=True)
+                    try:
+                        os.replace(path, os.path.join(
+                            failed_dir, os.path.basename(path)))
+                    except OSError as e2:
+                        self._log(f"[auto_train] 隔离失败 {os.path.basename(path)}: {e2}")
+                    continue
+                if status == "stopped":
+                    # 用户停止：文件保留在队列（不消费、不归档），后续
+                    # start 会重新训练它（2026-10-27 审计修复：旧实现停止后
+                    # 仍保存并归档，剩余步数永久跳过）
+                    self._log(f"[auto_train] 已停止，{os.path.basename(path)} "
+                              f"保留在队列")
+                    continue
+                # status == "ok" / "skipped"：完整执行完毕（或本就无步可训），
+                # 归档到 done（os.replace 在 try 内——文件被并发删除时
+                # 只记日志，守护继续运转，2026-10-23 审计修复 P2）
                 try:
                     os.replace(path, os.path.join(self.done_dir,
                                                   os.path.basename(path)))
@@ -236,26 +254,31 @@ class Trainer:
             self._log("[auto_train] 守护退出")
 
     def _train_file(self, path):
-        ids, step_ids = read_stream(path)
-        ids = list(ids)
-        step_ids = list(step_ids)
-        ids.append(spec.STOP_ID)            # 文档结束 → 停止 token，教模型学会终止
-        step_ids.append((max(step_ids) + 1) if step_ids else 0)
+        """训练一个队列文件。返回状态：
+          "ok"      — 全部步数执行完且检查点已成功落盘（可归档）；
+          "stopped" — 用户中途停止：参数更新未落盘，文件应保留在队列；
+          "skipped" — 文件过短无步可训：可归档（该数据永远无法训练）。
+        抛异常 = 训练失败：调用方负责隔离文件。"""
+        # read_doc 已追加 <stop> 时间步；多模态文档额外带装配用的 steps
+        doc = read_doc(path)
         B = self._block_size
-        if len(ids) < B + 2:
-            self._log(f"[auto_train] {os.path.basename(path)} 仅 {len(ids)} "
+        n_pos = len(doc["pos_ids"])
+        if n_pos < B + 2:
+            self._log(f"[auto_train] {os.path.basename(path)} 仅 {n_pos} "
                       f"tokens < {B + 2}，跳过训练")
-            return
+            return "skipped"
         m = self.get_model()
         if m is None:
             raise _NoModelError("无活动模型")
-        self._log(f"[auto_train] {os.path.basename(path)}: {len(ids)} tokens, "
+        self._log(f"[auto_train] {os.path.basename(path)}: {n_pos} tokens"
+                  f"{'（多模态）' if doc['multimodal'] else ''}, "
                   f"{self._steps_per_file} steps, block={B}")
 
         # 与 train.py 相同的优化器分组；模型实例变化时按需重建（防热替换失效）
         opts = build_optimizers(m, self._optimizer, spec.ADAMW_LR,
                                 spec.MUON_LR, spec.MUON_MOMENTUM)
-        for _ in range(self._steps_per_file):
+        stop_hit = False        # 2026-10-27 审计修复：每文档至少一个窗口含 STOP
+        for step in range(self._steps_per_file):
             if self._stop.is_set():
                 break
             m_now = self.get_model()
@@ -264,14 +287,19 @@ class Trainer:
                 opts = build_optimizers(m, self._optimizer, spec.ADAMW_LR,
                                         spec.MUON_LR, spec.MUON_MOMENTUM)
                 self._log("[auto_train] 检测到模型热替换，优化器已重建")
-            i = random.randint(0, len(ids) - B - 2)
-            x_in, s_in, dec_in, s_dec, y = make_batch(ids, i, B, step_ids)
-
+            # step 0 强制尾部窗口：STOP 在序列末尾，只有 i = n-B 的窗口
+            # 能让 y 覆盖最后一个 token，单文件训练因此必有停止监督
+            i = window_index(doc, B, random, force_last=(step == 0))
+            if i is None:
+                continue
             with self.lock:                          # 训练与推理互斥
                 m.train()
-                logits = m.forward_train(x_in, s_in, dec_in, s_dec)
-                loss = F.cross_entropy(logits.view(-1, logits.shape[-1]),
-                                       y.view(-1))
+                logits, y, n_valid = forward_window(m, doc, i, B)
+                if n_valid == 0:                     # 整窗都是媒体，无目标
+                    continue
+                if spec.STOP_ID in y[0].tolist():
+                    stop_hit = True
+                loss = window_loss(logits, y)
                 for o in opts:
                     o.zero_grad(set_to_none=True)
                 loss.backward()
@@ -292,13 +320,23 @@ class Trainer:
             with open(self.log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec) + "\n")
 
+        # 2026-10-27 审计修复：区分「完成」与「停止」——停止时不再保存
+        # 检查点（部分参数更新直接丢弃，文件保留在队列由下次 start 重训），
+        # 只有完整执行完 steps_per_file 步才落盘并归档。
+        if self._stop.is_set():
+            return "stopped"
+
         with self.lock:                              # 检查点落盘
             self.save_fn(m)
+        if not stop_hit:
+            self._log(f"[auto_train] 警告：{os.path.basename(path)} 本轮采样"
+                      f"未覆盖 <stop> 目标（步数过少）")
         if self._loss_tail:
             self._log(f"[auto_train] step={self._step} "
                       f"loss={self._loss_tail[-1]['loss']:.4f} 已落盘")
         else:
             self._log(f"[auto_train] step={self._step} 已落盘（无有效 step）")
+        return "ok"
 
 
 def _prefill_from_log(trainer: Trainer) -> None:
@@ -354,8 +392,8 @@ def _serve_handle(req: dict, st: _ServeState) -> dict:
                                    **st.trainer.status(),
                                    "model_dir": st.model_dir}}
             model_dir = req["model_dir"]
-            if not os.path.exists(os.path.join(model_dir, CKPT_NAME)):
-                raise ValueError(f"模型目录无 {CKPT_NAME}: {model_dir}")
+            if not model_exists(model_dir):
+                raise ValueError(f"模型目录无检查点: {model_dir}")
             m = build_model(model_dir)
             m.eval()
             set_model_vocab(model_dir)
@@ -459,6 +497,16 @@ def serve(idle_timeout: int = 300) -> int:
                        "error": f"请求解析失败: {e}"})
                 continue
             resp = _serve_handle(req, st)
+            if req.get("op") == "shutdown":
+                # 2026-10-27 审计修复：先停训练、等训练线程退出（含检查点
+                # 落盘），再应答 shutdown——旧实现先应答、退出时才 join，
+                # server 收到应答后立刻 terminate()，关闭恰逢训练 step 时
+                # 落盘前清理被 SIGTERM 中断，留下部分参数更新。
+                if st.trainer is not None and st.trainer.running:
+                    print("[auto_train] shutdown：停止中的训练……",
+                          file=sys.stderr)
+                    st.trainer.stop()
+                    st.trainer.join(timeout=120)
             _emit(resp)
             if req.get("op") == "shutdown":
                 print("[auto_train] 收到 shutdown，退出", file=sys.stderr)

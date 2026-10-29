@@ -129,7 +129,12 @@ class _Handle:
                        "error": f"服务 {self.name} 已退出"})
 
     def send(self, req: dict, timeout: float) -> dict:
-        """发一个请求并等待响应（调用方持锁）。"""
+        """发一个请求并等待响应（调用方持 h.lock，按服务串行）。
+
+        2026-10-27 审计修复：超时不再只是放弃等待——超时的请求会让
+        服务子进程继续执行（推理最长 600s，任务实际还在跑、还在写
+        存档，状态与执行分裂）。现在超时即判定服务失控：杀掉子进程
+        （迟到的响应随管道关闭被丢弃），由调用方决定是否重启。"""
         rid = uuid.uuid4().hex
         req = dict(req)
         req["id"] = rid
@@ -145,12 +150,27 @@ class _Handle:
             resp = q.get(timeout=timeout)
         except queue.Empty:
             self.pending.pop(rid, None)
-            raise ServiceError(f"服务 {self.name} 超时（{timeout:.0f}s）：{req.get('op')}")
+            # 隔离失控服务：任务随进程终止，杜绝「接口已报错、后台还在跑」
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+            raise ServiceError(
+                f"服务 {self.name} 超时（{timeout:.0f}s）：{req.get('op')}"
+                f"（服务已被终止）")
         finally:
             self.pending.pop(rid, None)
         if not resp.get("ok"):
             raise ServiceError(str(resp.get("error") or "未知服务错误"))
         return resp.get("result") or {}
+
+    def abort(self) -> None:
+        """终止子进程（超时隔离用）。调用方持 h.lock。"""
+        if self.proc is not None:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
 
 
 class ServiceSupervisor:
@@ -183,9 +203,15 @@ class ServiceSupervisor:
 
     # ------------------------------------------------------------------
     def call(self, name: str, op: str, timeout: float = 120.0, **args) -> dict:
-        """确保服务在跑 → 发请求 → 等响应。服务死亡时重启并重试一次。"""
+        """确保服务在跑 → 发请求 → 等响应。服务死亡时重启并重试一次。
+
+        2026-10-27 审计修复：全局锁（self._lock）只保护句柄注册表，
+        不再包住阻塞式 send——旧实现下 600s 的推理期间，训练停止、
+        状态查询等全部拿不到锁。每个服务句柄有自己的锁，请求按服务
+        串行、跨服务并行。"""
         with self._lock:
             h = self._handle(name)
+        with h.lock:
             for attempt in (1, 2):
                 if not h.alive():
                     h.spawn()
@@ -193,16 +219,21 @@ class ServiceSupervisor:
                     return h.send({"op": op, **args}, timeout)
                 except ServiceError:
                     if attempt == 1 and not h.alive():
-                        # 服务在请求期间死了：已重启，重试一次
+                        # 服务在请求期间死了（或超时被隔离）：已/将重启，重试一次
                         continue
                     raise
             raise ServiceError(f"服务 {name} 重试后仍失败")
 
     def query(self, name: str, op: str, timeout: float = 15.0, **args):
-        """状态查询：服务没在跑就返回 None（不为查询而起进程）。"""
+        """状态查询：服务没在跑就返回 None（不为查询而起进程）。
+
+        与 call 相同：句柄锁而非全局锁，长推理不再阻塞状态查询。"""
         with self._lock:
             h = self._handles.get(name)
-            if h is None or not h.alive():
+        if h is None or not h.alive():
+            return None
+        with h.lock:
+            if not h.alive():
                 return None
             try:
                 return h.send({"op": op, **args}, timeout)
@@ -239,22 +270,39 @@ class ServiceSupervisor:
         return obj.get("result") or {}
 
     # ------------------------------------------------------------------
-    def shutdown_all(self, grace: float = 5.0) -> None:
-        """server 退出时收尸：先 shutdown 协议，再 SIGTERM/SIGKILL。"""
+    def shutdown_all(self, grace: float = 30.0) -> None:
+        """server 退出时收尸：shutdown 协议 → 等自然退出 → SIGTERM → SIGKILL。
+
+        2026-10-27 审计修复：旧实现收到 shutdown 应答后立即 terminate()，
+        而训练服务的应答先于「停止并 join 训练线程」——关闭恰逢训练 step
+        时，落盘前清理被 SIGTERM 中断。现在应答后先等待服务自然退出
+        （训练服务在应答前已 stop+join，见 auto_train.serve），直至
+        grace 到期才 escalate 到 terminate/kill。"""
         with self._lock:
             handles = list(self._handles.values())
         for h in handles:
             if h.alive():
                 try:
-                    h.send({"op": "shutdown"}, timeout=3.0)
+                    with h.lock:
+                        if h.alive():
+                            h.send({"op": "shutdown"}, timeout=5.0)
                 except Exception:
                     pass
-            if h.proc is not None:
+        # 等自然退出（训练收尾/存档落盘需要时间）
+        deadline = time.time() + grace
+        for h in handles:
+            if h.proc is None:
+                continue
+            while time.time() < deadline and h.proc.poll() is None:
+                time.sleep(0.1)
+        # grace 内没退的才 escalate
+        for h in handles:
+            if h.proc is not None and h.proc.poll() is None:
                 try:
                     h.proc.terminate()
                 except Exception:
                     pass
-        deadline = time.time() + grace
+        deadline = time.time() + min(grace, 10.0)
         for h in handles:
             if h.proc is None:
                 continue

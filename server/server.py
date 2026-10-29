@@ -54,7 +54,8 @@ else:
     raise SystemExit("找不到 GARGANTUA 项目根（start/boot.py）")
 import boot
 boot.bootstrap()
-from common import MAX_BLOCKS, MAX_NEW_TOKENS, valid_model_name, validate_ctx_config
+from common import (MAX_BLOCKS, MAX_NEW_TOKENS, model_init_lock,
+                    valid_model_name, validate_ctx_config)
 from server_env import ROOT, check_environment, kill_proc
 from server_models import (ConflictError, ModelManager, TaskPool,
                            step_to_json)
@@ -72,6 +73,15 @@ WEB_INDEX = os.path.join(ROOT, "service", "web", "index.html")
 
 # 请求体硬上限（base64 后的视频/音频可能上百 MB，512MB 是宽松保护值）
 MAX_BODY_BYTES = 512 * 1024 * 1024
+# prompt 字符上限（2026-10-27 H10）：编码前的第一道闸门，防超长文本在
+# 服务进程里先完整 token 化（内存尖峰）才被拒
+MAX_PROMPT_CHARS = 1_000_000
+
+# 多模态推理的媒体闸门（2026-10-28）：单次最多 4 个附件、合计 64MB。
+# 真正把媒体解成 patch/采样后的规模上限在 infer 服务里再查一遍
+# （MAX_PATCHES_TOTAL / MAX_AUDIO_TOKENS）——这里只挡明显的滥用。
+MAX_MEDIA_ITEMS = 4
+MAX_MEDIA_BYTES = 64 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -105,17 +115,25 @@ class App(TrainApi, CodecApi, TokensApi):
         self.log_path = log_path
         self.supervisor = ServiceSupervisor(ROOT, idle_timeout=idle_timeout)
         self.trainer = _TrainStatusProxy(self.supervisor)
+        # 2026-10-27 审计修复（H11）：活动模型「检查+快照」与「切换」共用
+        # 的状态锁，消除模型切换与推理提交之间的 TOCTOU
+        self._state_lock = threading.RLock()
 
     def apply_model_vocab(self) -> None:
         """活动模型的词表覆盖（每模型可有自己的 vocab.txt，2026-10-24）。
-        没有 vocab.txt 就用全局词表（service/tokens/vocab.json）。"""
+        没有 vocab.txt 就用全局词表（service/tokens/vocab.json）。
+
+        2026-10-27 审计修复（M7）：词表损坏时清退到全局词表，而不是沿用
+        上一模型的词表（旧模型的映射对新模型是错的）。"""
         if self.mgr.name is None:
             return
         try:
             from tokens.vocab import set_model_vocab
             set_model_vocab(os.path.join(self.mgr.model_dir, self.mgr.name))
         except Exception as e:
-            print(f"[server] 模型词表加载警告: {e}")
+            from tokens.vocab import clear_model_vocab
+            clear_model_vocab()
+            print(f"[server] 模型词表加载失败，已清退到全局词表: {e}")
 
     # ---------------- status / models / infer ----------------
     def api_status(self):
@@ -235,22 +253,77 @@ class App(TrainApi, CodecApi, TokensApi):
             # 训练中热替换模型会令 Trainer 的优化器绑定旧参数（已防，但
             # 从源头禁止更稳）：加载与训练互斥
             raise ConflictError("训练进行中，请先停止训练再切换模型")
-        res = self.mgr.load(name)          # 注册表登记：不读权重，瞬时完成
-        self.apply_model_vocab()           # 活动模型的 vocab.txt 覆盖
+        d = os.path.join(self.mgr.model_dir, name)
+        # 2026-10-27 审计修复（M7）：先验证词表可完整加载，失败直接 400
+        # 且【不切换活动模型】——旧实现先切活动模型再捕获词表异常继续
+        # 成功，加载词表损坏的 B 后，B 的 token API 仍按旧模型 A 编解码。
+        from tokens.vocab import set_model_vocab
+        try:
+            set_model_vocab(d)
+        except Exception as e:
+            raise ValueError(f"模型词表加载失败: {e}")
+        # 状态锁内「再查训练状态 + 切换」原子化（H11）：与 api_infer 的
+        # 快照互斥，切换不可能插在检查与快照之间
+        with self._state_lock:
+            if self.trainer.running:
+                raise ConflictError("训练进行中，请先停止训练再切换模型")
+            res = self.mgr.load(name)      # 注册表登记：不读权重，瞬时完成
         return 200, res
 
     def api_infer(self, body):
         prompt = body.get("prompt")
         if not prompt:
             raise ValueError("缺少 prompt")
-        # 2026-10-23 审计修复（P1）：聊天窗会上传 media_b64/media_name，
-        # 但 generate() 只有文本路径——此前媒体被静默丢弃，用户以为模型
-        # 「看到了」附件。多模态生成尚未接线，显式拒绝好过静默成功。
+        if not isinstance(prompt, str):
+            raise ValueError(f"prompt 必须是字符串: {type(prompt).__name__}")
+        # 2026-10-27 审计修复（H10 的一部分）：请求体虽已有 512MB 硬上限，
+        # prompt 文本本身再限一道字符上限，防止超大字符串在服务进程里
+        # 先被完整编码成 token（内存尖峰）才被拒绝
+        if len(prompt) > MAX_PROMPT_CHARS:
+            raise ValueError(
+                f"prompt 过长: {len(prompt)} > {MAX_PROMPT_CHARS} 字符")
+        # 2026-10-28：多模态推理已接线——媒体作为 prompt 前缀参与编码
+        # （视觉走 visual_proj、音频走 audio_proj，统一投影到 d_model），
+        # 生成仍然是文本。media 是 [{kind, b64, filename?}]。
+        # 旧字段 media_b64/media_name 已废弃：留着不报错等于静默丢弃附件，
+        # 用户会以为模型「看到了」——显式拒绝并给出新格式。
         if body.get("media_b64") or body.get("media_name"):
-            raise ValueError("当前版本推理仅支持文本 prompt；媒体输入"
-                             "（image/audio/video）尚未接入生成路径")
-        if self.mgr.name is None:
-            raise ValueError("无活动模型，请先加载模型")
+            raise ValueError(
+                "media_b64/media_name 已废弃：请改用 "
+                "media=[{kind: image|audio|video, b64: ..., filename: ...}]")
+        media = body.get("media")
+        if media is None:
+            media = []
+        if not isinstance(media, list):
+            raise ValueError("media 必须是数组")
+        if len(media) > MAX_MEDIA_ITEMS:
+            raise ValueError(
+                f"媒体数量超限: {len(media)} > {MAX_MEDIA_ITEMS}")
+        total_bytes = 0
+        clean_media = []
+        for it in media:
+            if not isinstance(it, dict):
+                raise ValueError(f"每个 media 项必须是对象: {it!r}")
+            kind = it.get("kind")
+            if kind not in ("image", "audio", "video"):
+                raise ValueError(
+                    f"media.kind 必须是 image/audio/video: {kind!r}")
+            b64 = it.get("b64")
+            if not isinstance(b64, str) or not b64:
+                raise ValueError("media.b64 必须是非空 base64 字符串")
+            total_bytes += len(b64) * 3 // 4
+            if total_bytes > MAX_MEDIA_BYTES:
+                raise ValueError(
+                    f"媒体总量超限: > {MAX_MEDIA_BYTES // 1048576}MB")
+            clean_media.append({"kind": kind, "b64": b64,
+                                "filename": it.get("filename") or ""})
+        # 2026-10-27 审计修复（H11）：在状态锁内完成「无活动模型检查 +
+        # model_dir 快照」，后台任务只使用快照——旧实现在线程真正执行
+        # 时才读 self.mgr.name，A 模型推理排队后切换到 B，任务会在 B 上跑。
+        with self._state_lock:
+            if self.mgr.name is None:
+                raise ValueError("无活动模型，请先加载模型")
+            model_dir = os.path.join(self.mgr.model_dir, self.mgr.name)
         max_new = num_param(body, "max_new_tokens", 32, int)
         if not (1 <= max_new <= MAX_NEW_TOKENS):
             raise ValueError(
@@ -265,12 +338,14 @@ class App(TrainApi, CodecApi, TokensApi):
         def work():
             # 推理服务按需拉起（首次含建模加载，之后复用；空闲自行退出）。
             # 服务返回的 text 已用该模型的词表解码；archive 是本次推理的
-            # token id 存档（.tokens，随 logs 目录走）。
+            # token id 存档（.tokens，随 logs 目录走）。model_dir 是提交时
+            # 的快照：期间切换模型不影响本次任务。
             return self.supervisor.call(
                 "infer", "infer", timeout=600,
-                model_dir=os.path.join(self.mgr.model_dir, self.mgr.name),
+                model_dir=model_dir,
                 prompt=prompt, max_new=max_new,
                 temperature=temperature, top_p=top_p,
+                media=clean_media,
                 archive_dir=os.path.join(os.path.dirname(self.log_path),
                                          "infer_archive"))
 

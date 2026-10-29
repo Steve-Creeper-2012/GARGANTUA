@@ -32,6 +32,7 @@ boot.bootstrap()
 
 import spec
 import server_services
+import common
 from common import read_model_vocab
 from tokens.vocab import (Vocab, clear_model_vocab, get_vocab,
                           reset_vocab_cache, set_model_vocab)
@@ -258,13 +259,18 @@ class TestModelVocabTxt(unittest.TestCase):
                 f.write("alpha\nbeta\n")
             v = Vocab.from_tokens(["alpha", "beta"], p)
             slot = v.add_token("gamma", "regular")
-            self.assertEqual(slot, spec.INVISIBLE_END + 2)
-            with open(p, encoding="utf-8") as f:
-                self.assertEqual(f.read().splitlines(),
-                                 ["alpha", "beta", "gamma"])
-            # 重新加载应看到新 token
-            v2 = Vocab.from_tokens(read_model_vocab(tmp) or [], p)
+            # 扁平词表优先吃 EXTRA 区（用户新增 token 的专用区）
+            self.assertEqual(slot, spec.EXTRA_BEGIN)
+            # 落盘是 v2 显式 ID 格式，且只含真实 token
+            entries, legacy = common.read_flat_vocab_file(p)
+            self.assertFalse(legacy)
+            self.assertEqual(entries, [(spec.INVISIBLE_END, "alpha"),
+                                       (spec.INVISIBLE_END + 1, "beta"),
+                                       (slot, "gamma")])
+            # 重新加载应看到新 token，且原 ID 不漂移
+            v2 = Vocab.from_entries(common.read_model_vocab_entries(tmp)[0], p)
             self.assertEqual(v2.token_to_id["gamma"], slot)
+            self.assertEqual(v2.token_to_id["alpha"], spec.INVISIBLE_END)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

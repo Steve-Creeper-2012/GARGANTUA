@@ -6,9 +6,10 @@
 #      布局（regular / fallback / special / system），全部为 {token: id}；
 #      同一字符串在全词表内唯一，token_to_id 无反歧义。
 #   2) 每模型词表 models/NAME/vocab.txt（2026-10-24，steve：每个模型可以
-#      有不同的 vocab 词表）：一行一个 token，行号即 ID；全部按 regular
-#      处理（special/system 的不可见 token 由 spec 常量按 ID 定位，不依赖
-#      词表文件）。契约见 common.read_model_vocab 与 spec.py 第 9 节。
+#      有不同的 vocab 词表）：扁平可见 token 列表，ID 由文件显式给出
+#      （v2 格式，见 common.VOCAB_FILE_MAGIC）；全部按 regular 处理
+#      （special/system 的不可见 token 由 spec 常量按 ID 定位，不依赖
+#      词表文件）。契约见 common.read_model_vocab_entries 与 spec.py 第 9 节。
 #
 # 公共能力：
 #   - lookup(text)：enctok 查表优先级——先 regular 后 fallback；
@@ -35,7 +36,8 @@ import threading
 from pathlib import Path
 
 import spec
-from common import model_vocab_path, read_model_vocab
+from common import (model_vocab_path, read_flat_vocab_file,
+                    read_model_vocab_entries, write_flat_vocab_file)
 
 VOCAB_PATH = Path(__file__).resolve().parent / "vocab.json"
 
@@ -78,6 +80,11 @@ _REGULAR_RANGES = (
 
 def _is_reserved(tok: str) -> bool:
     return tok.startswith(_RESERVED_PREFIX)
+
+
+def _is_hole(tok: str) -> bool:
+    """空位：reserved 占位符或软删占位符，都不是可查表的真实 token。"""
+    return _is_reserved(tok) or tok.startswith(DEL_MARKER)
 
 
 # 全局词表的「不可见区」头部缓存：special/system/modal 三类固定 token
@@ -151,56 +158,93 @@ class Vocab:
     # ------------------------------------------------------------------
     @classmethod
     def from_tokens(cls, tokens: list, path: str | Path | None = None) -> "Vocab":
-        """每模型扁平词表（models/NAME/vocab.txt，见 common.read_model_vocab）。
+        """位置式便捷构造：第 N 个 token → ID = INVISIBLE_END + N。
 
-        布局（2026-10-24 修正）：vocab.txt 第 N 行 → ID = INVISIBLE_END + N。
-        不可见区 [0, INVISIBLE_END) 原样复用全局词表的固定 token——
-        <stop>/<caps>/{ } |/图元输出 token 的 ID 是架构契约（spec 常量
-        按 ID 定位，decode 的停止/大小写逻辑靠它们），自定义词表绝不
-        得占用。用户 token 之间不许重复；与不可见区撞名的（{ } | 这类
-        双挂载字符）按全局语义处理：文本→ID 解析到可见的那个。
+        仅用于「还没有 ID 的新词表」与测试；磁盘上的词表一律走
+        from_entries（v2 格式带显式 ID，不会被行序影响）。
+        """
+        base = spec.INVISIBLE_END
+        return cls.from_entries([(base + i, t) for i, t in enumerate(tokens)],
+                                path)
+
+    @classmethod
+    def from_entries(cls, entries, path: str | Path | None = None,
+                     legacy: bool = False) -> "Vocab":
+        """每模型扁平词表（models/NAME/vocab.txt，见 common.read_model_vocab_entries）。
+
+        entries 是 [(id, token)]，ID 必须在 [INVISIBLE_END,
+        VOCAB_SIZE_PADDED) 内且不重复。不可见区 [0, INVISIBLE_END) 原样
+        复用全局词表的固定 token——<stop>/<caps>/{ } |/图元输出 token 的
+        ID 是架构契约（spec 常量按 ID 定位，decode 的停止/大小写逻辑靠
+        它们），自定义词表绝不得占用。
+
+        2026-10-27 审计修复（H2）：special / system / fallback 三类查表
+        映射不再清空——
+          - special / system 直接取固定 head 的对应区（<stop> 必须能被
+            gts 识别，否则 Token 编辑器永远导不出停止标记）；
+          - fallback 取词表里的单字母常规 token（a–z），让 enctok 在整词
+            未命中时仍能逐字母拼写，而不是整段 skipped。
         """
         v = cls.__new__(cls)                # 绕开 json 加载路径
         v.flat = True
         v._path = Path(path) if path else None
-        base = spec.INVISIBLE_END
-        limit = spec.VOCAB_SIZE_PADDED - base
-        if len(tokens) > limit:
-            raise ValueError(
-                f"vocab.txt 条目数 {len(tokens)} 超过上限 {limit}"
-                f"（VOCAB_SIZE_PADDED - INVISIBLE_END）")
-        seen = set()
-        for t in tokens:
-            if t in seen:
-                raise ValueError(f"vocab.txt token 重复: {t!r}")
-            seen.add(t)
+        v.legacy_format = bool(legacy)
         head = _global_head()
-        pad_from = base + len(tokens)
-        v.id_to_token = (list(head) + list(tokens)
-                         + [f"<reserved:{i}>"
-                            for i in range(pad_from, spec.VOCAB_SIZE_PADDED)])
+        v.id_to_token = (list(head) + [f"<reserved:{i}>"
+                                       for i in range(spec.INVISIBLE_END,
+                                                      spec.VOCAB_SIZE_PADDED)])
+        seen_tok = set()
+        seen_ids = set()
+        for tid, tok in entries:
+            if not isinstance(tid, int) or isinstance(tid, bool):
+                raise ValueError(f"token ID 必须是整数: {tid!r}")
+            if not (spec.INVISIBLE_END <= tid < spec.VOCAB_SIZE_PADDED):
+                raise ValueError(
+                    f"token ID {tid} 越界 "
+                    f"[{spec.INVISIBLE_END}, {spec.VOCAB_SIZE_PADDED})")
+            if tid in seen_ids:
+                raise ValueError(f"token ID 重复: {tid}")
+            if not isinstance(tok, str) or not tok:
+                raise ValueError(f"token 文本必须是非空字符串: {tok!r}")
+            if tok in seen_tok:
+                raise ValueError(f"vocab.txt token 重复: {tok!r}")
+            seen_ids.add(tid)
+            seen_tok.add(tok)
+            v.id_to_token[tid] = tok
+
         # 查重覆盖全词表（含不可见区）；用户可见 token 优先——{ } | 这类
         # 双挂载字符按全局语义「文本→ID 解析到可见符号」
         v.token_to_id = {t: i for i, t in enumerate(head)
                          if not _is_reserved(t)}
-        for i, t in enumerate(tokens):
-            # 软删占位符 <del:N> 保留行号→ID 映射，但不登记可查表
-            if t.startswith(DEL_MARKER):
-                continue
-            v.token_to_id[t] = base + i
-        v.meta = {"source": "vocab.txt", "n_tokens": len(tokens)}
-        v._n_user = len(tokens)
-        # 扁平词表的最长 token 长度（encode_text 贪心匹配用）
-        v._max_match = max((len(t) for t in tokens if not t.startswith(DEL_MARKER)),
-                           default=1)
-        # 扁平词表的可见部分全部按 regular 处理；fallback/special/system
-        # 的查表映射为空（不可见 token 不参与文本编码查表）；
-        # <del:N> 软删占位符既不入查表也不计最长匹配
-        v.regular_ids = {t: base + i for i, t in enumerate(tokens)
-                         if not t.startswith(DEL_MARKER)}
+        v.regular_ids = {}
         v.fallback_ids = {}
+        for tid, tok in entries:
+            if _is_hole(tok):
+                continue                    # 软删/reserved 占位：留位不可查
+            v.token_to_id[tok] = tid
+            v.regular_ids[tok] = tid
+            if len(tok) == 1 and "a" <= tok <= "z":
+                v.fallback_ids[tok] = tid
+
+        # special / system：固定 head 里的真实 token（H2）
         v.special_ids = {}
+        for i in range(spec.SPECIAL_BEGIN, spec.INVISIBLE_END):
+            if spec.SYSTEM_BEGIN <= i < spec.SYSTEM_BEGIN + spec.SYSTEM_SIZE:
+                continue
+            t = v.id_to_token[i]
+            if not _is_reserved(t):
+                v.special_ids[t] = i
         v.system_ids = {}
+        for i in range(spec.SYSTEM_BEGIN, spec.SYSTEM_BEGIN + spec.SYSTEM_SIZE):
+            t = v.id_to_token[i]
+            if not _is_reserved(t):
+                v.system_ids[t] = i
+
+        v.meta = {"source": "vocab.txt", "n_tokens": len(v.regular_ids),
+                  "format": "v1" if legacy else "v2"}
+        v._n_user = len(v.regular_ids)
+        # 扁平词表的最长 token 长度（encode_text 贪心匹配用）
+        v._max_match = max((len(t) for t in v.regular_ids), default=1)
         return v
 
     # ------------------------------------------------------------------
@@ -240,33 +284,41 @@ class Vocab:
         return self.fallback_ids.get(text)
 
     def free_slots(self, category: str) -> int:
-        """该类别剩余可分配槽位数（reserved 尾段中的空位）。"""
-        begin, end = self._alloc_range(category)
+        """该类别剩余可分配槽位数（空位 = 尚未被真实 token 占用的槽）。"""
+        if self.flat:
+            # 扁平词表没有区间语义：可见区里所有 reserved 槽都可回收
+            return sum(1 for i in range(spec.INVISIBLE_END,
+                                        spec.VOCAB_SIZE_PADDED)
+                       if _is_reserved(self.id_to_token[i]))
+        begin, end = _ALLOC_RANGES[category]
         return sum(1 for i in range(begin, end)
                    if _is_reserved(self.id_to_token[i]))
 
     # ------------------------------------------------------------------
     # 添加 token（四类任选，全局查重，原子持久化）
     # ------------------------------------------------------------------
-    def _alloc_range(self, category: str):
+    def _alloc_ranges(self, category: str):
+        """按优先级返回候选分配区间列表。"""
         if self.flat:
-            # 扁平词表：新增 token 追加在可见区已用部分的尾部
-            return (spec.INVISIBLE_END + self._n_user,
-                    spec.VOCAB_SIZE_PADDED)
+            # 扁平词表：先吃 EXTRA（用户新增常规可见 token 的专用区），
+            # 再退到可见区任意空位——这样 base 这种带散落空位的词表也
+            # 能继续扩容，而不会因「尾部已被 padding 占满」直接失败。
+            return [(spec.EXTRA_BEGIN, spec.REGULAR_END),
+                    (spec.INVISIBLE_END, spec.VOCAB_SIZE_PADDED)]
         if category not in _ALLOC_RANGES:
             raise ValueError(f"未知 token 类别: {category!r}"
                              f"（可选 {CATEGORIES}）")
-        return _ALLOC_RANGES[category]
+        return [_ALLOC_RANGES[category]]
 
     def add_token(self, text: str, category: str) -> int:
         """添加一个 token，返回新 ID。
 
         规则：
           1. category ∈ {regular, fallback, special, system}（扁平词表
-             忽略 category，统一走尾部 reserved 段）；
+             忽略 category，统一走空位回收）；
           2. text 非空、不以 "<reserved:" 开头（占位符命名空间）；
           3. 全局查重——text 已存在于词表任何位置即拒绝（含四类之间）；
-          4. 无冲突则占用该类 reserved 尾段的第一个空槽，写回来源文件。
+          4. 无冲突则占用候选区间的第一个空槽，写回来源文件。
         """
         if not self.flat and category not in _ALLOC_RANGES:
             raise ValueError(f"未知 token 类别: {category!r}"
@@ -281,9 +333,12 @@ class Vocab:
                 f"（ID {self.token_to_id[text]}，"
                 f"类别 {self.category_of(self.token_to_id[text])}）")
 
-        begin, end = self._alloc_range(category)
-        slot = next((i for i in range(begin, end)
-                     if _is_reserved(self.id_to_token[i])), None)
+        slot = None
+        for begin, end in self._alloc_ranges(category):
+            slot = next((i for i in range(begin, end)
+                         if _is_reserved(self.id_to_token[i])), None)
+            if slot is not None:
+                break
         if slot is None:
             raise ValueError(f"{category} 类预留槽位已满，无法添加新 token")
 
@@ -296,6 +351,9 @@ class Vocab:
             if self.flat:
                 self.regular_ids[text] = slot
                 self._n_user += 1
+                self._max_match = max(self._max_match, len(text))
+                if len(text) == 1 and "a" <= text <= "z":
+                    self.fallback_ids[text] = slot
             elif category == CAT_REGULAR:
                 self.regular_ids[text] = slot
             elif category == CAT_FALLBACK:
@@ -324,6 +382,8 @@ class Vocab:
             self.id_to_token[tid] = f"{DEL_MARKER}{idx}>"
             self.regular_ids.pop(text, None)
             self.token_to_id.pop(text, None)
+            self.fallback_ids.pop(text, None)
+            self._n_user -= 1
             self._persist()
         return tid
 
@@ -332,12 +392,14 @@ class Vocab:
         if self._path is None:
             raise RuntimeError("该词表无来源文件路径，无法持久化")
         if self.flat:
-            # 只写用户可见区（不可见区是固定契约，不属于 vocab.txt）
-            base = spec.INVISIBLE_END
-            lines = self.id_to_token[base:base + self._n_user]
-            tmp = self._path.with_suffix(".txt.tmp")
-            tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            tmp.replace(self._path)
+            # 只写真实可见 token（显式 ID + JSON 转义）；reserved 空位不落盘，
+            # 空位本身就是「文件里没有这一行」，可被后续 add_token 回收。
+            entries = [(i, self.id_to_token[i])
+                       for i in range(spec.INVISIBLE_END,
+                                      spec.VOCAB_SIZE_PADDED)
+                       if not _is_reserved(self.id_to_token[i])]
+            write_flat_vocab_file(str(self._path), entries)
+            self.legacy_format = False
             return
         tmp = self._path.with_suffix(".json.tmp")
         tmp.write_text(
@@ -351,11 +413,8 @@ class Vocab:
     def reload(self) -> None:
         """丢弃内存映射，从磁盘重新加载（外部改动后同步）。"""
         if self.flat:
-            tokens = [ln.rstrip("\n").rstrip("\r")
-                      for ln in self._path.read_text(
-                          encoding="utf-8").splitlines()]
-            tokens = [t for t in tokens if t]
-            fresh = Vocab.from_tokens(tokens, self._path)
+            entries, legacy = read_flat_vocab_file(str(self._path))
+            fresh = Vocab.from_entries(entries, self._path, legacy=legacy)
         else:
             fresh = Vocab(self._path)
         self.__dict__.update(fresh.__dict__)
@@ -376,11 +435,13 @@ def set_model_vocab(model_dir: str) -> None:
     global _MODEL_VOCAB, _MODEL_VOCAB_DIR
     if model_dir == _MODEL_VOCAB_DIR and _MODEL_VOCAB is not None:
         return
-    tokens = read_model_vocab(model_dir)
-    if tokens is None:
+    got = read_model_vocab_entries(model_dir)
+    if got is None:
         clear_model_vocab()
         return
-    _MODEL_VOCAB = Vocab.from_tokens(tokens, model_vocab_path(model_dir))
+    entries, legacy = got
+    _MODEL_VOCAB = Vocab.from_entries(entries, model_vocab_path(model_dir),
+                                      legacy=legacy)
     _MODEL_VOCAB_DIR = model_dir
 
 
@@ -401,10 +462,8 @@ def set_vocab_source(path: str) -> None:
     if not p.is_file():
         raise FileNotFoundError(f"词表来源不存在: {path}")
     global _MODEL_VOCAB, _MODEL_VOCAB_DIR
-    tokens = [ln.rstrip("\n").rstrip("\r")
-              for ln in p.read_text(encoding="utf-8").splitlines()]
-    tokens = [t for t in tokens if t]
-    _MODEL_VOCAB = Vocab.from_tokens(tokens, p)
+    entries, legacy = read_flat_vocab_file(str(p))
+    _MODEL_VOCAB = Vocab.from_entries(entries, p, legacy=legacy)
     _MODEL_VOCAB_DIR = None
 
 

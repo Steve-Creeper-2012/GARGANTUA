@@ -173,11 +173,37 @@ def tokens_to_primitives(ids: Sequence[int]) -> List[Primitive]:
 
     步首 token 落在 special bin 区（含仓库自带 pad）即停止——
     模型输出特殊 bin 表示序列结束。总数非 9 倍数时截断尾部并 warning。
+
+    2026-10-27 审计修复：逐字段校验 bin 区间——旧实现不检查九个字段的
+    取值范围，9 个 0 也能「解出」cx=-48、负宽高、负颜色等荒谬图元；
+    畸形 token 现在一律 ValueError（HTTP 400），而不是静默产出坏图。
     """
     if len(ids) % _TOKENS_PER != 0:
         log.warning("draw_codec: token 数 %d 不是 %d 的倍数，截断尾部",
                     len(ids), _TOKENS_PER)
     b = spec.DRAW_BEGIN
+    # 九个字段的 (offset, bins) 表——与 primitive_to_tokens 的编码表同源
+    _FIELDS = (
+        (spec.DRAW_X_OFFSET, spec.DRAW_X_BINS),
+        (spec.DRAW_Y_OFFSET, spec.DRAW_Y_BINS),
+        (spec.DRAW_ANGLE_OFFSET, spec.DRAW_ANGLE_BINS),
+        (spec.DRAW_W_OFFSET, spec.DRAW_W_BINS),
+        (spec.DRAW_H_OFFSET, spec.DRAW_H_BINS),
+        (spec.DRAW_SHAPE_OFFSET, spec.DRAW_SHAPE_BINS),
+        (spec.DRAW_R_OFFSET, spec.DRAW_COLOR_BINS),
+        (spec.DRAW_G_OFFSET, spec.DRAW_COLOR_BINS),
+        (spec.DRAW_B_OFFSET, spec.DRAW_COLOR_BINS),
+    )
+
+    def _bin_of(tok: int, field: int) -> int:
+        off, bins = _FIELDS[field]
+        v = tok - b
+        if not (off <= v < off + bins):
+            raise ValueError(
+                f"draw token 字段 {field} 越界: id={tok}（期望 "
+                f"[{b + off}, {b + off + bins})）")
+        return v - off
+
     prims: List[Primitive] = []
     for i in range(0, len(ids) - _TOKENS_PER + 1, _TOKENS_PER):
         t = ids[i:i + _TOKENS_PER]
@@ -186,17 +212,16 @@ def tokens_to_primitives(ids: Sequence[int]) -> List[Primitive]:
         if t[0] - b >= spec.DRAW_SPECIAL_OFFSET:
             break
         prims.append(Primitive(
-            cx=(t[0] - b - spec.DRAW_X_OFFSET) / spec.XY_BINS_PER_PIXEL,
-            cy=(t[1] - b - spec.DRAW_Y_OFFSET) / spec.XY_BINS_PER_PIXEL,
-            w=(t[3] - b - spec.DRAW_W_OFFSET) / spec.SIZE_BINS_PER_PIXEL,
-            h=(t[4] - b - spec.DRAW_H_OFFSET) / spec.SIZE_BINS_PER_PIXEL,
-            shape_type=int(t[5] - b - spec.DRAW_SHAPE_OFFSET) - 1,
-            theta=math.radians(
-                (t[2] - b - spec.DRAW_ANGLE_OFFSET)
-                / spec.ANGLE_BINS_PER_DEGREE),
-            r=int(t[6] - b - spec.DRAW_R_OFFSET) * 2,
-            g=int(t[7] - b - spec.DRAW_G_OFFSET) * 2,
-            b=int(t[8] - b - spec.DRAW_B_OFFSET) * 2,
+            cx=_bin_of(t[0], 0) / spec.XY_BINS_PER_PIXEL,
+            cy=_bin_of(t[1], 1) / spec.XY_BINS_PER_PIXEL,
+            w=_bin_of(t[3], 3) / spec.SIZE_BINS_PER_PIXEL,
+            h=_bin_of(t[4], 4) / spec.SIZE_BINS_PER_PIXEL,
+            shape_type=_bin_of(t[5], 5) - 1,
+            theta=math.radians(_bin_of(t[2], 2)
+                               / spec.ANGLE_BINS_PER_DEGREE),
+            r=_bin_of(t[6], 6) * 2,
+            g=_bin_of(t[7], 7) * 2,
+            b=_bin_of(t[8], 8) * 2,
         ))
     return prims
 

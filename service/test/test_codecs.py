@@ -129,8 +129,11 @@ class TestImageCodec(unittest.TestCase):
         self.assertTrue(full_flags[30])                 # 第 31 帧全量
         self.assertTrue(all(not f for f in full_flags[31:34]))
         self.assertTrue(full_flags[34])                 # 末帧强制全量
-        # delta 帧无变化 → patches 为空
-        self.assertEqual(steps[1]["meta"]["patches"], [])
+        # 无变化的 delta 帧：时间步必须非空（.tokenvector 不接受空步），
+        # 送 1 个同值占位 patch 并标记 static
+        self.assertTrue(steps[1]["meta"]["static"])
+        self.assertEqual(len(steps[1]["meta"]["patches"]), 1)
+        self.assertEqual(steps[1]["meta"]["patches"][0]["x"], 0)
         # 全量帧带全部 patch
         self.assertEqual(len(steps[30]["meta"]["patches"]), 4)
 

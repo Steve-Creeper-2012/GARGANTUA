@@ -182,6 +182,32 @@ class SimApplyTest(unittest.TestCase):
             q2 = _sim_quant(n, q1)
             self.assertLessEqual(_max_abs_err(q1, q2), 1e-4)
 
+    def test_fp4_small_std_weights_not_all_zero(self):
+        # 2026-10-27 审计回归：初始权重 std≈0.02，旧实现（无 scale 归一化）
+        # 把 100% 的权重压成 0，模型输出近似均匀随机。
+        x = torch.randn(10000) * 0.02
+        q = _sim_fp4_direct(x)
+        zero_rate = (q == 0).float().mean().item()
+        self.assertLess(zero_rate, 0.9)          # 绝大多数权重必须非零
+        # 重建误差有界：|err| ≤ 半个最大网格间距 = scale（amax/6）
+        scale = x.abs().amax().item() / 6.0
+        self.assertLessEqual(_max_abs_err(x, q), scale + 1e-7)
+        # 量级保持：量化后 amax 应与原 amax 同数量级（网格含 6 → 精确命中）
+        self.assertAlmostEqual(q.abs().amax().item(),
+                               x.abs().amax().item(), delta=scale)
+
+    def test_fp4_grid_values_exact(self):
+        # scale 归一化后，amax 应精确落在网格最大值 6 上（重建精确）。
+        x = torch.tensor([0.02, -0.02, 0.01, 0.0, 0.03])
+        q = _sim_fp4_direct(x)
+        amax = x.abs().amax().item()
+        self.assertAlmostEqual(q.abs().amax().item(), amax, places=7)
+
+
+def _sim_fp4_direct(x: torch.Tensor) -> torch.Tensor:
+    from precision import _sim_fp4
+    return _sim_fp4(x)
+
 
 def _sim_quant(name: str, x: torch.Tensor) -> torch.Tensor:
     """直接用 precision 内部的量化函数（绕过 model，便于误差检验）。"""

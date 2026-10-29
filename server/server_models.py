@@ -22,7 +22,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import spec
-from common import (CKPT_NAME, read_config, read_ctx_config,
+from common import (CKPT_NAME, model_exists, read_config, read_ctx_config,
                     valid_model_name)
 
 
@@ -67,7 +67,9 @@ class ModelManager:
         for d in sorted(glob.glob(os.path.join(self.model_dir, "*"))):
             if not os.path.isdir(d):
                 continue
-            if not os.path.exists(os.path.join(d, CKPT_NAME)):
+            # 2026-10-27：manifest 化发布后权重文件名带 uuid，存在性判断
+            # 改用 model_exists（config.json 或 model*.safetensors 任一）
+            if not model_exists(d):
                 continue
             info = {"name": os.path.basename(d), "params": None}
             cfg = os.path.join(d, "config.json")
@@ -88,8 +90,7 @@ class ModelManager:
         if bad:
             raise ValueError(f"非法模型名: {bad}")
         d = os.path.join(self.model_dir, name)
-        ckpt = os.path.join(d, CKPT_NAME)
-        if not os.path.exists(ckpt):
+        if not model_exists(d):
             raise FileNotFoundError(f"模型不存在: {name}")
         # 只读 config.json（block 数/上下文/params 都在里面）——权重留给
         # 服务进程按需加载。config 缺失/损坏时 read_config 返回 {}，

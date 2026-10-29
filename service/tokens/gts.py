@@ -1,6 +1,10 @@
 # ===========================================================================
 # GARGANTUA v1 — gts：Token 编辑器文本（.gts）→ token ID 流
 # ---------------------------------------------------------------------------
+# 【历史格式】2026-10-28 起 .tokens 改为 token-5（tokens/tok5.py，spec 第
+# 5b 节），编辑器的导出走 tok5.parse_display。本模块保留为 tok-32 时代的
+# 只读解析器：仍可把老 .gts 文本转成 ID 流，但不再被 HTTP 端点使用。
+# ---------------------------------------------------------------------------
 # .gts 是 Token 编辑器里的可读形态（dectok 的逆过程）：
 #   {  时间步开始        }  时间步结束        |  步内分隔
 #   <user> / <stop> 等  特殊/系统 token（整词匹配词表，否则按普通文本）
@@ -60,7 +64,10 @@ def parse_gts(text: str, vocab=None) -> list:
             return
         s = "".join(buf)
         buf.clear()
-        got, skipped = enctok.encode_text(s)
+        # 2026-10-27 审计修复（H2）：必须把同一个词表实例传给 enctok，
+        # 否则每模型词表（flat）的编码会退回进程全局词表——用户自定义
+        # 的 token 编不出来、未收录字母也不会走该词表的 fallback。
+        got, skipped = enctok.encode_text(s, v)
         if skipped:
             raise GtsError(
                 f"以下字符未收录进词表，无法导出: {''.join(skipped)!r}"

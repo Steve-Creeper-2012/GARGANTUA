@@ -20,6 +20,7 @@ import tempfile
 import numpy as np
 from PIL import Image
 
+import spec
 from tokens import audio_codec
 
 # 编解码入口的尺寸/规模上限（防解压炸弹与 OOM：单个 patch = 4096 字节，
@@ -50,8 +51,12 @@ def size_guard_pil(img):
 
 
 def b64_to_pil(b64):
-    img = Image.open(_bytes_io(b64)).convert("RGBA")
-    return size_guard_pil(img)
+    # 2026-10-27 审计修复：先读图片头做尺寸守卫，再解码像素——旧实现
+    # convert("RGBA") 先把整张高压缩图片解出来（可达数百 MB）才检查尺寸，
+    # 守卫形同虚设。PIL 的 Image.open 是惰性的，size 在解码前即可得。
+    img = Image.open(_bytes_io(b64))
+    size_guard_pil(img)
+    return size_guard_pil(img.convert("RGBA"))
 
 
 def _bytes_io(b64):
@@ -98,13 +103,22 @@ def find_ffmpeg():
 
 
 def decode_audio_with_ffmpeg(path, sr=16000):
-    """ffmpeg 解码任意音频（wav/mp3/flac/ogg…）为 int16 单声道采样。"""
+    """ffmpeg 解码任意音频（wav/mp3/flac/ogg…）为 int16 单声道采样。
+
+    2026-10-27 审计修复：前置时长闸门（-t）+ 硬字节上限——旧实现先完整
+    收集 stdout 再检查长度，1MB 高压缩 mp3 ≈ 16 分钟波形（数百 MB）
+    在返回 400 前就已驻留内存。"""
     exe = find_ffmpeg()
     if exe is None:
         raise RuntimeError("未找到可用 ffmpeg，无法解码非 wav 音频")
+    # 音元上限换算的时长闸门（+10s 余量）：超长音频在这里就被截断，
+    # 而不是解完整份再报错
+    max_sec = MAX_AUDIO_TOKENS * spec.AUDIO_SAMPLES_PER_TOKEN / spec.AUDIO_SR
+    max_bytes = int(MAX_AUDIO_TOKENS * spec.AUDIO_SAMPLES_PER_TOKEN * 2 * 1.5)
     try:
         proc = subprocess.run(
-            [exe, "-v", "error", "-i", path, "-f", "s16le", "-acodec",
+            [exe, "-v", "error", "-t", f"{max_sec + 10:.0f}",
+             "-i", path, "-f", "s16le", "-acodec",
              "pcm_s16le", "-ar", str(sr), "-ac", "1", "-"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
     except subprocess.TimeoutExpired:
@@ -112,6 +126,10 @@ def decode_audio_with_ffmpeg(path, sr=16000):
     if proc.returncode != 0:
         raise RuntimeError("ffmpeg 解码失败: " +
                            proc.stderr.decode(errors="replace")[:200])
+    if len(proc.stdout) > max_bytes:
+        raise RuntimeError(
+            f"音频过长: 解码结果 > {max_bytes} 字节（约 "
+            f"{MAX_AUDIO_TOKENS / 30:.0f} 秒），请裁剪音频")
     return np.frombuffer(proc.stdout, dtype=np.int16).copy()
 
 

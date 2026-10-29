@@ -63,7 +63,12 @@ class FusedRMSNormGated(nn.Module):
 
 class CausalDepthwiseConv1d(nn.Module):
     """ 因果 depthwise 一维短卷积（KDA 的 q/k/v 局部混合，kernel=4）。
-    左侧补零保证严格因果：位置 t 只看 ≤ t 的输入。 """
+    左侧补零保证严格因果：位置 t 只看 ≤ t 的输入。
+
+    2026-10-27 审计修复（S2）：支持历史缓存——增量推理逐 token 调用时
+    传入上一调用的 cache（最近 kernel-1 个输入），卷积结果与整段一次
+    前向【逐位一致】。旧实现无缓存，逐 token 推理时每个 token 只看到
+    左侧零填充（训练时看到的是前 3 个真实 token），训练/推理不等价。"""
 
     def __init__(self, dim: int, kernel: int):
         super().__init__()
@@ -71,12 +76,21 @@ class CausalDepthwiseConv1d(nn.Module):
         self.weight = nn.Parameter(torch.randn(dim, 1, kernel) * 0.02)
         self.bias = nn.Parameter(torch.zeros(dim))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: Optional[torch.Tensor] = None
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """ x: [B, T, D] → out [B, T, D]；cache/new_cache: [B, D, K-1]。
+
+        cache=None 时左侧补零，与原行为逐位一致。"""
         # x: [B, T, D] -> [B, D, T]
         x = x.transpose(1, 2)
-        x = F.pad(x, (self.kernel - 1, 0))          # 左侧因果 padding
+        if cache is None:
+            x = F.pad(x, (self.kernel - 1, 0))          # 左侧因果 padding
+        else:
+            x = torch.cat([cache.to(x.device), x], dim=2)
+        new_cache = x[:, :, -self.kernel + 1:].detach() if self.kernel > 1 \
+            else None
         x = F.conv1d(x, self.weight, self.bias, groups=x.shape[1])
-        return x.transpose(1, 2)
+        return x.transpose(1, 2), new_cache
 
 
 # ===========================================================================
@@ -153,15 +167,30 @@ class KDAAttention(nn.Module):
     def forward(self, x: torch.Tensor,
                 state: Optional[torch.Tensor] = None,
                 reverse: bool = False,
-                ) -> Tuple[torch.Tensor, torch.Tensor]:
+                conv_cache: Optional[dict] = None,
+                ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """ x: [B, T, D]。reverse=True 时先翻转序列再递推（encoder 用 KDA
-        获得反向信息流；正向/反向两个 KDA 子层由 block 组装保证双向性）。 """
+        获得反向信息流；正向/反向两个 KDA 子层由 block 组装保证双向性）。
+
+        返回 (out, new_state, new_conv_cache)：
+          new_state      [B, H, dk, dv] 递推终态（增量推理跨调用持有）；
+          new_conv_cache {"q","k","v"} → 各自最近 kernel-1 个卷积输入
+          [B, C, K-1]（2026-10-27 S2：旧实现丢弃卷积历史，逐 token 推理
+          与整段前向的 q/k/v 不一致，训练/推理不等价）。
+
+        整段前向（训练/encoder）传 state=None, conv_cache=None，行为与旧
+        实现逐位一致。"""
         B, T, _ = x.shape
         if reverse:
             x = x.flip(1)
-        q = F.silu(self.conv_q(self.w_q(x))).view(B, T, self.H, self.dk)
-        k = F.silu(self.conv_k(self.w_k(x))).view(B, T, self.H, self.dk)
-        v = F.silu(self.conv_v(self.w_v(x))).view(B, T, self.H, self.dv)
+        cc = conv_cache or {}
+        q, cq = self.conv_q(self.w_q(x), cache=cc.get("q"))
+        k, ck = self.conv_k(self.w_k(x), cache=cc.get("k"))
+        v, cv = self.conv_v(self.w_v(x), cache=cc.get("v"))
+        new_conv_cache = {"q": cq, "k": ck, "v": cv}
+        q = F.silu(q).view(B, T, self.H, self.dk)
+        k = F.silu(k).view(B, T, self.H, self.dk)
+        v = F.silu(v).view(B, T, self.H, self.dv)
         q = F.normalize(q, p=2, dim=-1)
         k = F.normalize(k, p=2, dim=-1)
         # α ∈ (0,1]：log 空间衰减参数化，log α = -softplus(w)，α = exp(-softplus(...))
@@ -175,7 +204,7 @@ class KDAAttention(nn.Module):
         out = self.w_o(out.reshape(B, T, self.H * self.dv))
         if reverse:
             out = out.flip(1)
-        return out, state
+        return out, state, new_conv_cache
 
 
 # ===========================================================================
@@ -186,8 +215,26 @@ class KDAAttention(nn.Module):
 # 从流中向量重建 K/V：c = W_DKV·h_store（低秩隐向量），k = W_UK·c，
 # v = W_UV·c；q 从当前 hidden 低秩投影。
 # ===========================================================================
+def within_step_pos(step_ids: torch.Tensor) -> torch.Tensor:
+    """步内序号：同一 step 内第 0..n-1 个 token 的序号（张量运算）。
+
+    2026-10-27 审计修复（S1）的掩码基础：仅靠 step_id 的 <= 比较会让
+    同一步内的「未来 token」对当前位置可见（dec_in 左移一位后，位置 t
+    的输入就是位置 t+1 的标签，步内双向 = 标签泄漏）。有了步内序号，
+    因果掩码可以细化到 token 粒度：同 step 内只能看序号 <= 自己的。"""
+    T = step_ids.shape[1]
+    idx = torch.arange(T, device=step_ids.device).unsqueeze(0)
+    change = torch.ones_like(step_ids, dtype=torch.bool)
+    if T > 1:
+        change[:, 1:] = step_ids[:, 1:] != step_ids[:, :-1]
+    step_start = torch.cummax(torch.where(change, idx, idx.new_zeros(())),
+                              dim=1).values
+    return idx - step_start
+
+
 class MLAAttention(nn.Module):
-    """ MLA 注意力。causal=True 时按时间步因果（步内双向、步间因果）。"""
+    """ MLA 注意力。causal=True 时按时间步因果（步内 token 级因果、步间
+    因果；整步压缩的聚合条目只在【严格过去】可见）。"""
 
     def __init__(self, d_model: int = spec.D_MODEL, n_head: int = spec.N_HEADS,
                  head_dim: int = spec.HEAD_DIM, causal: bool = True):
@@ -207,18 +254,28 @@ class MLAAttention(nn.Module):
     def forward(self, x: torch.Tensor, kv: torch.Tensor,
                 kv_step_ids: Optional[torch.Tensor] = None,
                 x_step_ids: Optional[torch.Tensor] = None,
+                kv_pos: Optional[torch.Tensor] = None,
+                x_pos: Optional[torch.Tensor] = None,
                 ) -> torch.Tensor:
         """ x:  [B, Tq, D] 当前 hidden（q 侧）
         kv: [B, Tk, D] 共享 KV 流（或 encoder 段自身 hidden，双向）
-        因果规则：x 的每个位置可看 kv 中 step_id 严格小于自身 step 的全部
-        位置，以及同 step 内的全部位置（步内双向）。kv 为 encoder 段时
-        causal=False 全双向。
+        因果规则（2026-10-27 审计修复 S1，细化到 token 粒度）：
+          - kv step 严格小于 x step → 可见；
+          - kv step 等于 x step 且 kv_pos >= 0 且 kv_pos <= x_pos → 可见
+            （同 step 内按 token 序号因果，「未来 token」不可见）；
+          - kv_pos = -1 的整步压缩聚合条目（CSA/HCA/图元打包）只在
+            kv step 严格小于 x step 时可见——聚合组可能包含与查询同 step
+            的 token，按保守因果一律对同 step 查询隐身。
         2026-10-20：causal=True 而任一 step_ids 缺失时直接 raise——
-        此前静默跳过掩码会使 decoder 层退化为全双向（未来泄漏）。 """
+        此前静默跳过掩码会使 decoder 层退化为全双向（未来泄漏）。"""
         if self.causal and (kv_step_ids is None or x_step_ids is None):
             raise ValueError(
                 "causal MLA 需要 kv_step_ids 与 x_step_ids（缺失会导致"
                 "因果掩码被静默跳过、未来信息泄漏）")
+        if self.causal and (kv_pos is None or x_pos is None):
+            raise ValueError(
+                "causal MLA 需要 kv_pos 与 x_pos（步内序号；缺失会令掩码"
+                "无法区分当前 token 与未来 token，造成训练标签泄漏）")
         B, Tq, _ = x.shape
         Tk = kv.shape[1]
         q = self.w_uq(self.w_dq(x)).view(B, Tq, self.H, self.dh).transpose(1, 2)
@@ -228,8 +285,12 @@ class MLAAttention(nn.Module):
 
         attn = torch.einsum('bhqd,bhkd->bhqk', q, k) / math.sqrt(self.dh)
         if self.causal and kv_step_ids is not None and x_step_ids is not None:
-            # 步间因果 + 步内双向：kv_step <= x_step 即可见
-            mask = kv_step_ids.unsqueeze(1) <= x_step_ids.unsqueeze(2)  # [B,Tq,Tk]
+            past = kv_step_ids.unsqueeze(1) < x_step_ids.unsqueeze(2)
+            same = kv_step_ids.unsqueeze(1) == x_step_ids.unsqueeze(2)
+            # 同 step：压缩聚合条目（pos=-1）不可见；普通条目按步内序号因果
+            within = same & (kv_pos.unsqueeze(1) >= 0) \
+                & (kv_pos.unsqueeze(1) <= x_pos.unsqueeze(2))
+            mask = past | within                             # [B,Tq,Tk]
             attn = attn.masked_fill(~mask.unsqueeze(1), float('-inf'))
         out = torch.einsum('bhqk,bhkd->bhqd', attn.softmax(-1), v)
         out = out.transpose(1, 2).reshape(B, Tq, self.H * self.dh)
@@ -259,7 +320,10 @@ class StepCompressor(nn.Module):
         L = vecs.shape[1]
         idx = torch.arange(L, device=vecs.device).clamp_(max=self.ratio - 1)
         v = vecs + self.pos_emb[idx].unsqueeze(0)
-        m = mask.unsqueeze(-1).float()
+        # 2026-10-27 审计修复：mask 必须保持 vecs.dtype——旧实现 .float()
+        # 把 pooled 抬成 FP32，半精度/双精度模型再进 MLP 直接报
+        # mat1 and mat2 must have the same dtype（fp16/bf16/fp64 全中招）
+        m = mask.unsqueeze(-1).to(dtype=vecs.dtype)
         pooled = (v * m).sum(1) / m.sum(1).clamp(min=1.0)      # [G, D]
         return self.mlp(pooled) + pooled                        # 残差
 
@@ -335,6 +399,7 @@ class KVEntry:
     type_id: int
     source: str                # "enc" | "dec"
     token_id: Optional[int] = None   # 离散 token 的原始 id（向量类为 None）
+    pos: int = 0               # 步内序号（2026-10-27 S1）；整步压缩聚合条目为 -1
 
 
 @dataclass
@@ -397,12 +462,23 @@ class SharedKV:
                 self._pending_draw.clear()
                 return
             idx = list(range(n - spec.DRAW_KV_COMPRESS, n))
-            vs = torch.stack([self.entries[i].vec for i in idx])
+            group = [self.entries[i] for i in idx]
+            vs = torch.stack([e.vec for e in group])
             m = torch.ones(len(idx), dtype=torch.bool, device=vs.device)
             packed = self.draw_packer(vs.unsqueeze(0), m.unsqueeze(0))[0]
-            e0 = self.entries[idx[0]]
-            self.entries[idx[0]] = KVEntry(packed.detach(), e0.step_id,
-                                           e0.type_id, e0.source, None)
+            e0 = group[0]
+            # 2026-10-27 审计修复（L3）：
+            #   1. 归属步 = 组内最大 step。九字段若跨步，用首条 step 会让
+            #      早期步的查询看到后面几个字段（信息前移，等于泄漏）；
+            #   2. 九个原始 token id 在打包前全部归档——旧实现把首条 id
+            #      改成 None、其余直接删除，token 存档因此凭空少 9 条。
+            step_id = max(e.step_id for e in group)
+            for e in group:
+                self.archive.append(KVArchiveEntry(
+                    e.step_id, e.type_id, e.source, e.token_id))
+            # pos=-1：打包条目是整组聚合，对同 step 查询按严格过去处理
+            self.entries[idx[0]] = KVEntry(packed.detach(), step_id,
+                                           e0.type_id, e0.source, None, -1)
             for i in reversed(idx[1:]):
                 del self.entries[i]
             self._pending_draw.clear()
@@ -424,33 +500,40 @@ class SharedKV:
             self._pending_draw.clear()
 
     # ---- 读取视图 ----
-    def _stack(self, entries: List[KVEntry]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _stack(self, entries: List[KVEntry]
+               ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         vs = torch.stack([e.vec for e in entries])
         ss = torch.tensor([e.step_id for e in entries], device=vs.device)
-        return vs, ss
+        ps = torch.tensor([e.pos for e in entries], device=vs.device)
+        return vs, ss, ps
 
-    def view(self, kind: str, device=None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def view(self, kind: str, device=None
+             ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """ kind ∈ {"full", "csa", "hca"}。
         full：完整区原样。
         csa ：压缩区 4:1（检索视图）+ 全部完整区。
         hca ：压缩区 32:1（全局概括视图）+ 全部完整区。
         两个压缩视图都读完整区——处理未压缩 KV 时就是标准 MLA 逻辑
         （2026-10-25 删除局部窗：CSA 的保留区 = 完整 KV 区）。
-        返回 (vecs [1, T, D], step_ids [1, T])。 """
+        返回 (vecs [1, T, D], step_ids [1, T], pos [1, T])：
+        pos 为步内序号；整步压缩聚合条目为 -1（只对严格过去的查询
+        可见，2026-10-27 S1 因果细化到 token 粒度）。 """
         n = len(self.entries)
         full_n = min(n, self.ctx_full)
         full, comp = self.entries[n - full_n:], self.entries[:n - full_n]
         if kind == "full":
-            vs, ss = self._stack(full) if full else (None, None)
+            out = self._stack(full) if full else (None, None, None)
         elif kind == "csa":
             out_e = self._compress_entries(comp, self.csa) + full
-            vs, ss = self._stack(out_e) if out_e else (None, None)
+            out = self._stack(out_e) if out_e else (None, None, None)
         else:  # hca
             out_e = self._compress_entries(comp, self.hca) + full
-            vs, ss = self._stack(out_e) if out_e else (None, None)
-        if vs is None:
-            return None, None
-        return vs.unsqueeze(0).to(device), ss.unsqueeze(0).to(device)
+            out = self._stack(out_e) if out_e else (None, None, None)
+        if out[0] is None:
+            return None, None, None
+        vs, ss, ps = out
+        return (vs.unsqueeze(0).to(device), ss.unsqueeze(0).to(device),
+                ps.unsqueeze(0).to(device))
 
     def _compress_entries(self, entries: List[KVEntry],
                           comp) -> List[KVEntry]:
@@ -459,7 +542,7 @@ class SharedKV:
         if isinstance(comp, int):
             # 兼容旧调用形式（传 ratio 整数）：按比例解析回模块
             comp = self.csa if comp == self.csa.ratio else self.hca
-        vs, ss = self._stack(entries)
+        vs, ss, _ps = self._stack(entries)
         ratio = comp.ratio
         out = []
         for (s, e) in group_by_step(ss, ratio):
@@ -472,10 +555,11 @@ class SharedKV:
             vec = comp(g.unsqueeze(0), m.unsqueeze(0))[0]
             # step_id 取组内【最大】步：保守因果——组可能跨步聚合，
             # 若取首步，组内后续步的 token 会透过掩码泄漏给更早的查询
-            # （2026-10-20 审查实测复现，见 tests/test_model.py 泄漏回归）
+            # （2026-10-20 审查实测复现，见 tests/test_model.py 泄漏回归）。
+            # pos=-1：聚合条目对同 step 查询隐身（2026-10-27 S1）。
             out.append(KVEntry(vec.detach(), entries[e - 1].step_id,
                                entries[e - 1].type_id, entries[e - 1].source,
-                               None))
+                               None, -1))
         return out
 
 
@@ -489,7 +573,13 @@ class SharedKV:
 # 输出门控 / RMSNorm），不再维护一份简化的平行实现。
 # ===========================================================================
 class FastWeightBank(nn.Module):
-    """ 内嵌一个 KDAAttention 作为「层」，区别只在状态 S 跨调用持久。 """
+    """ 内嵌一个 KDAAttention 作为「层」，区别只在状态 S 跨调用持久。
+
+    2026-10-27 审计修复（S2）：持久状态从「仅 S」扩展为 (S, conv_cache)——
+    旧实现只持久化 S，kernel=4 短卷积的历史每次从零填充，逐 token 推理
+    与整段前向的 q/k/v 不一致（FastWeight 同样中招）。状态可存内部
+    self._state（训练/无状态调用），也可存外部 state dict（增量推理：
+    enc 写入 → dec 跨步推进，与 Gargantua.decode 的逐层状态同一容器）。"""
 
     def __init__(self, d_model: int = spec.D_MODEL):
         super().__init__()
@@ -497,23 +587,36 @@ class FastWeightBank(nn.Module):
         self.H = self.layer.H
         self.dk = self.layer.dk
         self.dv = self.layer.dv
-        self._state: Optional[torch.Tensor] = None   # [B, H, dk, dv]，B=1 持久
+        self._state = None       # (S [B,H,dk,dv], conv_cache dict) 或 None
 
     def reset(self):
         self._state = None
 
     def forward(self, x: torch.Tensor, write: bool = True,
-                detach_state: bool = True) -> torch.Tensor:
+                detach_state: bool = True, state: Optional[dict] = None,
+                key: str = "fw") -> torch.Tensor:
         """ x: [B, T, D]。先读后写（同一序列先以旧状态读出，再逐 token 推进）。
-        detach_state=True：样本边界处截断状态梯度（状态ful 训练惯例）。 """
-        state = self._state
-        if state is not None and state.shape[0] != x.shape[0]:
-            state = None                              # batch 变化则重置
-        if state is not None and state.device != x.device:
-            state = state.to(x.device)                # 设备迁移守卫（.to() 后）
-        out, new_state = self.layer(x, state=state)
+
+        detach_state=True：样本边界处截断状态梯度（状态ful 训练惯例）。
+        state=None：用内部 self._state（训练路径，forward_train 入口 reset）；
+        state=dict：用外部容器的 state[key]（增量推理，encode/decode 共享）。"""
+        cur = self._state if state is None else state.get(key)
+        S, cc = cur if cur is not None else (None, None)
+        if S is not None and S.shape[0] != x.shape[0]:
+            S, cc = None, None                              # batch 变化则重置
+        if S is not None and S.device != x.device:
+            S = S.to(x.device)                              # 设备迁移守卫
+            cc = {k: v.to(x.device) for k, v in cc.items()} if cc else cc
+        out, new_S, new_cc = self.layer(x, state=S, conv_cache=cc)
         if write:
-            self._state = new_state.detach() if detach_state else new_state
+            if detach_state:
+                new_S = new_S.detach()
+                new_cc = {k: (v.detach() if v is not None else None)
+                          for k, v in new_cc.items()}
+            if state is None:
+                self._state = (new_S, new_cc)
+            else:
+                state[key] = (new_S, new_cc)
         return out
 
 
@@ -567,13 +670,30 @@ class Block(nn.Module):
         a, b = self.ffn_up(x).chunk(2, dim=-1)       # GLU：SiLU(a) ⊙ b
         return self.ffn_down(F.silu(a) * b)
 
+    def _kda(self, layer: KDAAttention, name: str, normed: torch.Tensor,
+             rec_state: Optional[dict], reverse: bool = False) -> torch.Tensor:
+        """KDA 子层统一入口：decoder 增量推理（rec_state 非空且本层属
+        decoder）时读写持久 (S, conv_cache)；否则整段无状态前向（训练/
+        encoder 双向），行为与旧实现逐位一致。"""
+        if rec_state is not None and self.is_decoder:
+            S, cc = rec_state.get(name) or (None, None)
+            out, S2, cc2 = layer(normed, state=S, conv_cache=cc)
+            rec_state[name] = (S2, cc2)
+            return out
+        out, _, _ = layer(normed, reverse=reverse)
+        return out
+
     def forward(self, x: torch.Tensor, kv_view_hca, kv_view_csa,
                 x_step_ids: Optional[torch.Tensor] = None,
                 blocks: Optional[List[torch.Tensor]] = None,
+                rec_state: Optional[dict] = None,
                 ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """ kv_view_*: (vecs [1, Tk, D], step_ids [1, Tk]) 共享 KV 流视图；
-        encoder 段传 (None, None) 时 MLA 退化为对自身 hidden 的双向注意力。
+        """ kv_view_*: (vecs [1, Tk, D], step_ids [1, Tk], pos [1, Tk])
+        共享 KV 流视图（pos=步内序号，压缩聚合条目为 -1）；encoder 段传
+        (None, None, None) 时 MLA 退化为对自身 hidden 的双向注意力。
         blocks: 已完成的 block 表示（AttnRes 用；含 token embedding）。
+        rec_state: decoder 逐层递推状态 {kda名: (S, conv_cache)}——增量
+        推理跨 decode 调用持有（2026-10-27 S2）；训练/encoder 传 None。
         返回 (block 输出, 更新后的 blocks)。 """
         x0 = x
         partial = x
@@ -585,21 +705,31 @@ class Block(nn.Module):
             return block_attn_res(blocks, cur,
                                   self.attn_res_proj, self.attn_res_norm)
 
-        h, _ = self.kda1(self.norms[0](_res(partial)))
-        partial = partial + h
-        h, _ = self.kda2(self.norms[1](_res(partial)),
-                         reverse=not self.is_decoder)
-        partial = partial + h
-        h, _ = self.kda3(self.norms[2](_res(partial)))
-        partial = partial + h
-        kv_v, kv_s = (kv_view_csa if kv_view_csa[0] is not None
-                      else (partial, x_step_ids))
-        partial = partial + self.mla_csa(self.norms[3](_res(partial)),
-                                         kv_v, kv_s, x_step_ids)
-        kv_v, kv_s = (kv_view_hca if kv_view_hca[0] is not None
-                      else (partial, x_step_ids))
-        partial = partial + self.mla_hca(self.norms[4](_res(partial)),
-                                         kv_v, kv_s, x_step_ids)
+        # x 侧步内序号（2026-10-27 S1）：同 step 内按 token 序号因果
+        x_pos = (within_step_pos(x_step_ids)
+                 if x_step_ids is not None else None)
+        partial = partial + self._kda(self.kda1, "kda1",
+                                      self.norms[0](_res(partial)),
+                                      rec_state)
+        partial = partial + self._kda(self.kda2, "kda2",
+                                      self.norms[1](_res(partial)),
+                                      rec_state,
+                                      reverse=not self.is_decoder)
+        partial = partial + self._kda(self.kda3, "kda3",
+                                      self.norms[2](_res(partial)),
+                                      rec_state)
+        kv_v, kv_s, kv_p = (kv_view_csa if kv_view_csa[0] is not None
+                            else (partial, x_step_ids, x_pos))
+        partial = partial + self.mla_csa(
+            self.norms[3](_res(partial)), kv_v,
+            kv_step_ids=kv_s, x_step_ids=x_step_ids,
+            kv_pos=kv_p, x_pos=x_pos)
+        kv_v, kv_s, kv_p = (kv_view_hca if kv_view_hca[0] is not None
+                            else (partial, x_step_ids, x_pos))
+        partial = partial + self.mla_hca(
+            self.norms[4](_res(partial)), kv_v,
+            kv_step_ids=kv_s, x_step_ids=x_step_ids,
+            kv_pos=kv_p, x_pos=x_pos)
         ffn_in = (block_attn_res(blocks, partial, self.mlp_res_proj,
                                  self.mlp_res_norm)
                   if spec.ATTNRES_ENABLED else partial)
@@ -676,35 +806,53 @@ class Gargantua(nn.Module):
 
     def embed_visual(self, patch_vecs: torch.Tensor, coords: torch.Tensor,
                      type_ids: torch.Tensor) -> torch.Tensor:
-        """ patch_vecs: [N, 4096] uint8→float/255；coords: [N, 2] (gx, gy)。 """
-        v = self.visual_proj(patch_vecs.float() / 255.0)
+        """ patch_vecs: [N, 4096] uint8→float/255；coords: [N, 2] (gx, gy)。
+
+        2026-10-27 审计修复：输入必须显式转到投影权重的 dtype——旧实现
+        .float() 强制 FP32，fp16/bf16/fp64 模型在 visual_proj 直接 dtype
+        不匹配报错。 """
+        w = self.visual_proj.weight
+        v = self.visual_proj(
+            patch_vecs.to(dtype=w.dtype, device=w.device) / 255.0)
         v = v + self.visual_coord_x(coords[:, 0]) + self.visual_coord_y(coords[:, 1])
         return v + self.type_emb(type_ids)
 
     def embed_audio(self, samples: torch.Tensor, type_ids: torch.Tensor) -> torch.Tensor:
-        """ samples: [N, 533] float32（[-1,1] 波形）。 """
-        return self.audio_proj(samples) + self.type_emb(type_ids)
+        """ samples: [N, 533] float32（[-1,1] 波形）。
+
+        2026-10-27 审计修复：同上，采样显式转到 audio_proj 权重 dtype。 """
+        w = self.audio_proj.weight
+        return self.audio_proj(samples.to(dtype=w.dtype, device=w.device)) \
+            + self.type_emb(type_ids)
 
     # ---- encoder：输入段 → 词向量（双向）----
-    def encode(self, x: torch.Tensor, step_ids: torch.Tensor) -> torch.Tensor:
+    def encode(self, x: torch.Tensor, step_ids: torch.Tensor,
+               state: Optional[dict] = None) -> torch.Tensor:
+        """state: 外部递推状态容器（增量推理用；见 decode）。encoder 的
+        KDA 整段双向处理、不持有递推状态，但 fast weight 的写入要存进
+        state（None 则写内部 self._state，训练路径）。"""
         blocks = [x]                       # AttnRes：token embedding 也算一块
         for i, blk in enumerate(self.enc_blocks):
-            x, blocks = blk(x, (None, None), (None, None),
+            x, blocks = blk(x, (None, None, None), (None, None, None),
                             x_step_ids=step_ids, blocks=blocks)
             if i == 0:   # fast weight：第一个 block 之后调用一次（先用后更新）
-                x = x + self.fast_weight(x)
+                x = x + self.fast_weight(x, state=state)
                 blocks[-1] = x             # 提交块表示与实际流一致
         return self.enc_final_norm(x)
 
-    # ---- decoder：读共享 KV，自回归（步间因果 + 步内双向）----
+    # ---- decoder：读共享 KV，自回归（步间因果 + 步内 token 级因果）----
     def decode(self, x: torch.Tensor, step_ids: torch.Tensor,
-               kv_hca, kv_csa) -> torch.Tensor:
+               kv_hca, kv_csa, state: Optional[dict] = None) -> torch.Tensor:
+        """state: 逐层递推状态容器（2026-10-27 S2）——增量推理时由调用方
+        创建并在多次 decode 之间持有：{"kda1"/"kda2"/"kda3"/"fw":
+        (S, conv_cache)}。训练/整段前向传 None（每窗口从零递推，与
+        make_batch 语义一致）。"""
         blocks = [x]                       # decoder 栈独立的 block 表示列表
         for i, blk in enumerate(self.dec_blocks):
             x, blocks = blk(x, kv_hca, kv_csa, x_step_ids=step_ids,
-                            blocks=blocks)
+                            blocks=blocks, rec_state=state)
             if i == 0:   # fast weight：与 encoder 共享同一 bank，状态继续推进
-                x = x + self.fast_weight(x)
+                x = x + self.fast_weight(x, state=state)
                 blocks[-1] = x
         return self.dec_final_norm(x)
 
@@ -723,27 +871,33 @@ class Gargantua(nn.Module):
         spec 常量。
         2026-10-25：删除 CSA 局部窗——CSA 的保留区就是完整 KV 区，
         两个视图都 = 压缩段 + 全部完整段。
+        2026-10-27（S1）：视图携带步内序号 pos（完整区 = 步内序号；
+        压缩聚合条目 = -1），供因果掩码区分当前 token 与未来 token。
         """
         n = vecs.shape[1]
         full_n = min(n, self.ctx_full)
         full = vecs[:, n - full_n:]
         full_s = step_ids[:, n - full_n:]
+        # 完整区步内序号：与 SharedKV.view 同一语义（保留区内的 run 序）
+        full_p = within_step_pos(full_s)
         comp, comp_s = self._cap_comp(vecs[:, :n - full_n],
                                       step_ids[:, :n - full_n])
         # HCA：重压缩区 + 完整区（comp 为空时即全量，与 SharedKV 一致）
         if comp.shape[1] > 0:
             hca_c = self._compress_live(comp, comp_s, self.hca_compressor)
             kv_hca = (torch.cat([hca_c[0], full], 1),
-                      torch.cat([hca_c[1], full_s], 1))
+                      torch.cat([hca_c[1], full_s], 1),
+                      torch.cat([hca_c[2], full_p], 1))
         else:
-            kv_hca = (full, full_s)
+            kv_hca = (full, full_s, full_p)
         # CSA：轻压缩区 + 完整区（2026-10-25：无局部窗）
         if comp.shape[1] > 0:
             csa_c = self._compress_live(comp, comp_s, self.csa_compressor)
             kv_csa = (torch.cat([csa_c[0], full], 1),
-                      torch.cat([csa_c[1], full_s], 1))
+                      torch.cat([csa_c[1], full_s], 1),
+                      torch.cat([csa_c[2], full_p], 1))
         else:
-            kv_csa = (full, full_s)
+            kv_csa = (full, full_s, full_p)
         return kv_hca, kv_csa
 
     def _cap_comp(self, comp: torch.Tensor, comp_s: torch.Tensor):
@@ -769,13 +923,15 @@ class Gargantua(nn.Module):
         return comp[:, start:], comp_s[:, start:]
 
     def _compress_live(self, vecs: torch.Tensor, step_ids: torch.Tensor,
-                       comp) -> Tuple[torch.Tensor, torch.Tensor]:
+                       comp) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """ 压缩区过一遍可学习压缩器（comp 显式传入：CSA/HCA 比例
         可配后不能再按「ratio 是否等于 spec.CSA_RATIO」反猜模块）。
-        group_by_step 的 ratio 取 comp.ratio（与模块自身一致）。 """
+        group_by_step 的 ratio 取 comp.ratio（与模块自身一致）。
+        返回 (vecs, step_ids, pos)：pos 全 -1（聚合条目只对严格过去的
+        查询可见，2026-10-27 S1）。"""
         vs, ss = vecs[0], step_ids[0]
         ratio = comp.ratio
-        out_v, out_s = [], []
+        out_v, out_s, out_p = [], [], []
         for (s, e) in group_by_step(ss, ratio):
             g = vs[s:e]
             m = torch.ones(e - s, dtype=torch.bool, device=vs.device)
@@ -785,7 +941,9 @@ class Gargantua(nn.Module):
             out_v.append(comp(g.unsqueeze(0), m.unsqueeze(0))[0])
             # 取组内最大步：保守因果，防跨步聚合泄漏未来 token（同 _compress_entries）
             out_s.append(ss[e - 1:e])
-        return torch.stack(out_v).unsqueeze(0), torch.cat(out_s).unsqueeze(0)
+            out_p.append(ss.new_full((1,), -1))
+        return (torch.stack(out_v).unsqueeze(0), torch.cat(out_s).unsqueeze(0),
+                torch.cat(out_p).unsqueeze(0))
 
     def forward_train(self, input_ids: torch.Tensor, input_steps: torch.Tensor,
                       target_ids: torch.Tensor, target_steps: torch.Tensor,

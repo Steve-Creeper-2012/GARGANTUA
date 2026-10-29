@@ -41,8 +41,8 @@ else:
 import boot
 boot.bootstrap()
 import spec
-from common import (MAX_BLOCKS, save_checkpoint, valid_model_name,
-                    validate_ctx_config)
+from common import (MAX_BLOCKS, model_exists, model_init_lock,
+                    save_checkpoint, valid_model_name, validate_ctx_config)
 from model import Gargantua
 
 
@@ -88,32 +88,37 @@ def _run(args) -> dict:
     n = sum(p.numel() for p in m.parameters())
 
     d = os.path.join(args.out, args.name)
-    if os.path.exists(os.path.join(d, "model.safetensors")) and not args.force:
-        raise SystemExit(f"[init] {d} 已存在，拒绝覆盖（--force 强制）")
-    config = {
-        "name": args.name,
-        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "params": n,
-        "d_model": spec.D_MODEL, "head_dim": spec.HEAD_DIM,
-        # is not None：0/None 都要如实记录（0 已被上面拒绝，防御性保留）
-        "n_enc_blocks": (args.enc_blocks if args.enc_blocks is not None
-                         else spec.N_ENC_BLOCKS),
-        "n_dec_blocks": (args.dec_blocks if args.dec_blocks is not None
-                         else spec.N_DEC_BLOCKS),
-        "vocab_size_padded": spec.VOCAB_SIZE_PADDED,
-        # 上下文长度（建模期可选；CSA/HCA 是同一段压缩区内容的两个视图）
-        "ctx_full": ctx["ctx_full"],
-        "ctx_compress": ctx["ctx_compress"],
-        "csa_ratio": ctx["csa_ratio"],
-        "hca_ratio": ctx["hca_ratio"],
-        "optimizer": spec.OPTIMIZER,
-        # 2026-10-25：模型精度 + 词表预设来源（build_model 据此施加）
-        "dtype": dtype_name,
-        "vocab_preset": preset_name,
-    }
-    save_checkpoint(d, m, config)
-    # 2026-10-25：把选定词表预设的 vocab.txt 复制进模型目录（独立副本）
-    seed_model_vocab(d, preset_name)
+    # 2026-10-27 审计修复（H4）：冲突检查—写入—发布全程持跨进程锁。
+    # 并发提交两个同名初始化此前会并发写同一临时文件（replace 失败/
+    # 权重与 config 不配套）；训练 start 在同一把锁上等待，不可能读到
+    # 写了一半的模型。
+    with model_init_lock(d):
+        if model_exists(d) and not args.force:
+            raise SystemExit(f"[init] {d} 已存在，拒绝覆盖（--force 强制）")
+        config = {
+            "name": args.name,
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "params": n,
+            "d_model": spec.D_MODEL, "head_dim": spec.HEAD_DIM,
+            # is not None：0/None 都要如实记录（0 已被上面拒绝，防御性保留）
+            "n_enc_blocks": (args.enc_blocks if args.enc_blocks is not None
+                             else spec.N_ENC_BLOCKS),
+            "n_dec_blocks": (args.dec_blocks if args.dec_blocks is not None
+                             else spec.N_DEC_BLOCKS),
+            "vocab_size_padded": spec.VOCAB_SIZE_PADDED,
+            # 上下文长度（建模期可选；CSA/HCA 是同一段压缩区内容的两个视图）
+            "ctx_full": ctx["ctx_full"],
+            "ctx_compress": ctx["ctx_compress"],
+            "csa_ratio": ctx["csa_ratio"],
+            "hca_ratio": ctx["hca_ratio"],
+            "optimizer": spec.OPTIMIZER,
+            # 2026-10-25：模型精度 + 词表预设来源（build_model 据此施加）
+            "dtype": dtype_name,
+            "vocab_preset": preset_name,
+        }
+        save_checkpoint(d, m, config)
+        # 2026-10-25：把选定词表预设的 vocab.txt 复制进模型目录（独立副本）
+        seed_model_vocab(d, preset_name)
     _say(f"[init] 词表预设: {preset_name}  dtype: {dtype_name}")
     total_ctx = ctx["ctx_full"] + ctx["ctx_compress"]
     _say(f"[init] {d}  params={n/1e6:.1f}M  ({time.time()-t0:.1f}s)")

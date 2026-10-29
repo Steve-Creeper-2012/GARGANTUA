@@ -113,7 +113,8 @@ def extract_patches(img: ImageInput
 # Step 构造
 # ---------------------------------------------------------------------------
 def _make_step(frame_idx: int, full: bool, grid: Tuple[int, int],
-               patches: List[Tuple[int, int, bytes]]) -> Step:
+               patches: List[Tuple[int, int, bytes]],
+               static: bool = False) -> Step:
     return {
         "token_ids": [],                      # 视觉输入 token 不入词表
         "type": spec.TYPE_USER,
@@ -122,6 +123,9 @@ def _make_step(frame_idx: int, full: bool, grid: Tuple[int, int],
             "frame_idx": frame_idx,           # 输入帧序列内索引，从 0 起
             "full": full,
             "grid": [grid[0], grid[1]],
+            # static=True：与上一帧逐像素相同（delta 帧本应为空，用首 patch
+            # 作非空占位）。解码端按「重放同值 patch」处理，画面不变。
+            "static": static,
             "patches": [{"x": gx, "y": gy, "vec": vec}
                         for gx, gy, vec in patches],
         },
@@ -144,10 +148,13 @@ def frames_to_steps(frames: Sequence[ImageInput]) -> List[Step]:
       - 第 31 帧（每秒首帧）全量并重新计数；
       - 某帧全部 patch 都变 → 全量并以该帧为新第 1 帧重新计数；
       - 输入序列最后一帧强制全量；
-      - 帧尺寸（patch 网格）发生变化时无法比较，按全量并重新计数。
+      - 帧尺寸（patch 网格）发生变化时无法比较，按全量并重新计数；
+      - 与上一帧逐像素相同的帧（静态画面）：delta 本应为空，但时间步
+        必须非空，改用首 patch 作占位并置 meta["static"]=True。
     """
     steps: List[Step] = []
     prev: Dict[Tuple[int, int], bytes] | None = None
+    prev_grid: Tuple[int, int] | None = None
     counter = 0
     n = len(frames)
     for i, frame in enumerate(frames):
@@ -156,7 +163,10 @@ def frames_to_steps(frames: Sequence[ImageInput]) -> List[Step]:
                                              for gx, gy, vec in patches}
         counter += 1
         full = False
-        if prev is None or len(prev) != len(cur):
+        # 2026-10-27 审计修复：网格比较用完整 (gw, gh)——旧实现只比 patch
+        # 数（len(prev) != len(cur)），64×32 → 32×64 都是 2 个 patch 会被
+        # 当成同网格继续 delta，随后访问不存在的 prev[(0,1)] 直接 KeyError
+        if prev is None or prev_grid != grid:
             full = True                                   # 首帧 / 网格变化
         elif counter > 30:                                # 第 31 帧：每秒首帧
             full = True
@@ -166,13 +176,23 @@ def frames_to_steps(frames: Sequence[ImageInput]) -> List[Step]:
                 full = True
         if i == n - 1:                                    # 末帧强制全量
             full = True
+        static = False
         if full:
             counter = 1
             send = patches
         else:
             send = [(gx, gy, cur[(gx, gy)]) for gx, gy in changed]
-        steps.append(_make_step(i, full, grid, send))
+            if not send:
+                # 2026-10-27 审计修复（M3）：静态视频（三帧同画面即可触发）
+                # 的 delta 帧没有任何变化 patch。时间步是原子单位、必须非空
+                # （tokenvector.dumps 直接拒绝空步），而跳帧会丢失时序，
+                # 所以用首 patch 作「无变化占位」：值与上一帧逐像素相同，
+                # 解码端重放后画面不变，只是给这一步一个 token。
+                send = [patches[0]] if patches else []
+                static = True
+        steps.append(_make_step(i, full, grid, send, static=static))
         prev = cur
+        prev_grid = grid
     return steps
 
 

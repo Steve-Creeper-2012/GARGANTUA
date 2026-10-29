@@ -462,10 +462,18 @@ def main(argv=None):
         encoding="utf-8",
     )
     if args.export_txt:
+        # 2026-10-27 审计修复（H1）：导出必须与每模型词表同格式（v2，显式
+        # ID + JSON 转义），且只导出可见区的真实 token。旧实现把整个
+        # id_to_token（含不可见区与 reserved 占位符）按行拼接，既让 ID
+        # 整体错位，又把 token 自身的 "\n"/"\r" 变成空行。
+        from common import write_flat_vocab_file
         out = Path(args.export_txt)
-        out.write_text(
-            "\n".join(vocab["id_to_token"]) + "\n", encoding="utf-8")
-        print(f"  导出 vocab.txt : {out}（{len(vocab['id_to_token'])} 行）")
+        entries = [(i, t) for i, t in
+                   enumerate(vocab["id_to_token"][spec.INVISIBLE_END:],
+                             spec.INVISIBLE_END)
+                   if not t.startswith("<reserved:")]
+        write_flat_vocab_file(str(out), entries)
+        print(f"  导出 vocab.txt : {out}（{len(entries)} 个真实 token）")
     m = vocab["meta"]
     print(f"已写出 {OUT_PATH}")
     print(f"  总槽位        : {len(vocab['id_to_token'])}")

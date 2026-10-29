@@ -1,28 +1,42 @@
 # ===========================================================================
-# GARGANTUA v1 — server_tokens.py：tok-32 离散 token API
+# GARGANTUA v1 — server_tokens.py：token-5 离散 token API
 # ---------------------------------------------------------------------------
-# 从 server.py 拆出。这里只回答「文本 ↔ token ID 流」与「添加 token」，
+# 从 server.py 拆出。这里只回答「文本 ↔ token 流」与「添加 token」，
 # 不碰模型、不碰训练、不碰 HTTP 框架。App 以 mixin 方式继承本类：
 #
 #     class App(TrainApi, CodecApi, TokensApi): ...
 #
 # 端点：
-#   POST /api/tokens/encode  文本 → token ID 流（hex / .tokens 二进制 b64）
-#   POST /api/tokens/decode  token ID 流 → 可读形式（{ } | + hex / 表面文本）
-#   POST /api/tokens/export  Token 编辑器文本（.gts）→ .tokens 二进制 b64
+#   POST /api/tokens/encode  文本 → token-5 流（.tokens 二进制 b64 / 可读文本）
+#   POST /api/tokens/decode  token-5 流 → 可读文本（{text: 00001} …）
+#   POST /api/tokens/export  Token 编辑器文本（{t:}/{text:} …）→ .tokens b64
 #   POST /api/vocab/add      添加 token（regular/fallback/special/system
 #                            四类任选，全局查重，无冲突则入词表）
+#
+# 格式（spec 第 5b 节）：27 个符号、5 bit/字符；{ } 包裹时间步，| 分隔
+# 步内元素；{t:<id>} 文本、{w:<hex>} 音频、{v:<hex>x:..y:..} 视觉、
+# <id> 扩展系统 token。结构字符本身不是 token。
 #
 # HTTP 错误契约：非法入参一律抛 ValueError（→ 400）。
 # ===========================================================================
 import base64
 
-from tokens import dectok, enctok, gts, timestep, tok32
-from tokens.vocab import CATEGORIES, get_vocab
+from tokens import enctok, tok5
+from tokens.vocab import CAT_REGULAR, CATEGORIES, get_vocab
 
 # 入参守卫（与 codec 端点的尺寸守卫同思路）
 MAX_ENCODE_CHARS = 100_000     # 单次编码文本字符上限
-MAX_DECODE_TOKENS = 100_000    # 单次解码 token 数上限
+MAX_DECODE_TOKENS = 100_000    # 单次解码元素数上限
+
+
+def _name_of(v):
+    """扩展系统 token 的 ID → 名字（<stop> 等）；可见区返回 None。"""
+    return tok5.vocab_name_of(v)
+
+
+def _id_of(v):
+    """名字（"<stop>" 等）→ 扩展系统 token 的 ID；查不到返回 None。"""
+    return tok5.vocab_id_of(v)
 
 
 class TokensApi:
@@ -40,55 +54,70 @@ class TokensApi:
         if len(text) > MAX_ENCODE_CHARS:
             raise ValueError(
                 f"text 过长: {len(text)} > {MAX_ENCODE_CHARS} 字符")
-        fmt = body.get("format", "hex")
-        if fmt not in ("hex", "tokens_b64"):
-            raise ValueError(f"format 必须是 hex/tokens_b64: {fmt!r}")
+        fmt = body.get("format", "tokens_b64")
+        if fmt not in ("tokens_b64", "display"):
+            raise ValueError(f"format 必须是 tokens_b64/display: {fmt!r}")
         ids, skipped = enctok.encode_text(text)
-        if fmt == "tokens_b64":
-            return 200, {
-                "tokens_b64": base64.b64encode(
-                    tok32.encode_ids(ids)).decode(),
-                "n_tokens": len(ids),
-                "skipped": skipped,
-            }
-        return 200, {"hex": tok32.ids_to_hex(ids),
-                     "n_tokens": len(ids),
-                     "skipped": skipped}
+        items = [tok5.step(tok5.text(i)) for i in ids]
+        out = {"n_tokens": len(ids), "n_steps": len(items),
+               "skipped": skipped}
+        if fmt == "display":
+            out["display"] = tok5.to_display(items)
+        else:
+            out["tokens_b64"] = base64.b64encode(
+                tok5.dumps(items)).decode()
+        return 200, out
 
     # ---------------- token 流 → 可读形式 ----------------
     def api_tokens_decode(self, body):
-        mode = body.get("mode", "ids")
-        if mode not in ("ids", "text"):
-            raise ValueError(f"mode 必须是 ids/text: {mode!r}")
+        v = get_vocab()
         if "tokens_b64" in body:
             b64 = body["tokens_b64"]
             if not isinstance(b64, str):
                 raise ValueError("tokens_b64 必须是字符串")
-            ids = tok32.decode_ids(base64.b64decode(b64))
-        elif "hex" in body:
-            h = body["hex"]
-            if not isinstance(h, str):
-                raise ValueError("hex 必须是字符串")
-            ids = tok32.hex_to_ids(h)
+            # 2026-10-27 审计修复：严格 base64 + 预检长度
+            try:
+                data = base64.b64decode(b64, validate=True)
+            except Exception as e:
+                raise ValueError(f"tokens_b64 不是合法 base64: {e}")
+            if len(data) > MAX_DECODE_TOKENS * 8:
+                raise ValueError(
+                    f"数据过大: {len(data)} 字节（元素数上限 "
+                    f"{MAX_DECODE_TOKENS}）")
+            try:
+                items = tok5.loads(data)
+            except tok5.Tok5Error as e:
+                raise ValueError(f"不是合法的 token-5 .tokens: {e}")
         elif "ids" in body:
             ids = body["ids"]
             if not isinstance(ids, list) or any(
                     not isinstance(t, int) or isinstance(t, bool)
                     for t in ids):
                 raise ValueError("ids 必须是整数数组")
+            if len(ids) > MAX_DECODE_TOKENS:
+                raise ValueError(
+                    f"token 数超限: {len(ids)} > {MAX_DECODE_TOKENS}")
+            try:
+                items = [tok5.step(tok5.text(i)) for i in ids]
+            except tok5.Tok5Error as e:
+                raise ValueError(str(e))
         else:
-            raise ValueError("缺少 tokens_b64 / hex / ids")
-        if len(ids) > MAX_DECODE_TOKENS:
+            raise ValueError("缺少 tokens_b64 / ids")
+        n_el = sum(len(it["elements"]) for it in items if it["kind"] == "step")
+        if n_el > MAX_DECODE_TOKENS:
             raise ValueError(
-                f"token 数超限: {len(ids)} > {MAX_DECODE_TOKENS}")
-        return 200, {"text": dectok.decode_ids(ids, mode),
-                     "n_tokens": len(ids)}
+                f"元素数超限: {n_el} > {MAX_DECODE_TOKENS}")
+        return 200, {"display": tok5.to_display(items, name_of=_name_of(v)),
+                     "n_tokens": n_el,
+                     "n_steps": sum(1 for it in items
+                                    if it["kind"] == "step")}
 
     # ---------------- Token 编辑器 → .tokens 导出 ----------------
     def api_tokens_export(self, body):
-        """把编辑器里的 .gts 文本解析成 token ID 流，返回 .tokens 二进制。
+        """把编辑器里的 token-5 文本解析成流，返回 .tokens 二进制。
 
-        结构非法（括号不配对 / 空步 / 未收录字符）→ 400，不产出坏文件。
+        结构非法（括号不配对 / 载荷长度不符 / 未收录字符）→ 400，
+        不产出坏文件。同时接受紧凑形式 {t:00001} 与显示形式 {text: 00001}。
         """
         text = body.get("text")
         if text is None:
@@ -98,16 +127,21 @@ class TokensApi:
         if len(text) > MAX_ENCODE_CHARS:
             raise ValueError(
                 f"text 过长: {len(text)} > {MAX_ENCODE_CHARS} 字符")
+        v = get_vocab()
         try:
-            ids = gts.parse_gts(text)
-        except gts.GtsError as e:
+            items = tok5.parse_display(text, id_of=_id_of(v))
+        except tok5.Tok5Error as e:
             raise ValueError(str(e))
-        if len(ids) > MAX_DECODE_TOKENS:
-            raise ValueError(f"token 数超限: {len(ids)} > {MAX_DECODE_TOKENS}")
+        if not items:
+            raise ValueError(
+                "token 流为空：至少需要一个时间步（{...}）或扩展系统 token（<...>）")
+        n_el = sum(len(it["elements"]) for it in items if it["kind"] == "step")
+        if n_el > MAX_DECODE_TOKENS:
+            raise ValueError(f"元素数超限: {n_el} > {MAX_DECODE_TOKENS}")
         return 200, {
-            "tokens_b64": base64.b64encode(tok32.encode_ids(ids)).decode(),
-            "n_tokens": len(ids),
-            "n_steps": len(timestep.unwrap(ids)),
+            "tokens_b64": base64.b64encode(tok5.dumps(items)).decode(),
+            "n_tokens": n_el,
+            "n_steps": sum(1 for it in items if it["kind"] == "step"),
         }
 
     # ---------------- 添加 token ----------------

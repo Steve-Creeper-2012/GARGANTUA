@@ -123,8 +123,28 @@ def node_check(js: str) -> bool:
 
 
 def verify(src_text: str, dst_text: str) -> bool:
-    """五项校验，任一不过即失败。"""
+    """校验 dst 是否就是「当前源文件」压缩出来的产物。
+
+    2026-10-27 审计修复（L4）：新增第 0 项——内存里重新生成一遍，与产物
+    逐字节比对。旧的五项全是「语义等价」检查（脚本/CSS/标签序列/可见
+    文本/node 语法），源文件改过但产物没重新生成时它们可以全过，于是
+    --check 给出假绿灯。逐字节比对才是「产物是最新的」的唯一证明。
+    """
     ok = True
+
+    # 0. 与重新生成的结果逐字节一致（证明产物不过期）
+    expected = minify_html(src_text)
+    same = expected == dst_text
+    if not same:
+        # 给出第一处差异的位置，避免只看到「不一致」无从下手
+        n = min(len(expected), len(dst_text))
+        pos = next((i for i in range(n) if expected[i] != dst_text[i]), n)
+        print(f"[verify] 产物已过期：与重新生成结果不一致"
+              f"（首个差异 @ 字符 {pos}，长度 {len(dst_text)} vs "
+              f"{len(expected)}）{' ✗'}")
+    else:
+        print("[verify] 产物与重新生成结果逐字节一致 ✓")
+    ok &= same
 
     # 1. <script> 逐字一致
     a, b = _script_bodies(src_text), _script_bodies(dst_text)
@@ -184,11 +204,22 @@ def main() -> int:
         return 0 if verify(src_text, dst_text) else 1
 
     out = minify_html(src_text)
-    with open(DST, "w", encoding="utf-8") as f:
-        f.write(out)
+    # 2026-10-27 审计修复（L4）：先写临时文件 → 校验 → 原子替换。
+    # 旧实现直接覆盖 index.html 再校验，校验失败时坏产物已经落地。
+    fd, tmp = tempfile.mkstemp(prefix=".index.", suffix=".tmp", dir=HERE)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(out)
+        if not verify(src_text, out):
+            print("[minify] 校验失败，未覆盖 index.html")
+            return 1
+        os.replace(tmp, DST)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
     print(f"[minify] index_source.html -> index.html  "
           f"{len(src_text.encode('utf-8'))} -> {len(out.encode('utf-8'))} bytes")
-    return 0 if verify(src_text, out) else 1
+    return 0
 
 
 if __name__ == "__main__":

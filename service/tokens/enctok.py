@@ -49,7 +49,8 @@ else:
 import boot
 boot.bootstrap()
 import spec  # noqa: E402
-from tokens.tok32 import (ids_to_hex, write_tokens_file)  # noqa: E402
+from tokens import tok5  # noqa: E402
+from tokens.tok32 import ids_to_hex  # noqa: E402
 from tokens.vocab import get_vocab, set_vocab_source  # noqa: E402
 
 CAPS_ID = spec.SPECIAL_BEGIN + spec.SPECIAL_TOKENS.index("<caps>")
@@ -90,11 +91,16 @@ def _emit_word(word: str, v):
     return out, skipped
 
 
-def encode_text(text: str):
-    """文本 → (token ID 列表, 未收录字符列表)。"""
+def encode_text(text: str, vocab=None):
+    """文本 → (token ID 列表, 未收录字符列表)。
+
+    vocab 缺省用进程词表（get_vocab()）；显式传入可保证调用方与查表
+    使用同一实例（gts 导出时必须如此，否则每模型词表的 <stop>/字母
+    fallback 会落到全局词表上——2026-10-27 审计修复 H2）。
+    """
     if not isinstance(text, str):
         raise ValueError(f"输入必须是字符串，得到 {type(text).__name__}")
-    v = get_vocab()
+    v = vocab if vocab is not None else get_vocab()
     flat = getattr(v, "flat", False)
     max_match = getattr(v, "_max_match", 1) if flat else 1
     ids: list = []
@@ -170,9 +176,10 @@ def main(argv=None):
     if args.out:
         out = Path(args.out)
         if out.suffix.lower() == ".tokens":
-            write_tokens_file(out, ids)
-            print(f"已写出 {out}（{len(ids)} token，{len(ids) * 4} 字节）",
-                  file=sys.stderr)
+            items = [tok5.step(tok5.text(i)) for i in ids]
+            tok5.write_file(out, items)
+            print(f"已写出 {out}（{len(ids)} token，"
+                  f"{out.stat().st_size} 字节 token-5 位流）", file=sys.stderr)
         else:
             out.write_text(ids_to_hex(ids), encoding="utf-8")
             print(f"已写出 {out}（{len(ids)} token）", file=sys.stderr)

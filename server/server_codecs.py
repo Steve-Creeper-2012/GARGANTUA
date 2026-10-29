@@ -15,7 +15,7 @@ import os
 import tempfile
 
 import spec
-from tokens import image_codec, audio_codec, draw_codec
+from tokens import audio_codec, draw_codec, image_codec, tok5
 from prims.image_to_primitives import image_to_primitives
 from server_media import (MAX_AUDIO_TOKENS, MAX_PATCHES_TOTAL, b64_to_pil,
                           decode_audio_any, extract_video_audio,
@@ -28,6 +28,17 @@ from server_util import num_param
 # HTTP handler 线程），且无数量上限——几 KB 的请求体即可拖死线程池。
 # 现在与 image2prims 一致走任务池（202 + task_id），并设图元数上限。
 MAX_PRIMITIVES = 1000
+
+
+def token5_text(steps) -> str:
+    """Steps → token-5 可读文本（{text: 00001} / {wave: HEX} / {visual: …}）。
+
+    前端不再自己拼格式：hex 载荷（2132 / 10240 字符）在 JS 里拼既慢又容易
+    和 Python 侧的位序不一致，统一由后端给出唯一真相。
+    """
+    from tokens.vocab import get_vocab
+    items = tok5.from_steps(steps)
+    return tok5.to_display(items, name_of=tok5.vocab_name_of(get_vocab()))
 
 
 class CodecApi:
@@ -43,15 +54,28 @@ class CodecApi:
                 f"patch 数超限: {len(step['meta']['patches'])} > "
                 f"{MAX_PATCHES_TOTAL}")
         return 200, {"steps": [step_to_json(step)],
+                     "token5": token5_text([step]),
                      "archive": image_codec.step_to_archive(step)}
 
     def api_codec_frames(self, body):
         frames_b64 = body.get("frames_b64")
         if not frames_b64:
             raise ValueError("缺少 frames_b64")
-        frames = [b64_to_pil(b) for b in frames_b64]
-        if len(frames) > 300:
-            raise ValueError(f"帧数超限: {len(frames)} > 300")
+        # 2026-10-27 审计修复：帧数与像素预算在解码【之前】检查——旧实现
+        # 先把全部帧完整解码成 PIL（300 帧 × 8192² 可达数十 GB）才数帧数
+        if len(frames_b64) > 300:
+            raise ValueError(f"帧数超限: {len(frames_b64)} > 300")
+        from server_media import MAX_TOTAL_PIXELS
+        frames = []
+        total_px = 0
+        for b in frames_b64:
+            im = b64_to_pil(b)          # 单帧尺寸守卫（解码前先查头部）
+            total_px += im.size[0] * im.size[1]
+            if total_px > MAX_TOTAL_PIXELS:
+                raise ValueError(
+                    f"帧序列总像素超限: > {MAX_TOTAL_PIXELS}"
+                    f"（约 {MAX_TOTAL_PIXELS // 1048576}MP）")
+            frames.append(im)
         steps = image_codec.frames_to_steps(frames)
         total = sum(len(s["meta"]["patches"]) for s in steps)
         if total > MAX_PATCHES_TOTAL:
@@ -59,12 +83,17 @@ class CodecApi:
         stats = [{"frame_idx": s["meta"]["frame_idx"],
                   "full": s["meta"]["full"],
                   "grid": s["meta"]["grid"],
+                  # 2026-10-27（M3）：与上一帧逐像素相同 → delta 无变化，
+                  # 用首 patch 占位保证时间步非空，此标记供前端/存档识别
+                  "static": bool(s["meta"].get("static")),
                   "n_patches": len(s["meta"]["patches"])} for s in steps]
         return 200, {"frames": stats,
                      "delta_rule": ("第 1 帧全量；2..30 帧只送有变化 patch；"
                                     "第 31 帧（每秒首帧）全量；全变帧全量并重新"
-                                    "计数；最后一帧强制全量"),
-                     "steps": [step_to_json(s) for s in steps]}
+                                    "计数；最后一帧强制全量；静止帧（逐像素相同）"
+                                    "送 1 个占位 patch 并标记 static"),
+                     "steps": [step_to_json(s) for s in steps],
+                     "token5": token5_text(steps)}
 
     def api_codec_audio(self, body):
         """音频 → 音元 token 序列。支持 wav/mp3/flac/ogg（ffmpeg 强兼容）。"""
@@ -74,13 +103,20 @@ class CodecApi:
         data = base64.b64decode(b64)
         filename = body.get("filename", "audio.wav")
         suffix = os.path.splitext(filename)[1] or ".wav"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-            f.write(data)
-            apath = f.name
+        # 2026-10-27 审计修复：try/finally 从「创建临时文件」那一刻开始——
+        # 旧实现写在 write() 之后，磁盘满/写入异常时临时文件永久泄漏
+        apath = None
         try:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+                f.write(data)
+                apath = f.name
             samples = decode_audio_any(apath, filename, spec.AUDIO_SR)
         finally:
-            os.unlink(apath)
+            if apath:
+                try:
+                    os.unlink(apath)
+                except OSError:
+                    pass
         steps = audio_codec.waveform_to_steps(samples)
         n = len(steps)
         if n > MAX_AUDIO_TOKENS:
@@ -93,6 +129,7 @@ class CodecApi:
                                 / spec.AUDIO_SR, 3),
             "filename": filename,
             "steps": [step_to_json(s) for s in steps],
+            "token5": token5_text(steps),
         }
 
     def api_codec_draw(self, body):
@@ -120,6 +157,13 @@ class CodecApi:
                     isinstance(t, int) and not isinstance(t, bool)
                     for t in toks):
                 raise ValueError("tokens 必须是整数数组")
+            # 2026-10-27 审计修复：tokens 路径此前绕过 MAX_PRIMITIVES 上限，
+            # 一个巨大数组即可拖死渲染任务
+            if len(toks) > spec.DRAW_TOKENS_PER_PRIMITIVE * MAX_PRIMITIVES:
+                raise ValueError(
+                    f"绘图 token 数超限: {len(toks)} > "
+                    f"{spec.DRAW_TOKENS_PER_PRIMITIVE * MAX_PRIMITIVES}"
+                    f"（{MAX_PRIMITIVES} 个图元）")
             prims = draw_codec.tokens_to_primitives(toks)
         else:
             raise ValueError("缺少 primitives 或 tokens")
@@ -150,7 +194,8 @@ class CodecApi:
         if not isinstance(text, str):
             raise ValueError(f"text 必须是字符串: {type(text).__name__}")
         steps = text_encode(text)
-        return 200, {"steps": [step_to_json(s) for s in steps]}
+        return 200, {"steps": [step_to_json(s) for s in steps],
+                     "token5": token5_text(steps)}
 
     # ---------------- video codec ----------------
     def api_codec_video(self, body):
@@ -159,10 +204,13 @@ class CodecApi:
             raise ValueError("缺少 video_b64")
         data = base64.b64decode(b64)
         suffix = os.path.splitext(body.get("filename", ".mp4"))[1] or ".mp4"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-            f.write(data)
-            vpath = f.name
+        # 2026-10-27 审计修复：临时文件的清理从创建起就受 try/finally
+        # 保护（旧实现 finally 只包住解码，写入失败即泄漏）
+        vpath = None
         try:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+                f.write(data)
+                vpath = f.name
             frames = extract_video_frames(vpath)
             audio_samples = extract_video_audio(vpath)
             # 2026-10-23 审计修复（P1）：抽帧封顶 max_frames 但音轨不
@@ -188,21 +236,38 @@ class CodecApi:
             # 合并：每一帧的 visual step + 对应音频 steps 作为同一时间步列表
             combined = []
             total_patches = 0
+            frames_token5 = []
             for vstep, asteps in zip(visual_steps, aligned):
                 total_patches += len(vstep["meta"].get("patches", []))
                 combined.append({
                     "time_step": [step_to_json(vstep)] +
                                  [step_to_json(a) for a in asteps]
                 })
+                # token-5：一帧 = 一个 {}，里面先铺 patch 再铺音元
+                els = [tok5.visual(p["vec"], p["x"], p["y"])
+                       for p in vstep["meta"].get("patches") or []]
+                for a in asteps:
+                    if (a["meta"].get("n") or 0) >= spec.AUDIO_SAMPLES_PER_TOKEN:
+                        els.append(tok5.wave(a["meta"]["samples"]))
+                if els:
+                    frames_token5.append(tok5.step(els))
+            from tokens.vocab import get_vocab
             return 200, {
                 "n_frames": len(frames),
                 "n_audio_tokens": len(audio_steps),
                 "total_patches": total_patches,
                 "audio_truncated": audio_truncated,
                 "steps": combined,
+                "token5": tok5.to_display(
+                    frames_token5,
+                    name_of=tok5.vocab_name_of(get_vocab())),
             }
         finally:
-            os.unlink(vpath)
+            if vpath:
+                try:
+                    os.unlink(vpath)
+                except OSError:
+                    pass
 
     # ---------------- image -> primitives ----------------
     def api_codec_image2prims(self, body):

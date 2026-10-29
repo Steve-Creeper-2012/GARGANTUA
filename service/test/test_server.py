@@ -219,9 +219,11 @@ class TestServer(unittest.TestCase):
         self.assertEqual(len(frames), 3)
         self.assertTrue(frames[0]["full"])
         self.assertEqual(frames[0]["n_patches"], 1)
-        # 第 2 帧无变化 → delta 0 patch
+        # 第 2 帧无变化 → delta 无 patch，但时间步必须非空（.tokenvector
+        # 不允许空步），故送 1 个占位 patch 并标记 static
         self.assertFalse(frames[1]["full"])
-        self.assertEqual(frames[1]["n_patches"], 0)
+        self.assertTrue(frames[1]["static"])
+        self.assertEqual(frames[1]["n_patches"], 1)
         # 末帧强制全量
         self.assertTrue(frames[2]["full"])
         self.assertIn("delta_rule", j)
@@ -276,13 +278,14 @@ class TestServer(unittest.TestCase):
         # enqueue → queue 文件出现
         # 2026-10-25 契约：只接受 tokens_b64（.tokens 二进制，必须带
         # { } | 时间步结构）；一次上传 = 一条 token 流；JSON 上传被拒。
-        from tokens import timestep, tok32
+        from tokens import tok5
         from tokens.text_codec import encode as text_encode
 
         def make_tokens(text):
             steps = text_encode(text)
-            ids = timestep.wrap_steps([st["token_ids"] for st in steps])
-            return base64.b64encode(tok32.encode_ids(ids)).decode()
+            items = [tok5.step(tok5.text(i)) for st in steps
+                     for i in st["token_ids"]]
+            return base64.b64encode(tok5.dumps(items)).decode()
 
         def enqueue(text):
             return http("POST", self.port, "/api/train/enqueue",
@@ -304,10 +307,9 @@ class TestServer(unittest.TestCase):
                        {"json_b64": base64.b64encode(
                            b'{"text": "x"}').decode()})
         self.assertEqual(code, 400)
-        # 缺 { } 结构的裸 ID 流 → 400
+        # 不是 token-5 位流（随便几个字节）→ 400
         code, j = http("POST", self.port, "/api/train/enqueue",
-                       {"tokens_b64": base64.b64encode(
-                           tok32.encode_ids([100, 101, 102])).decode()})
+                       {"tokens_b64": base64.b64encode(b"\x00\x01\x02\x03").decode()})
         self.assertEqual(code, 400)
         # start → running
         code, j = http("POST", self.port, "/api/train/start",
@@ -364,10 +366,10 @@ class TestServer(unittest.TestCase):
             apath = os.path.join(ROOT, result["archive"])
             self.assertTrue(os.path.exists(apath), apath)
             self.assertIn("infer_archive", apath)
-            # 存档能按 .tokens 结构读回（prompt + 1 个生成 token）
-            from tokens import tok32, timestep
-            ids = tok32.read_tokens_file(apath)
-            steps = timestep.unwrap(ids)
+            # 存档能按 token-5 结构读回（prompt + 1 个生成 token）
+            from tokens import tok5
+            items = tok5.read_file(apath)
+            steps = [it for it in items if it["kind"] == "step"]
             meta_path = apath[:-7] + ".json"
             self.assertTrue(os.path.exists(meta_path))
             import json as _json
@@ -490,33 +492,38 @@ class TestServer(unittest.TestCase):
 
 
     # ------------------------------------------------------------------
-    # 2026-10-24 tok-32 离散 token API
+    # 2026-10-28 token-5 离散 token API
     # ------------------------------------------------------------------
     def test_14_tokens_encode_decode(self):
-        # encode：hex / tokens_b64 两种输出
+        from tokens import tok5
+        # encode：默认返回 token-5 位流（b64）
         code, j = http("POST", self.port, "/api/tokens/encode",
                        {"text": "Hello World"})
         self.assertEqual(code, 200)
         self.assertEqual(j["n_tokens"], 5)
-        self.assertEqual(len(j["hex"]), 40)          # 8 hex/token
+        self.assertEqual(j["n_steps"], 5)
         self.assertEqual(j["skipped"], [])
-        code, j2 = http("POST", self.port, "/api/tokens/encode",
-                        {"text": "Hello World", "format": "tokens_b64"})
+        items = tok5.loads(base64.b64decode(j["tokens_b64"]))
+        self.assertEqual(len(items), 5)
+        self.assertTrue(all(it["kind"] == "step" for it in items))
+        # display 形式：{text: 00001}
+        code, jd = http("POST", self.port, "/api/tokens/encode",
+                        {"text": "Hello World", "format": "display"})
         self.assertEqual(code, 200)
-        self.assertEqual(j2["n_tokens"], 5)
-        # decode：hex → ids 模式（{ } | 字面量，其余 hex）
+        self.assertTrue(jd["display"].startswith("{text: "))
+        self.assertEqual(jd["display"].count("{text: "), 5)
+        # decode：b64 → display
         code, j3 = http("POST", self.port, "/api/tokens/decode",
-                        {"hex": j["hex"]})
+                        {"tokens_b64": j["tokens_b64"]})
         self.assertEqual(code, 200)
         self.assertEqual(j3["n_tokens"], 5)
-        # decode：text 模式还原原文
+        self.assertEqual(j3["n_steps"], 5)
+        self.assertEqual(j3["display"], jd["display"])
+        # decode：ids 输入
         code, j4 = http("POST", self.port, "/api/tokens/decode",
-                        {"hex": j["hex"], "mode": "text"})
-        self.assertEqual(j4["text"], "Hello World")
-        # decode：二进制 b64 输入
-        code, j5 = http("POST", self.port, "/api/tokens/decode",
-                        {"tokens_b64": j2["tokens_b64"], "mode": "text"})
-        self.assertEqual(j5["text"], "Hello World")
+                        {"ids": [51046]})
+        self.assertEqual(code, 200)
+        self.assertEqual(j4["n_tokens"], 1)
         # 中文 + 未收录字符跳过记录
         code, j6 = http("POST", self.port, "/api/tokens/encode",
                         {"text": "\u4f60\u597d\U00020000"})
@@ -530,19 +537,21 @@ class TestServer(unittest.TestCase):
         code, j8 = http("POST", self.port, "/api/tokens/decode", {})
         self.assertEqual(code, 400)
         code, j9 = http("POST", self.port, "/api/tokens/decode",
-                        {"hex": "zz"})
+                        {"tokens_b64": "not-base64!!"})
         self.assertEqual(code, 400)
-        # 2026-10-25：Token 编辑器 → .tokens 导出
-        from tokens import tok32
+        # Token 编辑器 → .tokens 导出（token-5 文本）
         code, je = http("POST", self.port, "/api/tokens/export",
-                        {"text": "{<user>}{Hello}{<user/>}"})
+                        {"text": "<00001>{text: 51046}<00002>"})
         self.assertEqual(code, 200)
-        self.assertEqual(je["n_steps"], 3)
-        ids = tok32.decode_ids(base64.b64decode(je["tokens_b64"]))
-        self.assertEqual(len(ids), je["n_tokens"])
+        self.assertEqual(je["n_steps"], 1)
+        self.assertEqual(je["n_tokens"], 1)
+        got = tok5.loads(base64.b64decode(je["tokens_b64"]))
+        self.assertEqual([it["kind"] for it in got],
+                         ["ext", "step", "ext"])
+        self.assertEqual(got[1]["elements"][0]["id"], 51046)
         # 结构非法 / 空流 → 400（不产出坏 .tokens）
         code, _ = http("POST", self.port, "/api/tokens/export",
-                       {"text": "{a"})
+                       {"text": "{text: 0001"})
         self.assertEqual(code, 400)
         code, _ = http("POST", self.port, "/api/tokens/export", {"text": ""})
         self.assertEqual(code, 400)

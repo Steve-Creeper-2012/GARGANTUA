@@ -76,10 +76,33 @@ or in the web UI's model-creation form (four number inputs, defaults shown), or 
 
 ## Token System
 
-All text tokens are discrete. Token IDs are **32-bit**; the `.tokens` binary
-format (tok-32) is a plain big-endian `uint32` stream — 4 bytes per
-"character", one character per token — so any other program opening it sees
-garbage. Hex text form uses 8 hex digits per token.
+All text tokens are discrete. The `.tokens` binary is **token-5**: a 5-bit
+bitstream over an alphabet of exactly 27 symbols
+(`0-9 { } < > | : w t v A-F x y`), terminated by code 27 and zero-padded to a
+byte boundary. Any other program opening it sees garbage; `tokens/tok5.py` is
+the interpreter.
+
+Inside the stream, every element is wrapped in a time step:
+
+| Element | Meaning |
+|---|---|
+| `{t:00001}` | text token — visible, has a vector, enters the loss |
+| `{w:<hex>}` | audio token — 533 samples × 16 bit = 2132 hex chars |
+| `{v:<hex>x:10y:24}` | visual patch — 32×32 px, RGBA 10 bit each = 10240 hex chars |
+| `<00005>` | extended system token — has an embedding, no position coordinate, never in the loss |
+| `{ } \|` | structure characters — **not** tokens (no position, no loss, no embedding) |
+
+Multiple elements in one step are separated by `|`; `<...>` lives at stream
+level, outside `{}`. The human-readable form is `{text: 00001}`,
+`{wave: <hex>}`, `{visual: <hex> x: 10 y: 24}` — the editor accepts both.
+
+Why extended tokens carry the "position embedding" role: KDA lets the model
+learn relative order itself, so the standard Transformer position-embedding
+job is delegated to these extensible tokens; plain structure characters need
+no embedding at all.
+
+The old tok-32 (big-endian `uint32`) format is retired; `tokens/tok32.py`
+remains only as a reader for historical files.
 
 The vocabulary (88,704 slots) is split into **four categories**; `enctok`
 only ever looks up the two visible ones:
@@ -107,16 +130,17 @@ only ever looks up the two visible ones:
   look up regular tokens, then fallback letters; unmapped chars are skipped
   and reported. Output: hex string or `.tokens` binary.
   `--vocab <vocab.txt|模型目录>` 可用指定词表编码（见「每模型词表」）。
-- **dectok** (`python service/tokens/dectok.py stream.tokens`): `{ } |` render as
-  literals, everything else as 8-hex IDs; `--text` renders surface text.
-- **gts** (`tokens/gts.py`): parses the editor's `.gts` text back into IDs
-  (special tokens matched whole-word against the vocabulary, everything else
-  through `enctok`), validates the `{ } |` structure, and backs
-  `POST /api/tokens/export` — the Token editor's **Export .tokens** button.
-  Formatting whitespace (`\n\r\t`) is ignored; a literal space is a real token.
+- **tok5** (`tokens/tok5.py`): the token-5 codec — characters ↔ 5-bit
+  bitstream ↔ elements ↔ time-step stream, plus payload helpers
+  (`samples_to_hex`, `rgba8_to_hex`) and `to_display` / `parse_display`.
+- **dectok** (`python service/tokens/dectok.py stream.tokens`): renders a
+  token-5 file as `{text: 00001}` …; `--text` renders surface text.
+- **gts** (`tokens/gts.py`): *legacy* tok-32-era editor parser, kept read-only.
+  The editor now speaks token-5 directly (`POST /api/tokens/export`).
 - **tokenset** (`tokens/tokenset.py`): the only reader used by training —
-  `.tokens` → `(ids, step_ids)`, rejecting files without a valid time-step
-  structure.
+  token-5 `.tokens` → `(ids, step_ids)`, rejecting files without a valid
+  time-step structure and files carrying `{w:}`/`{v:}` elements (the current
+  `forward_train` only consumes discrete IDs).
 
 ### Time-Step Format (.gts / { } |)
 
@@ -240,8 +264,8 @@ overrides the binary path. Converter env vars (`SHAPE_RENDERER_INPUT_DIR`,
 - Muon can be disabled — falls back to full AdamW.
 
 ### Data Format
-Training data is a **`.tokens` file** — the tok-32 binary stream, with the
-`{ } |` time-step structure written out explicitly. The Token editor exports
+Training data is a **`.tokens` file** — the token-5 bitstream, with the
+`{ }` time-step structure written out explicitly. The Token editor exports
 exactly this format (Export .tokens), and it is the only accepted training
 input; JSON/JSONL uploads are rejected with `400`.
 
@@ -250,10 +274,20 @@ input; JSON/JSONL uploads are rejected with `400`.
 cp stream.tokens data/queue/
 ```
 
-Each file is one token stream. The trainer expands it into flat `token_ids`
-plus a parallel `step_ids` array (`tokens/tokenset.py`), and appends a `<stop>`
-step at the end of the document. Files without a valid `{ } |` structure are
-rejected before training starts.
+Each file is one token stream. The trainer expands it into flat positions
+plus a parallel `step_ids` array (`tokens/tokenset.py`), and appends a
+`<stop>` step at the end of the document. Files without a valid `{ }`
+structure are rejected before training starts.
+
+**Multimodal documents.** A file may mix `{t:}`, `{w:}` and `{v:}` elements.
+Text-only docs go through `make_batch` + `forward_train` (embedding lookup,
+cheapest). Docs containing media go through `make_batch_emb` +
+`forward_train_embeddings`: the whole document is projected once
+(`visual_proj` / `audio_proj`, both plain `Linear(…, d_model)`), and media
+positions are given target `-100` — the `lm_head` can only predict vocabulary
+IDs, so images and audio act purely as context while the text targets drive
+the loss. Both paths share `service/train/train_step.py`, so the queue daemon
+and the CLI trainer can never diverge.
 
 ### Training Script
 ```bash
@@ -267,6 +301,13 @@ python service/infer/infer.py --model models/my_model --prompt "Hello"
 ```
 
 The decoder stops immediately when `<stop>` (ID 5) is sampled.
+
+**Multimodal prompts.** `POST /api/infer` accepts `media: [{kind, b64,
+filename}]` with `kind` ∈ `image | audio | video` (up to 4 attachments, 64 MB
+total). The media is decoded in the inference service (patches / 533-sample
+tokens), placed *before* the text prompt, projected into the same `d_model`,
+and encoded into the KV cache — generation itself stays textual, so at least
+one text token is required as the decode seed.
 
 ### Token-id archive (inference)
 

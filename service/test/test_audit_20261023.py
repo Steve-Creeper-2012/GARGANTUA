@@ -370,9 +370,9 @@ class TestCodecContracts(unittest.TestCase):
 
     def test_enqueue_caps(self):
         # 修复前：入队无体积上限（2026-10-25 起数据格式 = .tokens）
-        from tokens import gts, tok32
-        stream = tok32.encode_ids(gts.parse_gts("{a}{b}{c}"))
-        b64 = base64.b64encode(stream).decode()
+        from tokens import tok5
+        items = [tok5.step(tok5.text(i)) for i in (1, 2, 3)]
+        b64 = base64.b64encode(tok5.dumps(items)).decode()
         with mock.patch.object(server_train, "MAX_ENQUEUE_BYTES", 8):
             with self.assertRaises(ValueError) as cm:
                 self.host.api_train_enqueue({"tokens_b64": b64})

@@ -278,7 +278,11 @@
             <select id="text-bound"><option value="user">用户输入 &lt;user&gt;</option><option value="model" selected>模型输出 &lt;model&gt;</option></select></label><button class="act" id="text-encode">编码</button><span class="hint">输出为项目定制 token 时间步格式：{}=一个时间步，{}内 token 以 | 分隔，裸字符/数字不带符号</span></div><div class="codec-io"><textarea id="text-in" placeholder="粘贴文本…">Hello, 世界！</textarea><pre id="text-out">—</pre></div></section><section class="page" id="p-audio"><h2>音频 → token 转换</h2><div class="hint">支持 wav / mp3 / flac / ogg（ffmpeg 解码后重采样到 16kHz 单声道）；533 个采样点平铺为一条向量 = 1 个音元（≈30 tok/s），每个音元是一个时间步；音频 token 是投影向量（无离散 ID），存档用 .tokenvector 格式</div><div class="row"><label>谁的输入/输出
             <select id="audio-bound"><option value="user" selected>用户输入 &lt;user&gt;</option><option value="model">模型输出 &lt;model&gt;</option></select></label><label class="file-pick" for="audio-file"><input type="file" id="audio-file" accept=".wav,.mp3,.flac,.ogg,audio/*"><span class="file-btn">选择文件</span><span class="file-name" id="audio-file-name">未选择</span></label><button class="act" id="audio-encode">编码</button></div><div id="audio-preview" class="row"></div><pre id="audio-out" style="flex:1;">—</pre></section><section class="page" id="p-image"><h2>图片 → token 转换（单帧）</h2><div class="hint">图片拆 32×32 patches，patch 内部平铺成一条向量，embedding 时乘矩阵投影，所有 patch 放在同一个时间步内；视觉 token 是投影向量（无离散 ID），存档用 .tokenvector 格式</div><div class="row"><label>谁的输入/输出
             <select id="image-bound"><option value="user" selected>用户输入 &lt;user&gt;</option><option value="model">模型输出 &lt;model&gt;</option></select></label><label class="file-pick" for="image-file"><input type="file" id="image-file" accept="image/*"><span class="file-btn">选择文件</span><span class="file-name" id="image-file-name">未选择</span></label><button class="act" id="image-encode">编码</button></div><div class="codec-io" style="margin-top:10px;"><div><img id="image-preview" style="max-width:100%;max-height:320px;border-radius:6px;border:1px solid var(--border);" alt=""></div><pre id="image-out">—</pre></div></section><section class="page" id="p-video"><h2>视频 → token 转换（含声音）</h2><div class="hint">导入视频（mp4/mov/webm/mkv/gif，ffmpeg 抽帧 30fps、提取音轨）；每帧 = 一个时间步，该 {} 内平铺该帧全部 patch token 与该帧音频 token（全部投影到同一个 d_model）</div><div class="row"><label>谁的输入/输出
-            <select id="video-bound"><option value="user" selected>用户输入 &lt;user&gt;</option><option value="model">模型输出 &lt;model&gt;</option></select></label><label class="file-pick" for="video-file"><input type="file" id="video-file" accept="video/*,.gif,.webp"><span class="file-btn">选择文件</span><span class="file-name" id="video-file-name">未选择</span></label><button class="act" id="video-encode">编码</button></div><div class="row"><video id="video-preview" controls style="max-height:180px;border-radius:6px;display:none;"></video></div><div id="video-stats" class="hint"></div><pre id="video-out" style="flex:1;">—</pre></section><section class="page" id="p-prims"><h2>图像 → 图元转换（可视化）</h2><div class="hint">上传图片，转换为图元序列并渲染。优先调用 vendored 的 Rust/wgpu GPU 转换器（service/prims/fast_shape_render，照搬 wonderfulearth/primitive-operation-painter，用 sh service/prims/setup.sh 构建）；未构建时回退 CPU 贪心拟合。token 布局照搬仓库 geometrize_256_v1：每图元 9 token（cx,cy,theta,w,h,shape,r,g,b），画布 256×256。</div><div class="row"><label class="file-pick" for="prims-file"><input type="file" id="prims-file" accept="image/*"><span class="file-btn">选择文件</span><span class="file-name" id="prims-file-name">未选择</span></label><label class="hint" for="prims-steps">步数上限</label><input type="number" id="prims-steps" value="100" min="1" max="1000" step="1" title="默认 100，服务端上限 1000；越大质量越高，耗时线性增长"><label class="hint" for="prims-quality">模式</label><select id="prims-quality" title="fast=快，20候选/步；slow=慢，50候选/步+短爬山"><option value="fast">fast</option><option value="slow">slow</option></select><button class="act" id="prims-convert">转换</button><span class="hint" id="prims-msg"></span></div><div class="codec-io" style="margin-top:10px;"><div><div class="hint">原图</div><img id="prims-src" style="max-width:100%;max-height:320px;border-radius:6px;border:1px solid var(--border);" alt=""></div><div><div class="hint">图元渲染（SVG）</div><div id="prims-render" class="svg-out"></div></div></div><pre id="prims-out" style="flex-shrink:0;max-height:200px;">—</pre></section><section class="page" id="p-json"><h2>Token 编辑器</h2><div class="hint">GARGANTUA token stream（.gts）：{} 为时间步原子，{} 内多 token 以 | 分隔；&lt;...&gt; 为特殊 token，裸字符为可见 token。特殊 token（&lt;user&gt;/&lt;model&gt; 等）各自独占一个时间步。同时间步多 token 用于图像/视频帧。词表查询与增删统一在「词表」页。</div><div class="row"><button class="act" id="json-format">格式化</button><button class="act sec" id="json-minify">压缩</button><button class="act sec" id="json-copy">复制</button><button class="act" id="json-export">导出 .tokens</button><span class="hint" id="json-msg"></span></div><div class="token-palette" id="json-palette"></div><div id="json-editor" contenteditable="true" spellcheck="false">{<user>}{h}{e}{l}{l}{o}{<user/>}</div></section></div></main></div><script>
+            <select id="video-bound"><option value="user" selected>用户输入 &lt;user&gt;</option><option value="model">模型输出 &lt;model&gt;</option></select></label><label class="file-pick" for="video-file"><input type="file" id="video-file" accept="video/*,.gif,.webp"><span class="file-btn">选择文件</span><span class="file-name" id="video-file-name">未选择</span></label><button class="act" id="video-encode">编码</button></div><div class="row"><video id="video-preview" controls style="max-height:180px;border-radius:6px;display:none;"></video></div><div id="video-stats" class="hint"></div><pre id="video-out" style="flex:1;">—</pre></section><section class="page" id="p-prims"><h2>图像 → 图元转换（可视化）</h2><div class="hint">上传图片，转换为图元序列并渲染。优先调用 vendored 的 Rust/wgpu GPU 转换器（service/prims/fast_shape_render，照搬 wonderfulearth/primitive-operation-painter，用 sh service/prims/setup.sh 构建）；未构建时回退 CPU 贪心拟合。token 布局照搬仓库 geometrize_256_v1：每图元 9 token（cx,cy,theta,w,h,shape,r,g,b），画布 256×256。</div><div class="row"><label class="file-pick" for="prims-file"><input type="file" id="prims-file" accept="image/*"><span class="file-btn">选择文件</span><span class="file-name" id="prims-file-name">未选择</span></label><label class="hint" for="prims-steps">步数上限</label><input type="number" id="prims-steps" value="100" min="1" max="1000" step="1" title="默认 100，服务端上限 1000；越大质量越高，耗时线性增长"><label class="hint" for="prims-quality">模式</label><select id="prims-quality" title="fast=快，20候选/步；slow=慢，50候选/步+短爬山"><option value="fast">fast</option><option value="slow">slow</option></select><button class="act" id="prims-convert">转换</button><span class="hint" id="prims-msg"></span></div><div class="codec-io" style="margin-top:10px;"><div><div class="hint">原图</div><img id="prims-src" style="max-width:100%;max-height:320px;border-radius:6px;border:1px solid var(--border);" alt=""></div><div><div class="hint">图元渲染（SVG）</div><div id="prims-render" class="svg-out"></div></div></div><pre id="prims-out" style="flex-shrink:0;max-height:200px;">—</pre></section><section class="page" id="p-json"><h2>Token 编辑器</h2><div class="hint">token-5 编码（spec 第 5b 节）：{} 为时间步原子，步内元素以 | 分隔。
+          {text: 00001} 文本 token（有向量、进 loss）；{wave: HEX} 音频（533 采样）；
+          {visual: HEX x: 1 y: 2} 视觉 patch（32×32，RGBA 各 10 bit）。
+          &lt;00005&gt; 是扩展系统 token（有嵌入、不进 loss），也可直接写名字如 &lt;stop&gt;。
+          { } | 本身不是 token。词表查询与增删统一在「词表」页。</div><div class="row"><button class="act" id="json-format">格式化</button><button class="act sec" id="json-minify">压缩</button><button class="act sec" id="json-copy">复制</button><button class="act" id="json-export">导出 .tokens</button><span class="hint" id="json-msg"></span></div><div class="token-palette" id="json-palette"></div><div id="json-editor" contenteditable="true" spellcheck="false">&lt;00001&gt;{text: 50994}{text: 12419}{text: 22152}{text: 22175}&lt;00002&gt;</div></section></div></main></div><script>
 const $ = id => document.getElementById(id);
 const $$ = (sel, el=document) => el.querySelectorAll(sel);
 
@@ -290,15 +294,61 @@ function clampNum(v, lo, hi, dflt) {
   return Math.min(hi, Math.max(lo, n));
 }
 
-async function api(path, body) {
-  const opt = body === undefined ? {} :
-    {method: "POST", headers: {"Content-Type": "application/json"},
-     body: JSON.stringify(body)};
-  const r = await fetch(path, opt);
-  const txt = await r.text();
-  const j = txt ? JSON.parse(txt) : {};
-  if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
-  return j;
+// 2026-10-27 审计修复（M11）：所有请求带超时 + 可取消。
+// 旧实现直接 await fetch()：一个悬挂请求（后端卡住/网络半断）会让轮询
+// 循环永远停在 await 上——deadline 只在请求返回后才检查，于是「创建中…」
+// 永不结束、按钮永久禁用。现在超时即 AbortController.abort()，调用方拿到
+// 明确的错误而不是无限等待。
+const API_TIMEOUT_MS = 20000;
+const API_UPLOAD_TIMEOUT_MS = 180000;   // 上传 .tokens / 视频等大 body
+async function api(path, body, opts) {
+  const o = opts || {};
+  const ms = o.timeout || API_TIMEOUT_MS;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  const opt = body === undefined
+    ? {signal: ctrl.signal}
+    : {method: "POST", headers: {"Content-Type": "application/json"},
+       body: JSON.stringify(body), signal: ctrl.signal};
+  try {
+    const r = await fetch(path, opt);
+    const txt = await r.text();
+    let j = {};
+    if (txt) {
+      try { j = JSON.parse(txt); }
+      catch (e) { throw new Error("响应不是 JSON: " + txt.slice(0, 120)); }
+    }
+    if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+    return j;
+  } catch (e) {
+    if (e && e.name === "AbortError") {
+      throw new Error(`请求超时（${ms}ms）: ${path}`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+// 2026-10-27 审计修复（M11）：统一任务轮询。
+// 旧写法 `while (Date.now()-t0 < T) { await sleep(); await api(...) }` 把
+// deadline 判断放在 await 之前的一轮循环里——请求悬挂时永远回不到判断点。
+// 这里每轮【先】检查 deadline，超时抛错（调用方能看到明确失败），
+// 并复用 api() 的单请求超时，双重保险。
+async function pollTask(taskId, opts) {
+  const o = opts || {};
+  const interval = o.interval || 1500;
+  const timeout = o.timeout || 120000;
+  const t0 = Date.now();
+  for (;;) {
+    if (Date.now() - t0 > timeout) {
+      throw new Error(`轮询超时（${Math.round(timeout / 1000)}s）`);
+    }
+    await new Promise(r => setTimeout(r, interval));
+    const t = await api("/api/task/" + taskId);
+    if (o.onTick) o.onTick(t);
+    if (t.status === "done") return t;
+    if (t.status === "error") throw new Error(t.error);
+  }
 }
 function esc(s) {
   // 2026-10-20：补引号转义。textContent→innerHTML 只转义 & < >，
@@ -339,94 +389,28 @@ function b64ToBytes(b64) {
   }
   return out.subarray(0, p);
 }
-const _F32 = new Float32Array(1), _U32 = new Uint32Array(_F32.buffer);
-function f32hex(f) { _F32[0] = f; return _U32[0].toString(16).padStart(8, "0"); }
+/* token-5 文本（spec 第 5b 节）：{text: 00001} / {wave: HEX} / {visual: HEX x: 1 y: 2}
+   音频/视觉的 hex 载荷（2132 / 10240 字符）一律由后端生成（r.token5），
+   前端只在没有后端文本时兜底拼文本 token —— 在 JS 里拼 40bit/像素的
+   位流既慢又容易和 Python 侧的位序不一致。 */
+const _ID5 = n => String(n).padStart(5, "0");
 
-function audioStepHex(st) {
-  const meta = st.meta || {};
-  if (!meta.samples_b64) return "00000000";
-  const b = b64ToBytes(meta.samples_b64);
-  if (b.length < 4) return "00000000";
-  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
-  return f32hex(dv.getFloat32(0, true));
-}
-
-function visualPatchToken(p) {
-  const b = b64ToBytes(p.vec_b64 || "");
-  const n = b.length >> 2;                       // 1024 pixels
-  if (n === 0) return `<x-axis:${p.x},y-axis:${p.y},R0,G0,B0,A0>`;
-  let rs = 0, gs = 0, bs = 0, as = 0;
-  for (let i = 0; i < b.length; i += 4) {
-    rs += b[i]; gs += b[i + 1]; bs += b[i + 2]; as += b[i + 3];
-  }
-  const q = (v, lv) => Math.round(v / n / 255 * (lv - 1));
-  return `<x-axis:${p.x},y-axis:${p.y},R${q(rs,1024)},G${q(gs,1024)},` +
-         `B${q(bs,1024)},A${q(as,1000)}>`;
-}
-
-function stepsToGts(steps, bound) {
-  const typeTag = bound === "user" ? "<user>" : "<model>";
-  const endTag = bound === "user" ? "<user/>" : "<model/>";
-  const parts = ["{" + typeTag + "}"];
-  let i = 0;
-  while (i < steps.length) {
-    const st = steps[i];
-
-    // 视频帧：{"time_step": [visual, audio0, audio1, ...]}
-    // → 每帧一个 {}（全部 patch + 全部 wave）
-    if (st.time_step) {
-      while (i < steps.length && steps[i].time_step) {
-        const frame = steps[i].time_step;
-        const visual = frame.find(s => s.modality === "visual");
-        const toks = [];
-        if (visual) {
-          for (const p of ((visual.meta || {}).patches || []))
-            toks.push(visualPatchToken(p));
-        }
-        for (const sub of frame) {
-          if (sub.modality === "audio") toks.push(`<wave:${audioStepHex(sub)}>`);
-        }
-        if (toks.length) parts.push("{" + toks.join("|") + "}");
-        i++;
-      }
-      continue;
-    }
-
-    if (st.modality === "audio") {
-      // 独立音轨：每 533 采样一个时间步
-      while (i < steps.length && steps[i].modality === "audio") {
-        parts.push(`{<wave:${audioStepHex(steps[i])}>}`);
-        i++;
-      }
-      continue;
-    }
-
-    if (st.modality === "visual") {
-      // 单张图片 = 单帧
-      while (i < steps.length && steps[i].modality === "visual") {
-        const patches = ((steps[i].meta || {}).patches) || [];
-        const toks = patches.map(visualPatchToken);
-        parts.push("{" + toks.join("|") + "}");
-        i++;
-      }
-      continue;
-    }
-
-    if (st.modality === "draw") {
-      const ids = st.token_ids || [];
-      for (let j = 0; j + 9 <= ids.length; j += 9)
-        parts.push("{" + ids.slice(j, j + 9).map(t => `<id:${t}>`).join("|") + "}");
-      i++;
-      continue;
-    }
-
-    // text / draw / other：每 token 独占一步（空时间步非法，不再输出 {}）
+function stepsToToken5(steps, bound) {
+  const openTag = bound === "user" ? "<00001>" : "<00003>";   // <user> / <model>
+  const closeTag = bound === "user" ? "<00002>" : "<00004>";  // <user/> / <model/>
+  const parts = [openTag];
+  for (const st of steps) {
     const ids = st.token_ids || [];
-    if (ids.length === 0) { i++; continue; }
-    for (const id of ids) parts.push(`{<id:${id}>}`);
-    i++;
+    if (!ids.length) continue;                 // 模态步：由后端 token5 给出
+    if (st.modality === "draw") {
+      // 绘图：一个图元 = 9 个 token = 一个时间步
+      for (let j = 0; j + 9 <= ids.length; j += 9)
+        parts.push("{" + ids.slice(j, j + 9).map(t => "text: " + _ID5(t)).join(" | ") + "}");
+      continue;
+    }
+    for (const id of ids) parts.push("{text: " + _ID5(id) + "}");
   }
-  parts.push("{" + endTag + "}");
+  parts.push(closeTag);
   return parts.join("");
 }
 
@@ -483,9 +467,14 @@ function wireFileInput(id) {
  "prims-file"].forEach(wireFileInput);
 
 /* ---------- 状态栏 ---------- */
+// 2026-10-27 审计修复（M11）：活动模型用服务端返回的精确名字记录。
+// 旧代码用 $("sb-model").textContent.includes(name) 判断，模型名互为
+// 子串时会误判（"m1" 命中 "m10"），导致该激活的不激活、不该切的切走。
+let ACTIVE_MODEL = "";
 async function refreshStatus() {
   try {
     const s = await api("/api/status");
+    ACTIVE_MODEL = s.model || "";
     $("sb-model").textContent = "模型: " +
       (s.model || (s.loading ? s.loading + "（加载中）" : "—"));
     $("sb-model").className = "pill" + (s.model ? " on" : s.loading ? " warn" : "");
@@ -537,17 +526,8 @@ async function refreshHome() {
         try {
           const {task_id} = await api("/api/system/install-optional",
                                       {names: miss});
-          const t0 = Date.now();
-          while (Date.now() - t0 < 900000) {
-            await new Promise(r => setTimeout(r, 2000));
-            const t = await api("/api/task/" + task_id);
-            if (t.status === "done") {
-              msg.textContent = (t.result && t.result.note) || "已安装";
-              return;
-            }
-            if (t.status === "error") throw new Error(t.error);
-          }
-          msg.textContent = "轮询超时";
+          const t = await pollTask(task_id, {interval: 2000, timeout: 900000});
+          msg.textContent = (t.result && t.result.note) || "已安装";
         } catch (e) {
           msg.textContent = "安装失败: " + e.message;
         } finally { btn.disabled = false; }
@@ -579,7 +559,10 @@ async function refreshModels() {
 }
 window.loadModel = async name => {
   try { await api("/api/model/load", {name});
-        $("model-create-msg").textContent = "已加载 " + name; refreshStatus(); }
+        $("model-create-msg").textContent = "已加载 " + name;
+        // 2026-10-27 审计修复（M11）：加载后刷新列表——「当前」徽标
+        // 此前一直停在旧模型上，用户看到的活动模型与实际不符
+        refreshModels(); refreshStatus(); }
   catch (e) { $("model-create-msg").textContent = "错误: " + e.message; }
 };
 $("model-create").onclick = async () => {
@@ -622,24 +605,18 @@ async function createModel(name, overwrite) {
     vocab: $("model-vocab").value || "base",
     dtype: $("model-dtype").value || "fp32",
   });
-  const t0 = Date.now();
-  while (Date.now() - t0 < 120000) {
-    await new Promise(r => setTimeout(r, 1500));
-    const t = await api("/api/task/" + task_id);
-    if (t.status === "done") {
-      $("model-create-msg").textContent = "创建成功";
-      refreshModels(); refreshStatus();
-      // 首个模型创建后自动激活（此前不加载，训练/推理仍报「无活动模型」）
-      if (!$("sb-model").textContent.includes(name)) {
-        try { await api("/api/model/load", {name}); refreshStatus(); }
-        catch (e) { $("model-create-msg").textContent =
-          "已创建（自动激活失败: " + e.message + "）"; }
-      }
-      return;
-    }
-    if (t.status === "error") throw new Error(t.error);
+  // 2026-10-27 审计修复（M11）：deadline 由 pollTask 每轮开头检查
+  await pollTask(task_id, {interval: 1500, timeout: 120000});
+  $("model-create-msg").textContent = "创建成功";
+  refreshModels(); await refreshStatus();
+  // 首个模型创建后自动激活（此前不加载，训练/推理仍报「无活动模型」）。
+  // 精确比较活动模型名，不用 textContent.includes（子串会误判）。
+  if (ACTIVE_MODEL !== name) {
+    try { await api("/api/model/load", {name});
+          refreshModels(); await refreshStatus(); }
+    catch (e) { $("model-create-msg").textContent =
+      "已创建（自动激活失败: " + e.message + "）"; }
   }
-  $("model-create-msg").textContent = "轮询超时";
 }
 $("model-refresh").onclick = refreshModels;
 
@@ -652,7 +629,7 @@ $("train-enqueue").onclick = async () => {
     const r = await api("/api/train/enqueue", {
       tokens_b64: await fileToB64(file),
       optimizer: $("train-mode").value,
-    });
+    }, {timeout: API_UPLOAD_TIMEOUT_MS});
     msg.textContent = `已入队 ${r.queued[0]}（${r.n_tokens} tokens / ` +
       `${r.n_steps} 时间步）`;
     $("train-file").value = "";
@@ -792,37 +769,36 @@ $("send-btn").onclick = async () => {
   st.textContent = "思考中…";
   $("send-btn").disabled = true;
   try {
-    // 2026-10-23 审计修复（P1）：媒体输入尚未接入生成路径（后端
-    // /api/infer 只走文本），先在前端拦一道——否则会白白上传几百
-    // MB 再吃一个 400
-    if (lastMedia) {
-      throw new Error("媒体输入（图片/音频/视频）尚未接入生成路径，"
-                    + "当前仅支持文本 prompt；附件未发送。");
-    }
+    // 2026-10-28：媒体已接入生成路径——作为 prompt 前缀参与编码
+    // （视觉/音频各走自己的线性投影到 d_model），生成仍是文本。
     const body = {prompt,
                   max_new_tokens: clampNum($("infer-maxnew").value, 1, 512, 32),
                   temperature: clampNum($("infer-temp").value, 0.05, 5, 0.8),
                   top_p: clampNum($("infer-topp").value, 0.01, 1, 0.95)};
-    const {task_id} = await api("/api/infer", body);
-    const t0 = Date.now();
-    while (Date.now() - t0 < 600000) {
-      await new Promise(r => setTimeout(r, 1500));
-      const t = await api("/api/task/" + task_id);
-      if (t.status === "done") {
-        addMsg("model", esc(t.result.text || "（无文本输出）"));
-        // 本次推理的 token id 存档（.tokens，悬停看路径）
-        st.textContent = t.result.archive ? "已存档 id" : "";
-        st.title = t.result.archive || "";
-        $("attach-preview").style.display = "none";
-        $("attach-preview").innerHTML = "";
-        $("infer-media").value = "";
-        lastMedia = null;
-        return;
+    if (lastMedia) {
+      const MAX_MEDIA_BYTES = 64 * 1024 * 1024;
+      if (lastMedia.size > MAX_MEDIA_BYTES) {
+        throw new Error(`附件 ${(lastMedia.size / 1048576).toFixed(1)}MB `
+                      + `超过上限 ${MAX_MEDIA_BYTES / 1048576}MB，未发送`);
       }
-      if (t.status === "error") throw new Error(t.error);
-      st.textContent = "思考中… " + t.status;
+      const kind = lastMedia.type.startsWith("image/") ? "image"
+                 : lastMedia.type.startsWith("video/") ? "video" : "audio";
+      body.media = [{kind, b64: await fileToB64(lastMedia),
+                     filename: lastMedia.name}];
     }
-    st.textContent = "轮询超时";
+    const {task_id} = await api("/api/infer", body);
+    const t = await pollTask(task_id, {
+      interval: 1500, timeout: 600000,
+      onTick: x => { st.textContent = "思考中… " + x.status; }});
+    addMsg("model", esc(t.result.text || "（无文本输出）"));
+    // 本次推理的 token id 存档（.tokens，悬停看路径）
+    st.textContent = t.result.archive ? "已存档 id" : "";
+    st.title = t.result.archive || "";
+    $("attach-preview").style.display = "none";
+    $("attach-preview").innerHTML = "";
+    $("infer-media").value = "";
+    lastMedia = null;
+    return;
   } catch (e) { st.textContent = "错误: " + e.message; addMsg("model", "⚠ " + esc(e.message)); }
   finally { $("send-btn").disabled = false; }
 };
@@ -836,7 +812,7 @@ $("debug-panel").querySelector(".toggle").onclick =
 $("text-encode").onclick = async () => {
   try {
     const r = await api("/api/codec/text", {text: $("text-in").value});
-    $("text-out").textContent = stepsToGts(r.steps, $("text-bound").value);
+    $("text-out").textContent = r.token5;
   } catch (e) { $("text-out").textContent = "错误: " + e.message; }
 };
 $("audio-encode").onclick = async () => {
@@ -845,10 +821,10 @@ $("audio-encode").onclick = async () => {
   $("audio-out").textContent = "编码中…";
   try {
     const r = await api("/api/codec/audio", {audio_b64: await fileToB64(f),
-                                             filename: f.name});
+                             filename: f.name},
+                        {timeout: API_UPLOAD_TIMEOUT_MS});
     $("audio-out").textContent =
-      `# 音元数 ${r.n_tokens}，时长 ${r.duration_s}s\n` +
-      stepsToGts(r.steps, $("audio-bound").value);
+      `# 音元数 ${r.n_tokens}，时长 ${r.duration_s}s\n` + r.token5;
   } catch (e) { $("audio-out").textContent = "错误: " + e.message; }
 };
 $("image-encode").onclick = async () => {
@@ -856,11 +832,12 @@ $("image-encode").onclick = async () => {
   $("image-preview").src = fileToUrl(f);
   $("image-out").textContent = "编码中…";
   try {
-    const r = await api("/api/codec/image", {image_b64: await fileToB64(f)});
+    const r = await api("/api/codec/image", {image_b64: await fileToB64(f)},
+                          {timeout: API_UPLOAD_TIMEOUT_MS});
     const st = r.steps[0];
     $("image-out").textContent =
       `# grid ${st.meta.grid[0]}×${st.meta.grid[1]}，patch 数 ${st.meta.n_patches}\n` +
-      stepsToGts(r.steps, $("image-bound").value);
+      r.token5;
   } catch (e) { $("image-out").textContent = "错误: " + e.message; }
 };
 $("video-encode").onclick = async () => {
@@ -869,10 +846,11 @@ $("video-encode").onclick = async () => {
   $("video-out").textContent = "编码中（ffmpeg 抽帧 + 提取音轨）…";
   try {
     const r = await api("/api/codec/video", {video_b64: await fileToB64(f),
-                                             filename: f.name});
+                             filename: f.name},
+                        {timeout: API_UPLOAD_TIMEOUT_MS});
     $("video-stats").textContent =
       `帧数: ${r.n_frames}　总 patches: ${r.total_patches}　音元: ${r.n_audio_tokens}`;
-    $("video-out").textContent = stepsToGts(r.steps, $("video-bound").value);
+    $("video-out").textContent = r.token5;
   } catch (e) { $("video-out").textContent = "错误: " + e.message;
                 $("video-stats").textContent = ""; }
 };
@@ -886,36 +864,31 @@ $("prims-convert").onclick = async () => {
                                 {image_b64: await fileToB64(f),
                                  // 钳到服务端区间 [1,1000]，避免越界后只能等到 400
                                  max_steps: clampNum($("prims-steps").value, 1, 1000, 100),
-                                 quality: $("prims-quality").value || "fast"});
-    const t0 = Date.now();
-    let r = null;
-    while (Date.now() - t0 < 120000) {
-      await new Promise(res => setTimeout(res, 1200));
-      const t = await api("/api/task/" + task_id);
-      if (t.status === "done") { r = t.result; break; }
-      if (t.status === "error") throw new Error(t.error);
-      $("prims-msg").textContent = "转换中… " + t.status;
-    }
-    if (!r) throw new Error("轮询超时");
+                                 quality: $("prims-quality").value || "fast"},
+                                {timeout: API_UPLOAD_TIMEOUT_MS});
+    const t = await pollTask(task_id, {
+      interval: 1200, timeout: 120000,
+      onTick: x => { $("prims-msg").textContent = "转换中… " + x.status; }});
+    const r = t.result;
     $("prims-render").innerHTML = r.svg;
     $("prims-out").textContent =
       `# ${r.note}\n# 图元 ${r.n_primitives} 个，token ${r.tokens.length} 个（9/图元）\n` +
-      stepsToGts([{modality: "draw", token_ids: r.tokens, meta: {}}], "model");
+      stepsToToken5([{modality: "draw", token_ids: r.tokens, meta: {}}], "model");
     $("prims-msg").textContent = r.n_primitives + " 个图元";
   } catch (e) { $("prims-msg").textContent = "错误: " + e.message; }
 };
 /* ---------- Token 编辑器 ----------
-   调色板与词表四类对应：特殊 token（<user>/<model>/<stop>/<caps>）、
-   系统 token（{ } |）。其余 token（可见字符/单词/emoji）直接键入。 */
+   调色板：扩展系统 token（<00000>..<00005>，也可直接写名字）+ 结构字符。
+   {text: NNNNN} 等载荷由编解码页 / 后端 token5 文本直接粘贴。 */
 const TOKEN_PALETTE = [
-  // 特殊 token（不可见，与词表 special 区一致）
-  {label:"<user>",    insert:"<user>"},
-  {label:"<user/>",   insert:"<user/>"},
-  {label:"<model>",   insert:"<model>"},
-  {label:"<model/>",  insert:"<model/>"},
-  {label:"<stop>",    insert:"<stop>"},
-  {label:"<caps>",    insert:"<caps>"},
-  // 系统 token（不可见，时间步结构）
+  // 扩展系统 token（不可见，与词表 special 区一致；数字形式最稳）
+  {label:"<user>",    insert:"<00001>"},
+  {label:"<user/>",   insert:"<00002>"},
+  {label:"<model>",   insert:"<00003>"},
+  {label:"<model/>",  insert:"<00004>"},
+  {label:"<stop>",    insert:"<00005>"},
+  {label:"<caps>",    insert:"<00000>"},
+  // 结构字符
   {label:"时间步 {",  insert:"{"},
   {label:"时间步 }",  insert:"}"},
   {label:"步内 |",    insert:"|"},
@@ -1068,12 +1041,19 @@ function renderVocabPresets(presets) {
   }).join("");
 }
 function populateVocabSelects(presets) {
+  // 2026-10-27 审计修复（M11）：重建下拉前记住当前选择并回填。
+  // 旧实现无条件重写 innerHTML——每次 refreshVocab（增删 token 后都会
+  // 触发）都把用户选好的预设弹回第一项，接着「添加 token」就落到
+  // 错误的预设上。
   const opts = presets.map(p =>
     `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
-  $("vocab-new-source").innerHTML = opts;
-  $("vocab-token-preset").innerHTML = opts;
-  const mc = $("model-vocab");
-  if (mc) mc.innerHTML = opts;
+  for (const id of ["vocab-new-source", "vocab-token-preset", "model-vocab"]) {
+    const el = $(id);
+    if (!el) continue;
+    const prev = el.value;
+    el.innerHTML = opts;
+    if (prev && presets.some(p => p.name === prev)) el.value = prev;
+  }
 }
 $("vocab-create-preset").onclick = async () => {
   const name = $("vocab-new-name").value.trim();

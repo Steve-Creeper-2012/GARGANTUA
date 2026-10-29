@@ -43,6 +43,15 @@ import tempfile
 import threading
 import unittest
 
+
+def _has_pywebview() -> bool:
+    """本机是否装了可选窗口依赖 pywebview（缺它只跳过窗口 smoke，不算失败）。"""
+    try:
+        import webview  # noqa: F401
+        return True
+    except Exception:
+        return False
+
 import numpy as np
 import torch
 
@@ -110,10 +119,18 @@ class TestCheckpointContract(unittest.TestCase):
             self.assertIsNotNone(valid_model_name(bad), f"应拒绝: {bad!r}")
 
     def test_save_checkpoint_atomic_and_complete(self):
-        self.assertTrue(os.path.exists(os.path.join(self.md, "model.safetensors")))
+        # 2026-10-27 M1：manifest 化发布——config.json 指向的权重文件必须
+        # 存在且无残留 tmp（权重文件名带 uuid，不再固定 model.safetensors）
+        from common import resolve_weights_path
+        wp = resolve_weights_path(self.md)
+        self.assertTrue(os.path.exists(wp), f"manifest 指向的权重缺失: {wp}")
+        self.assertTrue(wp.endswith(".safetensors"))
         self.assertTrue(os.path.exists(os.path.join(self.md, "config.json")))
         self.assertFalse(
             os.path.exists(os.path.join(self.md, "model.safetensors.tmp")))
+        import glob as _glob
+        self.assertFalse(_glob.glob(os.path.join(self.md, "*.tmp")),
+                         "save_checkpoint 不得留下 .tmp 半成品")
 
 
 class TestBlockSizeContract(unittest.TestCase):
@@ -177,7 +194,12 @@ class TestFastWeightContract(unittest.TestCase):
 
         def fw_spy(self, x, **kw):
             order.append("fw")
-            states.append(self._state is not None)
+            # 2026-10-27 S2：状态可存内部 self._state（训练路径）或外部
+            # state dict（增量推理路径）；两者任一非空即「入口可见状态」
+            ext = kw.get("state")
+            visible = (self._state is not None
+                       or (ext is not None and ext.get("fw") is not None))
+            states.append(visible)
             return orig_fw(self, x, **kw)
 
         model.FastWeightBank.reset = reset_spy
@@ -281,12 +303,15 @@ class TestCompressionCausality(unittest.TestCase):
         for i in range(n):
             kv.append(vecs[0, i:i + 1].clone(), step_id=i,
                       type_id=0, source="enc")
-        vh, _ = kv.view("hca")
-        vc, _ = kv.view("csa")
-        self.assertEqual(kv_hca[0].shape, vh.shape)
-        self.assertEqual(kv_csa[0].shape, vc.shape)
-        self.assertTrue(torch.allclose(kv_hca[0], vh, atol=1e-5))
-        self.assertTrue(torch.allclose(kv_csa[0], vc, atol=1e-5))
+        vh = kv.view("hca")
+        vc = kv.view("csa")
+        self.assertEqual(kv_hca[0].shape, vh[0].shape)
+        self.assertEqual(kv_csa[0].shape, vc[0].shape)
+        self.assertTrue(torch.allclose(kv_hca[0], vh[0], atol=1e-5))
+        self.assertTrue(torch.allclose(kv_csa[0], vc[0], atol=1e-5))
+        # 2026-10-27（S1）：视图同时携带步内序号 pos，两侧必须一致
+        self.assertTrue(torch.equal(kv_hca[2], vh[2]))
+        self.assertTrue(torch.equal(kv_csa[2], vc[2]))
 
     def test_comp_region_capped(self):
         """ P1-6：压缩区截断到 CTX_COMPRESS，注意力规模不再无界。 """
@@ -351,11 +376,16 @@ class TestAssembleContract(unittest.TestCase):
         mla = model.MLAAttention(causal=True)      # causal 侧才有掩码
         q = emb[:, :1]                            # 第一帧的查询（step 0）
         qs = torch.tensor([[0]])
-        out1 = mla(q, kv_hca[0], kv_hca[1], qs)
+        # 2026-10-27（S1）：causal 掩码已细化到 token 粒度，必须同时给
+        # 步内序号；查询是帧内第一个 token → pos 0
+        qpos = torch.tensor([[0]])
+        out1 = mla(q, kv_hca[0], kv_hca[1], qs,
+                   kv_pos=kv_hca[2], x_pos=qpos)
         emb2 = emb.clone()
         emb2[0, 1:] = torch.randn_like(emb2[0, 1:])   # 篡改第二帧
         kv_hca2, _ = self.m.build_views(emb2, sids)
-        out2 = mla(q, kv_hca2[0], kv_hca2[1], qs)
+        out2 = mla(q, kv_hca2[0], kv_hca2[1], qs,
+                   kv_pos=kv_hca2[2], x_pos=qpos)
         self.assertTrue(torch.allclose(out1, out2, atol=1e-5),
                         "第一帧查询看到了第二帧内容（step_id 撞名泄漏）")
 
@@ -598,17 +628,20 @@ class TestInferIdArchive(unittest.TestCase):
     def test_archive_roundtrip_and_metadata(self):
         import json as _json
         from infer import IdArchive
-        from tokens import timestep, tok32
+        from tokens import tok5
         tmp = tempfile.mkdtemp(prefix="garg_arch_")
         try:
             a = IdArchive("models/demo", tmp)
-            a.add([100, 101])
-            a.add([102])
+            # 真实推理的 ID 都落在可见区（>= INVISIBLE_END）
+            a.add([51046, 51047])
+            a.add([51048])
             self.assertTrue(a.path is not None)
             a.close(n_prompt=2, n_generated=1, ctx_total=2)
-            ids = tok32.read_tokens_file(a.path)
-            steps = timestep.unwrap(ids)          # 必须是合法 { } 结构
-            self.assertEqual([s[0] for s in steps], [100, 101, 102])
+            items = tok5.read_file(a.path)        # 必须是合法 token-5 流
+            steps = [it for it in items if it["kind"] == "step"]
+            self.assertEqual([e["id"] for st in steps
+                              for e in st["elements"]],
+                             [51046, 51047, 51048])
             meta = _json.loads(
                 a.path.with_suffix(".json").read_text(encoding="utf-8"))
             self.assertEqual(meta["n_tokens"], 3)
@@ -616,6 +649,20 @@ class TestInferIdArchive(unittest.TestCase):
             self.assertEqual(meta["n_generated_tokens"], 1)
             self.assertEqual(meta["ctx_total"], 2)
             self.assertEqual(meta["n_evicted"], 1)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_archive_marks_system_tokens(self):
+        """不可见区的 ID 必须写成扩展系统 token <NNNNN>，不是 {t:}。"""
+        from infer import IdArchive
+        from tokens import tok5
+        tmp = tempfile.mkdtemp(prefix="garg_arch2_")
+        try:
+            a = IdArchive("models/demo", tmp)
+            a.add([spec.STOP_ID])
+            a.close(n_prompt=0, n_generated=1)
+            self.assertEqual(tok5.read_file(a.path),
+                             [{"kind": "ext", "id": spec.STOP_ID}])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -808,6 +855,7 @@ class TestStartupChain(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), "False",
                          "server 模块级不得出现 torch")
 
+    @unittest.skipUnless(_has_pywebview(), "本机未安装 pywebview（可选窗口依赖）")
     def test_window_smoke(self):
         # pywebview 可导入、窗口对象可创建（无显示环境也能验证）。
         # 装不了/没装时给出可执行提示而不是默默失败。
