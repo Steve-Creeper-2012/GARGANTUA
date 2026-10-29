@@ -347,9 +347,13 @@ A built-in web UI provides:
 拉起、服务调度全部由 server 自己做：
 
 ```bash
+# 英文名 / 中文名 等价：中文名是薄包装，直接调用同目录的 start-server.*
 ./start-server.sh                # macOS / Linux
+./启动.sh                        # macOS / Linux（中文名）
 ./start-server.command           # macOS: double-click in Finder (Terminal → app window)
+./启动.command                   # macOS: 双击启动（中文名）
 start\terminal\start.bat         # Windows (double-click)
+启动.bat                         # Windows: 双击启动（中文名，调用 start\terminal\start.bat）
 ```
 
 首次启动 `setup-environment.sh` / `setup.bat` 会：
@@ -451,6 +455,9 @@ Long-running work (inference, model init, image→primitives, **drawing render**
 .
 ├── start-server.sh            # POSIX one-shot launch (macOS / Linux) → setup → exec server.py
 ├── start-server.command       # macOS double-click launch (same as above, .command)
+├── 启动.sh                    # 中文名启动（macOS / Linux）→ 调用 start-server.sh
+├── 启动.command               # 中文名启动（macOS 双击）→ 调用 start-server.sh
+├── 启动.bat                   # 中文名启动（Windows 双击）→ 调用 start\terminal\start.bat
 ├── setup-environment.sh       # Isolated Python 3.12.x + venv + deps (idempotent,
 │                             #   mirrors auto-selected by live speed test)
 ├── start/                     # 启动链：路径引导 + 分类依赖 + Windows 入口
