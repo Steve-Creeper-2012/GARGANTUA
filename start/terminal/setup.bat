@@ -3,18 +3,18 @@ REM ===========================================================================
 REM GARGANTUA v1 — start/terminal/setup.bat：Windows 构建隔离 Python 运行时
 REM ---------------------------------------------------------------------------
 REM 与 setup-environment.sh 同职责（详细说明见 setup-environment.sh 文件头），要点：
-REM   1. 发现「3.12 系列最新版」python-build-standalone 资产：
-REM      curl 拉 atom feed（~15KB）→ findstr 取最新 tag（失败回退内置 tag）；
-REM      curl HEAD 探测补 patch 版本；
-REM      GARGANTUA_PY_RELEASE / GARGANTUA_PY_VERSION 可手动指定；
-REM   2. 下载镜像【自动测速】：对候选镜像顺序发 Range 请求（前 2MB，curl
-REM      自报 speed_download），选最快的下载；失败按默认顺序回退。
-REM      GARGANTUA_PY_BASE_URL 可直接指定（跳过测速）；
-REM   3. 解包到 environment\python\，建 environment\venv\（含自愈：解释器
-REM      跑不了就重建）；
-REM   4. 装依赖：core.txt 必装；window.txt / dev.txt 按开关；
+REM   0. 幂等：venv 存在 + 解释器 >= 3.12.14 → 跳过；
+REM   1. 优先用系统包管理器装 python3.12（最快）：
+REM        - 已存在 python3.12 / py -3.12 → 直接建 venv；
+REM        - 否则 winget install Python.Python.3.12（sudo install 的 Windows 等价物）。
+REM      失败或不具备 → 回退到下面的 python-build-standalone 下载。
+REM   2. 下载路径：发现 release tag（atom feed）→ 探测 patch 版本；
+REM        探测先试滚动资产 cpython-3.12+<tag>（一次请求），缺失再窄范围探测
+REM        （3.12.8..3.12.24，--max-time 12，避免逐个 minor 静默卡死十几分钟）。
+REM   3. 下载镜像自动测速选最快；解包到 environment\python\，建 environment\venv\。
+REM   4. 装依赖：core.txt 必装；window.txt / dev.txt 按开关。
 REM   5. stamp 存在即视为就绪（依赖清单变化时删 environment\.venv 强制重建）。
-REM 需要 Windows 10+（自带 curl.exe / tar.exe）。
+REM 需要 Windows 10+（自带 curl.exe / tar.exe / winget.exe）。
 REM
 REM 开关（环境变量）：
 REM   set GARGANTUA_NO_WINDOW=1   跳过 pywebview 窗口依赖
@@ -37,15 +37,37 @@ set "PBS_REPO=astral-sh/python-build-standalone"
 set "PBS_FALLBACK_TAG=20261021"
 set "TAG_PREFIX=https://github.com/%PBS_REPO%/releases/tag/"
 
-REM ---- 幂等：venv + stamp 存在且解释器能跑 → 跳过 ----
+REM ---- 幂等：venv 存在 + 解释器能跑 + >= 3.12.14 → 跳过 ----
 if exist "%VENV%\Scripts\python.exe" if exist "%STAMP%" (
-  "%VENV%\Scripts\python.exe" -c "" >nul 2>&1
+  "%VENV%\Scripts\python.exe" -c "import sys;sys.exit(0 if sys.version_info>=(3,12,14) else 1)" >nul 2>&1
   if not errorlevel 1 (
-    echo [setup] 隔离环境已就绪（%VENV%），跳过安装。
+    echo [setup] 隔离环境已就绪（%VENV%），Python >= 3.12.14，跳过安装。
     goto :eof
   )
-  echo [setup] environment\venv 不可用（项目目录被移动过？），重建……
+  echo [setup] venv 的 Python 低于 3.12.14，重建……
   rmdir /s /q "%VENV%"
+)
+
+REM ---- 0) 优先用系统包管理器装 python3.12（winget，比下载快）----
+set "SYS_PY="
+where python3.12 >nul 2>&1 && set "SYS_PY=python3.12"
+if "%SYS_PY%"=="" ( py -3.12 --version >nul 2>&1 && set "SYS_PY=py -3.12" )
+if "%SYS_PY%"=="" (
+  where winget >nul 2>&1 && (
+    echo [setup] 使用 winget 安装 Python 3.12……
+    winget install --id Python.Python.3.12 -e --silent --accept-package-agreements --accept-source-agreements >nul 2>&1
+    where python3.12 >nul 2>&1 && set "SYS_PY=python3.12"
+    if "!SYS_PY!"=="" ( py -3.12 --version >nul 2>&1 && set "SYS_PY=py -3.12" )
+  )
+)
+if not "%SYS_PY%"=="" (
+  echo [setup] 用 %SYS_PY% 创建隔离虚拟环境：%VENV%
+  if exist "%VENV%" rmdir /s /q "%VENV%"
+  %SYS_PY% -m venv "%VENV%"
+  if exist "%VENV%\Scripts\python.exe" (
+    echo [setup] 虚拟环境就绪，跳到依赖安装。
+    goto :install_deps
+  )
 )
 
 REM ---- 1) 发现 release tag（atom feed；失败回退内置 tag）----
@@ -71,15 +93,22 @@ if "%TAG%"=="" (
   echo [setup] 最新 release tag=%TAG%
 )
 
-REM ---- 2) 探测 3.12.x patch 版本（HEAD 未命中很快，命中一次即停）----
+REM ---- 2) 探测 3.12.x patch 版本（先试滚动资产 cpython-3.12+<tag>，短超时；再窄范围探测）----
 set "VERSION=%GARGANTUA_PY_VERSION%"
 if "%VERSION%"=="" (
-  for /l %%m in (8,1,30) do (
-    if "!VERSION!"=="" (
-      set "PROBE_URL=https://github.com/%PBS_REPO%/releases/download/%TAG%/cpython-%PY_SERIES%.%%m+%TAG%-%TRIPLE%-install_only.tar.gz"
-      for /f "delims=" %%c in ('curl -s -o NUL -w "%%{http_code}" -I --connect-timeout 10 --max-time 30 "!PROBE_URL!" 2^>nul') do set "CODE=%%c"
-      if "!CODE!"=="200" set "VERSION=%PY_SERIES%.%%m"
-      if "!CODE!"=="302" set "VERSION=%PY_SERIES%.%%m"
+  set "ROLL_URL=https://github.com/%PBS_REPO%/releases/download/%TAG%/cpython-%PY_SERIES%+%TAG%-%TRIPLE%-install_only.tar.gz"
+  set "CODE=000"
+  for /f "delims=" %%c in ('curl -s -o NUL -w "%%{http_code}" -I --connect-timeout 10 --max-time 12 "!ROLL_URL!" 2^>nul') do set "CODE=%%c"
+  if "!CODE!"=="200" set "VERSION=%PY_SERIES%"
+  if "!CODE!"=="302" set "VERSION=%PY_SERIES%"
+  if "!VERSION!"=="" (
+    for /l %%m in (8,1,24) do (
+      if "!VERSION!"=="" (
+        set "PROBE_URL=https://github.com/%PBS_REPO%/releases/download/%TAG%/cpython-%PY_SERIES%.%%m+%TAG%-%TRIPLE%-install_only.tar.gz"
+        for /f "delims=" %%c in ('curl -s -o NUL -w "%%{http_code}" -I --connect-timeout 6 --max-time 12 "!PROBE_URL!" 2^>nul') do set "CODE=%%c"
+        if "!CODE!"=="200" set "VERSION=%PY_SERIES%.%%m"
+        if "!CODE!"=="302" set "VERSION=%PY_SERIES%.%%m"
+      )
     )
   )
 )
@@ -121,7 +150,7 @@ if not exist "%PYTHON_DIR%\python\python.exe" (
 
   if exist "%TEMP%\gargantua_py.tar.gz" del "%TEMP%\gargantua_py.tar.gz" 2>nul
   set "DL_OK=0"
-  curl -fSL --retry 3 --retry-delay 2 -C - --max-time 900 "!MIRROR!" -o "%TEMP%\gargantua_py.tar.gz"
+  curl -fSL --retry 3 --retry-delay 2 -C - --max-time 600 --progress-bar "!MIRROR!" -o "%TEMP%\gargantua_py.tar.gz"
   if errorlevel 1 (
     echo [setup] 主镜像失败，按默认顺序重试……
   ) else (
@@ -134,7 +163,7 @@ if not exist "%PYTHON_DIR%\python\python.exe" (
         if not "%%~m"=="!MIRROR!" (
           echo [setup] 尝试 %%~m
           del "%TEMP%\gargantua_py.tar.gz" 2>nul
-          curl -fSL --retry 2 -C - --max-time 900 "%%~m" -o "%TEMP%\gargantua_py.tar.gz"
+          curl -fSL --retry 2 -C - --max-time 600 --progress-bar "%%~m" -o "%TEMP%\gargantua_py.tar.gz"
           if not errorlevel 1 (
             tar -tzf "%TEMP%\gargantua_py.tar.gz" >nul 2>&1
             if not errorlevel 1 (
@@ -165,8 +194,13 @@ if not exist "%VENV%\Scripts\python.exe" (
   "%PYTHON_DIR%\python\python.exe" -m venv "%VENV%"
 )
 
+:install_deps
 REM ---- 5) 装依赖 ----
 set "PY=%VENV%\Scripts\python.exe"
+if not exist "%PY%" (
+  echo [setup] X 未找到 venv 解释器：%PY%
+  exit /b 1
+)
 if "%PIP_INDEX_URL%"=="" (
   set "INDEX_ARGS=-i https://pypi.tuna.tsinghua.edu.cn/simple"
 ) else (

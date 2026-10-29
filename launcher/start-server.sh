@@ -24,15 +24,14 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PY="$ROOT/environment/venv/bin/python3"
 
 # ---------------------------------------------------------------------------
-# 纯本地基础组件检查：隔离 Python 必须存在（这是启动的唯一硬前提）
+# 确保隔离 Python（>= 3.12.14，默认 3.12.15）就绪：
+#   - 已存在且达标 → setup-environment.sh 幂等秒回（不联网、不重装）；
+#   - 否则用系统包管理器（brew/apt/dnf/apk）或下载兜底装好。
+#   全程可见输出，绝不静默卡死。
 # ---------------------------------------------------------------------------
-if [ ! -x "$PY" ]; then
-  echo "[launcher] 未找到隔离 Python：$PY"
-  echo "[launcher] 首次启动需联网搭建隔离环境（Python 3.12 + venv + 依赖）……"
-  "$SCRIPT_DIR/setup-environment.sh"
-  # setup 可能没把解释器装到预期位置 → 复检
-  [ -x "$PY" ] || { echo "[launcher] ✗ setup 后仍未找到隔离 Python：$PY"; exit 1; }
-fi
+echo "[launcher] 确保隔离 Python（>= 3.12.14）就绪……"
+"$SCRIPT_DIR/setup-environment.sh"
+[ -x "$PY" ] || { echo "[launcher] ✗ setup 未能准备好隔离 Python，请查看上方报错。"; exit 1; }
 echo "[launcher] 隔离 Python ✓（$PY）"
 
 # ---------------------------------------------------------------------------
