@@ -2,7 +2,7 @@
 # ===========================================================================
 # GARGANTUA v1 — 启动.sh（项目根目录，中文名）：POSIX 一键启动（macOS / Linux）
 # ---------------------------------------------------------------------------
-# 薄包装：中文名启动入口，直接调用同目录的 start-server.sh
+# 薄包装：中文名启动入口，直接调用 launcher/start-server.sh
 # （含启动前 GitHub Release 检查、环境安装、拉起 server）。
 #   用法同 start-server.sh：
 #     ./启动.sh               正常启动（独立窗口）
@@ -11,4 +11,4 @@
 # ===========================================================================
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "$DIR/start-server.sh" "$@"
+exec "$DIR/launcher/start-server.sh" "$@"

@@ -2,7 +2,7 @@
 # GARGANTUA v1 — server_env.py：server 侧的环境预检
 # ---------------------------------------------------------------------------
 # 2026-10-24 重构：steve 的要求是「Server 检查环境，启动 windows.py」。
-# 终端脚本（项目根目录的 start-server.* / setup-environment.sh）只负责搭好隔离环境并 exec server.py，
+# 终端脚本（launcher/ 下的 start-server.* / setup-environment.sh，由根目录 启动.* 调用）只负责搭好隔离环境并 exec server.py，
 # 环境预检由 server 自己做（原 start/launcher.py 的职责并入 server）。
 #
 # 本模块（纯标准库，server 启动早期就能跑，缺依赖时也能给出可读提示）：
@@ -85,7 +85,7 @@ def check_environment(python_exe: str = None) -> bool:
 
     返回 True 才继续启动。失败时打印可执行的修复命令——用户最常见的
     情况是「用系统 Python 直接跑了 server/server.py」（那边没有 torch），
-    提示必须指向 start-server.sh（项目根目录）这条正规链路。
+    提示必须指向 launcher/start-server.sh（由根目录 启动.sh 调用）这条正规链路。
     """
     py = python_exe or sys.executable
     ver = python_version(py)
@@ -106,7 +106,7 @@ def check_environment(python_exe: str = None) -> bool:
     if not check_deps(py):
         print("[server] ✗ 主依赖缺失（torch/numpy/PIL/safetensors）。")
         print("[server]   正规启动方式（自动装好隔离环境后拉起 server）：")
-        print("[server]     ./start-server.sh")
+        print("[server]     ./启动.sh（或 ./启动.command）")
         print("[server]   或手动安装到当前解释器：")
         print(f"[server]     {py} -m pip install -r start/requirements/core.txt")
         return False

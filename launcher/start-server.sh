@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ===========================================================================
-# GARGANTUA v1 — start-server.sh（项目根目录）：POSIX 一键启动（macOS / Linux）
+# GARGANTUA v1 — launcher/start-server.sh：POSIX 一键启动（macOS / Linux，由根目录 启动.sh / 启动.command 调用）
 # ---------------------------------------------------------------------------
 # 1. 启动前自动检查 GitHub 上是否有比本地（VERSION）更新的 Release；
 #    pre-release 默认不建议更新，正式 latest 默认建议更新；y 更新 / n 跳过。
@@ -18,7 +18,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$SCRIPT_DIR" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ---------------------------------------------------------------------------
 # 启动前：检查 GitHub Release 是否有比本地（VERSION 文件）更新的版本

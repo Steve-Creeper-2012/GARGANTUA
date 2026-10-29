@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ===========================================================================
-# GARGANTUA v1 — start-server.command（项目根目录）：macOS 双击启动
+# GARGANTUA v1 — launcher/start-server.command：macOS 双击启动（由根目录 启动.command 调用）
 # ---------------------------------------------------------------------------
 # 与 start.sh 等价，但供 Finder 双击：双击 .command 时 Terminal.app 会以
 # 脚本所在目录为参照打开，这里先 cd 到脚本目录再复用 start.sh。

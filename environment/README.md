@@ -20,7 +20,7 @@ environment/
 
 1. **全部本地产物，不进 git**（`.gitignore` 只放行本 README）。
 2. **一切从脚本重建**：
-   - `setup-environment.sh`（macOS/Linux）或 `setup.bat`（Windows）
+   - `launcher/setup-environment.sh`（macOS/Linux）或 `start/terminal/setup.bat`（Windows）
      装 python + venv + 依赖；镜像自动测速选取（也可用
      `GARGANTUA_PY_BASE_URL` / `PIP_INDEX_URL` 手动指定）。
    - `service/prims/setup.sh` 装 Rust 工具链并构建 GPU 图元转换器。
