@@ -458,8 +458,8 @@ DTYPE = "float32"            # 训练/推理默认 FP32（x86_64 mac 无 CUDA）
 #   切换活动模型时，server / infer / train 进程各自 set_model_vocab()。
 #
 # 启动链（唯一入口）：
-#   start/terminal/start.{sh,bat,command}
-#     → setup.{sh,bat}（幂等：装/复用 environment/python + environment/venv；
+#   start-server.sh / start-server.command（项目根目录） / start/terminal/start.bat（Windows）
+#     → setup-environment.sh / setup.bat（幂等：装/复用 environment/python + environment/venv；
 #        下载镜像与 pip 源均自动测速选取）
 #     → server/server.py
 #         → server_env.check_environment（解释器版本 + 主依赖）

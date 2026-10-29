@@ -7,7 +7,7 @@
 ```
 environment/
 ├── python/     # standalone CPython 3.12.x（python-build-standalone）
-│               #   start/terminal/setup.sh 自动下载解包；不碰系统 Python
+│               #   setup-environment.sh 自动下载解包；不碰系统 Python
 ├── venv/       # 以上述解释器建的虚拟环境
 │               #   start/requirements/{core,window,dev}.txt 分类依赖
 │               #   内含 .gargantua_setup_stamp（依赖清单哈希，幂等）
@@ -20,7 +20,7 @@ environment/
 
 1. **全部本地产物，不进 git**（`.gitignore` 只放行本 README）。
 2. **一切从脚本重建**：
-   - `start/terminal/setup.sh`（macOS/Linux）或 `setup.bat`（Windows）
+   - `setup-environment.sh`（macOS/Linux）或 `setup.bat`（Windows）
      装 python + venv + 依赖；镜像自动测速选取（也可用
      `GARGANTUA_PY_BASE_URL` / `PIP_INDEX_URL` 手动指定）。
    - `service/prims/setup.sh` 装 Rust 工具链并构建 GPU 图元转换器。

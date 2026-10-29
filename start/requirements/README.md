@@ -1,6 +1,6 @@
 # GARGANTUA v1 — 依赖分类（start/requirements）
 
-启动器（`start/terminal/setup.sh` / `setup.bat`）按分类安装，避免把
+启动器（`setup-environment.sh` / `setup.bat`）按分类安装，避免把
 可选/开发依赖污染到训练运行时。
 
 | 文件 | 用途 | 何时安装 |

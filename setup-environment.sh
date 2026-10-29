@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ===========================================================================
-# GARGANTUA v1 — start/terminal/setup.sh：构建隔离 Python 运行时
+# GARGANTUA v1 — setup-environment.sh（项目根目录）：构建隔离 Python 运行时
 # ---------------------------------------------------------------------------
 # 终端启动链第一棒。职责（全部与系统 Python 隔离，装在项目内）：
 #   1. 发现「3.12 系列最新版」python-build-standalone 资产：
@@ -36,7 +36,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+ROOT="$(cd "$SCRIPT_DIR" && pwd)"
 PYTHON_DIR="$ROOT/environment/python"
 VENV="$ROOT/environment/venv"
 REQ_DIR="$ROOT/start/requirements"
@@ -299,4 +299,4 @@ printf 'ts=%s\nreq_hash=%s\npython=%s\npy_mirror=%s\npip_index=%s\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$CUR" "$("$PY" -V 2>&1)" \
   "${MIRROR:-}" "${CHOSEN_INDEX:-}" > "$STAMP"
 log "✓ 隔离环境就绪：${VENV}"
-log "  启动：start/terminal/start.sh（或双击 start.command）"
+log "  启动：./start-server.sh（或双击 start-server.command）"

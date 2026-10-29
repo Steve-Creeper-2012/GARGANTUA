@@ -2,7 +2,7 @@
 REM ===========================================================================
 REM GARGANTUA v1 — start/terminal/setup.bat：Windows 构建隔离 Python 运行时
 REM ---------------------------------------------------------------------------
-REM 与 setup.sh 同职责（详细说明见 setup.sh 文件头），要点：
+REM 与 setup-environment.sh 同职责（详细说明见 setup-environment.sh 文件头），要点：
 REM   1. 发现「3.12 系列最新版」python-build-standalone 资产：
 REM      curl 拉 atom feed（~15KB）→ findstr 取最新 tag（失败回退内置 tag）；
 REM      curl HEAD 探测补 patch 版本；

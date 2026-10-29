@@ -347,12 +347,12 @@ A built-in web UI provides:
 拉起、服务调度全部由 server 自己做：
 
 ```bash
-./start/terminal/start.sh        # macOS / Linux
-./start/terminal/start.command   # macOS: double-click in Finder (Terminal → app window)
+./start-server.sh                # macOS / Linux
+./start-server.command           # macOS: double-click in Finder (Terminal → app window)
 start\terminal\start.bat         # Windows (double-click)
 ```
 
-首次启动 `setup.sh` / `setup.bat` 会：
+首次启动 `setup-environment.sh` / `setup.bat` 会：
 
 1. 从 python-build-standalone 发现并下载 **3.12 系列最新版**（atom feed
    取最新 release tag + HEAD 探测补 patch 号），**镜像自动测速选取**
@@ -449,12 +449,15 @@ Long-running work (inference, model init, image→primitives, **drawing render**
 
 ```
 .
-├── start/                     # 启动链：终端脚本 + 分类依赖 + 路径引导
+├── start-server.sh            # POSIX one-shot launch (macOS / Linux) → setup → exec server.py
+├── start-server.command       # macOS double-click launch (same as above, .command)
+├── setup-environment.sh       # Isolated Python 3.12.x + venv + deps (idempotent,
+│                             #   mirrors auto-selected by live speed test)
+├── start/                     # 启动链：路径引导 + 分类依赖 + Windows 入口
 │   ├── boot.py                # Path bootstrap: server/ + service/* onto sys.path
-│   ├── terminal/              # Terminal entry points
-│   │   ├── setup.sh / .bat    # Isolated Python 3.12.x + venv + deps (idempotent,
-│   │   │                      #   mirrors auto-selected by live speed test)
-│   │   └── start.sh / .bat / .command   # setup → exec server.py
+│   ├── terminal/              # Windows-only entry points (.bat)
+│   │   ├── setup.bat          # Isolated Python 3.12.x + venv + deps (Windows)
+│   │   └── start.bat          # setup → exec server.py (Windows)
 │   └── requirements/          # Categorized dependencies
 │       ├── core.txt           # torch / numpy / pillow / safetensors (required)
 │       ├── window.txt         # pywebview — standalone window (~18 MB, optional)

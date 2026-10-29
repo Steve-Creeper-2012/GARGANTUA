@@ -31,6 +31,7 @@ htmlcov/
 # 编辑器 / 系统
 .DS_Store
 Thumbs.db
+.release_skip
 
 # Agent 工作区数据（会话记录 / 记忆 / 快照，本地产物，不属于代码仓库）
 .workbuddy/

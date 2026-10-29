@@ -804,7 +804,7 @@ class TestServerEnvLauncher(unittest.TestCase):
 class TestStartupChain(unittest.TestCase):
     """ 2026-10-24 启动链（server 拥有环境检查/窗口校验/服务调度）的回归。
 
-    端到端（setup.sh 装隔离环境 → server.py 起窗口+服务子进程、窗口崩溃
+    端到端（setup-environment.sh 装隔离环境 → server.py 起窗口+服务子进程、窗口崩溃
     不影响 server、server 退出带走服务）已手工验证；这里固化不依赖 GUI
     的部分：模块边界、re-export 完整性、窗口冒烟、收尸逻辑、环境预检。 """
 
