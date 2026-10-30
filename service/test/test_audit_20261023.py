@@ -410,10 +410,12 @@ class TestAuditMisc(unittest.TestCase):
 
     def test_frontend_dom_ids_exist(self):
         # 修复前：refreshHome 引用不存在的 DOM id（home 环境卡片死亡）
-        html = (Path(ROOT) / "service" / "web" / "index_source.html").read_text(
-            encoding="utf-8")
+        web = Path(ROOT) / "service" / "web"
+        html = (web / "index_source.html").read_text(encoding="utf-8")
+        js = (web / "app.js").read_text(encoding="utf-8")
+        # 前端 JS 已拆到 app.js：DOM id 引用可能来自 app.js
         # 负向回顾排除 $$（querySelectorAll，参数是 CSS 选择器不是 id）
-        js_ids = set(re.findall(r'(?<!\$)\$\("([^"]+)"\)', html))
+        js_ids = set(re.findall(r'(?<!\$)\$\("([^"]+)"\)', html + "\n" + js))
         dom_ids = set(re.findall(r'id="([^"]+)"', html))
         self.assertEqual(js_ids - dom_ids, set(),
                          "JS 引用了不存在的 DOM id")

@@ -57,6 +57,11 @@ SUITES = [
     ("test_audit_20261027", "service.test.test_audit_20261027", 1800, "unittest"),
     ("test_services", "service.test.test_services", 600, "unittest"),
     ("test_server", "service.test.test_server", 2400, "unittest"),
+    # 2026-10-29 新增：进程监视器 / CPU 拓扑 / 越权白名单（35 项，秒级）
+    ("test_monitor_ui", "service.test.test_monitor_ui", 600, "unittest"),
+    # 2026-10-29 新增：词表预设名路径穿越（任意 vocab.txt 写）防护（16 项）
+    ("test_vocab_preset_path", "service.test.test_vocab_preset_path", 600,
+     "unittest"),
     ("verify_formats", "service/test/verify_formats.py", 600, "script"),
 ]
 

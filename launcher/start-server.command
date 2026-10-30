@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ===========================================================================
-# GARGANTUA v1 — launcher/start-server.command：macOS 双击启动（由根目录 启动.command 调用）
+# GARGANTUA v1 — launcher/start-server.command：macOS 双击启动（兼容入口）
 # ---------------------------------------------------------------------------
-# 与 start.sh 等价，但供 Finder 双击：双击 .command 时 Terminal.app 会以
-# 脚本所在目录为参照打开，这里先 cd 到脚本目录再复用 start.sh。
-# 关闭终端窗口即触发 server 的收尾（窗口/服务依次退出）。
+# 真正的双击入口在根目录 启动.command（它负责「交接成功后关掉终端窗口」）。
+# 这里只是历史路径的兼容壳：转发给根目录 启动.command，避免两处各写一套
+# 关窗逻辑导致行为分叉。
 # ===========================================================================
 DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$DIR" || exit 1
-exec "./start-server.sh" "$@"
+cd "$DIR/.." || exit 1
+exec "./启动.command" "$@"

@@ -50,12 +50,39 @@ def _valid_name(name) -> str | None:
 # ---------------------------------------------------------------------------
 # 读取 / 写入扁平词表文件
 # ---------------------------------------------------------------------------
-def preset_dir(name: str) -> Path:
-    return VOCABS_DIR / name
+def _assert_within_vocabs(name, path) -> None:
+    """realpath 前缀校验：解析符号链接后路径仍须落在 VOCABS_DIR 内。"""
+    base = os.path.realpath(VOCABS_DIR)
+    target = os.path.realpath(path)
+    try:
+        inside = os.path.commonpath([base, target]) == base
+    except ValueError:          # 跨盘符 / 混合绝对相对路径：无公共前缀
+        inside = False
+    if not inside:
+        raise ValueError(f"非法词表预设名: {name!r}")
 
 
-def vocab_txt_path(name: str) -> Path:
-    return preset_dir(name) / "vocab.txt"
+def preset_dir(name) -> Path:
+    # 统一底层强制校验（2026-10-30 安全修复）：所有预设读写入口都经由这里
+    # 拼路径——vocab_txt_path 直接调用它，validate_preset / create_preset /
+    # delete_preset / ensure_base / _write_preset 也都用它。此前只有
+    # create_preset / delete_preset 校验 name，HTTP 入参的 name / source /
+    # --vocab 可传 "../models/alpha" 在其余入口穿越写出到任意 vocab.txt。
+    # 在这里拦一次即可覆盖全部调用者，避免逐处补校验再次遗漏。
+    # 一律抛 ValueError：server.do_POST 把 ValueError 统一映射为 400。
+    if _valid_name(name) is not None:
+        raise ValueError(f"非法词表预设名: {name!r}")
+    p = VOCABS_DIR / name
+    _assert_within_vocabs(name, p)   # 防 name 为符号链接目录绕过
+    return p
+
+
+def vocab_txt_path(name) -> Path:
+    p = preset_dir(name) / "vocab.txt"
+    # 目录层已校验；这里再对最终 vocab.txt 做一次前缀校验（纵深防御，
+    # 防目录内 vocab.txt 被换成指向外部文件的符号链接）。
+    _assert_within_vocabs(name, p)
+    return p
 
 
 def read_flat_entries(name: str) -> list:
@@ -162,6 +189,10 @@ def list_presets() -> list:
     if VOCABS_DIR.is_dir():
         for child in sorted(VOCABS_DIR.iterdir()):
             if not child.is_dir():
+                continue
+            # 跳过非法名目录：底层 preset_dir/vocab_txt_path 会拒这些名字，
+            # 这里不拦会让 _upgrade_preset 抛 ValueError，列预设接口变 500。
+            if _valid_name(child.name) is not None:
                 continue
             txt = child / "vocab.txt"
             if not txt.is_file():

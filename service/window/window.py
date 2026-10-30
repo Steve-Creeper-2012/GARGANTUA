@@ -23,6 +23,7 @@
 import argparse
 import os
 import sys
+import time
 import urllib.request
 
 APP_TITLE = "GARGANTUA"
@@ -30,7 +31,6 @@ APP_TITLE = "GARGANTUA"
 
 def wait_for_server(port: int, host: str, timeout: float = 60.0) -> bool:
     """ 等 server 就绪再开窗口：避免窗口先起来看到「无法连接」。 """
-    import time
     url = f"http://{host}:{port}/api/status"
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -60,8 +60,14 @@ def open_window(port: int, host: str, width: int, height: int):
     if not wait_for_server(port, host):
         print(f"[window] 等 server 就绪超时，仍尝试打开 {url}")
 
+    # 每次开窗都换一个查询串：WKWebView 会按 URL 缓存页面，旧窗口/旧会话可能
+    # 拿到上一版 index.html（2026-10-29 真实事故：界面停在重构前的旧版，看着
+    # 像「打不开」）。换 URL 等于强制走一次全新加载。
+    url = f"{url}?v={int(time.time() * 1000)}"
+
     win = webview.create_window(APP_TITLE, url, width=width, height=height,
                                 min_size=(960, 640), text_select=True)
+    print(f"[window] 已创建窗口 {url}", flush=True)
     # 关窗口 ≠ 关 server：这里只发通知，真正退出由 run.py 决定
     try:
         win.events.closed += lambda: print("[window] 窗口已关闭（server 继续运行）")

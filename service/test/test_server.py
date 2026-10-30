@@ -375,7 +375,11 @@ class TestServer(unittest.TestCase):
             import json as _json
             with open(meta_path, encoding="utf-8") as f:
                 meta = _json.load(f)
-            self.assertEqual(meta["n_tokens"], len(steps))
+            # n_tokens 是「本次推理落盘的 token 总数」（按元素累计），而 tok5
+            # 解码会把相邻单 token 步合并，steps 数量 ≠ token 数。正确不变量
+            # 是 n_tokens == 各 step 元素之和（见 infer.py IdArchive）。
+            n_step_tokens = sum(len(it.get("elements") or []) for it in steps)
+            self.assertEqual(meta["n_tokens"], n_step_tokens)
             self.assertEqual(meta["n_generated_tokens"], 1)
             self.assertGreaterEqual(meta["n_prompt_tokens"], 1)
             self.assertEqual(meta["n_evicted"], 0)

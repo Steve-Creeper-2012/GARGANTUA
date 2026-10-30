@@ -4,10 +4,20 @@
 # 只放无状态、无依赖的取值/校验助手，避免 server.py ↔ server_codecs.py
 # 之间为拿一个函数而互相 import（循环依赖）。
 # ===========================================================================
+import math
 import os
 import re
 
 _INT_RE = re.compile(r"[+-]?\d+")
+
+
+def _finite(value, key):
+    """拒绝 NaN / ±Inf（审计 L4）：JSON 的 1e400 会被 json.loads 解析成
+    inf，字符串 "nan"/"inf" 也能过 float()。非有限值流进 temperature /
+    top_p 等采样参数会造成不可预期行为，且 json.dumps 会产出非标准 JSON。"""
+    if not math.isfinite(value):
+        raise ValueError(f"{key} 必须是有限数值: {value!r}")
+    return value
 
 
 def num_param(body, key, default, cast):
@@ -37,14 +47,15 @@ def num_param(body, key, default, cast):
         if isinstance(v, str) and _INT_RE.fullmatch(v.strip()):
             return int(v.strip())
         raise ValueError(f"{key} 必须是整数: {v!r}")
-    # float
+    # float（审计 L4：非有限值必须拒，见 _finite）
     if isinstance(v, (int, float)):
-        return float(v)
+        return _finite(float(v), key)
     if isinstance(v, str):
         try:
-            return float(v.strip())
+            f = float(v.strip())
         except ValueError:
             raise ValueError(f"{key} 必须是数值: {v!r}")
+        return _finite(f, key)          # 不在 try 内，避免有限性错误被吞掉
     raise ValueError(f"{key} 必须是数值: {v!r}")
 
 

@@ -498,25 +498,36 @@ class TestMinifyFreshness(unittest.TestCase):
 
     def test_verify_detects_stale_product(self):
         minify = _load_minify()
-        with open(os.path.join(boot.project_root(), "service", "web",
-                               "index_source.html"), encoding="utf-8") as f:
+        web = os.path.join(boot.project_root(), "service", "web")
+        with open(os.path.join(web, "index_source.html"),
+                  encoding="utf-8") as f:
             src = f.read()
+        css = open(os.path.join(web, "app.css"), encoding="utf-8").read()
+        js = open(os.path.join(web, "app.js"), encoding="utf-8").read()
         good = minify.minify_html(src)
-        self.assertTrue(minify.verify(src, good))
-        # 旧产物（脚本段少一行）必须被判定过期
-        stale = good.replace("const $ = id =>", "const  $ = id =>", 1)
-        self.assertNotEqual(stale, good)
-        self.assertFalse(minify.verify(src, stale))
+        self.assertTrue(minify.verify(src, good, css, js))
+        # 旧产物（HTML 漂移：标题被改）必须被判定过期
+        stale_html = good.replace("<title>GARGANTUA</title>",
+                                  "<title>GARGANTUA2</title>", 1)
+        self.assertNotEqual(stale_html, good)
+        self.assertFalse(minify.verify(src, stale_html, css, js))
+        # app.css / app.js 是直接编辑、直接服务的源文件（无独立构建步），
+        # 不会「产物过期」；但语法损坏的 app.js 必须被 node --check 拦下
+        self.assertFalse(
+            minify.verify(src, good, css, "function ( { // 语法错误"))
 
     def test_shipped_index_html_is_current(self):
-        """仓库里的 index.html 必须就是当前 index_source.html 的压缩产物。"""
+        """仓库里的 index.html 必须与 app.css / app.js 一起构成当前
+        index_source.html 的最新产物（三件缺一不可漂移）。"""
         web = os.path.join(boot.project_root(), "service", "web")
         with open(os.path.join(web, "index_source.html"),
                   encoding="utf-8") as f:
             src = f.read()
         with open(os.path.join(web, "index.html"), encoding="utf-8") as f:
             dst = f.read()
-        self.assertEqual(dst, minify_html_of(src))
+        css = open(os.path.join(web, "app.css"), encoding="utf-8").read()
+        js = open(os.path.join(web, "app.js"), encoding="utf-8").read()
+        self.assertTrue(minify_html_of_verify(src, dst, css, js))
 
 
 class TestFrontendTaskState(unittest.TestCase):
@@ -524,9 +535,14 @@ class TestFrontendTaskState(unittest.TestCase):
 
     @staticmethod
     def _src():
-        with open(os.path.join(boot.project_root(), "service", "web",
-                               "index_source.html"), encoding="utf-8") as f:
-            return f.read()
+        # 前端 JS 已拆到 app.js：源码级断言需同时扫描 index_source.html 与 app.js
+        web = os.path.join(boot.project_root(), "service", "web")
+        with open(os.path.join(web, "index_source.html"),
+                  encoding="utf-8") as f:
+            html = f.read()
+        with open(os.path.join(web, "app.js"), encoding="utf-8") as f:
+            js = f.read()
+        return html + "\n" + js
 
     def test_api_has_timeout_and_cancel(self):
         src = self._src()
@@ -548,6 +564,10 @@ class TestFrontendTaskState(unittest.TestCase):
 
 def minify_html_of(src: str) -> str:
     return _load_minify().minify_html(src)
+
+
+def minify_html_of_verify(src: str, dst: str, css: str, js: str) -> bool:
+    return _load_minify().verify(src, dst, css, js)
 
 
 if __name__ == "__main__":

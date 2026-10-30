@@ -343,8 +343,8 @@ A built-in web UI provides:
 
 ### Launch
 
-终端脚本只负责「把隔离环境准备好，然后让位给 server」；环境检查、窗口
-拉起、服务调度全部由 server 自己做：
+终端脚本只负责「把隔离环境准备好，然后**把控制权交给 server 并自己退出**」；
+环境检查、窗口拉起、服务调度全部由 server 自己做：
 
 ```bash
 # 根目录只暴露三个中文名启动脚本；内部启动器在 launcher/ 子目录，一般无需直接调用
@@ -353,6 +353,20 @@ A built-in web UI provides:
 启动.bat                         # Windows: 双击启动（调用 start\terminal\start.bat）
 # 内部实现（launcher/ 子目录）：launcher/start-server.sh / launcher/setup-environment.sh
 ```
+
+**交接（2026-10-29 起）**：`start-server.sh` 不再 `exec` 顶替自己，而是用
+`nohup … &` + `disown` 把 server 放进**后台独立进程**（stdin 接 `/dev/null`，
+stdout 追加到 `logs/server.log`，PID 写 `logs/server.pid`），等 `/api/status`
+就绪后打印地址就退出。于是：
+
+- 终端窗口不再被 server 占着；双击 `启动.command` 时窗口会在交接成功后**自动关闭**
+  （只关自己那个窗口，且仅在 Terminal.app 内、退出码为 0 时才关）。
+- server 与窗口都用 `setsid` 脱离了启动它的会话，所以关终端、断 SSH 都碰不到它们
+  （只靠 `nohup` 挡 SIGHUP 是不够的：终端窗口关闭时整个会话被销毁，窗口会跟着消失）。
+- 重复双击不会起第二个 server；如果 server 在跑但**窗口没了**，会直接把窗口补开
+  （窗口是子进程，关掉就没了，server 自己不会再拉一次）。
+- 停止：`./启动.sh --stop`（pidfile 丢了也能按端口找；顺手收掉该端口的窗口）。
+- 调试想占住终端：`./启动.sh --foreground`（保留老的 `exec` 行为，窗口跑在终端会话里）。
 
 首次启动 `setup-environment.sh` / `setup.bat` 会：
 
@@ -380,6 +394,8 @@ A built-in web UI provides:
 | `--no-window` | Server only — no GUI window (SSH / servers / CI) |
 | `--idle-timeout S` | Service subprocess idle self-exit (default 300s) |
 | `--model-dir` / `--data-dir` / `--log-file` | Override default paths |
+| `--foreground` (launcher) | 前台 `exec`，不交接、不关窗（调试 / systemd / 容器） |
+| `--stop` (launcher) | 读 `logs/server.pid` 停掉后台 server |
 
 环境变量：`GARGANTUA_PY_RELEASE` / `GARGANTUA_PY_VERSION`（锁定
 python-build-standalone 版本）、`GARGANTUA_PY_BASE_URL`（指定 Python
@@ -406,15 +422,17 @@ a browser by hand.
 Process model (deliberate, Steam-like):
 
 ```
+启动脚本 ──→ 预检 + 交接（nohup，随后自己退出）
 server.py ──┬── infer/train/init 服务子进程   按需拉起，空闲自行退出
             └── window.py                    UI 窗口（崩了不影响 server）
 ```
 
+- 启动脚本交接完就退出，不占终端；server 是独立进程，关终端/断 SSH 都不影响它。
 - Closing or crashing the window leaves the server running; the log prints
   the command to reopen the UI.
 - Exiting the server takes the window and all service subprocesses down
   with it (no orphans pointing at a dead port). Ctrl-C / SIGTERM both go
-  through the cleanup path.
+  through the cleanup path. 后台启动的 server 用 `./启动.sh --stop` 停。
 
 ### Services start on demand (memory)
 

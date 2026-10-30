@@ -28,10 +28,11 @@
 # 文件末尾的 re-export 保持可用。
 #
 # HTTP 错误契约（README「HTTP contract」）：
-#   400 入参非法   404 路径/任务不存在   409 状态冲突
-#   411 需 Content-Length（拒 chunked）   413 请求体 > 512MB
+#   400 入参非法   404 路径/任务不存在   409 状态冲突   403 非法来源
+#   413 请求体 > 512MB / 拒 chunked（缺 Content-Length）
 # ===========================================================================
 import argparse
+import binascii
 import glob
 import json
 import os
@@ -71,6 +72,7 @@ from server_util import num_param, optional_install_cmd, pip_index_args
 
 WINDOW_PY = os.path.join(ROOT, "service", "window", "window.py")
 WEB_INDEX = os.path.join(ROOT, "service", "web", "index.html")
+WEB_DIR = os.path.dirname(WEB_INDEX)            # 前端静态资源（app.css/app.js）所在目录
 
 # 请求体硬上限（base64 后的视频/音频可能上百 MB，512MB 是宽松保护值）
 MAX_BODY_BYTES = 512 * 1024 * 1024
@@ -158,6 +160,11 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi):
         name = body.get("name")
         if not name:
             raise ValueError("缺少 name")
+        # 审计 L3：init 此前不校验模型名（load 早已校验），"../" 会拼进
+        # service/init/init.py 的 --name / --out 路径。统一走 valid_model_name。
+        bad = valid_model_name(name)
+        if bad:
+            raise ValueError(f"非法模型名: {bad}")
         # 2026-10-23 审计修复（P2）：训练中覆盖【活动模型】会把磁盘上的
         # 训练成果抹掉再被下一次落盘盖回，状态混乱。api_model_load 早有
         # 409 保护，init 此前没有——状态契约不对称，这里补齐。
@@ -481,6 +488,58 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     timeout = 30                          # socket 超时：慢速恶意连接不占死线程
 
+    # ---------------- 来源防护（2026-10-29 审计 S2） ----------------
+    # 默认绑定 127.0.0.1，但 HTTP 层此前完全信任 Host / Origin：
+    #   * DNS rebinding：恶意域名解析到 127.0.0.1，浏览器视其同源，
+    #     可读 /api/vocab 等状态、可用简单请求盲打状态变更端点；
+    #   * 任意网页可用 text/plain 简单 POST 盲打 /api/system/install。
+    # 三道闸门：Host 白名单 + Origin/Sec-Fetch-Site 校验 + 状态变更 POST
+    # 必须 application/json（非 CORS-safelisted，跨站会触发预检，而本服务
+    # 不支持 OPTIONS/CORS，预检必然失败）。本机 pywebview 同源请求不受影响。
+    _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+    @staticmethod
+    def _host_only(value):
+        """从 'host:port' / '[::1]:8712' 里取出 host 部分。"""
+        v = (value or "").strip()
+        if v.startswith("["):
+            return (v.split("]", 1)[0] + "]").lower()
+        return (v.rsplit(":", 1)[0] if ":" in v else v).lower()
+
+    def _guard_request(self, is_post=False):
+        bound = ""
+        try:
+            bound = self.server.server_address[0]
+        except Exception:
+            pass
+        # 显式绑定非回环（--host 0.0.0.0 供局域网访问）时跳过 Host 校验，
+        # 但下面的 Origin / Content-Type 校验仍然生效。
+        strict_host = bound in ("127.0.0.1", "::1", "localhost", "")
+        host = (self.headers.get("Host") or "").strip()
+        if strict_host and self._host_only(host) not in self._LOCAL_HOSTS:
+            self._send_error_json(403, f"非法 Host: {host!r}")
+            return False
+        if not is_post:
+            return True
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin and origin.lower() != "null":
+            oh = origin.split("://", 1)[-1].split("/", 1)[0]
+            if self._host_only(oh) not in self._LOCAL_HOSTS:
+                self._send_error_json(403, f"跨站来源被拒绝: {origin!r}")
+                return False
+        if (self.headers.get("Sec-Fetch-Site") or "").lower() == "cross-site":
+            self._send_error_json(403, "跨站请求被拒绝")
+            return False
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if ctype != "application/json":
+            self._send_error_json(403, "状态变更请求必须使用 application/json")
+            return False
+        return True
+
+    def do_OPTIONS(self):
+        # 明确拒绝预检：不返回任何 CORS 头，跨站 application/json 必然失败
+        self._send_error_json(403, "不支持跨源预检")
+
     def log_message(self, fmt, *args):
         pass                                    # 静默访问日志
     # ---------------- 基础工具 ----------------
@@ -497,6 +556,30 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": msg}, code)
         except Exception:
             pass
+
+    def _serve_static(self, name):
+        # 只放白名单里的前端资源（app.css / app.js），杜绝任意文件读取与穿越
+        if name not in ("app.css", "app.js"):
+            self._send_error_json(403, f"禁止访问: {name}")
+            return
+        base = os.path.realpath(WEB_DIR)
+        abspath = os.path.realpath(os.path.join(base, name))
+        if abspath != os.path.join(base, name) and not abspath.startswith(base + os.sep):
+            self._send_error_json(403, "禁止访问")
+            return
+        if not os.path.isfile(abspath):
+            self.send_error(404, "Not Found")
+            return
+        ctype = ("text/css; charset=utf-8" if name.endswith(".css")
+                 else "application/javascript; charset=utf-8")
+        with open(abspath, "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store, must-revalidate")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _read_body(self):
         # chunked 传输编码：Content-Length 解析为 0，后续 read 会错乱 → 411
@@ -531,6 +614,8 @@ class Handler(BaseHTTPRequestHandler):
     # ---------------- 路由 ----------------
     def do_GET(self):
         app = self.server.app
+        if not self._guard_request(False):
+            return
         u = urlparse(self.path)
         path, query = u.path, parse_qs(u.query)
         try:
@@ -577,6 +662,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/vocab/presets":
                 _code, obj = app.api_vocab_presets({})
                 self._send_json(obj, _code)
+            elif path in ("/app.css", "/app.js"):
+                self._serve_static(path.lstrip("/"))
             else:
                 self._send_error_json(404, f"未知路径: {path}")
         except BrokenPipeError:
@@ -586,6 +673,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         app = self.server.app
+        if not self._guard_request(True):
+            return
         path = urlparse(self.path).path
         routes = {
             "/api/model/init": app.api_model_init,
@@ -627,7 +716,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error_json(413, str(e))
         except (ConflictError, FileExistsError) as e:
             self._send_error_json(409, str(e))
-        except (ValueError, FileNotFoundError, KeyError) as e:
+        except (ValueError, FileNotFoundError, KeyError, TypeError,
+                binascii.Error) as e:
+            # 审计 L2：base64 错值抛 binascii.Error、类型混淆抛 TypeError，
+            # 都属入参问题，应 400 而不是 500（5xx 会误报成服务端故障）
             self._send_error_json(400, str(e))
         except RuntimeError as e:
             self._send_error_json(500, str(e))
@@ -650,7 +742,13 @@ def _window_env() -> dict:
 def spawn_window(port: int, host: str):
     cmd = [sys.executable, WINDOW_PY, "--port", str(port), "--host", host]
     print(f"[server] 启动窗口：{' '.join(cmd)}")
-    return subprocess.Popen(cmd, env=_window_env())
+    # start_new_session=True → 窗口 setsid 到自己的会话，脱离启动它的那个终端。
+    # 2026-10-29 真实事故：launcher 把 server 后台化后，双击 启动.command 的
+    # 终端窗口会在交接完成后自动关闭；窗口子进程当时和终端同一个会话，
+    # 终端一关就收到 SIGHUP/会话销毁，pywebview 触发 closed、窗口凭空消失
+    # （日志里只剩一句「窗口已关闭（server 继续运行）」）。setsid 之后终端
+    # 怎么关都碰不到它；GUI 权限来自 launchd 的 bootstrap 命名空间，与 tty 无关。
+    return subprocess.Popen(cmd, env=_window_env(), start_new_session=True)
 
 
 def _watch_window(proc, port: int, host: str) -> None:

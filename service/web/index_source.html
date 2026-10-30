@@ -1,385 +1,113 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark" data-contrast="normal">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GARGANTUA 控制台</title>
-<style>
-  :root {
-    --bg: #0d1117; --bg2: #161b22; --bg3: #21262d; --bg4: #30363d;
-    --fg: #e6edf3; --fg2: #8b949e; --fg3: #6e7681;
-    --accent: #58a6ff; --accent2: #79c0ff; --green: #3fb950; --red: #f85149;
-    --orange: #d29922; --purple: #a371f7;
-    --border: #30363d;
-  }
-  * { box-sizing: border-box; }
-  html, body { height: 100%; }
-  body { margin: 0; background: var(--bg); color: var(--fg);
-         font: 14px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-         overflow: hidden;
-         /* 设计语言：文本默认禁止选中（按钮/边栏/标题一律不可选），
-            输入框 / 日志 pre / 聊天消息 / 编辑器单独放开 */
-         user-select: none; -webkit-user-select: none; }
-  input, textarea, pre, [contenteditable="true"], .msg, code {
-    user-select: text; -webkit-user-select: text; }
-
-  /* ---------- 布局（2026-10-29 重构：顶栏整体删除，标题归边栏） ---------- */
-  #app { display: flex; height: 100vh; }
-
-  /* ---------- 左侧导航 ---------- */
-  #sidebar { display: flex; flex-direction: column; background: var(--bg2);
-             border-right: 1px solid var(--border); transition: width .18s ease;
-             width: 216px; flex-shrink: 0; }
-  #sidebar.collapsed { width: 60px; }
-  #sidebar .brand { display: flex; align-items: center; justify-content: space-between;
-                    padding: 16px 14px 10px; }
-  #sidebar.collapsed .brand { justify-content: center; padding: 16px 6px 10px; }
-  #sidebar .brand-text { font-weight: 800; color: var(--accent); font-size: 17px;
-                         letter-spacing: .8px; white-space: nowrap; }
-  #sidebar.collapsed .brand-text { display: none; }
-  #toggle-nav { background: none; border: none; color: var(--fg2); cursor: pointer;
-                padding: 4px; border-radius: 6px; display: flex; }
-  #toggle-nav:hover { background: var(--bg3); color: var(--fg); }
-  #nav, #nav-bottom { padding: 0 8px; }
-  #nav { flex: 1; overflow-y: auto; }
-  #nav-bottom { padding-bottom: 12px; }
-  .nav-group { margin: 14px 6px 4px; color: var(--fg3); font-size: 12px;
-               font-weight: 700; letter-spacing: .5px; white-space: nowrap; }
-  #sidebar.collapsed .nav-group { visibility: hidden; height: 8px; margin: 8px 0 0; }
-  .nav-item { display: flex; align-items: center; gap: 12px; width: 100%;
-              padding: 9px 12px; margin-bottom: 2px; border-radius: 8px;
-              background: none; border: none; color: var(--fg2); cursor: pointer;
-              text-align: left; transition: .15s; font-size: 15px; font-weight: 500; }
-  .nav-item:hover { background: var(--bg3); color: var(--fg); }
-  .nav-item.active { background: var(--bg4); color: var(--accent); font-weight: 700; }
-  .nav-item svg { width: 20px; height: 20px; flex-shrink: 0; }
-  .nav-item .label { white-space: nowrap; overflow: hidden; }
-  #sidebar.collapsed .nav-item { justify-content: center; padding: 9px 0; }
-  #sidebar.collapsed .nav-item .label { display: none; }
-
-  /* ---------- 主内容 ---------- */
-  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-  #pages { flex: 1; overflow: hidden; padding: 20px 26px; position: relative; }
-  .page { display: none; height: 100%; animation: fade .18s ease; }
-  .page.active { display: flex; flex-direction: column; }
-  .page.scroll { overflow-y: auto; }
-  @keyframes fade { from { opacity: 0; transform: translateY(4px); }
-                    to { opacity: 1; transform: translateY(0); } }
-  /* 标题体系（2026-10-29）：全部放大 + 加粗 */
-  h2 { margin: 4px 0 20px; font-size: 26px; font-weight: 700; color: var(--fg);
-       flex-shrink: 0; letter-spacing: .3px; }
-  h3 { margin: 0; font-size: 17px; font-weight: 700; color: var(--fg); }
-  .sec-head { display: flex; justify-content: space-between; align-items: center;
-              margin: 22px 0 10px; flex-shrink: 0; }
-
-  /* ---------- 表单控件（统一设计系统） ----------
-     深色主题下 macOS/WKWebView 的原生控件（灰渐变 select、白按钮 file input、
-     number 上下箭头）和界面完全不是一个世界。全部 appearance:none 抹掉系统外观，
-     用自己的边框/圆角/focus ring 重画，视觉才统一。 */
-  :root {
-    --field-bg: var(--bg3);
-    --field-border: var(--border);
-    --field-radius: 8px;
-    --field-ring: 0 0 0 3px rgba(88, 166, 255, .18);
-  }
-  input, select, textarea {
-    appearance: none; -webkit-appearance: none;
-    background: var(--field-bg); color: var(--fg);
-    border: 1px solid var(--field-border);
-    border-radius: var(--field-radius);
-    padding: 8px 11px; width: 100%; font-family: inherit;
-    font-size: 13px; line-height: 1.4; outline: none;
-    transition: border-color .15s ease, box-shadow .15s ease,
-                background-color .15s ease; }
-  input::placeholder, textarea::placeholder { color: var(--fg3); }
-  @media (hover: hover) and (pointer: fine) {
-    input:hover:not(:focus):not(:disabled),
-    select:hover:not(:focus):not(:disabled),
-    textarea:hover:not(:focus):not(:disabled) { border-color: var(--fg3); }
-  }
-  input:focus, select:focus, textarea:focus {
-    border-color: var(--accent); box-shadow: var(--field-ring); }
-  input:disabled, select:disabled, textarea:disabled {
-    opacity: .5; cursor: not-allowed; }
-  /* select：右侧自带 chevron（系统那个箭头被 appearance:none 抹掉了） */
-  select {
-    padding-right: 30px; cursor: pointer;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238b949e' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 10px center; }
-  select option { background: var(--bg2); color: var(--fg); }
-  /* number：去掉上下微调箭头 */
-  input[type=number] { -moz-appearance: textfield; font-variant-numeric: tabular-nums; }
-  input[type=number]::-webkit-inner-spin-button,
-  input[type=number]::-webkit-outer-spin-button {
-    appearance: none; -webkit-appearance: none; margin: 0; }
-  /* file input：整个藏起来，用 label 里的假按钮 + 文件名接管交互 */
-  input[type=file] { position: absolute; width: 1px; height: 1px;
-                     opacity: 0; pointer-events: none; }
-  .file-pick { display: inline-flex; align-items: center; gap: 10px;
-               min-width: 0; max-width: 100%; cursor: pointer; }
-  .file-pick .file-btn { flex-shrink: 0; padding: 7px 14px; font-size: 12px;
-    font-weight: 600; color: var(--fg); background: var(--bg3);
-    border: 1px solid var(--border); border-radius: var(--field-radius);
-    transition: border-color .15s ease, background-color .15s ease; }
-  @media (hover: hover) and (pointer: fine) {
-    .file-pick:hover .file-btn { border-color: var(--fg3); background: var(--bg4); }
-  }
-  .file-pick .file-name { color: var(--fg2); font-size: 12px; min-width: 0;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .file-pick.has-file .file-name { color: var(--accent2); }
-  .file-pick.has-file .file-btn { border-color: var(--accent); color: var(--accent2); }
-  .grow { flex: 1 1 auto; min-width: 140px; }
-  code { background: var(--bg3); border: 1px solid var(--border);
-         border-radius: 4px; padding: 0 5px; font-size: 12px;
-         font-family: ui-monospace, SFMono-Regular, monospace; }
-  textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, monospace; }
-
-  /* ---------- 按钮（设计语言：全部自绘 + 圆角 + 不可选中） ---------- */
-  button, .file-btn, .token-palette button { user-select: none;
-    -webkit-user-select: none; }
-  button.act { background: var(--accent); color: #06101f; border: none;
-    border-radius: 9px; padding: 8px 18px; cursor: pointer; font-weight: 600;
-    font-size: 13px; display: inline-flex; align-items: center; gap: 6px;
-    font-family: inherit; }
-  button.act:hover { background: var(--accent2); }
-  button.act:disabled { opacity: .45; cursor: default; }
-  button.act.sec { background: var(--bg3); color: var(--fg); border: 1px solid var(--border); }
-  button.act.sec:hover { background: var(--bg4); }
-  button.act.danger { background: var(--red); color: #fff; }
-  button.act.danger:hover { background: #ff7b72; }
-  button.act.xs { padding: 4px 11px; font-size: 12px; border-radius: 7px; }
-  .row { display: flex; gap: 12px; align-items: center; margin: 10px 0;
-         flex-wrap: wrap; }
-  .row label { color: var(--fg2); font-size: 12px; display: flex;
-               align-items: center; gap: 6px; }
-  .row input[type=number] { width: 78px; }
-  .card { background: var(--bg2); border: 1px solid var(--border);
-          border-radius: 12px; padding: 14px; margin-bottom: 12px; }
-  .card-head { display: flex; justify-content: space-between; align-items: center;
-               margin-bottom: 10px; }
-  .card-title { font-weight: 600; color: var(--fg); font-size: 15px; }
-  .hint { color: var(--fg2); font-size: 12px; }
-  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px;
-           background: var(--bg3); color: var(--fg2); font-size: 11px; }
-  .badge.on { color: var(--green); }
-  pre { background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
-        padding: 10px; overflow: auto; font-size: 12px; margin: 0;
-        white-space: pre-wrap; word-break: break-all;
-        font-family: ui-monospace, SFMono-Regular, monospace; }
-
-  /* ---------- 表格（设计语言：无竖线无横线，圆角容器 + 深浅交替行） ---------- */
-  .table-wrap { background: var(--bg2); border: 1px solid var(--border);
-                border-radius: 12px; overflow: hidden; }
-  table { border-collapse: collapse; width: 100%; font-size: 13px; }
-  th, td { border: none; padding: 9px 14px; text-align: left; }
-  thead th { background: var(--bg3); color: var(--fg2); font-weight: 600;
-             white-space: nowrap; }
-  tbody tr:nth-child(odd) { background: rgba(255, 255, 255, .03); }
-  tbody tr:hover { background: rgba(88, 166, 255, .06); }
-  td.mono { font-variant-numeric: tabular-nums; font-family: ui-monospace,
-            SFMono-Regular, monospace; font-size: 12px; }
-  th.clickable, td.clickable { cursor: pointer; }
-  canvas.chart { background: var(--bg); border: 1px solid var(--border);
-           border-radius: 8px; width: 100%; }
-  .svg-out svg { max-width: 100%; height: auto; display: block;
-                 border: 1px solid var(--border); border-radius: 8px; background: #fff; }
-
-  /* ---------- 主页：设备大框 ---------- */
-  .device-card { background: var(--bg2); border: 1px solid var(--border);
-                 border-radius: 12px; padding: 16px 18px; display: grid;
-                 grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-                 gap: 16px 24px; }
-  .dev-item { min-width: 0; }
-  .dev-k { color: var(--fg3); font-size: 12px; font-weight: 700;
-           letter-spacing: .5px; }
-  .dev-v { font-size: 16px; font-weight: 700; color: var(--fg); margin-top: 3px;
-           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .dev-s { color: var(--fg2); font-size: 12px; margin-top: 2px; }
-  .dev-s.warn { color: var(--orange); }
-
-  /* ---------- 主页：依赖卡片（一行两个同尺寸框：左两行字，右一个按钮） ---------- */
-  .dep-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
-  @media (max-width: 1000px) { .dep-grid { grid-template-columns: 1fr; } }
-  .dep-card { display: flex; align-items: center; justify-content: space-between;
-              gap: 14px; background: var(--bg2); border: 1px solid var(--border);
-              border-radius: 12px; padding: 13px 16px; min-width: 0; }
-  .dep-info { min-width: 0; }
-  .dep-title { font-weight: 700; font-size: 14px; color: var(--fg);
-               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .dep-ver { color: var(--fg2); font-weight: 500; font-size: 12px;
-             font-variant-numeric: tabular-nums; margin-left: 4px; }
-  .dep-desc { color: var(--fg2); font-size: 12px; margin-top: 2px;
-              overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .dep-ok { color: var(--green); font-size: 12px; font-weight: 600;
-            white-space: nowrap; }
-  .dep-muted { color: var(--fg3); font-size: 12px; white-space: nowrap; }
-  .dep-card button { flex-shrink: 0; }
-
-  /* ---------- 主页：资源监视器 ---------- */
-  .mon-card { display: flex; align-items: center; gap: 18px;
-              background: var(--bg2); border: 1px solid var(--border);
-              border-radius: 12px; padding: 12px 18px; margin-bottom: 10px; }
-  .mon-left { width: 220px; flex-shrink: 0; min-width: 0; }
-  .mon-title { font-weight: 700; font-size: 15px; color: var(--fg); }
-  .mon-sub { color: var(--fg3); font-size: 12px; overflow: hidden;
-             text-overflow: ellipsis; white-space: nowrap; }
-  .mon-bar { flex: 1; height: 16px; background: var(--bg4); border-radius: 8px;
-             overflow: hidden; }
-  .mon-fill { height: 100%; background: var(--accent); border-radius: 8px;
-              transition: width .5s ease; min-width: 0; }
-  .mon-right { width: 190px; flex-shrink: 0; text-align: right; }
-  .mon-pct { font-weight: 700; font-size: 15px; font-variant-numeric: tabular-nums; }
-  .mon-amt { color: var(--fg2); font-size: 12px; font-variant-numeric: tabular-nums; }
-  @media (max-width: 900px) {
-    .mon-left { width: 140px; } .mon-right { width: 140px; }
-  }
-  #proc-card { margin-top: 14px; }
-  #proc-card .table-wrap { margin-top: 8px; }
-
-  /* ---------- 训练 ---------- */
-  .train-top { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; flex-shrink: 0; }
-  .train-bottom { flex: 1; display: flex; flex-direction: column; gap: 12px; min-height: 0; }
-  .train-bottom .card { margin-bottom: 0; display: flex; flex-direction: column; }
-  #train-log-card { flex: 1.2; min-height: 0; }
-  #train-log-card pre { flex: 1; min-height: 120px; }
-  #train-loss-card { flex: 1; min-height: 0; }
-  #loss-canvas { flex: 1; min-height: 160px; }
-  @media (max-width: 1100px) { .train-top { grid-template-columns: 1fr; } }
-  .queue-item { display: flex; justify-content: space-between; align-items: center;
-                padding: 7px 10px; background: var(--bg); border-radius: 8px;
-                margin-bottom: 6px; border: 1px solid var(--border); }
-  .queue-item .name { font-family: monospace; font-size: 12px; overflow: hidden;
-                      text-overflow: ellipsis; white-space: nowrap; }
-  #train-queue { max-height: 260px; overflow-y: auto; }
-
-  /* ---------- 推理（类 Kimi 聊天） ---------- */
-  #infer-wrap { flex: 1; display: flex; gap: 0; min-height: 0; }
-  #infer-main { flex: 1; display: flex; flex-direction: column; min-width: 0;
-                padding: 0 24px; }
-  #chat-history { flex: 1; overflow-y: auto; padding: 8px 0;
-                  display: flex; flex-direction: column; gap: 16px; }
-  #chat-empty { margin: auto; text-align: center; color: var(--fg2); }
-  #chat-empty .big { font-size: 42px; font-weight: 800; letter-spacing: 4px;
-                     color: var(--fg); margin-bottom: 12px; }
-  .msg-row { display: flex; width: 100%; }
-  .msg { max-width: 76%; padding: 10px 16px; border-radius: 16px;
-         line-height: 1.6; word-break: break-word; }
-  .msg.user { margin-left: auto; background: var(--accent); color: #06101f;
-              border-bottom-right-radius: 4px; }
-  .msg.model { margin-right: auto; background: var(--bg3); color: var(--fg);
-               border-bottom-left-radius: 4px; }
-  .msg .media img, .msg .media video { max-width: 100%; border-radius: 10px;
-                                        display: block; margin-top: 6px; }
-  .msg .media audio { margin-top: 6px; }
-  #input-dock { flex-shrink: 0; padding: 8px 0 12px; }
-  #input-box { background: var(--bg2); border: 1px solid var(--border);
-               border-radius: 20px; padding: 10px 14px; }
-  #infer-prompt { border: none; background: none; resize: none; padding: 4px 2px;
-                  font-size: 14px; }
-  #infer-prompt:focus { outline: none; border: none; }
-  #input-tools { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
-  #send-btn { margin-left: auto; width: 34px; height: 34px; border-radius: 50%;
-              border: none; background: var(--accent); color: #06101f;
-              cursor: pointer; display: flex; align-items: center;
-              justify-content: center; font-size: 16px; }
-  #send-btn:hover { background: var(--accent2); }
-  #send-btn:disabled { opacity: .4; cursor: default; }
-  #attach-preview { display: none; margin-top: 6px; }
-  #attach-preview img, #attach-preview video { max-height: 100px; border-radius: 8px; }
-
-  /* 右侧调试面板（可隐藏，与导航对称） */
-  #debug-panel { width: 220px; flex-shrink: 0; background: var(--bg2);
-                 border-left: 1px solid var(--border); padding: 14px;
-                 overflow-y: auto; transition: width .18s, padding .18s; }
-  #debug-panel.collapsed { width: 44px; padding: 14px 4px; }
-  #debug-panel .head { display: flex; justify-content: space-between;
-                       align-items: center; margin-bottom: 12px; }
-  #debug-panel.collapsed .head { justify-content: center; }
-  #debug-panel.collapsed .head span, #debug-panel.collapsed .field { display: none; }
-  #debug-panel .toggle { background: none; border: none; color: var(--fg2);
-                         cursor: pointer; padding: 4px; border-radius: 6px; }
-  #debug-panel .toggle:hover { background: var(--bg3); color: var(--fg); }
-  .field { margin-bottom: 12px; }
-  .field label { display: block; color: var(--fg2); font-size: 12px; margin-bottom: 4px; }
-
-  /* ---------- 编解码器 ---------- */
-  .codec-io { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; flex: 1;
-              min-height: 0; }
-  .codec-io pre { max-height: none; height: 100%; }
-  @media (max-width: 900px) { .codec-io { grid-template-columns: 1fr; } }
-
-  /* ---------- JSON 编辑器 ---------- */
-  .token-palette { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
-  .token-palette button { background: var(--bg3); border: 1px solid var(--border);
-                          color: var(--fg2); border-radius: 8px; padding: 5px 10px;
-                          cursor: pointer; font-size: 12px;
-                          font-family: ui-monospace, monospace; }
-  .token-palette button:hover { background: var(--bg4); color: var(--fg); }
-  #json-editor { flex: 1; border: 1px solid var(--border); border-radius: 8px;
-                 background: var(--bg); font-family: ui-monospace, SFMono-Regular, monospace;
-                 font-size: 13px; padding: 12px; outline: none; overflow: auto;
-                 white-space: pre; tab-size: 2; min-height: 300px; }
-  #json-editor:focus { border-color: var(--accent); }
-
-  ::-webkit-scrollbar { width: 8px; height: 8px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: var(--bg4); border-radius: 4px; }
-  ::-webkit-scrollbar-thumb:hover { background: var(--fg3); }
-</style>
+<title>GARGANTUA</title>
+<script>
+/* 主题在首帧之前就定好，避免「先白后黑」的闪屏。
+   值来自 localStorage：gargantua.theme = dark | light | auto
+                     gargantua.contrast = normal | high
+   auto 交给 matchMedia 判定，之后由 prefers-color-scheme 的 change 事件跟随。 */
+(function () {
+  var el = document.documentElement;
+  try {
+    var t = localStorage.getItem("gargantua.theme") || "auto";
+    var c = localStorage.getItem("gargantua.contrast") || "normal";
+    var dark = t === "dark" ||
+      (t === "auto" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+    el.setAttribute("data-theme", dark ? "dark" : "light");
+    el.setAttribute("data-contrast", c === "high" ? "high" : "normal");
+    el.setAttribute("data-theme-mode", t);
+    if (localStorage.getItem("gargantua.side") === "0")
+      el.setAttribute("data-side", "collapsed");
+    var rr = Number(localStorage.getItem("gargantua.radius"));
+    if (rr >= 4 && rr <= 24) el.style.setProperty("--r", rr + "px");
+  } catch (e) {}
+})();
+</script>
+<link rel="stylesheet" href="app.css">
 </head>
 <body>
 <div id="app">
-  <nav id="sidebar">
-    <div class="brand">
-      <span class="brand-text">GARGANTUA</span>
-      <button id="toggle-nav" title="折叠/展开">
-        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
-      </button>
+  <nav id="sidebar" aria-label="主导航">
+    <div class="side-inner">
+      <div class="side-head">
+        <button id="side-toggle" class="side-btn" title="收起边栏" aria-label="收起边栏">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></svg>
+        </button>
+        <div class="brand">GARGANTUA</div>
+      </div>
+      <div id="nav"></div>
+      <div id="nav-bottom"></div>
     </div>
-    <div id="nav"></div>
-    <div id="nav-bottom"></div>
   </nav>
 
   <main id="main">
+    <div id="topbar">
+      <button id="float-toggle" class="side-btn" title="展开边栏" aria-label="展开边栏">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></svg>
+      </button>
+      <h1 class="page-title" id="page-title">主页</h1>
+    </div>
+
     <div id="pages">
 
-      <!-- 主页 -->
+      <!-- ==================== 主页 ==================== -->
       <section class="page scroll active" id="p-home">
-        <h2>主页</h2>
-
-        <div class="sec-head" style="margin-top:0">
-          <h3>环境与依赖</h3>
-          <button class="act sec" id="env-refresh" title="重新检查设备、依赖与更新">刷新</button>
+        <div class="sec-head first">
+          <h2 class="sec-title">环境与依赖</h2>
+          <button class="act sec" id="env-refresh" title="重新检查设备、依赖与可用更新">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6"/></svg>
+            刷新
+          </button>
         </div>
+
         <div class="device-card" id="device-card">
           <div class="dev-item"><div class="dev-k">设备</div>
-            <div class="dev-v">加载中…</div><div class="dev-s"></div></div>
+            <div class="dev-v">加载中…</div></div>
         </div>
+
         <div class="dep-grid" id="dep-grid" style="margin-top:12px">
           <div class="dep-card"><div class="dep-info">
-            <div class="dep-title">依赖</div>
+            <div class="dep-title"><span class="dep-name">依赖</span></div>
             <div class="dep-desc">加载中…</div></div></div>
         </div>
-        <div class="hint" id="env-msg" style="margin-top:8px"></div>
+        <div class="note" id="env-msg" style="margin-top:10px"></div>
 
         <div class="sec-head">
-          <h3>资源监视器</h3>
-          <span class="hint" id="mon-msg"></span>
+          <h2 class="sec-title">资源监视器</h2>
+          <span class="note" id="mon-msg"></span>
         </div>
         <div id="monitors">
-          <div class="mon-card"><div class="mon-left"><div class="mon-title">加载中…</div></div>
-            <div class="mon-bar"></div><div class="mon-right"></div></div>
+          <div class="mon-card">
+            <div class="mon-left"><div class="mon-title">加载中…</div>
+              <div class="mon-sub"></div></div>
+            <div class="mon-bar"><div class="mon-fill" style="width:0"></div></div>
+            <div class="mon-right"><div class="mon-pct">—</div></div>
+          </div>
         </div>
-        <div class="card" id="proc-card">
-          <div class="card-head"><span class="card-title">GARGANTUA 进程</span>
-            <span class="hint">内存列点击可在 百分比 / 实际占用 之间切换</span></div>
+
+        <div class="card flush" id="proc-card">
+          <div class="card-head">
+            <span class="card-title">进程监视器</span>
+            <span class="note" id="proc-note">内存 / 显存列点击可在「百分比 ↔ 实际占用」间切换</span>
+          </div>
           <div class="table-wrap">
             <table>
               <thead><tr>
-                <th>进程名称</th><th>PID</th><th>CPU</th>
+                <th>进程名称</th>
+                <th>PID</th>
+                <th>CPU</th>
                 <th class="clickable" id="proc-mem-th" title="点击切换 百分比 / 实际占用">内存</th>
-                <th>显存</th><th>操作</th>
+                <th class="clickable" id="proc-vram-th" title="点击切换 百分比 / 实际占用">显存</th>
+                <th class="right">操作</th>
               </tr></thead>
               <tbody id="proc-tbody">
                 <tr><td colspan="6" class="hint">加载中…</td></tr>
@@ -389,21 +117,28 @@
         </div>
       </section>
 
-      <!-- 模型 -->
+      <!-- ==================== 模型 ==================== -->
       <section class="page scroll" id="p-models">
-        <h2>模型</h2>
         <div class="card">
           <div class="card-head"><span class="card-title">创建新模型</span></div>
-          <div class="row">
-            <input type="text" id="model-name" placeholder="模型目录名，如 beta" style="max-width:260px">
-            <label title="默认 4">enc blocks <input type="number" id="model-enc" value="4" min="1" max="64"></label>
-            <label title="默认 6">dec blocks <input type="number" id="model-dec" value="6" min="1" max="64"></label>
-            <label title="完整 KV 区容量（原始 token），默认 1024">完整上下文 <input type="number" id="model-ctx-full" value="1024" min="1" max="65536" style="width:92px"></label>
-            <label title="压缩区容量（原始 token 计），默认 3072；填 0 表示不压缩">压缩上下文 <input type="number" id="model-ctx-compress" value="3072" min="0" max="1048576" style="width:92px"></label>
-            <label title="CSA 检索视图的压缩比 N:1，默认 4（与 HCA 同读完整区）">CSA 比 <input type="number" id="model-csa-ratio" value="4" min="2" max="256" style="width:64px"></label>
-            <label title="HCA 全局概括视图的压缩比 N:1，默认 32（须 ≥ CSA 比）">HCA 比 <input type="number" id="model-hca-ratio" value="32" min="2" max="256" style="width:64px"></label>
-            <label title="词表预设：每个模型的 vocab.txt 从该预设派生（独立副本），默认 base">词表预设 <select id="model-vocab"></select></label>
-            <label title="模型精度：fp64/32/16/bf16 走 torch 原生；fp8/fp4/int16/int8/int4/int2 在 CPU 上以 fp32 容器+权重量化模拟（有损耗）">精度
+          <div class="form-grid">
+            <label class="form-field"><span>模型名称</span>
+              <input type="text" id="model-name" placeholder="目录名，如 beta"></label>
+            <label class="form-field"><span>enc blocks</span>
+              <input type="number" id="model-enc" value="4" min="1" max="64"></label>
+            <label class="form-field"><span>dec blocks</span>
+              <input type="number" id="model-dec" value="6" min="1" max="64"></label>
+            <label class="form-field"><span>完整上下文（token）</span>
+              <input type="number" id="model-ctx-full" value="1024" min="1" max="65536"></label>
+            <label class="form-field"><span>压缩上下文（token）</span>
+              <input type="number" id="model-ctx-compress" value="3072" min="0" max="1048576"></label>
+            <label class="form-field"><span>CSA 压缩比</span>
+              <input type="number" id="model-csa-ratio" value="4" min="2" max="256"></label>
+            <label class="form-field"><span>HCA 压缩比</span>
+              <input type="number" id="model-hca-ratio" value="32" min="2" max="256"></label>
+            <label class="form-field"><span>词表预设</span>
+              <select id="model-vocab"></select></label>
+            <label class="form-field"><span>精度</span>
               <select id="model-dtype">
                 <option value="fp32" selected>fp32</option>
                 <option value="fp64">fp64</option>
@@ -416,37 +151,44 @@
                 <option value="int4">int4</option>
                 <option value="int2">int2</option>
               </select></label>
+          </div>
+          <div class="row" style="margin-top:16px">
             <button class="act" id="model-create">创建并初始化</button>
             <span class="hint" id="model-create-msg"></span>
           </div>
-          <div class="hint">总上下文 = 完整 + 压缩（默认 1024+3072=4096 token）。KV 分两段：完整段不压缩；压缩段是同一段内容的两份压法——CSA 检索视图（4:1）与 HCA 全局概括视图（32:1），两者都读【压缩段 + 全部完整段】（处理未压缩 KV 时就是标准 MLA）。压缩分组以时间步为原子：组内 token 数尽量等于压缩比，凑不齐取误差最小的整步组合，绝不跨步拆分。上下文长度随 config.json 固化，加载时按同一份配置重建。</div>
+          <div class="hint" style="margin-top:10px">
+            总上下文 = 完整 + 压缩（默认 1024+3072=4096 token）。KV 分两段：完整段不压缩；
+            压缩段是同一段内容的两份压法——CSA 检索视图（默认 4:1）与 HCA 全局概括视图（默认 32:1），
+            两者都读【压缩段 + 全部完整段】。压缩分组以时间步为原子，绝不跨步拆分。
+          </div>
         </div>
-        <div class="card">
+
+        <div class="card flush">
           <div class="card-head"><span class="card-title">已有模型</span>
-            <button class="act sec xs" id="model-refresh">刷新</button></div>
+            <button class="act sec xs" id="model-refresh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6"/></svg>刷新</button></div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>名称</th><th>参数量</th><th>操作</th></tr></thead>
+              <thead><tr><th>名称</th><th>参数量</th><th class="right">操作</th></tr></thead>
               <tbody id="model-tbody"></tbody>
             </table>
           </div>
         </div>
       </section>
 
-      <!-- 词表 -->
+      <!-- ==================== 词表 ==================== -->
       <section class="page scroll" id="p-vocab">
-        <h2>词表</h2>
         <div class="card">
           <div class="card-head"><span class="card-title">ID 区间占用（自动归类）</span>
-            <span class="hint" id="vocab-bar-note"></span></div>
+            <span class="note" id="vocab-bar-note"></span></div>
           <canvas class="chart" id="vocab-bar" width="1200" height="44"></canvas>
-          <div class="table-wrap" style="margin-top:10px">
+          <div class="table-wrap" style="margin-top:12px">
             <table id="vocab-regions">
               <thead><tr><th>子区</th><th>大类</th><th>ID 区间</th><th>容量</th><th>已用</th><th>占用率</th></tr></thead>
               <tbody></tbody>
             </table>
           </div>
         </div>
+
         <div class="card">
           <div class="card-head"><span class="card-title">全局词表：查询 / 添加 token</span></div>
           <div class="row">
@@ -458,7 +200,7 @@
           <div class="hint" id="vocab-hits"></div>
           <div class="row">
             <input class="grow" id="vocab-add-token" type="text" autocomplete="off"
-                   placeholder="新 token 文本（如 𠀀 / <mood> / { ）">
+                   placeholder="新 token 文本（如 𠀀 / &lt;mood&gt; / { ）">
             <select id="vocab-add-cat" title="四类：regular 常规可见 / fallback 可见 / special 特殊 / system 系统">
               <option value="regular">regular 常规可见</option>
               <option value="fallback">fallback 可见</option>
@@ -470,27 +212,30 @@
           </div>
           <div class="hint">添加前全局查重（同文本已存在即拒绝）；新 token 占用该类预留槽位，写入词表文件，模型维度不变。</div>
         </div>
-        <div class="card">
+
+        <div class="card flush">
           <div class="card-head"><span class="card-title">词表预设（每个从基础词表 fork，独立隔离、可增删）</span></div>
-          <div class="row">
+          <div class="row" style="padding:0 2px">
             <input type="text" id="vocab-new-name" placeholder="新预设名（字母/数字/_-）" style="max-width:240px">
-            <label>源预设 <select id="vocab-new-source"></select></label>
+            <label class="hint">源预设</label>
+            <select id="vocab-new-source" style="width:auto;min-width:140px"></select>
             <button class="act" id="vocab-create-preset">创建预设</button>
             <span class="hint" id="vocab-create-msg"></span>
           </div>
-          <div class="table-wrap">
+          <div class="table-wrap" style="margin-top:10px">
             <table id="vocab-presets">
-              <thead><tr><th>名称</th><th>已用/容量</th><th>操作</th></tr></thead>
+              <thead><tr><th>名称</th><th>已用 / 容量</th><th class="right">操作</th></tr></thead>
               <tbody></tbody>
             </table>
           </div>
         </div>
+
         <div class="card">
           <div class="card-head"><span class="card-title">预设内增删 token（软删保留 ID 位置）</span></div>
           <div class="row">
-            <label>预设 <select id="vocab-token-preset"></select></label>
+            <select id="vocab-token-preset" style="width:auto;min-width:140px"></select>
             <input class="grow" id="preset-add-token" type="text" autocomplete="off" placeholder="新增 token 文本">
-            <select id="preset-add-cat" title="四类任选">
+            <select id="preset-add-cat" title="四类任选" style="width:auto">
               <option value="regular">regular 常规可见</option>
               <option value="fallback">fallback 可见</option>
               <option value="special">special 特殊</option>
@@ -504,59 +249,62 @@
         </div>
       </section>
 
-      <!-- 训练 -->
+      <!-- ==================== 训练 ==================== -->
       <section class="page" id="p-train">
-        <h2>训练</h2>
         <div class="train-top">
           <div class="card">
             <div class="card-head"><span class="card-title">创建训练任务</span></div>
-            <div class="hint">上传 .tokens 训练数据（tok-32 二进制，必须带 { } | 时间步结构；Token 编辑器可直接导出）。一次上传 = 一条 token 流</div>
-            <div class="row"><label class="file-pick" for="train-file"><input type="file" id="train-file" accept=".tokens">
-            <span class="file-btn">选择文件</span>
-            <span class="file-name" id="train-file-name">未选择</span></label></div>
-            <div class="row">
-              <label>优化器（Muon：隐藏层矩阵；AdamW：embedding/输出头/RMSNorm）
+            <div class="hint">上传 .tokens 训练数据（必须带 { } | 时间步结构；Token 编辑器可直接导出）。一次上传 = 一条 token 流。</div>
+            <div class="row" style="margin-top:12px">
+              <label class="file-pick" for="train-file">
+                <input type="file" id="train-file" accept=".tokens">
+                <span class="file-btn">选择文件</span>
+                <span class="file-name" id="train-file-name">未选择</span></label>
+            </div>
+            <div class="form-grid" style="margin-top:12px">
+              <label class="form-field"><span>优化器（Muon 隐藏层矩阵 / AdamW 其余）</span>
                 <select id="train-mode">
                   <option value="muon" selected>muon + adamw（分工）</option>
                   <option value="adamw">全部 adamw</option>
-                </select>
-              </label>
-              <label>目标模型 <select id="train-target"><option value="">当前活动模型</option></select></label>
-            </div>
-            <div class="row">
-              <label title="每次训练从文本中随机截取的连续 token 窗口长度">上下文窗口 block_size
+                </select></label>
+              <label class="form-field"><span>目标模型</span>
+                <select id="train-target"><option value="">当前活动模型</option></select></label>
+              <label class="form-field"><span>上下文窗口 block_size</span>
                 <input type="number" id="train-block" value="16" min="4" step="2"></label>
-              <label>steps/文件 <input type="number" id="train-steps" value="20" min="1"></label>
+              <label class="form-field"><span>steps / 文件</span>
+                <input type="number" id="train-steps" value="20" min="1"></label>
+            </div>
+            <div class="row" style="margin-top:14px">
               <button class="act" id="train-enqueue">提交训练任务</button>
               <span class="hint" id="train-enqueue-msg"></span>
             </div>
           </div>
           <div class="card">
             <div class="card-head"><span class="card-title">训练队列</span>
-              <button class="act sec xs" id="queue-refresh">刷新</button></div>
+              <button class="act sec xs" id="queue-refresh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6"/></svg>刷新</button></div>
             <div id="train-queue"><span class="hint">加载中…</span></div>
           </div>
         </div>
         <div class="train-bottom">
           <div class="card" id="train-log-card">
             <div class="card-head"><span class="card-title">训练日志</span>
-              <span>
+              <span class="row" style="margin:0">
                 <button class="act xs" id="train-start">开始训练</button>
                 <button class="act danger xs" id="train-stop">停止</button>
-                <span class="hint" id="train-state" style="margin-left:8px;"></span>
+                <span class="hint" id="train-state"></span>
               </span>
             </div>
             <pre id="train-log">—</pre>
           </div>
           <div class="card" id="train-loss-card">
             <div class="card-head"><span class="card-title">Loss 曲线</span>
-              <span class="hint">每步 = 单个样本随机窗口的独立 loss；悬停查看数值，点与点之间无平均，波动为样本难度差异，非回升</span></div>
+              <span class="hint">每步 = 单个样本随机窗口的独立 loss；点与点之间不做平均</span></div>
             <canvas class="chart" id="loss-canvas" width="1200" height="240"></canvas>
           </div>
         </div>
       </section>
 
-      <!-- 推理 -->
+      <!-- ==================== 推理 ==================== -->
       <section class="page" id="p-infer">
         <div id="infer-wrap">
           <div id="infer-main">
@@ -586,42 +334,52 @@
             <div class="head">
               <span class="card-title">调试参数</span>
               <button class="toggle" title="折叠">
-                <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M15 6l-6 6 6 6"/></svg>
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M15 6l-6 6 6 6"/></svg>
               </button>
             </div>
             <div class="field" title="采样温度：越低输出越确定"><label>temperature</label>
               <input type="number" id="infer-temp" value="0.8" step="0.1" min="0.05"></div>
-            <div class="field" title="核采样累计概率阈值：只从累计概率达到 top_p 的最小 token 集合中采样"><label>top_p</label>
+            <div class="field" title="核采样累计概率阈值"><label>top_p</label>
               <input type="number" id="infer-topp" value="0.95" step="0.01" min="0.01" max="1"></div>
           </aside>
         </div>
       </section>
 
-      <!-- 文本 -> token -->
+      <!-- ==================== 文本 ==================== -->
       <section class="page" id="p-text">
-        <h2>文本 → token 转换</h2>
-        <div class="row">
-          <label>谁的输入/输出
-            <select id="text-bound"><option value="user">用户输入 &lt;user&gt;</option>
-              <option value="model" selected>模型输出 &lt;model&gt;</option></select></label>
+        <div class="row" style="margin-top:0">
+          <label>谁的输入 / 输出</label>
+          <select id="text-bound" style="width:auto">
+            <option value="user">用户输入 &lt;user&gt;</option>
+            <option value="model" selected>模型输出 &lt;model&gt;</option>
+          </select>
           <button class="act" id="text-encode">编码</button>
-          <span class="hint">输出为项目定制 token 时间步格式：{}=一个时间步，{}内 token 以 | 分隔，裸字符/数字不带符号</span>
+          <span class="hint">输出为 token 时间步格式：{}=一个时间步，{} 内 token 以 | 分隔</span>
         </div>
         <div class="codec-io">
-          <textarea id="text-in" placeholder="粘贴文本…">Hello, 世界！</textarea>
-          <pre id="text-out">—</pre>
+          <div class="card"><div class="card-head"><span class="card-title">输入文本</span></div>
+            <textarea id="text-in" style="flex:1;min-height:220px">Hello, 世界！</textarea></div>
+          <div class="card"><div class="card-head"><span class="card-title">输出 token</span></div>
+            <pre id="text-out">—</pre></div>
         </div>
       </section>
 
-      <!-- 音频 -> token -->
+      <!-- ==================== 音频 ==================== -->
       <section class="page" id="p-audio">
-        <h2>音频 → token 转换</h2>
-        <div class="hint">支持 wav / mp3 / flac / ogg（ffmpeg 解码后重采样到 16kHz 单声道）；533 个采样点平铺为一条向量 = 1 个音元（≈30 tok/s），每个音元是一个时间步；音频 token 是投影向量（无离散 ID），存档用 .tokenvector 格式</div>
-        <div class="row">
-          <label>谁的输入/输出
-            <select id="audio-bound"><option value="user" selected>用户输入 &lt;user&gt;</option>
-              <option value="model">模型输出 &lt;model&gt;</option></select></label>
-          <label class="file-pick" for="audio-file"><input type="file" id="audio-file" accept=".wav,.mp3,.flac,.ogg,audio/*">
+        <div class="hint" style="margin-bottom:10px">
+          支持 wav / mp3 / flac / ogg（ffmpeg 解码后重采样到 16kHz 单声道）；533 个采样点平铺为一条向量 = 1 个音元（≈30 tok/s），
+          每个音元是一个时间步；音频 token 是投影向量（无离散 ID），存档用 .tokenvector 格式。
+        </div>
+        <div class="row" style="margin-top:0">
+          <label>谁的输入 / 输出</label>
+          <select id="audio-bound" style="width:auto">
+            <option value="user" selected>用户输入 &lt;user&gt;</option>
+            <option value="model">模型输出 &lt;model&gt;</option>
+          </select>
+          <label class="file-pick" for="audio-file">
+            <input type="file" id="audio-file" accept=".wav,.mp3,.flac,.ogg,audio/*">
             <span class="file-btn">选择文件</span>
             <span class="file-name" id="audio-file-name">未选择</span></label>
           <button class="act" id="audio-encode">编码</button>
@@ -630,55 +388,71 @@
         <pre id="audio-out" style="flex:1;">—</pre>
       </section>
 
-      <!-- 图片 -> token -->
+      <!-- ==================== 图片 ==================== -->
       <section class="page" id="p-image">
-        <h2>图片 → token 转换（单帧）</h2>
-        <div class="hint">图片拆 32×32 patches，patch 内部平铺成一条向量，embedding 时乘矩阵投影，所有 patch 放在同一个时间步内；视觉 token 是投影向量（无离散 ID），存档用 .tokenvector 格式</div>
-        <div class="row">
-          <label>谁的输入/输出
-            <select id="image-bound"><option value="user" selected>用户输入 &lt;user&gt;</option>
-              <option value="model">模型输出 &lt;model&gt;</option></select></label>
-          <label class="file-pick" for="image-file"><input type="file" id="image-file" accept="image/*">
+        <div class="hint" style="margin-bottom:10px">
+          图片拆 32×32 patches，patch 内部平铺成一条向量，embedding 时乘矩阵投影，所有 patch 放在同一个时间步内；
+          视觉 token 是投影向量（无离散 ID），存档用 .tokenvector 格式。
+        </div>
+        <div class="row" style="margin-top:0">
+          <label>谁的输入 / 输出</label>
+          <select id="image-bound" style="width:auto">
+            <option value="user" selected>用户输入 &lt;user&gt;</option>
+            <option value="model">模型输出 &lt;model&gt;</option>
+          </select>
+          <label class="file-pick" for="image-file">
+            <input type="file" id="image-file" accept="image/*">
             <span class="file-btn">选择文件</span>
             <span class="file-name" id="image-file-name">未选择</span></label>
           <button class="act" id="image-encode">编码</button>
         </div>
         <div class="codec-io" style="margin-top:10px;">
-          <div><img id="image-preview" style="max-width:100%;max-height:320px;border-radius:8px;border:1px solid var(--border);" alt=""></div>
-          <pre id="image-out">—</pre>
+          <div class="card"><div class="card-head"><span class="card-title">原图</span></div>
+            <img id="image-preview" style="max-width:100%;max-height:320px;border-radius:var(--r);" alt=""></div>
+          <div class="card"><div class="card-head"><span class="card-title">输出 token</span></div>
+            <pre id="image-out">—</pre></div>
         </div>
       </section>
 
-      <!-- 视频 -> token -->
+      <!-- ==================== 视频 ==================== -->
       <section class="page" id="p-video">
-        <h2>视频 → token 转换（含声音）</h2>
-        <div class="hint">导入视频（mp4/mov/webm/mkv/gif，ffmpeg 抽帧 30fps、提取音轨）；每帧 = 一个时间步，该 {} 内平铺该帧全部 patch token 与该帧音频 token（全部投影到同一个 d_model）</div>
-        <div class="row">
-          <label>谁的输入/输出
-            <select id="video-bound"><option value="user" selected>用户输入 &lt;user&gt;</option>
-              <option value="model">模型输出 &lt;model&gt;</option></select></label>
-          <label class="file-pick" for="video-file"><input type="file" id="video-file" accept="video/*,.gif,.webp">
+        <div class="hint" style="margin-bottom:10px">
+          导入视频（mp4/mov/webm/mkv/gif，ffmpeg 抽帧 30fps、提取音轨）；每帧 = 一个时间步，
+          该 {} 内平铺该帧全部 patch token 与该帧音频 token。
+        </div>
+        <div class="row" style="margin-top:0">
+          <label>谁的输入 / 输出</label>
+          <select id="video-bound" style="width:auto">
+            <option value="user" selected>用户输入 &lt;user&gt;</option>
+            <option value="model">模型输出 &lt;model&gt;</option>
+          </select>
+          <label class="file-pick" for="video-file">
+            <input type="file" id="video-file" accept="video/*,.gif,.webp">
             <span class="file-btn">选择文件</span>
             <span class="file-name" id="video-file-name">未选择</span></label>
           <button class="act" id="video-encode">编码</button>
         </div>
-        <div class="row"><video id="video-preview" controls style="max-height:180px;border-radius:8px;display:none;"></video></div>
+        <div class="row"><video id="video-preview" controls style="max-height:180px;border-radius:var(--r);display:none;"></video></div>
         <div id="video-stats" class="hint"></div>
         <pre id="video-out" style="flex:1;">—</pre>
       </section>
 
-      <!-- 图像 -> 图元 -->
+      <!-- ==================== 图元绘画 ==================== -->
       <section class="page" id="p-prims">
-        <h2>图像 → 图元转换（可视化）</h2>
-        <div class="hint">上传图片，转换为图元序列并渲染。优先调用 vendored 的 Rust/wgpu GPU 转换器（service/prims/fast_shape_render，照搬 wonderfulearth/primitive-operation-painter，用 sh service/prims/setup.sh 构建）；未构建时回退 CPU 贪心拟合。token 布局照搬仓库 geometrize_256_v1：每图元 9 token（cx,cy,theta,w,h,shape,r,g,b），画布 256×256。</div>
-        <div class="row">
-          <label class="file-pick" for="prims-file"><input type="file" id="prims-file" accept="image/*">
+        <div class="hint" style="margin-bottom:10px">
+          上传图片，转换为图元序列并渲染。优先调用 vendored 的 Rust/wgpu GPU 转换器（service/prims/fast_shape_render，
+          用 sh service/prims/setup.sh 构建）；未构建时回退 CPU 贪心拟合。每图元 9 token（cx,cy,theta,w,h,shape,r,g,b），画布 256×256。
+        </div>
+        <div class="row" style="margin-top:0">
+          <label class="file-pick" for="prims-file">
+            <input type="file" id="prims-file" accept="image/*">
             <span class="file-btn">选择文件</span>
             <span class="file-name" id="prims-file-name">未选择</span></label>
-          <label class="hint" for="prims-steps">步数上限</label>
-          <input type="number" id="prims-steps" value="100" min="1" max="1000" step="1" title="默认 100，服务端上限 1000；越大质量越高，耗时线性增长">
-          <label class="hint" for="prims-quality">模式</label>
-          <select id="prims-quality" title="fast=快，20候选/步；slow=慢，50候选/步+短爬山">
+          <label class="hint">步数上限</label>
+          <input type="number" id="prims-steps" value="100" min="1" max="1000" step="1"
+                 style="width:90px" title="默认 100，服务端上限 1000">
+          <label class="hint">模式</label>
+          <select id="prims-quality" style="width:auto" title="fast=快，20 候选/步；slow=慢，50 候选/步+短爬山">
             <option value="fast">fast</option>
             <option value="slow">slow</option>
           </select>
@@ -686,21 +460,22 @@
           <span class="hint" id="prims-msg"></span>
         </div>
         <div class="codec-io" style="margin-top:10px;">
-          <div><div class="hint">原图</div>
-            <img id="prims-src" style="max-width:100%;max-height:320px;border-radius:8px;border:1px solid var(--border);" alt=""></div>
-          <div><div class="hint">图元渲染（SVG）</div><div id="prims-render" class="svg-out"></div></div>
+          <div class="card"><div class="card-head"><span class="card-title">原图</span></div>
+            <img id="prims-src" style="max-width:100%;max-height:320px;border-radius:var(--r);" alt=""></div>
+          <div class="card"><div class="card-head"><span class="card-title">图元渲染（SVG）</span></div>
+            <div id="prims-render" class="svg-out"></div></div>
         </div>
-        <pre id="prims-out" style="flex-shrink:0;max-height:200px;">—</pre>
+        <pre id="prims-out" style="flex-shrink:0;max-height:200px;margin-top:12px;">—</pre>
       </section>
 
-      <!-- Token 编辑器 -->
+      <!-- ==================== Token 编辑器 ==================== -->
       <section class="page" id="p-json">
-        <h2>Token 编辑器</h2>
-        <div class="hint">token-5 编码（spec 第 5b 节）：{} 为时间步原子，步内元素以 | 分隔。
-          {text: 00001} 文本 token（有向量、进 loss）；{wave: HEX} 音频（533 采样）；
-          {visual: HEX x: 1 y: 2} 视觉 patch（32×32，RGBA 各 10 bit）。
+        <div class="hint" style="margin-bottom:10px">
+          token-5 编码：{} 为时间步原子，步内元素以 | 分隔。{text: 00001} 文本 token（有向量、进 loss）；
+          {wave: HEX} 音频（533 采样）；{visual: HEX x: 1 y: 2} 视觉 patch（32×32，RGBA 各 10 bit）。
           &lt;00005&gt; 是扩展系统 token（有嵌入、不进 loss），也可直接写名字如 &lt;stop&gt;。
-          { } | 本身不是 token。词表查询与增删统一在「词表」页。</div>
+          { } | 本身不是 token。词表查询与增删统一在「词表」页。
+        </div>
         <div class="row">
           <button class="act" id="json-format">格式化</button>
           <button class="act sec" id="json-minify">压缩</button>
@@ -712,12 +487,91 @@
         <div id="json-editor" contenteditable="true" spellcheck="false">&lt;00001&gt;{text: 50994}{text: 12419}{text: 22152}{text: 22175}&lt;00002&gt;</div>
       </section>
 
-      <!-- 设置（暂时为空） -->
+      <!-- ==================== 设置 ==================== -->
       <section class="page scroll" id="p-settings">
-        <h2>设置</h2>
         <div class="card">
-          <div class="card-title">设置</div>
-          <div class="hint" style="margin-top:6px">暂无可配置项。</div>
+          <div class="card-head"><span class="card-title">主题</span></div>
+
+          <div class="set-row">
+            <div class="set-info">
+              <div class="set-name">模式</div>
+              <div class="set-desc">界面底色。「跟随系统」会随 macOS 外观自动切换。</div>
+            </div>
+            <div class="seg" id="set-theme">
+              <button data-v="dark">深色</button>
+              <button data-v="light">浅色</button>
+              <button data-v="auto">跟随系统</button>
+            </div>
+          </div>
+
+          <div class="set-row">
+            <div class="set-info">
+              <div class="set-name">对比度</div>
+              <div class="set-desc">高对比给每个框加一圈边线，边界更清楚。</div>
+            </div>
+            <div class="seg" id="set-contrast">
+              <button data-v="normal">普通</button>
+              <button data-v="high">高对比</button>
+            </div>
+          </div>
+
+          <div class="set-row">
+            <div class="set-info">
+              <div class="set-name">圆角半径</div>
+              <div class="set-desc">全站唯一的一个 R 值：卡片、按钮、表格、弹窗、边栏共用它，小徽章与胶囊由它派生。</div>
+            </div>
+            <div class="set-ctl">
+              <input type="range" class="slider" id="set-radius"
+                     min="4" max="24" step="1" value="16"
+                     aria-label="圆角半径">
+              <span class="set-val" id="set-radius-val">16px</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">快捷键</span>
+            <button class="act sec xs" id="hotkey-reset">恢复默认</button>
+          </div>
+
+          <div class="set-row">
+            <div class="set-info">
+              <div class="set-name">隐藏 / 展开边栏</div>
+              <div class="set-desc">切换左侧导航栏的显示状态。</div>
+            </div>
+            <div class="set-ctl">
+              <span class="kbd" id="hk-label-toggleSidebar">—</span>
+              <button class="act sec xs" data-hk="toggleSidebar">录制</button>
+            </div>
+          </div>
+
+          <div class="set-row">
+            <div class="set-info">
+              <div class="set-name">切换工具（上一个）</div>
+              <div class="set-desc">在 文本 / 音频 / 图片 / 视频 / 图元绘画 / Token 编辑器 间依次切换。</div>
+            </div>
+            <div class="set-ctl">
+              <span class="kbd" id="hk-label-prevTool">—</span>
+              <button class="act sec xs" data-hk="prevTool">录制</button>
+            </div>
+          </div>
+
+          <div class="set-row">
+            <div class="set-info">
+              <div class="set-name">切换工具（下一个）</div>
+              <div class="set-desc">在转换工具组内循环，未在工具页时跳到第一个工具。</div>
+            </div>
+            <div class="set-ctl">
+              <span class="kbd" id="hk-label-nextTool">—</span>
+              <button class="act sec xs" data-hk="nextTool">录制</button>
+            </div>
+          </div>
+
+          <div class="hint" id="hotkey-msg" style="margin-top:10px">
+            点击「录制」后按下组合键即可绑定；Esc 取消。若新组合与其它动作冲突，会自动解绑旧的那一项。
+            输入框内仅带 ⌘/Ctrl 或 ⌥/Alt 的组合会生效，避免干扰打字。
+          </div>
         </div>
       </section>
 
@@ -725,966 +579,19 @@
   </main>
 </div>
 
-<script>
-const $ = id => document.getElementById(id);
-const $$ = (sel, el=document) => el.querySelectorAll(sel);
+<!-- 自绘模态框：替代系统 alert / confirm（禁令：不出现原生 UI） -->
+<div class="modal-mask" id="modal-mask" hidden>
+  <div class="modal" role="dialog" aria-modal="true">
+    <div class="modal-title" id="modal-title"></div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-foot">
+      <button class="act sec" id="modal-cancel">取消</button>
+      <button class="act" id="modal-ok">确定</button>
+    </div>
+  </div>
+</div>
+<div class="toast-stack" id="toast-stack"></div>
 
-// 数值入参钳位：空输入 / 手敲越界值在前端就地修正，不让 400 打到用户脸上。
-// NaN（空输入框）回落到 default，而不是被 `|| default` 把合法的 0 也吃掉。
-function clampNum(v, lo, hi, dflt) {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return dflt;
-  return Math.min(hi, Math.max(lo, n));
-}
-
-// 所有请求带超时 + 可取消：一个悬挂请求（后端卡住/网络半断）不能让轮询
-// 循环永远停在 await 上——超时即 AbortController.abort()，调用方拿到明确错误。
-const API_TIMEOUT_MS = 20000;
-const API_UPLOAD_TIMEOUT_MS = 180000;   // 上传 .tokens / 视频等大 body
-async function api(path, body, opts) {
-  const o = opts || {};
-  const ms = o.timeout || API_TIMEOUT_MS;
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), ms);
-  const opt = body === undefined
-    ? {signal: ctrl.signal}
-    : {method: "POST", headers: {"Content-Type": "application/json"},
-       body: JSON.stringify(body), signal: ctrl.signal};
-  try {
-    const r = await fetch(path, opt);
-    const txt = await r.text();
-    let j = {};
-    if (txt) {
-      try { j = JSON.parse(txt); }
-      catch (e) { throw new Error("响应不是 JSON: " + txt.slice(0, 120)); }
-    }
-    if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
-    return j;
-  } catch (e) {
-    if (e && e.name === "AbortError") {
-      throw new Error(`请求超时（${ms}ms）: ${path}`);
-    }
-    throw e;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-// 统一任务轮询：每轮【先】检查 deadline，超时抛错，并复用 api() 的单请求超时。
-async function pollTask(taskId, opts) {
-  const o = opts || {};
-  const interval = o.interval || 1500;
-  const timeout = o.timeout || 120000;
-  const t0 = Date.now();
-  for (;;) {
-    if (Date.now() - t0 > timeout) {
-      throw new Error(`轮询超时（${Math.round(timeout / 1000)}s）`);
-    }
-    await new Promise(r => setTimeout(r, interval));
-    const t = await api("/api/task/" + taskId);
-    if (o.onTick) o.onTick(t);
-    if (t.status === "done") return t;
-    if (t.status === "error") throw new Error(t.error);
-  }
-}
-function esc(s) {
-  // 补引号转义：textContent→innerHTML 只转义 & < >，拼进属性时可注入
-  const d = document.createElement("div"); d.textContent = s;
-  return d.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-}
-function fileToB64(f) {
-  return new Promise((res, rej) => {
-    const rd = new FileReader();
-    rd.onload = () => res(rd.result.split(",")[1]);
-    rd.onerror = rej;
-    rd.readAsDataURL(f);
-  });
-}
-function fileToUrl(f) { return URL.createObjectURL(f); }
-
-/* ---------- 定制 token 时间步格式 ----------
-   格式（GARGANTUA token stream .gts，以 {} 为时间步原子）：
-     {} = 一个时间步；同一 {} 内多 token 以 | 分隔，无空格；
-     <...> = 特殊 token（<user>/<model>/<stop>/<caps>）；裸字符 = 可见 token。
-     特殊 token（<user>、<model> 等）各自独占一个时间步。
-     视觉段：每一帧一个 {}，该 {} 内平铺该帧全部 patch token。
-     独立音频：每 533 采样一个 {<wave:hex>}。
-     绘图时间步：每个图元 = 一个 {}，内部 9 个 <id:...> token 平铺。
-*/
-const _B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-function b64ToBytes(b64) {
-  const out = new Uint8Array(b64.length * 3 / 4);
-  let p = 0, buf = 0, bits = 0;
-  for (const c of b64) {
-    if (c === "=") break;
-    buf = (buf << 6) | _B64_CHARS.indexOf(c); bits += 6;
-    if (bits >= 8) { bits -= 8; out[p++] = (buf >> bits) & 0xFF; }
-  }
-  return out.subarray(0, p);
-}
-/* token-5 文本（spec 第 5b 节）：{text: NNNNN} / {wave: HEX} / {visual: HEX x: 1 y: 2}
-   音频/视觉的 hex 载荷一律由后端生成（r.token5），前端只在没有后端文本时兜底。 */
-const _ID5 = n => String(n).padStart(5, "0");
-
-function stepsToToken5(steps, bound) {
-  const openTag = bound === "user" ? "<00001>" : "<00003>";   // <user> / <model>
-  const closeTag = bound === "user" ? "<00002>" : "<00004>";  // <user/> / <model/>
-  const parts = [openTag];
-  for (const st of steps) {
-    const ids = st.token_ids || [];
-    if (!ids.length) continue;                 // 模态步：由后端 token5 给出
-    if (st.modality === "draw") {
-      // 绘图：一个图元 = 9 个 token = 一个时间步
-      for (let j = 0; j + 9 <= ids.length; j += 9)
-        parts.push("{" + ids.slice(j, j + 9).map(t => "text: " + _ID5(t)).join(" | ") + "}");
-      continue;
-    }
-    for (const id of ids) parts.push("{text: " + _ID5(id) + "}");
-  }
-  parts.push(closeTag);
-  return parts.join("");
-}
-
-/* ---------- 导航（2026-10-29 重构：按类型分组，灰色加粗组名分隔，
-   底部固定「设置」；所有文本 user-select 已由全局 CSS 禁止） ---------- */
-const NAV_GROUPS = [
-  {label: "概览", items: [
-    {id:"home", label:"主页", icon:"M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"},
-  ]},
-  {label: "模型", items: [
-    {id:"models", label:"模型", icon:"M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"},
-    {id:"vocab", label:"词表", icon:"M4 19.5A2.5 2.5 0 0 1 6.5 17H20M4 19.5A2.5 2.5 0 0 0 6.5 22H20V2H6.5A2.5 2.5 0 0 0 4 4.5v15z"},
-  ]},
-  {label: "训练与推理", items: [
-    {id:"train", label:"训练", icon:"M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"},
-    {id:"infer", label:"推理", icon:"M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"},
-  ]},
-  {label: "转换工具", items: [
-    {id:"text", label:"文本→token", icon:"M4 6h16M4 12h16M4 18h7"},
-    {id:"audio", label:"音频→token", icon:"M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2z"},
-    {id:"image", label:"图片→token", icon:"M4 16l4.586-5.657a2 2 0 013 0L15 14m-2-2l2.586-3.657a2 2 0 013 0L20 12M4 6h16M4 12h16M4 18h16"},
-    {id:"video", label:"视频→token", icon:"M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"},
-    {id:"prims", label:"图像→图元", icon:"M12 3l1.9 5.8H20l-4.9 3.6 1.9 5.8-5-3.6-5 3.6 1.9-5.8L4 8.8h6.1z"},
-    {id:"json", label:"Token 编辑器", icon:"M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"},
-  ]},
-];
-const NAV_BOTTOM = [
-  {id:"settings", label:"设置", icon:"M12 15a3 3 0 100-6 3 3 0 000 6zm7.5-3a7.4 7.4 0 00-.1-1.2l2-1.6-2-3.4-2.4 1a7.6 7.6 0 00-2-1.2L14.6 3H9.4l-.4 2.6a7.6 7.6 0 00-2 1.2l-2.4-1-2 3.4 2 1.6a7.4 7.4 0 000 2.4l-2 1.6 2 3.4 2.4-1a7.6 7.6 0 002 1.2l.4 2.6h5.2l.4-2.6a7.6 7.6 0 002-1.2l2.4 1 2-3.4-2-1.6c.06-.4.1-.8.1-1.2z"},
-];
-function navItemHTML(n) {
-  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="${n.icon}"/></svg><span class="label">${esc(n.label)}</span>`;
-}
-const navEl = $("nav");
-NAV_GROUPS.forEach(g => {
-  const gl = document.createElement("div");
-  gl.className = "nav-group";
-  gl.textContent = g.label;
-  navEl.appendChild(gl);
-  g.items.forEach(n => {
-    const b = document.createElement("button");
-    b.className = "nav-item" + (n.id === "home" ? " active" : "");
-    b.dataset.p = n.id;
-    b.innerHTML = navItemHTML(n);
-    b.onclick = () => switchPage(n.id);
-    navEl.appendChild(b);
-  });
-});
-const navBottomEl = $("nav-bottom");
-{
-  const gl = document.createElement("div");
-  gl.className = "nav-group";
-  gl.textContent = "系统";
-  navBottomEl.appendChild(gl);
-  NAV_BOTTOM.forEach(n => {
-    const b = document.createElement("button");
-    b.className = "nav-item";
-    b.dataset.p = n.id;
-    b.innerHTML = navItemHTML(n);
-    b.onclick = () => switchPage(n.id);
-    navBottomEl.appendChild(b);
-  });
-}
-function switchPage(id) {
-  $$(".nav-item").forEach(x => x.classList.toggle("active", x.dataset.p === id));
-  $$(".page").forEach(x => x.classList.toggle("active", x.id === "p-" + id));
-  if (id === "models") refreshModels();
-  if (id === "train") refreshQueue();
-  if (id === "vocab") refreshVocab();
-  if (id === "home") refreshMonitors();
-}
-$("toggle-nav").onclick = () => $("sidebar").classList.toggle("collapsed");
-
-/* ---------- 文件选择器（自定义外观） ---------- */
-function wireFileInput(id) {
-  const input = $(id);
-  const label = input.closest(".file-pick");
-  const name = $(id + "-name");
-  if (!input || !label || !name) return;
-  const sync = () => {
-    const f = input.files && input.files[0];
-    name.textContent = f ? f.name : "未选择";
-    name.title = f ? `${f.name}（${(f.size / 1024).toFixed(1)} KB）` : "";
-    label.classList.toggle("has-file", !!f);
-  };
-  input.addEventListener("change", sync);
-  sync();
-}
-["train-file", "audio-file", "image-file", "video-file",
- "prims-file"].forEach(wireFileInput);
-
-/* ---------- 活动模型（后台静默跟踪，供建模后自动激活判断） ---------- */
-let ACTIVE_MODEL = "";
-async function refreshStatus() {
-  try {
-    const s = await api("/api/status");
-    ACTIVE_MODEL = s.model || "";
-  } catch (e) {}
-}
-
-/* ---------- 主页：环境与依赖 ---------- */
-const DEP_META = {
-  torch: {display: "PyTorch", desc: "深度学习框架"},
-  numpy: {display: "NumPy", desc: "数值计算库"},
-  PIL: {display: "Pillow", desc: "图像处理库"},
-  safetensors: {display: "Safetensors", desc: "模型权重存储"},
-  cv2: {display: "OpenCV", desc: "图像/视频解码加速（可选）"},
-  soundfile: {display: "SoundFile", desc: "音频解码加速（可选）"},
-};
-let SYSTEM_CACHE = null, UPDATES_CACHE = null;
-
-function fmtBytes(b) {
-  if (b === null || b === undefined || isNaN(b)) return "—";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let i = 0, v = b;
-  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
-  return v.toFixed(2) + units[i];
-}
-
-async function refreshEnv(force) {
-  const q = force ? "?force=1" : "";
-  try {
-    const [s, d] = await Promise.all([api("/api/system"),
-                                      api("/api/system/devices" + q)]);
-    SYSTEM_CACHE = s;
-    renderDevices(d);
-    renderDeps();
-    // 更新检查是网络活（镜像源），异步补上后再重渲染按钮
-    api("/api/system/updates" + q, undefined, {timeout: 60000})
-      .then(u => { UPDATES_CACHE = u.updates || []; renderDeps(); })
-      .catch(() => { UPDATES_CACHE = null; renderDeps(); });
-  } catch (e) {
-    $("device-card").innerHTML =
-      `<div class="dev-item"><div class="dev-k">设备</div>
-       <div class="dev-v">获取失败</div>
-       <div class="dev-s">${esc(e.message)}</div></div>`;
-  }
-}
-
-function renderDevices(d) {
-  const mem = d.memory || {};
-  const unified = !!d.unified_memory;
-  let gpuHtml = "";
-  for (const g of (d.gpus || [])) {
-    const sub = g.torch_ok
-      ? "支持 PyTorch"
-      : `<span class="dev-s warn">${esc(g.note || "不支持 torch")}</span>`;
-    gpuHtml += `<div class="dev-item"><div class="dev-k">GPU</div>
-      <div class="dev-v" title="${esc(g.model)}">${esc(g.model)}</div>
-      <div class="dev-s">${sub}</div></div>`;
-  }
-  if (!gpuHtml) {
-    gpuHtml = `<div class="dev-item"><div class="dev-k">GPU</div>
-      <div class="dev-v">—</div><div class="dev-s">未发现</div></div>`;
-  }
-  const vramSub = unified ? "与统一内存共享" : "";
-  $("device-card").innerHTML = `
-    <div class="dev-item"><div class="dev-k">CPU</div>
-      <div class="dev-v" title="${esc(d.cpu.model)}">${esc(d.cpu.model)}</div>
-      <div class="dev-s">${d.cpu.cores ? d.cpu.cores + " 核心" : ""}</div></div>
-    ${gpuHtml}
-    <div class="dev-item"><div class="dev-k">${unified ? "统一内存" : "内存"}</div>
-      <div class="dev-v">${fmtBytes(mem.total)}</div>
-      <div class="dev-s">${mem.used != null ? "已用 " + fmtBytes(mem.used) : ""}</div></div>
-    <div class="dev-item"><div class="dev-k">显存</div>
-      <div class="dev-v">${unified || !d.vram || d.vram.total == null ? "—" : fmtBytes(d.vram.total)}</div>
-      <div class="dev-s">${esc(vramSub)}</div></div>`;
-}
-
-function renderDeps() {
-  const s = SYSTEM_CACHE;
-  if (!s) return;
-  const grid = $("dep-grid");
-  const um = {};
-  (UPDATES_CACHE || []).forEach(u => { um[u.name] = u; });
-  grid.innerHTML = (s.dependencies || []).map(d => {
-    const meta = DEP_META[d.name] || {display: d.name, desc: d.why || ""};
-    const line2 = d.ok ? meta.desc : "未发现";
-    let right;
-    if (!d.ok) {
-      right = `<button class="act" onclick="installDep('${esc(d.name)}', false)">安装</button>`;
-    } else {
-      const u = um[d.name];
-      if (!u) right = `<span class="dep-muted">检查更新中…</span>`;
-      else if (u.update_available)
-        right = `<button class="act" onclick="installDep('${esc(d.name)}', true)"
-                       title="更新到 ${esc(u.latest || "")}">更新</button>`;
-      else if (!u.checked) right = `<span class="dep-muted">未能检查更新</span>`;
-      else right = `<span class="dep-ok">当前已是最新版本</span>`;
-    }
-    return `<div class="dep-card"><div class="dep-info">
-      <div class="dep-title" title="${esc(meta.display)}">${esc(meta.display)}${d.ok && d.version ? `<span class="dep-ver">${esc(d.version)}</span>` : ""}</div>
-      <div class="dep-desc" title="${esc(line2)}">${esc(line2)}</div>
-    </div>${right}</div>`;
-  }).join("");
-}
-
-window.installDep = async (name, upgrade) => {
-  const msg = $("env-msg");
-  msg.textContent = (upgrade ? "正在更新 " : "正在安装 ") + name + " …";
-  try {
-    const {task_id} = await api("/api/system/install",
-                                {names: [name], upgrade: !!upgrade});
-    const t = await pollTask(task_id, {interval: 2000, timeout: 1800000});
-    msg.textContent = (t.result && t.result.note) || "完成";
-    await refreshEnv(true);
-  } catch (e) {
-    msg.textContent = "错误: " + e.message;
-  }
-};
-$("env-refresh").onclick = () => {
-  $("env-msg").textContent = "";
-  refreshEnv(true);
-  refreshMonitors();
-};
-
-/* ---------- 主页：资源监视器 ---------- */
-function monRow(title, sub, pct, used, total) {
-  const p = (pct === null || pct === undefined) ? null : Math.max(0, Math.min(100, pct));
-  const amt = (used === null || used === undefined)
-    ? "—" : fmtBytes(used) + (total ? " / " + fmtBytes(total) : "");
-  return `<div class="mon-card">
-    <div class="mon-left"><div class="mon-title">${esc(title)}</div>
-      <div class="mon-sub" title="${esc(sub || "")}">${esc(sub || "")}</div></div>
-    <div class="mon-bar"><div class="mon-fill" style="width:${p === null ? 0 : p.toFixed(2)}%"></div></div>
-    <div class="mon-right"><div class="mon-pct">${p === null ? "—" : p.toFixed(2) + "%"}</div>
-      <div class="mon-amt">${esc(amt)}</div></div>
-  </div>`;
-}
-function renderMonitors(d) {
-  const rows = [];
-  rows.push(monRow("CPU", d.cpu.model, d.cpu.usage, null, null));
-  for (const g of (d.gpus || [])) {
-    rows.push(monRow("GPU", g.model, null, null,
-                     g.vram_total || null));
-  }
-  const mem = d.memory || {};
-  const memPct = (mem.total && mem.used != null) ? mem.used / mem.total * 100 : null;
-  rows.push(monRow(d.unified_memory ? "统一内存" : "内存",
-                   fmtBytes(mem.total), memPct, mem.used, mem.total));
-  if (!d.unified_memory) {
-    rows.push(monRow("显存",
-                     (d.gpus || []).map(g => g.model).join(" / "),
-                     null, null, d.vram && d.vram.total));
-  }
-  $("monitors").innerHTML = rows.join("");
-}
-
-let PROC_MEM_MODE = "pct";        // "pct" | "actual"
-let PROC_CACHE = [];
-function memCell(p) {
-  if (PROC_MEM_MODE === "actual") return fmtBytes(p.mem_bytes);
-  return p.mem_pct == null ? "—" : p.mem_pct.toFixed(2) + "%";
-}
-function renderProcesses(procs) {
-  PROC_CACHE = procs || [];
-  const tb = $("proc-tbody");
-  $("proc-mem-th").textContent =
-    PROC_MEM_MODE === "actual" ? "内存（点击切换）" : "内存";
-  if (!PROC_CACHE.length) {
-    tb.innerHTML = `<tr><td colspan="6" class="hint">没有正在运行的 GARGANTUA 进程</td></tr>`;
-    return;
-  }
-  tb.innerHTML = PROC_CACHE.map(p => `<tr>
-    <td>${esc(p.name)}</td>
-    <td class="mono">${p.pid}</td>
-    <td class="mono">${p.cpu == null ? "—" : p.cpu.toFixed(2) + "%"}</td>
-    <td class="mono clickable" onclick="toggleMemMode()" title="点击切换 百分比 / 实际占用">${memCell(p)}</td>
-    <td class="mono">${p.vram_bytes == null ? "—" : fmtBytes(p.vram_bytes)}</td>
-    <td><button class="act danger xs" onclick="killProc(${p.pid})">结束</button></td>
-  </tr>`).join("");
-}
-window.toggleMemMode = () => {
-  PROC_MEM_MODE = PROC_MEM_MODE === "pct" ? "actual" : "pct";
-  renderProcesses(PROC_CACHE);
-};
-window.killProc = async pid => {
-  const msg = $("mon-msg");
-  try {
-    await api("/api/system/kill", {pid});
-    msg.textContent = `已向 ${pid} 发送终止信号`;
-  } catch (e) {
-    msg.textContent = "结束失败: " + e.message;
-  }
-  refreshMonitors();
-};
-async function refreshMonitors() {
-  try {
-    const [d, p] = await Promise.all([api("/api/system/devices"),
-                                      api("/api/system/processes")]);
-    renderDevices(d);
-    renderMonitors(d);
-    renderProcesses(p.processes);
-    $("mon-msg").textContent = "";
-  } catch (e) {
-    $("mon-msg").textContent = "监视数据获取失败: " + e.message;
-  }
-}
-// 资源监视 2s 轮询（主页激活时才发请求）
-setInterval(() => {
-  if ($("p-home").classList.contains("active")) refreshMonitors();
-}, 2000);
-refreshEnv(false);
-refreshMonitors();
-refreshStatus();
-
-/* ---------- 模型 ---------- */
-async function refreshModels() {
-  try {
-    const r = await api("/api/models");
-    $("model-tbody").innerHTML = r.models.map(m =>
-      `<tr><td>${esc(m.name)} ${m.name === r.active ? '<span class="badge on">当前</span>' : ""}</td>
-       <td>${m.params ? (m.params/1e6).toFixed(1)+"M" : "—"}</td>
-       <td><button class="act sec xs" onclick="loadModel('${esc(m.name)}')">加载</button></td></tr>`).join("");
-    const target = $("train-target");
-    const cur = target.value;
-    target.innerHTML = '<option value="">当前活动模型</option>' +
-      r.models.map(m => `<option value="${esc(m.name)}">${esc(m.name)}</option>`).join("");
-    target.value = cur;
-  } catch (e) {}
-}
-window.loadModel = async name => {
-  try { await api("/api/model/load", {name});
-        $("model-create-msg").textContent = "已加载 " + name;
-        refreshModels(); refreshStatus(); }
-  catch (e) { $("model-create-msg").textContent = "错误: " + e.message; }
-};
-$("model-create").onclick = async () => {
-  const name = $("model-name").value.trim();
-  if (!name) return;
-  $("model-create-msg").textContent = "初始化中…";
-  try {
-    await createModel(name, false);
-  } catch (e) {
-    // 已存在 → 确认后覆盖（服务端 init_new 默认拒绝覆盖）
-    if (e.message.includes("已存在") &&
-        confirm("模型 " + name + " 已存在，覆盖其检查点？")) {
-      try {
-        await createModel(name, true);
-        return;
-      } catch (e2) {
-        $("model-create-msg").textContent = "错误: " + e2.message;
-      }
-    } else {
-      $("model-create-msg").textContent = "错误: " + e.message;
-    }
-  }
-};
-async function createModel(name, overwrite) {
-  // 空值/非数字不下发（服务端取 spec 默认）。
-  // 注意不能用 `parseInt(v) || undefined`——0 对压缩上下文是合法值
-  // （表示不压缩），会被静默吞成默认 3072
-  const intOrUndef = (v) => {
-    const n = parseInt(v, 10);
-    return Number.isFinite(n) ? n : undefined;
-  };
-  const {task_id} = await api("/api/model/init", {
-    name, overwrite,
-    n_enc_blocks: intOrUndef($("model-enc").value),
-    n_dec_blocks: intOrUndef($("model-dec").value),
-    ctx_full: intOrUndef($("model-ctx-full").value),
-    ctx_compress: intOrUndef($("model-ctx-compress").value),
-    csa_ratio: intOrUndef($("model-csa-ratio").value),
-    hca_ratio: intOrUndef($("model-hca-ratio").value),
-    vocab: $("model-vocab").value || "base",
-    dtype: $("model-dtype").value || "fp32",
-  });
-  await pollTask(task_id, {interval: 1500, timeout: 120000});
-  $("model-create-msg").textContent = "创建成功";
-  refreshModels(); await refreshStatus();
-  // 首个模型创建后自动激活（此前不加载，训练/推理仍报「无活动模型」）。
-  if (ACTIVE_MODEL !== name) {
-    try { await api("/api/model/load", {name});
-          refreshModels(); await refreshStatus(); }
-    catch (e) { $("model-create-msg").textContent =
-      "已创建（自动激活失败: " + e.message + "）"; }
-  }
-}
-$("model-refresh").onclick = refreshModels;
-
-/* ---------- 训练 ---------- */
-$("train-enqueue").onclick = async () => {
-  const file = $("train-file").files[0];
-  const msg = $("train-enqueue-msg");
-  if (!file) { msg.textContent = "请先选择 .tokens 训练数据文件"; return; }
-  try {
-    const r = await api("/api/train/enqueue", {
-      tokens_b64: await fileToB64(file),
-      optimizer: $("train-mode").value,
-    }, {timeout: API_UPLOAD_TIMEOUT_MS});
-    msg.textContent = `已入队 ${r.queued[0]}（${r.n_tokens} tokens / ` +
-      `${r.n_steps} 时间步）`;
-    $("train-file").value = "";
-    refreshQueue(); refreshStatus();
-  } catch (e) { msg.textContent = "错误: " + e.message; }
-};
-async function refreshQueue() {
-  try {
-    const r = await api("/api/train/queue");
-    const el = $("train-queue");
-    if (!r.items.length) { el.innerHTML = '<span class="hint">队列为空</span>'; return; }
-    el.innerHTML = r.items.map(it =>
-      `<div class="queue-item"><span class="name" title="${esc(it.name)}">${esc(it.name)}
-        <span class="hint">（${it.optimizer || "?"}）</span></span>
-       <button class="act danger xs" onclick="deleteQueue('${esc(it.name)}')">删除</button></div>`
-    ).join("");
-  } catch (e) { $("train-queue").textContent = "错误: " + e.message; }
-}
-window.deleteQueue = async name => {
-  try { await api("/api/train/delete", {name}); refreshQueue(); refreshStatus(); }
-  catch (e) { alert(e.message); }
-};
-$("queue-refresh").onclick = refreshQueue;
-$("train-start").onclick = async () => {
-  try {
-    const r = await api("/api/train/start", {
-      steps: clampNum($("train-steps").value, 1, 1e6, 20),
-      // & ~1：强制为偶数（block_size 会二分给 enc/dec，奇数令前向崩溃）
-      block_size: clampNum($("train-block").value, 4, 1024, 32) & ~1,
-      optimizer: $("train-mode").value,
-      target: $("train-target").value});
-    $("train-state").textContent = r.started ? "已启动" : "已在运行中";
-  } catch (e) { $("train-state").textContent = "错误: " + e.message; }
-};
-$("train-stop").onclick = async () => {
-  try { await api("/api/train/stop", {});
-        $("train-state").textContent = "停止请求已发送"; }
-  catch (e) { $("train-state").textContent = "错误: " + e.message; }
-};
-
-/* Loss 曲线：每步 = 单个样本的独立 loss，逐点折线，悬停显示数值 */
-function drawLoss(tail) {
-  const cv = $("loss-canvas"), ctx = cv.getContext("2d");
-  ctx.clearRect(0, 0, cv.width, cv.height);
-  ctx.fillStyle = "#8b949e"; ctx.font = "12px ui-monospace, monospace";
-  if (!tail.length) { ctx.fillText("暂无 loss 数据", 20, 30); cv._pts = null; return; }
-  const losses = tail.map(r => r.loss);
-  const lo = Math.min(...losses), hi = Math.max(...losses);
-  const pad = 40, W = cv.width - pad * 2, H = cv.height - pad * 2;
-  ctx.strokeStyle = "#30363d"; ctx.strokeRect(pad, pad, W, H);
-  ctx.fillText(hi.toFixed(3), 4, pad + 4); ctx.fillText(lo.toFixed(3), 4, pad + H);
-  ctx.fillText("step " + tail[0].step + " → " + tail[tail.length - 1].step,
-               pad, cv.height - 10);
-  const pts = tail.map((r, i) => {
-    const x = pad + (tail.length === 1 ? W / 2 : i / (tail.length - 1) * W);
-    const y = pad + H - (hi === lo ? H / 2 : (r.loss - lo) / (hi - lo) * H);
-    return {x, y, step: r.step, loss: r.loss, file: r.file || ""};
-  });
-  cv._pts = pts;
-  ctx.strokeStyle = "#58a6ff"; ctx.lineWidth = 1.2; ctx.beginPath();
-  pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
-  ctx.stroke();
-  ctx.fillStyle = "#58a6ff";
-  pts.forEach(p => { ctx.beginPath(); ctx.arc(p.x, p.y, 2, 0, 7); ctx.fill(); });
-}
-$("loss-canvas").onmousemove = e => {
-  const cv = e.currentTarget, pts = cv._pts;
-  if (!pts || !pts.length) return;
-  const rect = cv.getBoundingClientRect();
-  const sx = cv.width / rect.width, sy = cv.height / rect.height;
-  const mx = (e.clientX - rect.left) * sx, my = (e.clientY - rect.top) * sy;
-  let best = null, bd = 1e9;
-  for (const p of pts) {
-    const d = (p.x - mx) ** 2 + (p.y - my) ** 2;
-    if (d < bd) { bd = d; best = p; }
-  }
-  if (best && bd < 4000) {
-    cv.title = `step ${best.step}  loss=${best.loss}` +
-               (best.file ? `\n样本: ${best.file}` : "");
-  }
-};
-async function refreshTrain() {
-  try {
-    const s = await api("/api/train/status");
-    drawLoss(s.loss_tail || []);
-    $("train-log").textContent = (s.log_tail || []).slice(-200).join("\n") || "—";
-    $("train-state").textContent =
-      (s.running ? "运行中 step=" + s.step : "空闲 step=" + s.step)
-      + (s.optimizer ? " · " + s.optimizer : "");
-  } catch (e) {}
-}
-setInterval(refreshTrain, 2000);
-
-/* ---------- 推理（类 Kimi 聊天） ---------- */
-const chatHistory = $("chat-history");
-let lastMedia = null, mediaObjUrl = null;
-function hideEmpty() { const e = $("chat-empty"); if (e) e.style.display = "none"; }
-function addMsg(role, html) {
-  hideEmpty();
-  const row = document.createElement("div"); row.className = "msg-row";
-  const d = document.createElement("div"); d.className = "msg " + role;
-  d.innerHTML = html; row.appendChild(d);
-  chatHistory.appendChild(row); chatHistory.scrollTop = chatHistory.scrollHeight;
-}
-$("infer-media").onchange = () => {
-  const f = $("infer-media").files[0]; if (!f) return;
-  lastMedia = f;
-  if (mediaObjUrl) URL.revokeObjectURL(mediaObjUrl);
-  mediaObjUrl = fileToUrl(f);
-  let tag = "";
-  if (f.type.startsWith("image/")) tag = `<img src="${mediaObjUrl}">`;
-  else if (f.type.startsWith("video/")) tag = `<video src="${mediaObjUrl}" controls></video>`;
-  else tag = `<div class="hint">已选择音频/文件：${esc(f.name)}</div><audio src="${mediaObjUrl}" controls></audio>`;
-  const ap = $("attach-preview"); ap.innerHTML = tag; ap.style.display = "block";
-};
-$("send-btn").onclick = async () => {
-  const st = $("infer-status");
-  const prompt = $("infer-prompt").value;
-  if (!prompt.trim() && !lastMedia) return;
-  let userHtml = esc(prompt);
-  if (lastMedia) {
-    let tag = "";
-    if (lastMedia.type.startsWith("image/")) tag = `<img src="${mediaObjUrl}">`;
-    else if (lastMedia.type.startsWith("video/")) tag = `<video src="${mediaObjUrl}" controls></video>`;
-    else tag = `<audio src="${mediaObjUrl}" controls></audio>`;
-    userHtml += `<div class="media">${tag}</div>`;
-  }
-  addMsg("user", userHtml);
-  $("infer-prompt").value = "";
-  st.textContent = "思考中…";
-  $("send-btn").disabled = true;
-  try {
-    // 媒体已接入生成路径——作为 prompt 前缀参与编码
-    // （视觉/音频各走自己的线性投影到 d_model），生成仍是文本。
-    const body = {prompt,
-                  max_new_tokens: clampNum($("infer-maxnew").value, 1, 512, 32),
-                  temperature: clampNum($("infer-temp").value, 0.05, 5, 0.8),
-                  top_p: clampNum($("infer-topp").value, 0.01, 1, 0.95)};
-    if (lastMedia) {
-      const MAX_MEDIA_BYTES = 64 * 1024 * 1024;
-      if (lastMedia.size > MAX_MEDIA_BYTES) {
-        throw new Error(`附件 ${(lastMedia.size / 1048576).toFixed(1)}MB `
-                      + `超过上限 ${MAX_MEDIA_BYTES / 1048576}MB，未发送`);
-      }
-      const kind = lastMedia.type.startsWith("image/") ? "image"
-                 : lastMedia.type.startsWith("video/") ? "video" : "audio";
-      body.media = [{kind, b64: await fileToB64(lastMedia),
-                     filename: lastMedia.name}];
-    }
-    const {task_id} = await api("/api/infer", body);
-    const t = await pollTask(task_id, {
-      interval: 1500, timeout: 600000,
-      onTick: x => { st.textContent = "思考中… " + x.status; }});
-    addMsg("model", esc(t.result.text || "（无文本输出）"));
-    st.textContent = t.result.archive ? "已存档 id" : "";
-    st.title = t.result.archive || "";
-    $("attach-preview").style.display = "none";
-    $("attach-preview").innerHTML = "";
-    $("infer-media").value = "";
-    lastMedia = null;
-    return;
-  } catch (e) { st.textContent = "错误: " + e.message; addMsg("model", "⚠ " + esc(e.message)); }
-  finally { $("send-btn").disabled = false; }
-};
-$("infer-prompt").addEventListener("keydown", e => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("send-btn").click(); }
-});
-$("debug-panel").querySelector(".toggle").onclick =
-  () => $("debug-panel").classList.toggle("collapsed");
-
-/* ---------- 编解码器 ---------- */
-$("text-encode").onclick = async () => {
-  try {
-    const r = await api("/api/codec/text", {text: $("text-in").value});
-    $("text-out").textContent = r.token5;
-  } catch (e) { $("text-out").textContent = "错误: " + e.message; }
-};
-$("audio-encode").onclick = async () => {
-  const f = $("audio-file").files[0]; if (!f) return;
-  $("audio-preview").innerHTML = `<audio src="${fileToUrl(f)}" controls></audio>`;
-  $("audio-out").textContent = "编码中…";
-  try {
-    const r = await api("/api/codec/audio", {audio_b64: await fileToB64(f),
-                             filename: f.name},
-                        {timeout: API_UPLOAD_TIMEOUT_MS});
-    $("audio-out").textContent =
-      `# 音元数 ${r.n_tokens}，时长 ${r.duration_s}s\n` + r.token5;
-  } catch (e) { $("audio-out").textContent = "错误: " + e.message; }
-};
-$("image-encode").onclick = async () => {
-  const f = $("image-file").files[0]; if (!f) return;
-  $("image-preview").src = fileToUrl(f);
-  $("image-out").textContent = "编码中…";
-  try {
-    const r = await api("/api/codec/image", {image_b64: await fileToB64(f)},
-                          {timeout: API_UPLOAD_TIMEOUT_MS});
-    const st = r.steps[0];
-    $("image-out").textContent =
-      `# grid ${st.meta.grid[0]}×${st.meta.grid[1]}，patch 数 ${st.meta.n_patches}\n` +
-      r.token5;
-  } catch (e) { $("image-out").textContent = "错误: " + e.message; }
-};
-$("video-encode").onclick = async () => {
-  const f = $("video-file").files[0]; if (!f) return;
-  const vp = $("video-preview"); vp.src = fileToUrl(f); vp.style.display = "block";
-  $("video-out").textContent = "编码中（ffmpeg 抽帧 + 提取音轨）…";
-  try {
-    const r = await api("/api/codec/video", {video_b64: await fileToB64(f),
-                             filename: f.name},
-                        {timeout: API_UPLOAD_TIMEOUT_MS});
-    $("video-stats").textContent =
-      `帧数: ${r.n_frames}　总 patches: ${r.total_patches}　音元: ${r.n_audio_tokens}`;
-    $("video-out").textContent = r.token5;
-  } catch (e) { $("video-out").textContent = "错误: " + e.message;
-                $("video-stats").textContent = ""; }
-};
-$("prims-convert").onclick = async () => {
-  const f = $("prims-file").files[0]; if (!f) return;
-  $("prims-src").src = fileToUrl(f);
-  $("prims-msg").textContent = "转换中（贪心图元拟合，后台任务）…";
-  $("prims-render").innerHTML = ""; $("prims-out").textContent = "—";
-  try {
-    const {task_id} = await api("/api/codec/image2prims",
-                                {image_b64: await fileToB64(f),
-                                 max_steps: clampNum($("prims-steps").value, 1, 1000, 100),
-                                 quality: $("prims-quality").value || "fast"},
-                                {timeout: API_UPLOAD_TIMEOUT_MS});
-    const t = await pollTask(task_id, {
-      interval: 1200, timeout: 120000,
-      onTick: x => { $("prims-msg").textContent = "转换中… " + x.status; }});
-    const r = t.result;
-    $("prims-render").innerHTML = r.svg;
-    $("prims-out").textContent =
-      `# ${r.note}\n# 图元 ${r.n_primitives} 个，token ${r.tokens.length} 个（9/图元）\n` +
-      stepsToToken5([{modality: "draw", token_ids: r.tokens, meta: {}}], "model");
-    $("prims-msg").textContent = r.n_primitives + " 个图元";
-  } catch (e) { $("prims-msg").textContent = "错误: " + e.message; }
-};
-/* ---------- Token 编辑器 ----------
-   调色板：扩展系统 token（<00000>..<00005>，也可直接写名字）+ 结构字符。 */
-const TOKEN_PALETTE = [
-  {label:"<user>",    insert:"<00001>"},
-  {label:"<user/>",   insert:"<00002>"},
-  {label:"<model>",   insert:"<00003>"},
-  {label:"<model/>",  insert:"<00004>"},
-  {label:"<stop>",    insert:"<00005>"},
-  {label:"<caps>",    insert:"<00000>"},
-  {label:"时间步 {",  insert:"{"},
-  {label:"时间步 }",  insert:"}"},
-  {label:"步内 |",    insert:"|"},
-  {label:"完整 {}",   insert:"{}", back: 1},
-];
-const paletteEl = $("json-palette");
-TOKEN_PALETTE.forEach(t => {
-  const b = document.createElement("button");
-  b.textContent = t.label;
-  b.onclick = () => insertAtCursor(t.insert, t.back || 0);
-  paletteEl.appendChild(b);
-});
-function insertAtCursor(text, back) {
-  const ed = $("json-editor"); ed.focus();
-  document.execCommand("insertText", false, text);
-  if (back > 0) {
-    const sel = window.getSelection();
-    for (let i = 0; i < back && sel.modify; i++)
-      sel.modify("move", "backward", "character");
-  }
-}
-$("json-format").onclick = () => {
-  // 每个 {} 时间步独占一行；只清排版空白（\n\r\t），空格是合法 token 要保留
-  const t = $("json-editor").innerText.replace(/[\n\r\t]+/g, "");
-  $("json-editor").textContent = t.replace(/\}\{/g, "}\n{");
-  $("json-msg").textContent = "";
-};
-$("json-minify").onclick = () => {
-  $("json-editor").textContent =
-    $("json-editor").innerText.replace(/[\n\r\t]+/g, "");
-  $("json-msg").textContent = "";
-};
-$("json-copy").onclick = () => {
-  navigator.clipboard.writeText($("json-editor").innerText)
-    .then(() => $("json-msg").textContent = "已复制");
-};
-$("json-export").onclick = async () => {
-  const msg = $("json-msg");
-  msg.textContent = "导出中…";
-  try {
-    const r = await api("/api/tokens/export",
-                        {text: $("json-editor").innerText});
-    const bytes = b64ToBytes(r.tokens_b64);
-    const blob = new Blob([bytes], {type: "application/octet-stream"});
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `stream_${r.n_tokens}tok.tokens`;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
-    msg.textContent = `已导出 ${r.n_tokens} tokens / ${r.n_steps} 时间步`;
-  } catch (e) { msg.textContent = "错误: " + e.message; }
-};
-
-/* ---------- 词表搜索（/api/vocab，GET ?q=） ---------- */
-async function vocabSearch() {
-  const q = $("vocab-q").value.trim();
-  const msg = $("vocab-msg"), hits = $("vocab-hits");
-  if (!q) { msg.textContent = ""; hits.textContent = ""; return; }
-  msg.textContent = "搜索中…";
-  try {
-    const r = await api("/api/vocab?q=" + encodeURIComponent(q));
-    msg.textContent = `${r.hits.length} 项命中（词表共 ${r.vocab_size}）`;
-    hits.innerHTML = r.hits.length
-      ? r.hits.map(h => `<code>${esc(h.token)}</code><span class="hint">#${h.id} ${h.category || ""}</span>`).join("　")
-      : '<span class="hint">无命中</span>';
-  } catch (e) { msg.textContent = "错误: " + e.message; hits.textContent = ""; }
-}
-$("vocab-search").onclick = vocabSearch;
-$("vocab-q").addEventListener("keydown", e => {
-  if (e.key === "Enter") vocabSearch();
-});
-
-/* ---------- 添加 token（/api/vocab/add，POST） ---------- */
-$("vocab-add").onclick = async () => {
-  const token = $("vocab-add-token").value;
-  const category = $("vocab-add-cat").value;
-  const msg = $("vocab-add-msg");
-  if (!token) { msg.textContent = "token 文本不能为空"; return; }
-  msg.textContent = "添加中…";
-  try {
-    const r = await api("/api/vocab/add", {token, category});
-    const fs = Object.entries(r.free_slots || {})
-      .map(([k, v]) => `${k}=${v}`).join(" ");
-    msg.textContent = `已添加 ${r.token} → #${r.id}（${r.category}）；` +
-      (fs ? `剩余槽位 ${fs}` : "已写入词表");
-    $("vocab-add-token").value = "";
-    vocabSearch();
-  } catch (e) { msg.textContent = "错误: " + e.message; }
-};
-$("vocab-add-token").addEventListener("keydown", e => {
-  if (e.key === "Enter") $("vocab-add").onclick();
-});
-
-/* ---------- 词表页面（区间占用 + 预设管理） ---------- */
-function catColor(cat) {
-  return {regular:"#58a6ff", fallback:"#a371f7",
-          special:"#d29922", system:"#3fb950"}[cat] || "#6e7681";
-}
-async function refreshVocab() {
-  try {
-    const r = await api("/api/vocab/ranges");
-    drawVocabBar(r);
-    renderVocabRegions(r.regions);
-    renderVocabPresets(r.presets);
-    populateVocabSelects(r.presets);
-    const ct = r.category_totals || {};
-    $("vocab-bar-note").textContent =
-      `总槽位 ${r.vocab_size_padded}　已用 ` +
-      `regular=${ct.regular||0} fallback=${ct.fallback||0} ` +
-      `special=${ct.special||0} system=${ct.system||0}`;
-  } catch (e) {}
-}
-function drawVocabBar(r) {
-  const cv = $("vocab-bar"), ctx = cv.getContext("2d");
-  const W = cv.width, H = cv.height;
-  ctx.clearRect(0, 0, W, H);
-  const total = r.vocab_size_padded;
-  let x = 0;
-  // 不可见头 [0, invisible_end)：special/system 固定契约，画一段灰底
-  const headW = r.invisible_end / total * W;
-  ctx.fillStyle = "#30363d";
-  ctx.fillRect(0, 0, headW, H);
-  x = headW;
-  for (const reg of r.regions) {
-    const w = reg.size / total * W;
-    ctx.fillStyle = catColor(reg.category);
-    ctx.fillRect(x, 0, Math.max(w, 0.5), H);
-    x += w;
-  }
-}
-function renderVocabRegions(regions) {
-  const tb = $("vocab-regions").querySelector("tbody");
-  tb.innerHTML = regions.map(rg => {
-    const pct = rg.padded ? (rg.used / rg.padded * 100).toFixed(1) : "0";
-    return `<tr><td>${rg.region}</td><td>${rg.category}</td>` +
-      `<td>${rg.begin}–${rg.begin + rg.size - 1}</td>` +
-      `<td>${rg.size}</td><td>${rg.used}</td><td>${pct}%</td></tr>`;
-  }).join("");
-}
-function renderVocabPresets(presets) {
-  const tb = $("vocab-presets").querySelector("tbody");
-  tb.innerHTML = presets.map(p => {
-    const pct = p.capacity ? (p.used / p.capacity * 100).toFixed(1) : "0";
-    const del = p.is_base ? "" :
-      `<button class="act danger xs" onclick="deletePreset('${esc(p.name)}')">删除</button>`;
-    return `<tr><td>${esc(p.name)} ` +
-      `${p.is_base ? '<span class="badge on">基础</span>' : ""}</td>` +
-      `<td>${p.used}/${p.capacity}（${pct}%）</td><td>${del}</td></tr>`;
-  }).join("");
-}
-function populateVocabSelects(presets) {
-  // 重建下拉前记住当前选择并回填，避免每次 refreshVocab 都弹回第一项
-  const opts = presets.map(p =>
-    `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
-  for (const id of ["vocab-new-source", "vocab-token-preset", "model-vocab"]) {
-    const el = $(id);
-    if (!el) continue;
-    const prev = el.value;
-    el.innerHTML = opts;
-    if (prev && presets.some(p => p.name === prev)) el.value = prev;
-  }
-}
-$("vocab-create-preset").onclick = async () => {
-  const name = $("vocab-new-name").value.trim();
-  if (!name) { $("vocab-create-msg").textContent = "请输入预设名"; return; }
-  $("vocab-create-msg").textContent = "创建中…";
-  try {
-    await api("/api/vocab/presets", {action:"create", name,
-                                    source: $("vocab-new-source").value});
-    $("vocab-create-msg").textContent = "已创建 " + name;
-    $("vocab-new-name").value = "";
-    refreshVocab();
-  } catch (e) { $("vocab-create-msg").textContent = "错误: " + e.message; }
-};
-window.deletePreset = async name => {
-  if (!confirm("删除词表预设 " + name + "？（其 vocab.txt 将被移除）")) return;
-  try { await api("/api/vocab/presets", {action:"delete", name});
-        refreshVocab(); }
-  catch (e) { alert(e.message); }
-};
-$("preset-add").onclick = async () => {
-  const name = $("vocab-token-preset").value;
-  const token = $("preset-add-token").value;
-  if (!token) { $("preset-token-msg").textContent = "请输入 token"; return; }
-  $("preset-token-msg").textContent = "添加中…";
-  try {
-    const r = await api("/api/vocab/preset/token",
-      {name, action:"add", token, category: $("preset-add-cat").value});
-    $("preset-token-msg").textContent =
-      `已添加 ${r.token} → #${r.id}（${r.category}）；剩余可见槽 ${r.used}`;
-    $("preset-add-token").value = "";
-    refreshVocab();
-  } catch (e) { $("preset-token-msg").textContent = "错误: " + e.message; }
-};
-$("preset-remove").onclick = async () => {
-  const name = $("vocab-token-preset").value;
-  const token = $("preset-remove-token").value;
-  if (!token) { $("preset-token-msg").textContent = "请输入 token"; return; }
-  $("preset-token-msg").textContent = "删除中…";
-  try {
-    const r = await api("/api/vocab/preset/token",
-      {name, action:"remove", token});
-    $("preset-token-msg").textContent = `已软删 ${r.token}（原 #${r.id}）`;
-    $("preset-remove-token").value = "";
-    refreshVocab();
-  } catch (e) { $("preset-token-msg").textContent = "错误: " + e.message; }
-};
-</script>
+<script src="app.js"></script>
 </body>
 </html>
