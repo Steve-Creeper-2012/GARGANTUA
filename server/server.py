@@ -63,6 +63,7 @@ from server_media import (MAX_IMAGE_DIM, MAX_PATCHES_TOTAL, b64_to_pil,
                           decode_audio_any, extract_video_audio,
                           extract_video_frames, size_guard_pil)
 from server_codecs import CodecApi
+from server_monitor import MonitorApi
 from server_train import TrainApi
 from server_tokens import TokensApi
 from server_services import ServiceError, ServiceSupervisor
@@ -105,7 +106,7 @@ class _TrainStatusProxy:
 # ---------------------------------------------------------------------------
 # 应用装配：注册表 + 任务池 + 服务监督器 + 三个 API mixin
 # ---------------------------------------------------------------------------
-class App(TrainApi, CodecApi, TokensApi):
+class App(TrainApi, CodecApi, TokensApi, MonitorApi):
     def __init__(self, model_dir, data_dir, log_path, idle_timeout=300):
         self.mgr = ModelManager(model_dir)
         self.pool = TaskPool()
@@ -561,6 +562,12 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/system":
                 _code, obj = app.api_system()
                 self._send_json(obj, _code)
+            elif path == "/api/system/devices":
+                self._send_json(app.api_system_devices()[1])
+            elif path == "/api/system/processes":
+                self._send_json(app.api_system_processes()[1])
+            elif path == "/api/system/updates":
+                self._send_json(app.api_system_updates(query)[1])
             elif path == "/api/vocab":
                 _code, obj = app.api_vocab(query)
                 self._send_json(obj, _code)
@@ -602,6 +609,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/vocab/presets": app.api_vocab_presets,
             "/api/vocab/preset/token": app.api_vocab_preset_token,
             "/api/system/install-optional": app.api_system_install_optional,
+            "/api/system/install": app.api_system_install,
+            "/api/system/kill": app.api_system_kill,
         }
         fn = routes.get(path)
         if fn is None:
