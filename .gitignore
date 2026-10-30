@@ -19,9 +19,11 @@ logs/
 *.safetensors
 
 # 词表预设（vocabs/<name>/vocab.txt）：base 由 service/tokens/vocab.json
-# 的可见区确定性派生（vocab_presets.ensure_base 幂等重建），其余是用户
-# 本地增删的产物——与 models/ 同性质，不进仓库。
-vocabs/
+# 的可见区确定性派生（vocab_presets.ensure_base 幂等重建）。
+# 策略：原始 base 词表（vocabs/base/）是共享资产，供 fork 用户直接使用，进仓库；
+# 其余自定义预设仍是用户本地产物，不进仓库（与 models/ 同性质）。models/ 也保持忽略。
+vocabs/*
+!vocabs/base/
 
 # 测试/构建缓存
 .pytest_cache/
