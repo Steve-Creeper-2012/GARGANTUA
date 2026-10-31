@@ -55,10 +55,11 @@
     --border: transparent;
     --shadow: 0 18px 44px rgba(0, 0, 0, .45);
     --ease: cubic-bezier(.2, .7, .3, 1);
-    /* 侧栏收起/展开时长；标题位移与之同步。内容区左移更长(488ms)，收起末端
-       才钻入按钮条下方，避开「内容在动画里穿过尚未收完的面板」造成的重叠。 */
-    --side-dur: .388s;
-    --content-dur: .488s;
+    /* 侧栏收起/展开 + 标题位移 + 内容左移 统一 400ms、同步起步；
+       --move-ease 用 linear，整段位移匀速（移动速度均匀、无快慢起伏）。
+       仅侧栏收起这套动画用线性，全局 --ease 留给 hover 等其它过渡。 */
+    --dur: .4s;
+    --move-ease: linear;
   }
   /* —— 浅色 —— */
   :root[data-theme="light"] {
@@ -112,7 +113,7 @@
   #sidebar {
     width: 244px; flex-shrink: 0; margin: 0;
     overflow: hidden;
-    transition: width var(--side-dur) var(--ease);
+    transition: width var(--dur) var(--move-ease);
   }
   /* 收起态宽度 = 按钮宽 50px（按钮右缘 x=50）：布局宽度 244→50 的收拢量
      正好等于 clip 右侧 194px（→x=50），二者逐帧重合，右缘精确停在按钮右缘，
@@ -140,15 +141,15 @@
   /* 编排动画只由用户点击触发（JS 给 <html> 挂 .side-anim，播完移除），
      首帧恢复折叠状态时直接落位、不播动画。 */
   html.side-anim #sidebar.collapsed .side-inner {
-    animation: sideShrink var(--side-dur) var(--ease) forwards;
+    animation: sideShrink var(--dur) var(--move-ease) forwards;
   }
   html.side-anim #sidebar:not(.collapsed) .side-inner {
-    animation: sideGrow var(--side-dur) var(--ease);
+    animation: sideGrow var(--dur) var(--move-ease);
   }
   /* 四边同进同退：单一 clip-path 插值，0% → 100% 之间不设任何中间档。
      终态 = 按钮矩形（上13 右194 下~高-51 左12）：面板不是缩到中心一个点，
      而是恰好收进收起按钮的占位里——终点即按钮本身，不是「什么都没有」。
-     路径越长速度越快，但都从同一时刻出发、同一时刻到位（恒 --side-dur=388ms）。 */
+     路径越长速度越快，但都从同一时刻出发、同一时刻到位（恒 --dur=400ms，linear 匀速）。 */
   @keyframes sideShrink {
     0%   { clip-path: inset(0 0 0 0 round 0 var(--r) var(--r) 0); }
     100% { clip-path: inset(13px 194px calc(100% - 51px) 12px round var(--r)); }
@@ -260,20 +261,21 @@
     margin: 0; font-size: var(--title); font-weight: 800;
     letter-spacing: .01em; color: var(--fg); line-height: 1.1;
     white-space: nowrap; display: flex; align-items: center; height: 38px;
-    transition: transform var(--side-dur) var(--ease);
+    transition: transform var(--dur) var(--move-ease);
   }
   /* 收起态边栏宽 50px，顶栏左起 x=50、padding 18 → 标题自然落点 x=68；
      位移写死 -10px 维持在 x=58（按钮右沿 50 留 8 间距），与之前批准的落点
      完全一致。全程向左、不向右、不消失，与固定按钮构成「按钮 + 标题」两栏。
      位移是常量，与窗口宽度/标题文字无关，不跳变。 */
   html[data-side="collapsed"] .page-title { transform: translateX(-10px); }
-  #pages { flex: 1; overflow: hidden; transition: margin-left var(--content-dur) var(--ease); }
+  #pages { flex: 1; overflow: hidden; transition: margin-left var(--dur) var(--move-ease); }
   /* 收起态内容左移：#pages 整体左移 50px 抵消收起按钮栏（sidebar 50px）的占位，
      内容左缘 = 50 − 50 + 18 = 18px，与右缘 padding 18 严格对称（不含标题——
      顶栏在 #pages 外，标题保持 x=58）。移 #pages 而非 .page：#pages 的
      overflow:hidden 裁的是自身盒子，左移自身不会裁掉内容；移 .page 则会被裁。
-     margin(--content-dur=488ms) 比 #sidebar width(--side-dur=388ms) 慢，所以收起时
-     内容滞后、末尾才钻入按钮条下方，避开穿过尚未收完面板的重叠；标题随侧栏(388ms)。 */
+     侧栏 width 与 #pages margin 同 --dur=400ms、同 --move-ease=linear、同步起步；
+     注意：内容走 244px 而侧栏只走 194px，匀速下内容仍会在中段越过面板右沿
+     （重叠回归），若要彻底无重叠需让内容比侧栏慢或停在 x=50（见上轮讨论）。 */
   html[data-side="collapsed"] #pages { margin-left: -50px; }
   .page { display: none; height: 100%; }
   .page.active { display: flex; flex-direction: column; }
