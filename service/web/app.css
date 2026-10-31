@@ -114,10 +114,10 @@
   /* 首帧就按上次的折叠状态画（属性由 <head> 内联脚本写），避免「先展开再收起」的闪动 */
   html[data-side="collapsed"] #sidebar { width: 0; pointer-events: none; }
   /* 固定内宽：宽度动画时文字不重排。面板底色/描边/圆角全在内层上——
-     收起不是淡出，而是一次定向裁切：四边同时开始收缩、同时到达折叠按钮
-     （内层坐标 31,32，与 fixed 常驻按钮逐像素重合）。路径长短不同 →
-     各边速度不同（浏览器按同一时长对每条边做插值，速度 = 距离/时长，
-     自动同步完成）。全程内容不透明，只是被裁掉。 */
+     收起不是淡出，也不是缩成一个点后消失，而是整块面板收敛到收起按钮的
+     矩形占位（内层坐标 12..50 × 13..51，与 fixed 常驻按钮逐像素重合，
+     终态四角圆角 = 按钮圆角）。四边同时出发同时到位，路径长短不同 →
+     速度不同（同一时长插值，速度 = 距离/时长）。全程内容不透明。 */
   .side-inner {
     position: relative;
     width: 244px; height: 100%; display: flex; flex-direction: column;
@@ -128,7 +128,7 @@
   }
   #sidebar.collapsed .side-inner,
   html[data-side="collapsed"] #sidebar .side-inner {
-    clip-path: inset(32px 213px calc(100% - 32px) 31px round 0 var(--r) var(--r) 0);
+    clip-path: inset(13px 194px calc(100% - 51px) 12px round var(--r));
   }
   /* 编排动画只由用户点击触发（JS 给 <html> 挂 .side-anim，播完移除），
      首帧恢复折叠状态时直接落位、不播动画。 */
@@ -139,15 +139,16 @@
     animation: sideGrow .42s var(--ease);
   }
   /* 四边同进同退：单一 clip-path 插值，0% → 100% 之间不设任何中间档。
-     右沿 213px、底沿 ~高-32px、顶 32px、左 31px——路径越长速度越快，
-     但都从同一时刻出发、同一时刻到位（总时长恒为 .42s，与距离无关）。 */
+     终态 = 按钮矩形（上13 右194 下~高-51 左12）：面板不是缩到中心一个点，
+     而是恰好收进收起按钮的占位里——终点即按钮本身，不是「什么都没有」。
+     路径越长速度越快，但都从同一时刻出发、同一时刻到位（恒 .42s）。 */
   @keyframes sideShrink {
     0%   { clip-path: inset(0 0 0 0 round 0 var(--r) var(--r) 0); }
-    100% { clip-path: inset(32px 213px calc(100% - 32px) 31px round 0 var(--r) var(--r) 0); }
+    100% { clip-path: inset(13px 194px calc(100% - 51px) 12px round var(--r)); }
   }
-  /* 展开 = 同一条插值的反向播放：四边同时从按钮处向四方同时铺开 */
+  /* 展开 = 同一条插值的反向播放：四边同时从按钮占位向四方铺开 */
   @keyframes sideGrow {
-    0%   { clip-path: inset(32px 213px calc(100% - 32px) 31px round 0 var(--r) var(--r) 0); }
+    0%   { clip-path: inset(13px 194px calc(100% - 51px) 12px round var(--r)); }
     100% { clip-path: inset(0 0 0 0 round 0 var(--r) var(--r) 0); }
   }
   /* 高亮滑块：整块 accent-soft 底由这一个元素承担，切页时 transform 滑过去，
@@ -236,36 +237,34 @@
     border-radius: var(--r); color: var(--fg2); background: none;
     transition: color .15s var(--ease);
   }
-  /* 悬停外框比按钮本身小一圈（inset 5px），只给里层上底色，
-     不再把整个 38×38 铺满。 */
+  /* 悬停底色默认比按钮小一圈（inset 5px），悬停时向四周扩张到 inset 2px——
+     是「加深区域变大」而不是按钮本体变大。 */
   .side-btn::before {
     content: ""; position: absolute; inset: 5px;
     border-radius: var(--r); background: transparent;
-    transition: background .15s var(--ease);
+    transition: background .15s var(--ease), inset .16s var(--ease);
   }
   .side-btn:hover { color: var(--fg); }
-  .side-btn:hover::before { background: var(--hover); }
+  .side-btn:hover::before { background: var(--hover); inset: 2px; }
   .side-btn svg { width: 21px; height: 21px; position: relative; z-index: 1; }
-  /* 折叠按钮：fixed 常驻窗口左上（12,13），与边栏裁切收敛点逐像素重合。
+  /* 折叠按钮：fixed 常驻窗口左上（12,13），与边栏裁切收敛矩形逐像素重合。
      它不属于边栏/顶栏任何会被裁切的层，收起全程原地可见，彻底取代旧的
      「边栏内按钮 + 浮层按钮」双按钮交接。 */
-  #side-toggle {
-    position: fixed; left: 12px; top: 13px; z-index: 40;
-    transition: transform .16s var(--ease), color .15s var(--ease);
-  }
-  /* 悬停时整体放大一点（含图标与 hover 底色），落点不动（缩放围绕中心） */
-  #side-toggle:hover { transform: scale(1.12); }
+  #side-toggle { position: fixed; left: 12px; top: 13px; z-index: 40; }
   /* 标题盒高度与边栏那个 38px 的折叠按钮对齐：两边的文字垂直中心都在 y=32，
      这样 GARGANTUA 与页面标题永远在同一条水平线上（含边栏收起/展开两种状态）。 */
   .page-title {
     margin: 0; font-size: var(--title); font-weight: 800;
     letter-spacing: .01em; color: var(--fg); line-height: 1.1;
     white-space: nowrap; display: flex; align-items: center; height: 38px;
+    transition: opacity .42s var(--ease);
   }
-  /* 标题不做任何补偿位移：收起/展开时随自然布局整体滑动，与下方内容左缘
-     永远严格对齐（展开 x=262，收起 x=18，只往左、不往右）。
-     （旧版收起态标题被浮层按钮推右 46px，fixed 常驻按钮接管后该补偿
-     已无存在理由，2026-10-30 回退。） */
+  /* 标题不做任何补偿位移：收起/展开随自然布局整体滑动，与下方内容左缘
+     严格对齐（展开 x=262，收起 x=18，只往左、不往右）。收起态标题的落点
+     （x=18）会压进固定按钮（12..50）——两个约束（不右移、不重叠）下唯一
+     的解是滑到最左的同时渐隐：收起后标题隐去，该角落只留按钮；展开时随
+     布局滑回并淡入。首帧恢复折叠态由 head 内联脚本先行写属性，不播动画。 */
+  html[data-side="collapsed"] .page-title { opacity: 0; }
   #pages { flex: 1; overflow: hidden; }
   .page { display: none; height: 100%; }
   .page.active { display: flex; flex-direction: column; }
