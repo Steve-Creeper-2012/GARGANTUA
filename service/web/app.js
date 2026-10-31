@@ -680,7 +680,7 @@ function renderMonitors(d) {
 
 /* 进程监视器：内存 / 显存两列各自独立切换「百分比 ↔ 实际占用」 */
 let MEM_ACTUAL = false, VRAM_ACTUAL = false;
-let PROC_CACHE = [];
+let PROC_CACHE = [], PROC_ERROR = "";
 function procMemCell(p) {
   if (MEM_ACTUAL) return p.mem_bytes == null ? "—" : fmtBytes(p.mem_bytes);
   return p.mem_pct == null ? "—" : fmtPct(p.mem_pct);
@@ -693,15 +693,20 @@ function syncProcHeaders() {
   $("proc-mem-th").textContent = MEM_ACTUAL ? "内存（实际）" : "内存";
   $("proc-vram-th").textContent = VRAM_ACTUAL ? "显存（实际）" : "显存";
 }
-function renderProcesses(procs) {
+function renderProcesses(procs, err) {
   PROC_CACHE = procs || [];
+  PROC_ERROR = err || "";
   syncProcHeaders();
   const tb = $("proc-tbody");
-  $("proc-note").textContent = PROC_CACHE.length
-    ? `${PROC_CACHE.length} 个进程　·　内存 / 显存列点击可切换「百分比 ↔ 实际占用」`
-    : "内存 / 显存列点击可在「百分比 ↔ 实际占用」间切换";
+  $("proc-note").textContent = PROC_ERROR
+    ? "进程列表读取失败"
+    : PROC_CACHE.length
+      ? `${PROC_CACHE.length} 个进程　·　内存 / 显存列点击可切换「百分比 ↔ 实际占用」`
+      : "内存 / 显存列点击可在「百分比 ↔ 实际占用」间切换";
   if (!PROC_CACHE.length) {
-    tb.innerHTML = `<tr><td colspan="7" class="hint">没有正在运行的 GARGANTUA 进程</td></tr>`;
+    // 读不到 ≠ 没有：后端给了 error 就照实显示，别让用户以为进程都退了
+    tb.innerHTML = `<tr><td colspan="7" class="hint">${esc(
+      PROC_ERROR || "没有正在运行的 GARGANTUA 进程")}</td></tr>`;
     return;
   }
   tb.innerHTML = PROC_CACHE.map(p => `<tr>
@@ -768,7 +773,7 @@ async function refreshMonitors() {
     DEVICE_CACHE = d;
     renderDevices(d);
     renderMonitors(d);
-    renderProcesses(p.processes);
+    renderProcesses(p.processes, p.error);
     $("mon-msg").textContent = "";
   } catch (e) {
     $("mon-msg").textContent = "监视数据获取失败: " + e.message;

@@ -530,5 +530,31 @@ class TestAuditHardening(unittest.TestCase):
                 mon._ssl_context()
 
 
+class TestMonitorUnavailable(unittest.TestCase):
+    """ps 跑不起来（沙箱/权限拒绝、命令缺失）时必须报「读不到」，
+    不能吞成空列表让前端显示「没有正在运行的 GARGANTUA 进程」。"""
+
+    def test_ps_rows_none_means_unavailable(self):
+        # _run 返回空串 = ps 没跑起来（真 ps 至少输出它自己那一行）
+        with mock.patch.object(mon, "_run", return_value=""):
+            self.assertIsNone(mon._ps_process_rows())
+            with self.assertRaises(mon.MonitorUnavailable):
+                mon._gargantua_processes()
+
+    def test_api_processes_reports_error(self):
+        with mock.patch.object(mon, "_run", return_value=""):
+            code, obj = mon.MonitorApi().api_system_processes()
+        self.assertEqual(code, 200)
+        self.assertEqual(obj["processes"], [])
+        self.assertIn("ps", obj["error"])
+
+    def test_kill_refuses_when_unavailable(self):
+        # 白名单都拿不到时，不能报「pid 不属于 GARGANTUA」这种误导信息
+        with mock.patch.object(mon, "_run", return_value=""):
+            with self.assertRaises(ValueError) as cm:
+                mon.MonitorApi().api_system_kill({"pid": 12345})
+        self.assertIn("ps", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -515,9 +515,23 @@ def _is_gargantua_args(args, exe, root, allow_other=True):
     return False, None
 
 
+class MonitorUnavailable(RuntimeError):
+    """底层采集命令不可用（ps 被拒 / 命令缺失 / 被沙箱限制）。
+
+    必须与「确实没有匹配进程」区分开：前者是读不到，后者是真的空。
+    旧版 `_run` 把所有失败都吞成空串，前端于是把「读不到」显示成
+    「没有正在运行的 GARGANTUA 进程」——一句谎话。"""
+
+
 def _ps_process_rows():
-    """非 Windows：ps -axo pid,%cpu,rss,args → [(pid, cpu, rss_kb, args)]。"""
+    """非 Windows：ps -axo pid,%cpu,rss,args → [(pid, cpu, rss_kb, args)]。
+
+    返回 None 表示 ps 根本没跑起来（被系统/沙箱拒绝、命令缺失）；
+    返回 [] 表示跑起来了但没有一行能解析。两者语义不同，不能混。"""
     out = _run(["ps", "-axo", "pid=,%cpu=,rss=,args="], timeout=10)
+    if not out.strip():
+        # ps 至少会输出它自己那一行，空输出只可能是执行失败
+        return None
     rows = []
     for line in (out or "").splitlines():
         parts = line.strip().split(None, 3)
@@ -647,6 +661,9 @@ def _gargantua_processes(include_other=True):
     按 CPU/内存降序（cpu=None 视为 0）排序。"""
     is_win = platform.system() == "Windows"
     rows = _windows_process_rows() if is_win else _ps_process_rows()
+    if rows is None:
+        raise MonitorUnavailable(
+            "进程列表读取失败：ps 不可用（被沙箱或系统权限拒绝）")
     total_mem, _ = _mem_stat()
     procs = []
     for pid, cpu, rss_kb, args in rows:
@@ -881,7 +898,12 @@ class MonitorApi:
         }
 
     def api_system_processes(self):
-        return 200, {"processes": _gargantua_processes()}
+        # 读不到就如实说读不到（200 + error），不要伪装成「没有进程」：
+        # 沙箱/权限拒绝 ps 时，空列表会让用户以为 GARGANTUA 没在跑。
+        try:
+            return 200, {"processes": _gargantua_processes()}
+        except MonitorUnavailable as e:
+            return 200, {"processes": [], "error": str(e)}
 
     def api_system_kill(self, body):
         pid = body.get("pid")
@@ -892,7 +914,11 @@ class MonitorApi:
         # 单独拦截 self，只做目录边界校验——只允许结束当前项目目录内的进程，
         # 越界（其它副本 / 外部进程，标 external）一律拒绝，防止误杀别的
         # GARGANTUA 副本。
-        known = {p["pid"] for p in _gargantua_processes(include_other=False)}
+        try:
+            known = {p["pid"] for p in _gargantua_processes(include_other=False)}
+        except MonitorUnavailable as e:
+            # 白名单都拿不到就别假装「pid 不属于 GARGANTUA」，如实报读不到
+            raise ValueError(str(e))
         if pid not in known:
             raise ValueError(f"pid {pid} 不属于 GARGANTUA，拒绝终止")
         import signal
