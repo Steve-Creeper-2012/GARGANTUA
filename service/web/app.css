@@ -138,26 +138,19 @@
   html[data-side="collapsed"] #sidebar .side-inner {
     clip-path: inset(13px 194px calc(100% - 51px) 12px round var(--r));
   }
-  /* 编排动画只由用户点击触发（JS 给 <html> 挂 .side-anim，播完移除），
-     首帧恢复折叠状态时直接落位、不播动画。 */
-  html.side-anim #sidebar.collapsed .side-inner {
-    animation: sideShrink var(--dur) var(--move-ease) forwards;
-  }
-  html.side-anim #sidebar:not(.collapsed) .side-inner {
-    animation: sideGrow var(--dur) var(--move-ease);
-  }
-  /* 四边同进同退：单一 clip-path 插值，0% → 100% 之间不设任何中间档。
+  /* 四边同进同退：单一 clip-path 插值，起点与终点之间不设任何中间档。
      终态 = 按钮矩形（上13 右194 下~高-51 左12）：面板不是缩到中心一个点，
      而是恰好收进收起按钮的占位里——终点即按钮本身，不是「什么都没有」。
-     路径越长速度越快，但都从同一时刻出发、同一时刻到位（恒 --dur=400ms，linear 匀速）。 */
-  @keyframes sideShrink {
-    0%   { clip-path: inset(0 0 0 0 round 0 var(--r) var(--r) 0); }
-    100% { clip-path: inset(13px 194px calc(100% - 51px) 12px round var(--r)); }
-  }
-  /* 展开 = 同一条插值的反向播放：四边同时从按钮占位向四方铺开 */
-  @keyframes sideGrow {
-    0%   { clip-path: inset(13px 194px calc(100% - 51px) 12px round var(--r)); }
-    100% { clip-path: inset(0 0 0 0 round 0 var(--r) var(--r) 0); }
+     这里必须是 transition，不能是 @keyframes：width / margin-left / transform
+     三条都是过渡，clip 若是动画，连点两次时它会从 100% 重新起播（实测单帧
+     瞬跳 119.8px），而另外三条从当前插值处平滑反向 —— 那才叫不同步。
+     用 transition 后四条位移共用同一套过渡引擎：同一帧起步、同一帧到位、
+     同一 linear 匀速、中途反向也从当前值折返。
+     transition 只在 .side-anim 期间挂上（JS 点击时加、播完移除）：
+     首帧恢复折叠状态直接落位不播；拖圆角滑杆改 --r 时这条 clip 过渡
+     也不在场，面板圆角不会慢 400ms 才跟上。 */
+  html.side-anim .side-inner {
+    transition: clip-path var(--dur) var(--move-ease);
   }
   /* 高亮滑块：整块 accent-soft 底由这一个元素承担，切页时 transform 滑过去，
      不再靠每个 .nav-item 各自瞬间换背景。坐标系是 .side-inner（非滚动容器），
