@@ -345,7 +345,10 @@ def _gpu_runtime():
     PerformanceStatistics 是唯一免 sudo 的来源（Apple Silicon 与
     Intel/AMD 独立显卡都有）。统一内存机型上 GPU 吃的是系统内存，
     对应 inUseSysMemoryBytes；独立显存机型对应 inUseVidMemoryBytes。
-    读不到返回 []，前端渲染为「—」。"""
+    注意 ioreg 把 64 位有符号数按无符号打印：Intel 核显驱动会报负的在用
+    内存（如 -152322560 印成 18446744073594331136 ≈ 16384PB），必须按
+    有符号回绕还原并丢弃非正值，改用 gartUsedBytes（Intel GART 实际
+    占用）兜底。读不到返回 []，前端渲染为「—」。"""
     now = time.time()
     with _GPU_RT_LOCK:
         if _GPU_RT["data"] is not None and now - _GPU_RT["ts"] < GPU_RT_TTL:
@@ -364,8 +367,20 @@ def _gpu_runtime():
             used = 0
             for key in ("inUseSysMemoryBytes", "inUseVidMemoryBytes"):
                 m = re.search(r'"' + key + r'"\s*=\s*(\d+)', block)
+                if not m:
+                    continue
+                v = int(m.group(1))
+                if v >= 1 << 63:      # ioreg 无符号打印的负值 = 驱动无效数据
+                    v -= 1 << 64      # 按 64 位有符号回绕还原（如 -1 印成 2^64-1）
+                if v > 0:
+                    used += v
+            if not used:
+                # Intel 核显兜底：GART 已用字节 ≈ 实际显存占用
+                m = re.search(r'"gartUsedBytes"\s*=\s*(\d+)', block)
                 if m:
-                    used += int(m.group(1))
+                    v = int(m.group(1))
+                    if 0 < v < (1 << 63):
+                        used = v
             data.append({"usage": float(u.group(1)),
                          "used": used if used else None})
     with _GPU_RT_LOCK:

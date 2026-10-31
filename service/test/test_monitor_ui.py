@@ -293,6 +293,53 @@ class TestProcPorts(unittest.TestCase):
         self.assertEqual(r, {777: [8765]})
 
 
+class TestGpuRuntime(unittest.TestCase):
+    """_gpu_runtime：ioreg 无符号负值回绕丢弃 + gartUsedBytes 兜底。
+
+    实测 Intel 核显驱动会把负的在用内存按无符号打印（-152322560 印成
+    18446744073594331136 ≈ 16384PB），不处理就会在前端显示 16384.00PB。"""
+
+    def setUp(self):
+        mon._GPU_RT.update({"ts": 0.0, "data": None})
+
+    def _run(self, out):
+        return mock.patch.object(mon, "_run", return_value=out)
+
+    # 真机样本：Accum 块无利用率键会被跳过；真实块 inUse 为无符号负值
+    IOREG_INTEL = (
+        '  "PerformanceStatisticsAccum" = {"inUseSysMemoryBytes"'
+        '=18446744073594331136,"inUseVidMemoryBytes"=0,'
+        '"gartUsedBytes"=103919616}\n'
+        '  "PerformanceStatistics" = {"Device Utilization %"=7,'
+        '"inUseSysMemoryBytes"=18446744073594331136,'
+        '"inUseVidMemoryBytes"=0,"gartUsedBytes"=103919616}\n'
+    )
+
+    def test_negative_inuse_falls_back_to_gart(self):
+        # 16384PB 事故样本：inUse 无效 → 回退 gartUsedBytes=103919616（≈99MB）
+        with self._run(self.IOREG_INTEL):
+            r = mon._gpu_runtime()
+        self.assertEqual(r, [{"usage": 7.0, "used": 103919616}])
+
+    def test_valid_inuse_used_directly(self):
+        # Apple Silicon / 正常驱动：inUse 有效值直接采用，gart 不参与
+        out = ('  "PerformanceStatistics" = {"Device Utilization %"=12,'
+               '"inUseSysMemoryBytes"=268435456,"inUseVidMemoryBytes"=1048576,'
+               '"gartUsedBytes"=1}\n')
+        with self._run(out):
+            r = mon._gpu_runtime()
+        self.assertEqual(r, [{"usage": 12.0, "used": 269484032}])
+
+    def test_all_invalid_returns_none(self):
+        # inUse 无效且无 gart：宁可少报，used=None（前端显示 —）
+        out = ('  "PerformanceStatistics" = {"Device Utilization %"=0,'
+               '"inUseSysMemoryBytes"=18446744073709551615,'
+               '"inUseVidMemoryBytes"=0}\n')
+        with self._run(out):
+            r = mon._gpu_runtime()
+        self.assertEqual(r, [{"usage": 0.0, "used": None}])
+
+
 class TestGargantuaProcesses(unittest.TestCase):
     """BUG1 端到端：伪造 ps 输出 → 只剩项目进程，name / 排序 / 类型正确。"""
 

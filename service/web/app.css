@@ -30,12 +30,6 @@
        不统一）；--r-pill 给滑块/轨道/滚动条这类天然胶囊。 */
   --r-sm: calc(var(--r) / 2);
   --r-pill: 999px;
-  /* 嵌套内层的「同心圆角」：同半径的框套框，内框显得更圆、外框显得更尖。
-     光学正确的内层半径 = 外层半径 − 两框间距；站内嵌套间距普遍 8px 上下，
-     故统一派生一个内层值：外层（卡片/弹窗/表格容器）用 --r，
-     内层（卡片里的输入框/按钮、分段控件段、监视器 bar 等）用 --r-in。
-     --r 调到 0 时它也是 0，半径为零全程合法。 */
-  --r-in: max(calc(var(--r) - 8px), 0px);
 
     /* —— 深色（默认） —— */
     --bg: #0a0c10;
@@ -120,9 +114,10 @@
   /* 首帧就按上次的折叠状态画（属性由 <head> 内联脚本写），避免「先展开再收起」的闪动 */
   html[data-side="collapsed"] #sidebar { width: 0; pointer-events: none; }
   /* 固定内宽：宽度动画时文字不重排。面板底色/描边/圆角全在内层上——
-     收起不是淡出，而是一次定向裁切：右沿先撤，左沿与顶部慢一步，
-     底部最后以最快速度上收，四边全部汇聚到折叠按钮处（内层坐标 31,32，
-     与 fixed 常驻按钮逐像素重合）。全程内容不透明，只是被裁掉。 */
+     收起不是淡出，而是一次定向裁切：四边同时开始收缩、同时到达折叠按钮
+     （内层坐标 31,32，与 fixed 常驻按钮逐像素重合）。路径长短不同 →
+     各边速度不同（浏览器按同一时长对每条边做插值，速度 = 距离/时长，
+     自动同步完成）。全程内容不透明，只是被裁掉。 */
   .side-inner {
     position: relative;
     width: 244px; height: 100%; display: flex; flex-direction: column;
@@ -143,20 +138,16 @@
   html.side-anim #sidebar:not(.collapsed) .side-inner {
     animation: sideGrow .42s var(--ease);
   }
-  /* 收起编排：0→70% 右沿先收完；左/上 70% 起慢推；底部 85% 起全速上收 */
+  /* 四边同进同退：单一 clip-path 插值，0% → 100% 之间不设任何中间档。
+     右沿 213px、底沿 ~高-32px、顶 32px、左 31px——路径越长速度越快，
+     但都从同一时刻出发、同一时刻到位（总时长恒为 .42s，与距离无关）。 */
   @keyframes sideShrink {
     0%   { clip-path: inset(0 0 0 0 round 0 var(--r) var(--r) 0); }
-    45%  { clip-path: inset(0 140px 0 0 round 0 var(--r) var(--r) 0); }
-    70%  { clip-path: inset(0 213px 0 10px round 0 var(--r) var(--r) 0); }
-    85%  { clip-path: inset(22px 213px 18% 24px round 0 var(--r) var(--r) 0); }
     100% { clip-path: inset(32px 213px calc(100% - 32px) 31px round 0 var(--r) var(--r) 0); }
   }
-  /* 展开编排 = 收起的镜像：底部先全速冲下去，左/上慢铺，右沿最后展开 */
+  /* 展开 = 同一条插值的反向播放：四边同时从按钮处向四方同时铺开 */
   @keyframes sideGrow {
     0%   { clip-path: inset(32px 213px calc(100% - 32px) 31px round 0 var(--r) var(--r) 0); }
-    15%  { clip-path: inset(32px 213px 30% 31px round 0 var(--r) var(--r) 0); }
-    40%  { clip-path: inset(14px 213px 6% 12px round 0 var(--r) var(--r) 0); }
-    75%  { clip-path: inset(0 120px 0 0 round 0 var(--r) var(--r) 0); }
     100% { clip-path: inset(0 0 0 0 round 0 var(--r) var(--r) 0); }
   }
   /* 高亮滑块：整块 accent-soft 底由这一个元素承担，切页时 transform 滑过去，
@@ -173,7 +164,7 @@
   .side-head, #nav, #nav-bottom { position: relative; z-index: 1; }
 
   /* 边栏头：折叠按钮已外移为 fixed 常驻按钮，占位 38+8 由 padding-left 让出，
-     GARGANTUA 落点与旧版完全一致（内层 x=58），也与收起态页面标题对齐 */
+     GARGANTUA 落点与旧版完全一致（内层 x=58） */
   .side-head {
     display: flex; align-items: center;
     min-height: 38px; padding: 0 2px 10px 48px;
@@ -258,20 +249,23 @@
   /* 折叠按钮：fixed 常驻窗口左上（12,13），与边栏裁切收敛点逐像素重合。
      它不属于边栏/顶栏任何会被裁切的层，收起全程原地可见，彻底取代旧的
      「边栏内按钮 + 浮层按钮」双按钮交接。 */
-  #side-toggle { position: fixed; left: 12px; top: 13px; z-index: 40; }
+  #side-toggle {
+    position: fixed; left: 12px; top: 13px; z-index: 40;
+    transition: transform .16s var(--ease), color .15s var(--ease);
+  }
+  /* 悬停时整体放大一点（含图标与 hover 底色），落点不动（缩放围绕中心） */
+  #side-toggle:hover { transform: scale(1.12); }
   /* 标题盒高度与边栏那个 38px 的折叠按钮对齐：两边的文字垂直中心都在 y=32，
      这样 GARGANTUA 与页面标题永远在同一条水平线上（含边栏收起/展开两种状态）。 */
   .page-title {
     margin: 0; font-size: var(--title); font-weight: 800;
     letter-spacing: .01em; color: var(--fg); line-height: 1.1;
     white-space: nowrap; display: flex; align-items: center; height: 38px;
-    /* 与侧栏宽度动画同时长，两个方向的位移叠加后依然平滑 */
-    transition: transform .36s var(--ease);
   }
-  /* 收起态标题让出 fixed 按钮（12..50）+ 8 间距：落点 x=58 = 基线 18 + 40。
-     位移量写死 40px，用 transform 过渡（不触发重排）；距离是常量，
-     与窗口宽度、标题文字无关，不出现布局跳变。 */
-  html[data-side="collapsed"] .page-title { transform: translateX(40px); }
+  /* 标题不做任何补偿位移：收起/展开时随自然布局整体滑动，与下方内容左缘
+     永远严格对齐（展开 x=262，收起 x=18，只往左、不往右）。
+     （旧版收起态标题被浮层按钮推右 46px，fixed 常驻按钮接管后该补偿
+     已无存在理由，2026-10-30 回退。） */
   #pages { flex: 1; overflow: hidden; }
   .page { display: none; height: 100%; }
   .page.active { display: flex; flex-direction: column; }
@@ -326,10 +320,6 @@
   .act.danger:hover { filter: brightness(1.08); }
   .act.xs { padding: 5px 12px; font-size: 12px; }
   .act svg { width: 15px; height: 15px; }
-  /* 嵌在面板里的按钮用内层同心圆角：外框 --r、内框 --r-in，内外才协调 */
-  .card .act, .dep-card .act, .set-row .act, .modal-foot .act {
-    border-radius: var(--r-in);
-  }
 
   /* ---------- 卡片 ---------- */
   .card {
@@ -358,7 +348,7 @@
   input, select, textarea {
     appearance: none; -webkit-appearance: none;
     background: var(--sunken); color: var(--fg);
-    border: 1px solid var(--border); border-radius: var(--r-in);
+    border: 1px solid var(--border); border-radius: var(--r);
     padding: 8px 12px; width: 100%; outline: none;
     font-family: inherit; font-size: 13px; line-height: 1.4;
     transition: border-color .15s var(--ease), box-shadow .15s var(--ease),
@@ -394,7 +384,7 @@
     min-width: 0; max-width: 100%; cursor: pointer;
   }
   .file-pick .file-btn {
-    flex-shrink: 0; padding: 8px 14px; border-radius: var(--r-in);
+    flex-shrink: 0; padding: 8px 14px; border-radius: var(--r);
     background: var(--fill); color: var(--fg);
     font-size: 12.5px; font-weight: 600;
     transition: background .15s var(--ease);
@@ -538,11 +528,11 @@
   }
   .mon-sub.warn { color: var(--amber); }
   .mon-bar {
-    flex: 1; min-width: 80px; height: 48px; border-radius: var(--r-in);
+    flex: 1; min-width: 80px; height: 48px; border-radius: var(--r);
     background: var(--track); overflow: hidden;
   }
   .mon-fill {
-    height: 100%; border-radius: var(--r-in);
+    height: 100%; border-radius: var(--r);
     background: linear-gradient(90deg, var(--accent), var(--accent-2));
     /* DOM 复用后每轮只改 width，这里的过渡才真的生效；此前每次
        innerHTML 重建，新元素直接以最终宽度出生，表现为「突然改变」。 */
@@ -603,7 +593,7 @@
     background: var(--sunken); border-radius: var(--r);
   }
   .seg button {
-    padding: 7px 15px; border-radius: var(--r-in);
+    padding: 7px 15px; border-radius: var(--r);
     font-size: 13px; font-weight: 600; color: var(--fg2);
     transition: background .15s var(--ease), color .15s var(--ease);
   }
@@ -622,7 +612,7 @@
   .queue-item {
     display: flex; align-items: center; justify-content: space-between;
     gap: 12px; padding: 10px 14px; margin-bottom: 6px;
-    background: var(--fill); border-radius: var(--r-in);
+    background: var(--fill); border-radius: var(--r);
   }
   .queue-item .name {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -661,7 +651,7 @@
   #input-tools label { color: var(--fg2); font-size: 12px; }
   #input-tools input[type=number] { width: 72px; }
   #send-btn {
-    margin-left: auto; width: 34px; height: 34px; border-radius: var(--r-in);
+    margin-left: auto; width: 34px; height: 34px; border-radius: var(--r);
     background: var(--accent); color: var(--on-accent); font-size: 16px; font-weight: 700;
     display: flex; align-items: center; justify-content: center;
   }
@@ -701,7 +691,7 @@
   .token-palette { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
   .token-palette button {
     background: var(--fill); color: var(--fg2);
-    border-radius: var(--r-in); padding: 5px 12px;
+    border-radius: var(--r); padding: 5px 12px;
     font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
   .token-palette button:hover { background: var(--fill-2); color: var(--fg); }
