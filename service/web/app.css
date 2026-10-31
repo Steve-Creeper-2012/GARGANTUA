@@ -260,7 +260,13 @@
      完全一致。全程向左、不向右、不消失，与固定按钮构成「按钮 + 标题」两栏。
      位移是常量，与窗口宽度/标题文字无关，不跳变。 */
   html[data-side="collapsed"] .page-title { transform: translateX(-10px); }
-  #pages { flex: 1; overflow: hidden; }
+  #pages { flex: 1; overflow: hidden; transition: margin-left .42s var(--ease); }
+  /* 收起态内容左移：#pages 整体左移 50px 抵消收起按钮栏（sidebar 50px）的占位，
+     内容左缘 = 50 − 50 + 18 = 18px，与右缘 padding 18 严格对称（不含标题——
+     顶栏在 #pages 外，标题保持 x=58）。移 #pages 而非 .page：#pages 的
+     overflow:hidden 裁的是自身盒子，左移自身不会裁掉内容；移 .page 则会被裁。
+     margin 与 #sidebar width 同为 .42s var(--ease)，收起/展开全程同步。 */
+  html[data-side="collapsed"] #pages { margin-left: -50px; }
   .page { display: none; height: 100%; }
   .page.active { display: flex; flex-direction: column; }
   /* 左右边距严格相等：滚动条占 9px，所以右侧 padding 预先减掉它 */
