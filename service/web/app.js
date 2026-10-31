@@ -195,10 +195,14 @@ applyRadius(savedRadius());
 /* ---------- 边栏折叠 ----------
    按钮是 fixed 常驻窗口左上的唯一一枚（12,13，与边栏原按钮位逐像素一致），
    不从属任何裁切层——收起全程原地可见、可点。收起/展开是 CSS 的四条过渡
-   同时跑（侧栏 width 244→50、.side-inner clip-path 四边内缩到按钮矩形、
-   标题 translateX、内容区 margin-left），全部 var(--dur)=400ms + linear：
-   同一帧起步、同一帧到位、匀速无起伏。JS 只负责给 <html> 挂 .side-anim
-   让这套过渡仅在用户点击时生效（首帧恢复折叠状态直接落位、不播）。
+   同一帧起步、全程恒定 1px/ms：
+     · 侧栏 width 244→50（194px）、标题 translateX、.side-inner clip-path
+       四边内缩到按钮矩形 —— 都是 var(--dur-side)=194ms
+     · 内容区 margin-left 单独走 50px（var(--dur-tail)=50ms），
+       收起时排在面板停稳之后、展开时排在面板出发之前 ——
+       于是面板在动的 194ms 里，内容左沿与面板右沿逐帧重合，不重叠
+   JS 只负责给 <html> 挂 .side-anim 让这套过渡仅在用户点击时生效
+   （首帧恢复折叠状态直接落位、不播）。
    状态存 localStorage，首帧由 <head> 内联脚本恢复，不会先闪一下再收。 */
 function applySidebar(collapsed) {
   $("sidebar").classList.toggle("collapsed", collapsed);
@@ -206,13 +210,16 @@ function applySidebar(collapsed) {
                                         collapsed ? "collapsed" : "open");
   $("side-toggle").title = collapsed ? "展开边栏" : "收起边栏";
 }
-/* 时长只有一个真源（CSS 的 --dur），别在这里另写一份毫秒数：
+/* 时长只有一个真源（CSS 的 --dur-side / --dur-tail），别在这里另写一份毫秒数：
    388/488 那次的漂移就是两处数字各写各的。 */
-function moveDurMs() {
+function cssMs(name) {
   const v = getComputedStyle(document.documentElement)
-              .getPropertyValue("--dur").trim();
+              .getPropertyValue(name).trim();
   const n = parseFloat(v) || 0;
   return /ms$/.test(v) ? n : n * 1000;
+}
+function moveDurMs() {
+  return cssMs("--dur-side") + cssMs("--dur-tail");
 }
 function toggleSidebar() {
   const collapsed = !$("sidebar").classList.contains("collapsed");

@@ -55,10 +55,16 @@
     --border: transparent;
     --shadow: 0 18px 44px rgba(0, 0, 0, .45);
     --ease: cubic-bezier(.2, .7, .3, 1);
-    /* 侧栏收起/展开 + 标题位移 + 内容左移 统一 400ms、同步起步；
-       --move-ease 用 linear，整段位移匀速（移动速度均匀、无快慢起伏）。
-       仅侧栏收起这套动画用线性，全局 --ease 留给 hover 等其它过渡。 */
-    --dur: .4s;
+    /* 侧栏收起/展开：全程恒定 1px/ms（时长 = 距离 ÷ 速度）。
+       · 侧栏右沿 244→50 走 194px，标题随布局同步 → 194ms
+       · 内容左沿 244→0 走 244px → 全程 244ms
+       内容左沿 = 侧栏右沿 + #pages 的 margin，所以拆成两段接力，中间不重叠：
+       收起 = 面板先缩 194ms（内容边贴着面板边走）→ 停稳后 margin 补 50px；
+       展开 = margin 先退 50px → 面板再长 194ms（内容边仍贴着面板边走）。
+       两个方向都满足「面板在动时，内容边与面板边逐帧重合」。
+       改速度就按同一比例改这两个数（194:50 必须保持），别只改一个。 */
+    --dur-side: 194ms;
+    --dur-tail: 50ms;
     --move-ease: linear;
   }
   /* —— 浅色 —— */
@@ -110,11 +116,17 @@
   /* ---------- 左侧边栏：上/左/下贴边，只有右边留缝；圆角只在右侧两角 ----------
      右边不留 margin：内容区自己的 --pad 就是「边栏 → 内容」的间距，
      这样它和「内容 → 窗口右沿」的间距严格相等（展开/收起都一样）。 */
+  /* 收起/展开的 delay 是分状态的（见下方各条）：面板真的在动的那 194ms 里，
+     内容左沿与面板右沿逐帧重合（零相对运动）；那 50px 的内收/退出
+     安排在面板停稳之后（收起）或面板出发之前（展开）。 */
   #sidebar {
     width: 244px; flex-shrink: 0; margin: 0;
     overflow: hidden;
-    transition: width var(--dur) var(--move-ease);
+    transition: width var(--dur-side) var(--move-ease);
   }
+  /* 展开时先让内容把最后 50px 退出来，面板再动 —— 否则内容会一直缩在
+     面板底下 50px，卡片贴着面板正面滑过去。收起时这条不生效（delay 归 0）。 */
+  html[data-side="open"] #sidebar { transition-delay: var(--dur-tail); }
   /* 收起态宽度 = 按钮宽 50px（按钮右缘 x=50）：布局宽度 244→50 的收拢量
      正好等于 clip 右侧 194px（→x=50），二者逐帧重合，右缘精确停在按钮右缘，
      不再被 width→0 多滑到 0。内容收到的不是整屏宽度，而是留出这 50px 按钮栏。 */
@@ -148,9 +160,13 @@
      同一 linear 匀速、中途反向也从当前值折返。
      transition 只在 .side-anim 期间挂上（JS 点击时加、播完移除）：
      首帧恢复折叠状态直接落位不播；拖圆角滑杆改 --r 时这条 clip 过渡
-     也不在场，面板圆角不会慢 400ms 才跟上。 */
+     也不在场，面板圆角不会慢 194ms 才跟上。 */
   html.side-anim .side-inner {
-    transition: clip-path var(--dur) var(--move-ease);
+    transition: clip-path var(--dur-side) var(--move-ease);
+  }
+  /* clip 与 width 必须同相：展开时一起延后，否则裁切先铺开、面板还没长出来 */
+  html.side-anim[data-side="open"] .side-inner {
+    transition-delay: var(--dur-tail);
   }
   /* 高亮滑块：整块 accent-soft 底由这一个元素承担，切页时 transform 滑过去，
      不再靠每个 .nav-item 各自瞬间换背景。坐标系是 .side-inner（非滚动容器），
@@ -254,21 +270,30 @@
     margin: 0; font-size: var(--title); font-weight: 800;
     letter-spacing: .01em; color: var(--fg); line-height: 1.1;
     white-space: nowrap; display: flex; align-items: center; height: 38px;
-    transition: transform var(--dur) var(--move-ease);
+    transition: transform var(--dur-side) var(--move-ease);
   }
+  /* 标题跟面板同相（它随 #main 的布局走，面板不动它也不该动） */
+  html[data-side="open"] .page-title { transition-delay: var(--dur-tail); }
   /* 收起态边栏宽 50px，顶栏左起 x=50、padding 18 → 标题自然落点 x=68；
      位移写死 -10px 维持在 x=58（按钮右沿 50 留 8 间距），与之前批准的落点
      完全一致。全程向左、不向右、不消失，与固定按钮构成「按钮 + 标题」两栏。
      位移是常量，与窗口宽度/标题文字无关，不跳变。 */
   html[data-side="collapsed"] .page-title { transform: translateX(-10px); }
-  #pages { flex: 1; overflow: hidden; transition: margin-left var(--dur) var(--move-ease); }
+  #pages {
+    flex: 1; overflow: hidden;
+    /* 内容左沿 = 侧栏右沿 + margin。面板动的时候（前/后 194ms）margin 必须
+       纹丝不动，内容才会和面板边逐帧重合；那 50px 留给面板停稳后（收起）
+       或面板出发前（展开）单独走，仍是 1px/ms。 */
+    transition: margin-left var(--dur-tail) var(--move-ease);
+  }
+  /* 收起：面板先缩到底（194ms），margin 再补最后 50px */
+  html[data-side="collapsed"] #pages { transition-delay: var(--dur-side); }
   /* 收起态内容左移：#pages 整体左移 50px 抵消收起按钮栏（sidebar 50px）的占位，
      内容左缘 = 50 − 50 + 18 = 18px，与右缘 padding 18 严格对称（不含标题——
      顶栏在 #pages 外，标题保持 x=58）。移 #pages 而非 .page：#pages 的
      overflow:hidden 裁的是自身盒子，左移自身不会裁掉内容；移 .page 则会被裁。
-     侧栏 width 与 #pages margin 同 --dur=400ms、同 --move-ease=linear、同步起步；
-     注意：内容走 244px 而侧栏只走 194px，匀速下内容仍会在中段越过面板右沿
-     （重叠回归），若要彻底无重叠需让内容比侧栏慢或停在 x=50（见上轮讨论）。 */
+     时间表见上：0..194ms 侧栏缩（内容跟着走、边贴边不重叠），
+     194..244ms 面板停稳后 margin 补最后 50px。 */
   html[data-side="collapsed"] #pages { margin-left: -50px; }
   .page { display: none; height: 100%; }
   .page.active { display: flex; flex-direction: column; }
