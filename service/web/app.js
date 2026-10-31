@@ -31,7 +31,13 @@ async function api(path, body, opts) {
       try { j = JSON.parse(txt); }
       catch (e) { throw new Error("响应不是 JSON: " + txt.slice(0, 120)); }
     }
-    if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+    if (!r.ok) {
+      // 整体响应挂在 e.data 上：像 /api/vocab/source 这类会带 errors[{line,message}]
+      // 数组的失败，调用方要能取到逐条原因，只靠 e.message 会全丢。
+      const err = new Error(j.error || ("HTTP " + r.status));
+      err.data = j; err.status = r.status;
+      throw err;
+    }
     return j;
   } catch (e) {
     if (e && e.name === "AbortError") {
@@ -78,11 +84,18 @@ function fileToUrl(f) { return URL.createObjectURL(f); }
    禁令：系统原生 alert / confirm 一律不出现。uiAlert / uiConfirm 返回 Promise，
    调用处用 await 即可，语义与原生版本一致。 */
 let MODAL_RESOLVE = null;
+function modalBodySet(body) {
+  const el = $("modal-body");
+  el.textContent = "";
+  // body 可以是字符串，也可以是一个 DOM 节点（供 uiPrompt 塞输入框）
+  if (body && body.nodeType) el.appendChild(body);
+  else el.textContent = body == null ? "" : String(body);
+}
 function modalOpen(title, body, okText, withCancel) {
   return new Promise(res => {
     MODAL_RESOLVE = res;
     $("modal-title").textContent = title;
-    $("modal-body").textContent = body;
+    modalBodySet(body);
     $("modal-ok").textContent = okText || "确定";
     $("modal-cancel").style.display = withCancel ? "" : "none";
     $("modal-mask").hidden = false;
@@ -106,6 +119,19 @@ document.addEventListener("keydown", e => {
 });
 const uiAlert = msg => modalOpen("提示", msg, "知道了", false);
 const uiConfirm = msg => modalOpen("确认", msg, "确定", true);
+/* 带一个输入框的对话框（Fork / 复制时问新词表名）。取消 → null。 */
+async function uiPrompt(title, label, dflt) {
+  const wrap = document.createElement("div");
+  const lb = document.createElement("div");
+  lb.className = "hint"; lb.textContent = label || "";
+  const inp = document.createElement("input");
+  inp.type = "text"; inp.value = dflt || ""; inp.autocomplete = "off";
+  wrap.appendChild(lb); wrap.appendChild(inp);
+  const p = modalOpen(title, wrap, "确定", true);
+  inp.focus(); inp.select();
+  const ok = await p;
+  return ok ? inp.value.trim() : null;
+}
 
 function toast(msg, isErr) {
   const t = document.createElement("div");
@@ -195,12 +221,12 @@ applyRadius(savedRadius());
 /* ---------- 边栏折叠 ----------
    按钮是 fixed 常驻窗口左上的唯一一枚（12,13，与边栏原按钮位逐像素一致），
    不从属任何裁切层——收起全程原地可见、可点。收起/展开是 CSS 的四条过渡
-   同一帧起步、全程恒定 1px/ms：
+   同一帧起步、两方向同速匀速（面板 ~1.49px/ms、内容 ~1.52px/ms）：
      · 侧栏 width 244→50（194px）、标题 translateX、.side-inner clip-path
-       四边内缩到按钮矩形 —— 都是 var(--dur-side)=194ms
-     · 内容区 margin-left 单独走 50px（var(--dur-tail)=50ms），
+       四边内缩到按钮矩形 —— 都是 var(--dur-side)=130ms
+     · 内容区 margin-left 单独走 33px（var(--dur-tail)=33ms），
        收起时排在面板停稳之后、展开时排在面板出发之前 ——
-       于是面板在动的 194ms 里，内容左沿与面板右沿逐帧重合，不重叠
+       于是面板在动的 130ms 里，内容左沿与面板右沿逐帧重合，不重叠
    JS 只负责给 <html> 挂 .side-anim 让这套过渡仅在用户点击时生效
    （首帧恢复折叠状态直接落位、不播）。
    状态存 localStorage，首帧由 <head> 内联脚本恢复，不会先闪一下再收。 */
@@ -1100,7 +1126,9 @@ $("debug-panel").querySelector(".toggle").onclick =
 /* ---------- 编解码器 ---------- */
 $("text-encode").onclick = async () => {
   try {
-    const r = await api("/api/codec/text", {text: $("text-in").value});
+    // vocab：用哪个词表来转换（后端尚未认这个字段时忽略即可，不影响编码）
+    const r = await api("/api/codec/text",
+                        {text: $("text-in").value, vocab: $("text-vocab").value});
     $("text-out").textContent = r.token5;
   } catch (e) { $("text-out").textContent = "错误: " + e.message; }
 };
@@ -1110,7 +1138,7 @@ $("audio-encode").onclick = async () => {
   $("audio-out").textContent = "编码中…";
   try {
     const r = await api("/api/codec/audio", {audio_b64: await fileToB64(f),
-                             filename: f.name},
+                             filename: f.name, vocab: $("audio-vocab").value},
                         {timeout: API_UPLOAD_TIMEOUT_MS});
     $("audio-out").textContent =
       `# 音元数 ${r.n_tokens}，时长 ${r.duration_s}s\n` + r.token5;
@@ -1121,7 +1149,8 @@ $("image-encode").onclick = async () => {
   $("image-preview").src = fileToUrl(f);
   $("image-out").textContent = "编码中…";
   try {
-    const r = await api("/api/codec/image", {image_b64: await fileToB64(f)},
+    const r = await api("/api/codec/image",
+                        {image_b64: await fileToB64(f), vocab: $("image-vocab").value},
                           {timeout: API_UPLOAD_TIMEOUT_MS});
     const st = r.steps[0];
     $("image-out").textContent =
@@ -1135,7 +1164,7 @@ $("video-encode").onclick = async () => {
   $("video-out").textContent = "编码中（ffmpeg 抽帧 + 提取音轨）…";
   try {
     const r = await api("/api/codec/video", {video_b64: await fileToB64(f),
-                             filename: f.name},
+                             filename: f.name, vocab: $("video-vocab").value},
                         {timeout: API_UPLOAD_TIMEOUT_MS});
     $("video-stats").textContent =
       `帧数: ${r.n_frames}　总 patches: ${r.total_patches}　音元: ${r.n_audio_tokens}`;
@@ -1229,164 +1258,457 @@ $("json-export").onclick = async () => {
   } catch (e) { msg.textContent = "错误: " + e.message; }
 };
 
-/* ---------- 词表搜索（/api/vocab，GET ?q=） ---------- */
-async function vocabSearch() {
-  const q = $("vocab-q").value.trim();
-  const msg = $("vocab-msg"), hits = $("vocab-hits");
-  if (!q) { msg.textContent = ""; hits.textContent = ""; return; }
-  msg.textContent = "搜索中…";
-  try {
-    const r = await api("/api/vocab?q=" + encodeURIComponent(q));
-    msg.textContent = `${r.hits.length} 项命中（词表共 ${r.vocab_size}）`;
-    hits.innerHTML = r.hits.length
-      ? r.hits.map(h => `<code>${esc(h.token)}</code><span class="hint">#${h.id} ${esc(h.category || "")}</span>`).join("　")
-      : '<span class="hint">无命中</span>';
-  } catch (e) { msg.textContent = "错误: " + e.message; hits.textContent = ""; }
-}
-$("vocab-search").onclick = vocabSearch;
-$("vocab-q").addEventListener("keydown", e => {
-  if (e.key === "Enter") vocabSearch();
-});
-
-/* ---------- 添加 token（/api/vocab/add，POST） ---------- */
-$("vocab-add").onclick = async () => {
-  const token = $("vocab-add-token").value;
-  const category = $("vocab-add-cat").value;
-  const msg = $("vocab-add-msg");
-  if (!token) { msg.textContent = "token 文本不能为空"; return; }
-  msg.textContent = "添加中…";
-  try {
-    const r = await api("/api/vocab/add", {token, category});
-    const fs = Object.entries(r.free_slots || {})
-      .map(([k, v]) => `${k}=${v}`).join(" ");
-    msg.textContent = `已添加 ${r.token} → #${r.id}（${r.category}）；` +
-      (fs ? `剩余槽位 ${fs}` : "已写入词表");
-    $("vocab-add-token").value = "";
-    vocabSearch();
-  } catch (e) { msg.textContent = "错误: " + e.message; }
+/* =========================================================================
+   词表页：标签页 + 分区 + 增删 token + 词表级操作
+   -------------------------------------------------------------------------
+   · 一个标签页 = 一个「视图」。关掉标签只是关视图，不删词表文件。
+   · 分区表完全按接口返回渲染：不同词表的区块划分可以完全不同，前端不写死一套。
+   · main 词表不允许直接编辑：发起编辑操作会被拦下弹窗，出口是 Fork。
+   · 文本式保存失败时编辑区内容必须原样留着——先把文本塞进 VOCAB.src 再发请求。
+   ========================================================================= */
+const VOCAB = {
+  list: [],       // /api/vocab/list 全量词表
+  max: 0,
+  tabs: [],       // 已打开的标签（词表名）
+  active: "",     // 当前标签
+  info: null,     // 当前标签的 /api/vocab/regions 结果
+  src: {},        // name -> .vfc 源文本缓存（保存失败不丢）
+  mode: "form",   // form | text
+  write: "this",  // this | fork
 };
-$("vocab-add-token").addEventListener("keydown", e => {
-  if (e.key === "Enter") $("vocab-add").click();
+/* 转换器四页 + 建模页「词表预设」共用同一份词表列表 */
+const VOCAB_SELECTS = ["text-vocab", "audio-vocab", "image-vocab",
+                       "video-vocab", "model-vocab"];
+const MAIN_WHY =
+  "main 词表是全站基准：模型维度、不可见区契约、系统 token 都锚在它身上，"
+  + "直接改动会牵连所有已建模型。请 Fork 出一份新词表，再在新词表上编辑。";
+
+function vocabMeta(name) {
+  return VOCAB.list.find(v => v.name === name) || null;
+}
+function vocabIsMain(name) {
+  const m = vocabMeta(name);
+  return !!(m && m.is_main);
+}
+/* 新词表名：base+suffix，撞名就往后加序号 */
+function vocabSuggestName(base, suffix) {
+  const s = (base || "vocab") + (suffix || "_copy");
+  if (!VOCAB.list.some(v => v.name === s)) return s;
+  for (let i = 2; i < 999; i++) {
+    const c = s + i;
+    if (!VOCAB.list.some(v => v.name === c)) return c;
+  }
+  return s + "_" + Date.now();
+}
+function vocabMenuClose() { $("vtab-menu").hidden = true; }
+function vocabMenuToggle() {
+  const m = $("vtab-menu");
+  if (m.hidden) { renderVocabMenu(); m.hidden = false; }
+  else vocabMenuClose();
+}
+$("vtab-add").onclick = e => { e.stopPropagation(); vocabMenuToggle(); };
+// 点空白处收起下拉（下拉内部的点击已在各自 handler 里收起）
+document.addEventListener("click", e => {
+  if ($("vtab-menu").hidden) return;
+  if (!e.target.closest(".vtab-add-wrap")) vocabMenuClose();
 });
 
-/* ---------- 词表页面（区间占用 + 预设管理） ---------- */
-function catColor(cat) {
-  return {regular:"#4c8dff", fallback:"#a78bfa",
-          special:"#f0b429", system:"#3ddc97"}[cat] || "#6b7280";
-}
-async function refreshVocab() {
-  try {
-    const r = await api("/api/vocab/ranges");
-    drawVocabBar(r);
-    renderVocabRegions(r.regions);
-    renderVocabPresets(r.presets);
-    populateVocabSelects(r.presets);
-    const ct = r.category_totals || {};
-    $("vocab-bar-note").textContent =
-      `总槽位 ${r.vocab_size_padded}　已用 ` +
-      `regular=${ct.regular||0} fallback=${ct.fallback||0} ` +
-      `special=${ct.special||0} system=${ct.system||0}`;
-  } catch (e) {}
-}
-function drawVocabBar(r) {
-  const cv = $("vocab-bar"), ctx = cv.getContext("2d");
-  const W = cv.width, H = cv.height;
-  ctx.clearRect(0, 0, W, H);
-  const total = r.vocab_size_padded;
-  let x = 0;
-  // 不可见头 [0, invisible_end)：special/system 固定契约，画一段灰底
-  const headW = r.invisible_end / total * W;
-  ctx.fillStyle = getComputedStyle(document.documentElement)
-    .getPropertyValue("--track").trim() || "#242b35";
-  ctx.fillRect(0, 0, headW, H);
-  x = headW;
-  for (const reg of r.regions) {
-    const w = reg.size / total * W;
-    ctx.fillStyle = catColor(reg.category);
-    ctx.fillRect(x, 0, Math.max(w, 0.5), H);
-    x += w;
-  }
-}
-function renderVocabRegions(regions) {
-  const tb = $("vocab-regions").querySelector("tbody");
-  tb.innerHTML = regions.map(rg => {
-    const pct = rg.padded ? (rg.used / rg.padded * 100).toFixed(2) : "0.00";
-    return `<tr><td>${esc(rg.region)}</td><td>${esc(rg.category)}</td>` +
-      `<td>${rg.begin}–${rg.begin + rg.size - 1}</td>` +
-      `<td>${rg.size}</td><td>${rg.used}</td><td>${pct}%</td></tr>`;
-  }).join("");
-}
-function renderVocabPresets(presets) {
-  const tb = $("vocab-presets").querySelector("tbody");
-  tb.innerHTML = presets.map(p => {
-    const pct = p.capacity ? (p.used / p.capacity * 100).toFixed(2) : "0.00";
-    const del = p.is_base ? "" :
-      `<button class="act danger xs" data-delpreset="${esc(p.name)}">删除</button>`;
-    return `<tr><td>${esc(p.name)} ` +
-      `${p.is_base ? '<span class="badge on">基础</span>' : ""}</td>` +
-      `<td>${p.used}/${p.capacity}（${pct}%）</td><td class="right">${del}</td></tr>`;
-  }).join("");
-  tb.querySelectorAll("[data-delpreset]").forEach(b => {
-    b.onclick = () => deletePreset(b.dataset.delpreset);
-  });
-}
-function populateVocabSelects(presets) {
-  // 重建下拉前记住当前选择并回填，避免每次 refreshVocab 都弹回第一项
-  const opts = presets.map(p =>
-    `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
-  for (const id of ["vocab-new-source", "vocab-token-preset", "model-vocab"]) {
+/* ---------- 词表列表：全量 + 全站下拉 ---------- */
+async function refreshVocabList() {
+  const r = await api("/api/vocab/list");
+  VOCAB.list = r.vocabs || [];
+  VOCAB.max = r.max_vocab_size || 0;
+  const opts = VOCAB.list.map(v =>
+    `<option value="${esc(v.name)}">${esc(v.name)}</option>`).join("");
+  for (const id of VOCAB_SELECTS) {
     const el = $(id);
     if (!el) continue;
     const prev = el.value;
     el.innerHTML = opts;
-    if (prev && presets.some(p => p.name === prev)) el.value = prev;
+    if (prev && VOCAB.list.some(v => v.name === prev)) el.value = prev;
+    else if (!el.value) {
+      const main = VOCAB.list.find(v => v.is_main);
+      if (main) el.value = main.name;
+    }
+  }
+  // 已被删除的词表：从打开的标签里摘掉
+  VOCAB.tabs = VOCAB.tabs.filter(n => VOCAB.list.some(v => v.name === n));
+  if (VOCAB.active && !VOCAB.tabs.includes(VOCAB.active)) VOCAB.active = "";
+  if (!VOCAB.tabs.length && VOCAB.list.length) {
+    const main = VOCAB.list.find(v => v.is_main);
+    VOCAB.active = (main || VOCAB.list[0]).name;
+    VOCAB.tabs = [VOCAB.active];
+  }
+  renderVocabTabs();
+  return VOCAB.list;
+}
+
+/* ---------- 标签页条 ---------- */
+function renderVocabTabs() {
+  const strip = $("vtab-strip");
+  strip.innerHTML = VOCAB.tabs.map(n => {
+    const m = vocabMeta(n);
+    const badge = m && m.is_main ? ' <span class="badge">main</span>' : "";
+    return `<div class="vtab${n === VOCAB.active ? " on" : ""}" data-tab="${esc(n)}"
+                 title="${esc(n)}"><span class="nm">${esc(n)}</span>${badge}` +
+      `<button class="x" data-close="${esc(n)}" aria-label="关闭标签"
+               title="关闭这个视图（不删词表文件）">×</button></div>`;
+  }).join("");
+  strip.querySelectorAll("[data-tab]").forEach(el => {
+    el.onclick = e => {
+      if (e.target.closest("[data-close]")) return;
+      vocabActivate(el.dataset.tab);
+    };
+  });
+  strip.querySelectorAll("[data-close]").forEach(b => {
+    b.onclick = e => { e.stopPropagation(); vocabCloseTab(b.dataset.close); };
+  });
+}
+function renderVocabMenu() {
+  const menu = $("vtab-menu");
+  if (!VOCAB.list.length) {
+    menu.innerHTML = `<div class="empty">没有可用词表</div>`;
+    return;
+  }
+  menu.innerHTML = VOCAB.list.map(v => {
+    const opened = VOCAB.tabs.includes(v.name);
+    return `<button class="it${opened ? " opened" : ""}" data-open="${esc(v.name)}">` +
+      `<span>${esc(v.name)}${v.is_main ? ' <span class="badge">main</span>' : ""}</span>` +
+      `<span class="sub">${opened ? "已打开" : (v.vocab_size || "")}</span></button>`;
+  }).join("");
+  menu.querySelectorAll("[data-open]").forEach(b => {
+    b.onclick = () => { vocabMenuClose(); vocabActivate(b.dataset.open); };
+  });
+}
+async function vocabActivate(name) {
+  if (!VOCAB.tabs.includes(name)) VOCAB.tabs.push(name);
+  VOCAB.active = name;
+  renderVocabTabs();
+  await vocabLoadActive();
+}
+function vocabCloseTab(name) {
+  VOCAB.tabs = VOCAB.tabs.filter(n => n !== name);
+  delete VOCAB.src[name];
+  if (VOCAB.active === name)
+    VOCAB.active = VOCAB.tabs[VOCAB.tabs.length - 1] || "";
+  renderVocabTabs();
+  if (VOCAB.active) vocabLoadActive();
+  else vocabClearPanes();
+}
+function vocabClearPanes() {
+  VOCAB.info = null;
+  renderVocabRegions([]);
+  drawVocabBar(null);
+  $("vocab-bar-note").textContent = "";
+  $("vsrc-text").value = "";
+  $("vsrc-msg").textContent = "";
+  $("vsrc-err").hidden = true;
+  vocabWriteNote();
+}
+
+/* ---------- 当前标签的数据 ---------- */
+async function vocabLoadActive() {
+  const name = VOCAB.active;
+  renderVocabTabs();
+  vocabWriteNote();
+  if (!name) { vocabClearPanes(); return; }
+  try {
+    const r = await api("/api/vocab/regions?name=" + encodeURIComponent(name));
+    VOCAB.info = r;
+    drawVocabBar(r);
+    renderVocabRegions(r.regions || []);
+    const ct = r.category_totals || {}, m = vocabMeta(name);
+    $("vocab-bar-note").textContent =
+      `${name}　容量 ${r.vocab_size}` +
+      (m ? `　可见 ${m.visible_size}　不可见 ${m.invisible_size}` : "") +
+      (m && m.source ? `　派生自 ${m.source}` : "") +
+      `　已用 regular=${ct.regular || 0} fallback=${ct.fallback || 0} ` +
+      `special=${ct.special || 0} system=${ct.system || 0}`;
+  } catch (e) {
+    VOCAB.info = null;
+    drawVocabBar(null);
+    renderVocabRegions([]);
+    $("vocab-bar-note").textContent = "分区信息获取失败: " + e.message;
+  }
+  if (VOCAB.mode === "text") await vocabLoadSource(name, false);
+}
+
+/* ---------- 第 1 块：分区展示 ---------- */
+function catColor(cat) {
+  return {regular: "#4c8dff", fallback: "#a78bfa",
+          special: "#f0b429", system: "#3ddc97"}[cat] || "#6b7280";
+}
+function drawVocabBar(info) {
+  const cv = $("vocab-bar"), ctx = cv.getContext("2d");
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = getComputedStyle(document.documentElement)
+    .getPropertyValue("--track").trim() || "#242b35";
+  ctx.fillRect(0, 0, W, H);
+  const total = (info && info.vocab_size) || 0;
+  if (!total) return;
+  // 浅色块 = 该子区的容量，实心块 = 已用部分（按 begin 定位，不假设区是连续的）
+  for (const rg of info.regions || []) {
+    const x = rg.begin / total * W, w = rg.size / total * W;
+    ctx.fillStyle = catColor(rg.category);
+    ctx.globalAlpha = .32;
+    ctx.fillRect(x, 0, Math.max(w, .5), H);
+    ctx.globalAlpha = 1;
+    const uw = rg.size ? rg.used / rg.size * w : 0;
+    if (uw > 0) ctx.fillRect(x, 0, Math.max(uw, .5), H);
   }
 }
-$("vocab-create-preset").onclick = async () => {
-  const name = $("vocab-new-name").value.trim();
-  if (!name) { $("vocab-create-msg").textContent = "请输入预设名"; return; }
-  $("vocab-create-msg").textContent = "创建中…";
-  try {
-    await api("/api/vocab/presets", {action:"create", name,
-                                    source: $("vocab-new-source").value});
-    $("vocab-create-msg").textContent = "已创建 " + name;
-    $("vocab-new-name").value = "";
-    refreshVocab();
-  } catch (e) { $("vocab-create-msg").textContent = "错误: " + e.message; }
-};
-async function deletePreset(name) {
-  if (!await uiConfirm("删除词表预设 " + name + "？（其 vocab.txt 将被移除）")) return;
-  try { await api("/api/vocab/presets", {action:"delete", name});
-        refreshVocab(); }
-  catch (e) { toast(e.message, true); }
+function renderVocabRegions(regions) {
+  const tb = $("vocab-regions").querySelector("tbody");
+  if (!regions.length) {
+    tb.innerHTML = `<tr><td colspan="6" class="hint">暂无分区数据</td></tr>`;
+    return;
+  }
+  tb.innerHTML = regions.map(rg => {
+    const pct = rg.size ? (rg.used / rg.size * 100).toFixed(2) : "0.00";
+    return `<tr><td>${esc(rg.region)}</td><td>${esc(rg.category)}</td>` +
+      `<td class="mono">${rg.begin}–${rg.begin + rg.size - 1}</td>` +
+      `<td class="mono">${rg.size}</td><td class="mono">${rg.used}</td>` +
+      `<td class="mono">${pct}%</td></tr>`;
+  }).join("");
 }
-$("preset-add").onclick = async () => {
-  const name = $("vocab-token-preset").value;
-  const token = $("preset-add-token").value;
-  if (!token) { $("preset-token-msg").textContent = "请输入 token"; return; }
-  $("preset-token-msg").textContent = "添加中…";
+/* 大类下拉写死两档：.vfc 的文件格式只有「引号包裹=可显示 / 尖括号包裹=不可显示」
+   两种形态，正好对应 regular / special。fallback（可显示的单字母）与 system
+   （{ } | 架构契约头）是派生的、不是用户可选的，所以不按分区推导。
+   注意：分区表里的 regions[].category 仍是 four-category 语义，照实渲染即可。 */
+
+/* ---------- 第 2 块：两个模式 + 写入目标 ---------- */
+async function vocabSetMode(m) {
+  VOCAB.mode = m;
+  const isText = m === "text";
+  $("vocab-pane-form").hidden = isText;
+  $("vocab-pane-text").hidden = !isText;
+  if (isText && VOCAB.active) await vocabLoadSource(VOCAB.active, false);
+}
+function vocabWriteNote() {
+  const el = $("vocab-write-note");
+  if (!VOCAB.active) { el.textContent = ""; return; }
+  el.textContent = VOCAB.write === "fork"
+    ? "改动会先 Fork 出一份新词表，再写进新词表"
+    : vocabIsMain(VOCAB.active)
+      ? "当前是 main 词表，添加 / 保存时会先要求 Fork"
+      : `改动直接写入 ${VOCAB.active}`;
+}
+function vocabSegSync(id, v) {
+  $(id).querySelectorAll("button").forEach(b =>
+    b.classList.toggle("on", b.dataset.v === v));
+}
+function vocabSegWire(id, setter) {
+  $(id).querySelectorAll("button").forEach(b => {
+    b.onclick = () => { setter(b.dataset.v); vocabSegSync(id, b.dataset.v); };
+  });
+}
+vocabSegWire("vocab-mode-seg", v => vocabSetMode(v));
+vocabSegWire("vocab-write-seg", v => { VOCAB.write = v; vocabWriteNote(); });
+vocabSegSync("vocab-mode-seg", VOCAB.mode);
+vocabSegSync("vocab-write-seg", VOCAB.write);
+
+/* 编辑前的统一闸门：main 词表不让直接改 → 弹窗解释 + 给 Fork 出口。
+   返回 {name, mode, new_name}；null = 用户放弃。 */
+async function vocabResolveWrite() {
+  const name = VOCAB.active;
+  if (!name) { toast("请先打开一个词表标签页", true); return null; }
+  if (VOCAB.write === "fork") {
+    const nn = await vocabAskNewName(name, "_fork", "Fork 出新词表");
+    return nn ? {name, mode: "fork", new_name: nn} : null;
+  }
+  if (vocabIsMain(name)) {
+    const ok = await modalOpen("main 词表不能直接修改",
+      `「${name}」是 main 词表。${MAIN_WHY}`, "Fork 一份再改", true);
+    if (!ok) return null;
+    const nn = await vocabAskNewName(name, "_fork", "Fork 出新词表");
+    return nn ? {name, mode: "fork", new_name: nn} : null;
+  }
+  return {name, mode: "this", new_name: null};
+}
+async function vocabAskNewName(base, suffix, title) {
+  const nn = await uiPrompt(title, `从「${base}」派生一份新词表，名字：`,
+                            vocabSuggestName(base, suffix));
+  if (!nn) return null;
+  if (VOCAB.list.some(v => v.name === nn)) {
+    toast("词表 " + nn + " 已存在", true);
+    return null;
+  }
+  return nn;
+}
+async function vocabDoFork(name, newName) {
+  const r = await api("/api/vocab/fork", {name, new_name: newName});
+  const nn = r.name || newName;
+  await refreshVocabList();
+  await vocabActivate(nn);
+  toast("已 fork 出 " + nn);
+  return nn;
+}
+
+/* 模式一：表单式（添加 / 删除 / 查询） */
+async function vocabTokenAction(action) {
+  const token = $("vtok-token").value;
+  const msg = $("vtok-msg");
+  if (!token) { msg.textContent = "请输入 token 文本"; return; }
+  if (!VOCAB.active) { toast("请先打开一个词表标签页", true); return; }
+  // 查询是只读的：不写词表，也就不必过 Fork 闸门
+  const tgt = action === "query"
+    ? {name: VOCAB.active, mode: "this", new_name: null}
+    : await vocabResolveWrite();
+  if (!tgt) return;
+  msg.textContent = "处理中…";
   try {
-    const r = await api("/api/vocab/preset/token",
-      {name, action:"add", token, category: $("preset-add-cat").value});
-    $("preset-token-msg").textContent =
-      `已添加 ${r.token} → #${r.id}（${r.category}）；剩余可见槽 ${r.used}`;
-    $("preset-add-token").value = "";
-    refreshVocab();
-  } catch (e) { $("preset-token-msg").textContent = "错误: " + e.message; }
-};
-$("preset-remove").onclick = async () => {
-  const name = $("vocab-token-preset").value;
-  const token = $("preset-remove-token").value;
-  if (!token) { $("preset-token-msg").textContent = "请输入 token"; return; }
-  $("preset-token-msg").textContent = "删除中…";
+    let name = tgt.name;
+    if (tgt.mode === "fork") name = await vocabDoFork(tgt.name, tgt.new_name);
+    const r = await api("/api/vocab/token",
+      {name, action, token, category: $("vtok-cat").value});
+    if (action === "add")
+      msg.textContent = `已添加 ${r.token} → #${r.id}（${r.category || "—"}）；`
+        + `词表容量 ${r.vocab_size}`;
+    else if (action === "remove")
+      msg.textContent = `已删除 ${r.token}（原 #${r.id}）；词表容量 ${r.vocab_size}`;
+    else
+      msg.textContent = r.found
+        ? `命中 #${r.id}　${r.token}（${r.category || "—"}）`
+        : `未命中：${token}`;
+    if (action !== "query") {
+      $("vtok-token").value = "";
+      await refreshVocabList();
+      await vocabLoadActive();
+    }
+  } catch (e) {
+    msg.textContent = "错误: " + e.message;
+    toast(e.message, true);
+  }
+}
+$("vtok-add").onclick = () => vocabTokenAction("add");
+$("vtok-remove").onclick = () => vocabTokenAction("remove");
+$("vtok-query").onclick = () => vocabTokenAction("query");
+$("vtok-token").addEventListener("keydown", e => {
+  if (e.key === "Enter") $("vtok-add").click();
+});
+
+/* 模式二：文本式（裸文本编辑区，保存时语法校验） */
+async function vocabLoadSource(name, force) {
+  const ta = $("vsrc-text");
+  if (!name) { ta.value = ""; return; }
+  if (!force && VOCAB.src[name] != null) {
+    ta.value = VOCAB.src[name];
+    $("vsrc-msg").textContent = `${name}　${VOCAB.src[name].length} 字符`;
+    return;
+  }
+  ta.value = "载入中…";
   try {
-    const r = await api("/api/vocab/preset/token",
-      {name, action:"remove", token});
-    $("preset-token-msg").textContent = `已软删 ${r.token}（原 #${r.id}）`;
-    $("preset-remove-token").value = "";
-    refreshVocab();
-  } catch (e) { $("preset-token-msg").textContent = "错误: " + e.message; }
+    const r = await api("/api/vocab/source?name=" + encodeURIComponent(name));
+    VOCAB.src[name] = r.text || "";
+    ta.value = VOCAB.src[name];
+    $("vsrc-msg").textContent = `${r.name}　${r.vocab_size} 槽位`;
+    $("vsrc-err").hidden = true;
+  } catch (e) {
+    delete VOCAB.src[name];
+    ta.value = "";
+    $("vsrc-msg").textContent = "源文本获取失败: " + e.message;
+  }
+}
+function renderVocabSourceErrors(e) {
+  const box = $("vsrc-err");
+  // 语法错误逐条带行号；e.data 由 api() 挂上的完整响应体
+  const errs = (e && e.data && Array.isArray(e.data.errors)) ? e.data.errors : null;
+  $("vsrc-msg").textContent = "保存失败: " + e.message + "（内容已保留在编辑区）";
+  if (!errs || !errs.length) { box.hidden = true; toast("保存失败: " + e.message, true); return; }
+  box.innerHTML = `<div class="eh">共 ${errs.length} 处语法错误，未写入词表：</div><ul>` +
+    errs.map(x => `<li>${x.line == null ? "" : `<span class="ln">第 ${x.line} 行</span>`}` +
+      `${esc(x.message || "")}</li>`).join("") + `</ul>`;
+  box.hidden = false;
+}
+$("vsrc-save").onclick = async () => {
+  const text = $("vsrc-text").value;
+  // 先缓存再发请求：保存失败也不能把用户刚写的文本弄丢
+  if (VOCAB.active) VOCAB.src[VOCAB.active] = text;
+  const tgt = await vocabResolveWrite();
+  if (!tgt) return;
+  const msg = $("vsrc-msg");
+  msg.textContent = "校验并保存中…";
+  $("vsrc-err").hidden = true;
+  try {
+    const body = {name: tgt.name, text, mode: tgt.mode};
+    if (tgt.new_name) body.new_name = tgt.new_name;   // mode=this 时不带
+    const r = await api("/api/vocab/source", body);
+    const nn = r.name || (tgt.mode === "fork" ? tgt.new_name : tgt.name);
+    VOCAB.src[nn] = text;
+    if (nn !== tgt.name) delete VOCAB.src[tgt.name];
+    await refreshVocabList();
+    await vocabActivate(nn);
+    msg.textContent = `已保存 ${nn}（${r.vocab_size} 槽位）`;
+  } catch (e) {
+    renderVocabSourceErrors(e);
+  }
 };
+$("vsrc-reload").onclick = () => vocabLoadSource(VOCAB.active, true);
+
+/* ---------- 第 3 块：删除 / 复制该词表 ---------- */
+$("vocab-del").onclick = async () => {
+  const name = VOCAB.active, msg = $("vocab-foot-msg");
+  if (!name) { msg.textContent = "请先打开一个词表标签页"; return; }
+  if (vocabIsMain(name)) {
+    await uiAlert("main 词表不能删除。" + MAIN_WHY);
+    return;
+  }
+  if (!await uiConfirm(`删除词表 ${name}？其文件将被移除，且不可恢复。`)) return;
+  msg.textContent = "删除中…";
+  try {
+    await api("/api/vocab/delete", {name});
+    delete VOCAB.src[name];
+    VOCAB.tabs = VOCAB.tabs.filter(n => n !== name);
+    VOCAB.active = VOCAB.tabs[0] || "";
+    msg.textContent = "已删除 " + name;
+    await refreshVocabList();
+    if (VOCAB.active) await vocabLoadActive(); else vocabClearPanes();
+    toast("已删除 " + name);
+  } catch (e) {
+    msg.textContent = "错误: " + e.message;
+    toast(e.message, true);
+  }
+};
+$("vocab-dup").onclick = async () => {
+  const name = VOCAB.active, msg = $("vocab-foot-msg");
+  if (!name) { msg.textContent = "请先打开一个词表标签页"; return; }
+  const nn = await vocabAskNewName(name, "_copy", "复制词表");
+  if (!nn) return;
+  msg.textContent = "复制中…";
+  try {
+    await vocabDoFork(name, nn);
+    msg.textContent = "已复制为 " + nn;
+  } catch (e) {
+    msg.textContent = "错误: " + e.message;
+    toast(e.message, true);
+  }
+};
+
+/* ---------- 页面入口 ---------- */
+async function refreshVocab() {
+  const note = $("vtab-note");
+  try {
+    await refreshVocabList();
+  } catch (e) {
+    VOCAB.tabs = []; VOCAB.active = "";
+    note.textContent = "词表列表获取失败: " + e.message;
+    vocabClearPanes();
+    renderVocabTabs();
+    return;
+  }
+  if (!VOCAB.list.length) {
+    note.textContent = "还没有任何词表";
+    vocabClearPanes();
+    renderVocabTabs();
+    return;
+  }
+  note.textContent = `${VOCAB.list.length} 个词表　·　` +
+    `点最右侧 ＋ 可打开其它词表（上限 ${VOCAB.max || "—"} 槽位）`;
+  await vocabLoadActive();
+}
+// 首屏就把转换器四页 / 建模页的词表下拉填上（失败静默，切到词表页会再报一次）
+refreshVocabList().catch(() => {});
 
 /* =========================================================================
    自定义快捷键
