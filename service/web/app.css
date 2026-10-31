@@ -237,15 +237,14 @@
     border-radius: var(--r); color: var(--fg2); background: none;
     transition: color .15s var(--ease);
   }
-  /* 悬停底色默认比按钮小一圈（inset 5px），悬停时向四周扩张到 inset 2px——
-     是「加深区域变大」而不是按钮本体变大。 */
+  /* 悬停：只把底色显示出来（加深区大小不变，不放大），本体纹丝不动 */
   .side-btn::before {
     content: ""; position: absolute; inset: 5px;
     border-radius: var(--r); background: transparent;
-    transition: background .15s var(--ease), inset .16s var(--ease);
+    transition: background .15s var(--ease);
   }
   .side-btn:hover { color: var(--fg); }
-  .side-btn:hover::before { background: var(--hover); inset: 2px; }
+  .side-btn:hover::before { background: var(--hover); }
   .side-btn svg { width: 21px; height: 21px; position: relative; z-index: 1; }
   /* 折叠按钮：fixed 常驻窗口左上（12,13），与边栏裁切收敛矩形逐像素重合。
      它不属于边栏/顶栏任何会被裁切的层，收起全程原地可见，彻底取代旧的
@@ -257,14 +256,13 @@
     margin: 0; font-size: var(--title); font-weight: 800;
     letter-spacing: .01em; color: var(--fg); line-height: 1.1;
     white-space: nowrap; display: flex; align-items: center; height: 38px;
-    transition: opacity .42s var(--ease);
+    transition: transform .36s var(--ease);
   }
-  /* 标题不做任何补偿位移：收起/展开随自然布局整体滑动，与下方内容左缘
-     严格对齐（展开 x=262，收起 x=18，只往左、不往右）。收起态标题的落点
-     （x=18）会压进固定按钮（12..50）——两个约束（不右移、不重叠）下唯一
-     的解是滑到最左的同时渐隐：收起后标题隐去，该角落只留按钮；展开时随
-     布局滑回并淡入。首帧恢复折叠态由 head 内联脚本先行写属性，不播动画。 */
-  html[data-side="collapsed"] .page-title { opacity: 0; }
+  /* 标题随布局左移（展开 x=262 → 收起 x=18），但停在收起按钮右侧：
+     收起态位移写死 +40px，落点 x=58（按钮右沿 50 留 8 间距），比内容左缘
+     （x=18）少左移 40px——全程向左、不向右、不消失，与固定按钮构成
+     「按钮 + 标题」两栏。位移是常量，与窗口宽度/标题文字无关，不跳变。 */
+  html[data-side="collapsed"] .page-title { transform: translateX(40px); }
   #pages { flex: 1; overflow: hidden; }
   .page { display: none; height: 100%; }
   .page.active { display: flex; flex-direction: column; }
