@@ -124,7 +124,7 @@
   .side-inner {
     position: relative;
     width: 244px; height: 100%; display: flex; flex-direction: column;
-    padding: 13px 10px 10px;
+    padding: 12px 10px 10px;
     background: var(--panel); border: 1px solid var(--border);
     border-left: none; border-radius: 0 var(--r) var(--r) 0;
     clip-path: inset(0 0 0 0 round 0 var(--r) var(--r) 0);
@@ -168,10 +168,13 @@
   .side-head, #nav, #nav-bottom { position: relative; z-index: 1; }
 
   /* 边栏头：折叠按钮已外移为 fixed 常驻按钮，占位 38+8 由 padding-left 让出，
-     GARGANTUA 落点与旧版完全一致（内层 x=58） */
+     GARGANTUA 落点与旧版完全一致（内层 x=58）。
+     全局 box-sizing:border-box → min-height 含 padding：去掉 padding-bottom，
+     内容区吃满 38px，brand 垂直中心 = 边框1 + 内边距12 + 19 = y=32，
+     与右侧标题(13+19)、折叠按钮(13+19) 三者严格平行。 */
   .side-head {
     display: flex; align-items: center;
-    min-height: 38px; padding: 0 2px 10px 48px;
+    min-height: 38px; padding: 0 2px 0 48px;
   }
   #sidebar .brand {
     font-size: var(--title); font-weight: 800; letter-spacing: .02em;
@@ -272,20 +275,37 @@
   /* 左右边距严格相等：滚动条占 9px，所以右侧 padding 预先减掉它 */
   .page { padding: 0 var(--pad) 16px; }
   .page.scroll { overflow-y: auto; padding-right: calc(var(--pad) - var(--sbw)); }
-  /* 顶部渐变磨砂条：上滚溢出的内容在滚动区顶端不再硬切消失，而是透过一条
-     sticky 磨砂条渐隐（backdrop-filter 负责磨砂，mask-image 负责向下渐隐）。
-     仅滚动后出现（.scrolled 由 JS 维护），静止在顶部时不模糊首屏内容。 */
-  .page.scroll::before {
+  /* 顶部渐变磨砂条（双层，规避 Chromium「opacity<1 破坏 backdrop-filter」坑——
+     背景取样被 opacity 切断，淡入时 blur 直接失效，只剩滚动容器把内容硬切）：
+     · ::before 只做磨砂：backdrop-filter 由 blur(0)→blur(12px) 过渡（不碰 opacity，
+       mask 恒定负责向下渐隐）。静止时 blur(0) 完全透明，不模糊首屏。
+     · ::after 只做渐隐：背景 var(--bg) 实色→透明 的渐变 + opacity 0→1 淡入
+       （无 backdrop-filter，opacity 淡入安全）。两层都 sticky top:0、高 32、负 margin 重叠。
+       即便 blur 在个别浏览器失效，::after 也能保证内容平滑溶解而非硬切。
+     仅滚动后出现（.scrolled 由 JS 维护），静止在顶部时 blur(0)+opacity:0 全透明。 */
+  .page.scroll::before,
+  .page.scroll::after {
     content: ""; position: sticky; top: 0; z-index: 5;
-    display: block; height: 26px; margin-bottom: -26px;
+    display: block; flex-shrink: 0;
+    height: 32px; margin-bottom: -32px;
     pointer-events: none;
-    backdrop-filter: blur(14px) saturate(1.4);
-    -webkit-backdrop-filter: blur(14px) saturate(1.4);
-    mask-image: linear-gradient(to bottom, #000 20%, transparent);
-    -webkit-mask-image: linear-gradient(to bottom, #000 20%, transparent);
+  }
+  .page.scroll::before {
+    backdrop-filter: blur(0px) saturate(1);
+    -webkit-backdrop-filter: blur(0px) saturate(1);
+    mask-image: linear-gradient(to bottom, #000 30%, transparent);
+    -webkit-mask-image: linear-gradient(to bottom, #000 30%, transparent);
+    transition: backdrop-filter .25s var(--ease), -webkit-backdrop-filter .25s var(--ease);
+  }
+  .page.scroll.scrolled::before {
+    backdrop-filter: blur(12px) saturate(1.4);
+    -webkit-backdrop-filter: blur(12px) saturate(1.4);
+  }
+  .page.scroll::after {
+    background: linear-gradient(to bottom, var(--bg), transparent 80%);
     opacity: 0; transition: opacity .25s var(--ease);
   }
-  .page.scroll.scrolled::before { opacity: 1; }
+  .page.scroll.scrolled::after { opacity: 1; }
 
   .sec-head {
     display: flex; align-items: center; justify-content: space-between;
