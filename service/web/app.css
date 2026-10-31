@@ -209,6 +209,7 @@
   /* 顶行：折叠按钮（仅边栏收起时出现）+ 页面标题，与边栏 GARGANTUA 同高。
      padding-top 13 = 边栏 1px 描边 + 12px 内边距，两者基线严格对齐 */
   #topbar {
+    position: relative; /* 浮层折叠按钮的定位基准 */
     display: flex; align-items: center; gap: 8px;
     min-height: 38px; padding: 13px var(--pad) 8px; flex-shrink: 0;
   }
@@ -229,22 +230,29 @@
   .side-btn:hover { color: var(--fg); }
   .side-btn:hover::before { background: var(--hover); }
   .side-btn svg { width: 21px; height: 21px; position: relative; z-index: 1; }
-  #float-toggle { display: none; }
-  #float-toggle.show {
-    display: flex;
-    animation: toggleIn .28s var(--ease) .1s both;
+  /* 浮层折叠按钮：绝对定位、常驻布局，出现/消失只做淡入淡出。
+     旧实现用 display:none↔flex 翻转：按钮一出现顶行瞬间多出 46px（按钮 38 +
+     间距 8），把页面标题猛地向右一推，和侧栏收起的左滑打架——这就是标题"闪"的
+     根源。改为脱离文档流后顶行宽度恒定，按钮只影响自己的透明度。 */
+  #float-toggle {
+    position: absolute; left: var(--pad); top: 13px;
+    opacity: 0; pointer-events: none;
+    transition: opacity .22s var(--ease);
   }
-  @keyframes toggleIn {
-    from { opacity: 0; transform: scale(.88); }
-    to   { opacity: 1; transform: none; }
-  }
+  #float-toggle.show { opacity: 1; pointer-events: auto; }
   /* 标题盒高度与边栏那个 38px 的折叠按钮对齐：两边的文字垂直中心都在 y=32，
      这样 GARGANTUA 与页面标题永远在同一条水平线上（含边栏收起/展开两种状态）。 */
   .page-title {
     margin: 0; font-size: var(--title); font-weight: 800;
     letter-spacing: .01em; color: var(--fg); line-height: 1.1;
     white-space: nowrap; display: flex; align-items: center; height: 38px;
+    /* 与侧栏宽度动画同时长，两个方向的位移叠加后依然平滑 */
+    transition: transform .36s var(--ease);
   }
+  /* 收起态标题让出浮层按钮的位置：位移量写死 46px（按钮 38 + 间距 8），
+     用 transform 过渡（不触发重排）。距离是常量，与窗口宽度、标题文字无关，
+     彻底消除旧布局方案里的瞬跳/闪烁。 */
+  html[data-side="collapsed"] .page-title { transform: translateX(46px); }
   #pages { flex: 1; overflow: hidden; }
   .page { display: none; height: 100%; }
   .page.active { display: flex; flex-direction: column; }
