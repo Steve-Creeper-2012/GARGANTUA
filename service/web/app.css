@@ -110,9 +110,12 @@
     overflow: hidden;
     transition: width .42s var(--ease);
   }
-  #sidebar.collapsed { width: 0; pointer-events: none; }
+  /* 收起态宽度 = 按钮宽 50px（按钮右缘 x=50）：布局宽度 244→50 的收拢量
+     正好等于 clip 右侧 194px（→x=50），二者逐帧重合，右缘精确停在按钮右缘，
+     不再被 width→0 多滑到 0。内容收到的不是整屏宽度，而是留出这 50px 按钮栏。 */
+  #sidebar.collapsed { width: 50px; pointer-events: none; }
   /* 首帧就按上次的折叠状态画（属性由 <head> 内联脚本写），避免「先展开再收起」的闪动 */
-  html[data-side="collapsed"] #sidebar { width: 0; pointer-events: none; }
+  html[data-side="collapsed"] #sidebar { width: 50px; pointer-events: none; }
   /* 固定内宽：宽度动画时文字不重排。面板底色/描边/圆角全在内层上——
      收起不是淡出，也不是缩成一个点后消失，而是整块面板收敛到收起按钮的
      矩形占位（内层坐标 12..50 × 13..51，与 fixed 常驻按钮逐像素重合，
@@ -258,11 +261,11 @@
     white-space: nowrap; display: flex; align-items: center; height: 38px;
     transition: transform .36s var(--ease);
   }
-  /* 标题随布局左移（展开 x=262 → 收起 x=18），但停在收起按钮右侧：
-     收起态位移写死 +40px，落点 x=58（按钮右沿 50 留 8 间距），比内容左缘
-     （x=18）少左移 40px——全程向左、不向右、不消失，与固定按钮构成
-     「按钮 + 标题」两栏。位移是常量，与窗口宽度/标题文字无关，不跳变。 */
-  html[data-side="collapsed"] .page-title { transform: translateX(40px); }
+  /* 收起态边栏宽 50px，顶栏左起 x=50、padding 18 → 标题自然落点 x=68；
+     位移写死 -10px 维持在 x=58（按钮右沿 50 留 8 间距），与之前批准的落点
+     完全一致。全程向左、不向右、不消失，与固定按钮构成「按钮 + 标题」两栏。
+     位移是常量，与窗口宽度/标题文字无关，不跳变。 */
+  html[data-side="collapsed"] .page-title { transform: translateX(-10px); }
   #pages { flex: 1; overflow: hidden; }
   .page { display: none; height: 100%; }
   .page.active { display: flex; flex-direction: column; }
