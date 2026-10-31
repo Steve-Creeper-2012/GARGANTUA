@@ -255,6 +255,44 @@ class TestCpuTopology(unittest.TestCase):
         self.assertTrue(topo["hyperthreaded"])
 
 
+class TestProcPorts(unittest.TestCase):
+    """_process_ports：lsof / netstat 输出解析——端口去重升序、状态括号剥离。"""
+
+    LSOF = (
+        "COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n"
+        "python3  1234 steve   12u  IPv4  0xabc      0t0  TCP 127.0.0.1:8765 (LISTEN)\n"
+        "python3  1234 steve   15u  IPv6  0xabc      0t0  TCP *:9000 (LISTEN)\n"
+        "python3  1234 steve   16u  IPv4  0xabc      0t0  TCP 127.0.0.1:8765 (ESTABLISHED)\n"
+        "python3  1234 steve   18u  IPv4  0xabc      0t0  UDP *:5353\n"
+    )
+
+    def test_lsof_parse_dedup_sorted(self):
+        # 同一端口 LISTEN+ESTABLISHED 去重；结果升序；UDP 也收
+        with mock.patch.object(mon, "_run", return_value=self.LSOF):
+            r = mon._process_ports([1234])
+        self.assertEqual(r, {1234: [5353, 8765, 9000]})
+
+    def test_lsof_pid_filter(self):
+        # 不在请求列表里的 pid 不收
+        out = self.LSOF + "other     999 steve   20u  IPv4  0xabc      0t0  TCP 1.2.3.4:80\n"
+        with mock.patch.object(mon, "_run", return_value=out):
+            r = mon._process_ports([1234])
+        self.assertEqual(r, {1234: [5353, 8765, 9000]})
+
+    def test_no_output_empty(self):
+        with mock.patch.object(mon, "_run", return_value=""):
+            self.assertEqual(mon._process_ports([1]), {})
+        self.assertEqual(mon._process_ports([]), {})
+
+    def test_windows_netstat_parse(self):
+        out = ("\n  TCP    127.0.0.1:8765     0.0.0.0:0    LISTENING    777\n"
+               "  UDP    0.0.0.0:5353        *:*                       999\n")
+        with mock.patch.object(mon.platform, "system", return_value="Windows"), \
+             mock.patch.object(mon, "_run", return_value=out):
+            r = mon._process_ports([777])
+        self.assertEqual(r, {777: [8765]})
+
+
 class TestGargantuaProcesses(unittest.TestCase):
     """BUG1 端到端：伪造 ps 输出 → 只剩项目进程，name / 排序 / 类型正确。"""
 
@@ -290,6 +328,8 @@ class TestGargantuaProcesses(unittest.TestCase):
             self.assertIsNone(p["gpu_pct"])
             self.assertIsNone(p["vram_bytes"])
         self.assertIsInstance(procs[0]["mem_pct"], float)
+        # _run 被 mock 成 ps 文本，lsof 解析不出端口 → 空列表契约
+        self.assertEqual(procs[0]["ports"], [])
 
     def test_windows_branch_no_ps(self):
         # Windows 无 ps：改用 PowerShell JSON；cpu 列必须为 None（宁可少报）

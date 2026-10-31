@@ -167,7 +167,7 @@ $("set-contrast").querySelectorAll("button").forEach(b => {
 /* ---------- 圆角半径（全站唯一的 --r） ----------
    直接改 <html> 上的 --r 变量，卡片/按钮/表格/弹窗/边栏同时跟着变。 */
 const RADIUS_KEY = "gargantua.radius";
-const RADIUS_MIN = 4, RADIUS_MAX = 24, RADIUS_DEF = 16;
+const RADIUS_MIN = 0, RADIUS_MAX = 24, RADIUS_DEF = 16;
 function applyRadius(px) {
   const n = Number(px);
   const v = Math.min(RADIUS_MAX, Math.max(RADIUS_MIN,
@@ -180,8 +180,10 @@ function applyRadius(px) {
 }
 function savedRadius() {
   try {
-    const v = Number(localStorage.getItem(RADIUS_KEY));
-    return Number.isFinite(v) && v > 0 ? v : RADIUS_DEF;
+    const s = localStorage.getItem(RADIUS_KEY);
+    if (s == null || s === "") return RADIUS_DEF;
+    const v = Number(s);
+    return Number.isFinite(v) && v >= 0 ? v : RADIUS_DEF;
   } catch (e) { return RADIUS_DEF; }
 }
 $("set-radius").addEventListener("input", e => {
@@ -191,24 +193,29 @@ $("set-radius").addEventListener("input", e => {
 applyRadius(savedRadius());
 
 /* ---------- 边栏折叠 ----------
-   收起时整块（含 GARGANTUA 标题）向左缩回；展开时向外扩。
-   按钮在 GARGANTUA 左边；收起后边栏连同按钮一起滑走，顶栏最左侧补一个
-   同样大小的浮动按钮，标题落在它右边。
-   状态存 localStorage，首帧由 <head> 内联脚本恢复，不会先闪一下再收。 */
+   按钮是 fixed 常驻窗口左上的唯一一枚（12,13，与边栏原按钮位逐像素一致），
+   不从属任何裁切层——收起全程原地可见、可点。收起/展开动画是 CSS 编排的
+   定向裁切（收起：右沿先撤、左/上慢一步、底部最快上收，四边汇聚到按钮处；
+   展开为镜像），JS 只负责给 <html> 挂 .side-anim 让动画仅在用户点击时播放
+   （首帧恢复折叠状态直接落位、不播）。状态存 localStorage，首帧由 <head>
+   内联脚本恢复，不会先闪一下再收。 */
 function applySidebar(collapsed) {
   $("sidebar").classList.toggle("collapsed", collapsed);
   document.documentElement.setAttribute("data-side",
                                         collapsed ? "collapsed" : "open");
-  $("float-toggle").classList.toggle("show", collapsed);
   $("side-toggle").title = collapsed ? "展开边栏" : "收起边栏";
 }
 function toggleSidebar() {
   const collapsed = !$("sidebar").classList.contains("collapsed");
   try { localStorage.setItem("gargantua.side", collapsed ? "0" : "1"); } catch (e) {}
+  document.documentElement.classList.add("side-anim");
   applySidebar(collapsed);
+  clearTimeout(toggleSidebar._t);
+  toggleSidebar._t = setTimeout(() => {
+    document.documentElement.classList.remove("side-anim");
+  }, 460);
 }
 $("side-toggle").onclick = toggleSidebar;
-$("float-toggle").onclick = toggleSidebar;
 applySidebar(document.documentElement.getAttribute("data-side") === "collapsed");
 
 /* ---------- 导航（2026-10-29 重构：按类型分组，灰色加粗组名分隔，
@@ -361,9 +368,9 @@ function switchPage(id) {
   if (page && page.animate) {
     if (page._anim) page._anim.cancel();
     page._anim = page.animate(
-      [{opacity: 0, transform: "translateY(8px)"},
+      [{opacity: 0, transform: "translateY(12px)"},
        {opacity: 1, transform: "none"}],
-      {duration: 220, easing: "cubic-bezier(.2, .7, .3, 1)"});
+      {duration: 320, easing: "cubic-bezier(.22, .61, .36, 1)"});
   }
   if (id === "models") refreshModels();
   if (id === "train") refreshQueue();
@@ -676,12 +683,13 @@ function renderProcesses(procs) {
     ? `${PROC_CACHE.length} 个进程　·　内存 / 显存列点击可切换「百分比 ↔ 实际占用」`
     : "内存 / 显存列点击可在「百分比 ↔ 实际占用」间切换";
   if (!PROC_CACHE.length) {
-    tb.innerHTML = `<tr><td colspan="6" class="hint">没有正在运行的 GARGANTUA 进程</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="7" class="hint">没有正在运行的 GARGANTUA 进程</td></tr>`;
     return;
   }
   tb.innerHTML = PROC_CACHE.map(p => `<tr>
     <td>${esc(p.name)}</td>
     <td class="mono">${p.pid}</td>
+    <td class="mono">${(p.ports && p.ports.length) ? p.ports.join(", ") : "—"}</td>
     <td class="mono">${p.cpu == null ? "—" : fmtPct(p.cpu)}</td>
     <td class="mono clickable" data-col="mem" title="点击切换 百分比 / 实际占用">${procMemCell(p)}</td>
     <td class="mono clickable" data-col="vram" title="点击切换 百分比 / 实际占用">${procVramCell(p)}</td>
@@ -704,6 +712,13 @@ function toggleProcCol(col) {
 }
 $("proc-mem-th").onclick = () => toggleProcCol("mem");
 $("proc-vram-th").onclick = () => toggleProcCol("vram");
+
+/* 滚动区顶部磨砂条：只在滚动后出现（静止在顶部时不能模糊首屏内容） */
+$$(".page.scroll").forEach(pg => {
+  pg.addEventListener("scroll", () => {
+    pg.classList.toggle("scrolled", pg.scrollTop > 6);
+  }, {passive: true});
+});
 
 async function killProc(pid, isSelf) {
   if (isSelf && !await uiConfirm(

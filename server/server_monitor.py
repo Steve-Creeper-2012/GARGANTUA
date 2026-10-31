@@ -570,8 +570,57 @@ def _wmic_process_rows():
     return rows
 
 
+def _process_ports(pids):
+    """{pid: [本地端口, ...] 升序}。一次 lsof / netstat 查全部目标 pid。
+
+    macOS/Linux：lsof -nP -i -a -p pid1,pid2,...（单次调用，无逐 pid 开销）。
+    NAME 列形如 127.0.0.1:8765 / *:8765 / [::]:8765，取末个冒号后的数字；
+    macOS 的 TCP 行尾会缀 "(LISTEN)" 等状态括号，NAME 实际在倒数第二列。
+    Windows：netstat -ano（TCP+UDP），末列 PID，本地地址在第 2 列。
+    查不到（超时 / 无 lsof）返回 {}，前端渲染「—」——宁可少报，不可误报。"""
+    if not pids:
+        return {}
+    pid_set = set(pids)
+    ports = {}
+    if platform.system() == "Windows":
+        out = _run(["netstat", "-ano"], timeout=12)
+        for line in (out or "").splitlines():
+            cols = line.split()
+            if len(cols) < 3 or cols[0].lower() not in ("tcp", "udp"):
+                continue
+            try:
+                pid = int(cols[-1])
+            except ValueError:
+                continue          # 表头行 / 分隔线
+            if pid not in pid_set:
+                continue
+            m = re.search(r":(\d+)$", cols[1])
+            if m:
+                ports.setdefault(pid, set()).add(int(m.group(1)))
+    else:
+        out = _run(["lsof", "-nP", "-i", "-a",
+                    "-p", ",".join(str(p) for p in sorted(pid_set))], timeout=8)
+        for line in (out or "").splitlines()[1:]:
+            cols = line.split()
+            if len(cols) < 9:
+                continue
+            try:
+                pid = int(cols[1])
+            except ValueError:
+                continue
+            if pid not in pid_set:
+                continue            # lsof 正常只回目标 pid，此处兜底过滤
+            name = cols[-1]
+            if name.startswith("(") and len(cols) >= 10:
+                name = cols[-2]   # "127.0.0.1:8765 (LISTEN)" → NAME 在倒数第二列
+            m = re.search(r":(\d+)$", name)
+            if m:
+                ports.setdefault(pid, set()).add(int(m.group(1)))
+    return {p: sorted(v) for p, v in ports.items()}
+
+
 def _gargantua_processes(include_other=True):
-    """本项目相关进程：[{pid, name, cpu, mem_bytes, mem_pct, gpu_pct,
+    """本项目相关进程：[{pid, name, ports, cpu, mem_bytes, mem_pct, gpu_pct,
     vram_bytes, external}]。
 
     include_other=True 连带列出「其它 GARGANTUA 副本」的进程（信息完整，
@@ -579,6 +628,7 @@ def _gargantua_processes(include_other=True):
     False 的严格集合——否则本工作台的「结束」按钮能杀掉别的副本的 server。
     平台分支：非 Windows 走 ps；Windows 走 PowerShell/wmic（cpu=None）。
     GPU/显存按进程占用无标准库途径可读 → 恒为 None（前端显示 —）。
+    端口来自一次 lsof / netstat（_process_ports），读不到为空列表。
     按 CPU/内存降序（cpu=None 视为 0）排序。"""
     is_win = platform.system() == "Windows"
     rows = _windows_process_rows() if is_win else _ps_process_rows()
@@ -607,6 +657,10 @@ def _gargantua_processes(include_other=True):
             "external": external,
             "self": (pid == os.getpid()),
         })
+    if procs:
+        port_map = _process_ports([p["pid"] for p in procs])
+        for p in procs:
+            p["ports"] = port_map.get(p["pid"]) or []
     procs.sort(key=lambda p: (-(p["cpu"] or 0.0), -p["mem_bytes"]))
     return procs
 

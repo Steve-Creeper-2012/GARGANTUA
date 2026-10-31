@@ -28,8 +28,14 @@
        改设置里的滑杆时三档同步变化，绝不再出现 16/12/10/8 混用。
        --r-sm 给高度很小的徽章/胶囊（--r 会被元素高度压成零碎值，视觉反而
        不统一）；--r-pill 给滑块/轨道/滚动条这类天然胶囊。 */
-    --r-sm: calc(var(--r) / 2);
-    --r-pill: 999px;
+  --r-sm: calc(var(--r) / 2);
+  --r-pill: 999px;
+  /* 嵌套内层的「同心圆角」：同半径的框套框，内框显得更圆、外框显得更尖。
+     光学正确的内层半径 = 外层半径 − 两框间距；站内嵌套间距普遍 8px 上下，
+     故统一派生一个内层值：外层（卡片/弹窗/表格容器）用 --r，
+     内层（卡片里的输入框/按钮、分段控件段、监视器 bar 等）用 --r-in。
+     --r 调到 0 时它也是 0，半径为零全程合法。 */
+  --r-in: max(calc(var(--r) - 8px), 0px);
 
     /* —— 深色（默认） —— */
     --bg: #0a0c10;
@@ -107,34 +113,51 @@
      这样它和「内容 → 窗口右沿」的间距严格相等（展开/收起都一样）。 */
   #sidebar {
     width: 244px; flex-shrink: 0; margin: 0;
-    background: var(--panel); border: 1px solid var(--border);
-    border-left: none; border-radius: 0 var(--r) var(--r) 0;
     overflow: hidden;
-    transition: width .36s var(--ease), opacity .3s var(--ease),
-                border-color .2s var(--ease);
+    transition: width .42s var(--ease);
   }
-  #sidebar.collapsed { width: 0; opacity: 0; border-width: 0; pointer-events: none; }
+  #sidebar.collapsed { width: 0; pointer-events: none; }
   /* 首帧就按上次的折叠状态画（属性由 <head> 内联脚本写），避免「先展开再收起」的闪动 */
-  html[data-side="collapsed"] #sidebar {
-    width: 0; opacity: 0; border-width: 0; pointer-events: none;
-  }
-  /* 固定内宽：宽度动画时文字不重排。
-     收起/展开用 clip-path 圆形遮罩，圆心固定在折叠按钮（左上角 29,32）：
-     收起时内容从四角向这个图标收拢成一个点，展开时反向铺开——比单纯
-     「宽度 + 透明度」更有方向感。首帧应用不会触发过渡（无 before-change 态）。 */
+  html[data-side="collapsed"] #sidebar { width: 0; pointer-events: none; }
+  /* 固定内宽：宽度动画时文字不重排。面板底色/描边/圆角全在内层上——
+     收起不是淡出，而是一次定向裁切：右沿先撤，左沿与顶部慢一步，
+     底部最后以最快速度上收，四边全部汇聚到折叠按钮处（内层坐标 31,32，
+     与 fixed 常驻按钮逐像素重合）。全程内容不透明，只是被裁掉。 */
   .side-inner {
     position: relative;
     width: 244px; height: 100%; display: flex; flex-direction: column;
     padding: 12px 10px 10px;
-    clip-path: circle(160% at 29px 32px);
-    transform-origin: 29px 32px; transform: scale(1); opacity: 1;
-    transition: clip-path .38s var(--ease), transform .38s var(--ease),
-                opacity .26s var(--ease);
+    background: var(--panel); border: 1px solid var(--border);
+    border-left: none; border-radius: 0 var(--r) var(--r) 0;
+    clip-path: inset(0 0 0 0 round 0 var(--r) var(--r) 0);
   }
   #sidebar.collapsed .side-inner,
   html[data-side="collapsed"] #sidebar .side-inner {
-    clip-path: circle(0% at 29px 32px);
-    transform: scale(.92); opacity: 0;
+    clip-path: inset(32px 213px calc(100% - 32px) 31px round 0 var(--r) var(--r) 0);
+  }
+  /* 编排动画只由用户点击触发（JS 给 <html> 挂 .side-anim，播完移除），
+     首帧恢复折叠状态时直接落位、不播动画。 */
+  html.side-anim #sidebar.collapsed .side-inner {
+    animation: sideShrink .42s var(--ease) forwards;
+  }
+  html.side-anim #sidebar:not(.collapsed) .side-inner {
+    animation: sideGrow .42s var(--ease);
+  }
+  /* 收起编排：0→70% 右沿先收完；左/上 70% 起慢推；底部 85% 起全速上收 */
+  @keyframes sideShrink {
+    0%   { clip-path: inset(0 0 0 0 round 0 var(--r) var(--r) 0); }
+    45%  { clip-path: inset(0 140px 0 0 round 0 var(--r) var(--r) 0); }
+    70%  { clip-path: inset(0 213px 0 10px round 0 var(--r) var(--r) 0); }
+    85%  { clip-path: inset(22px 213px 18% 24px round 0 var(--r) var(--r) 0); }
+    100% { clip-path: inset(32px 213px calc(100% - 32px) 31px round 0 var(--r) var(--r) 0); }
+  }
+  /* 展开编排 = 收起的镜像：底部先全速冲下去，左/上慢铺，右沿最后展开 */
+  @keyframes sideGrow {
+    0%   { clip-path: inset(32px 213px calc(100% - 32px) 31px round 0 var(--r) var(--r) 0); }
+    15%  { clip-path: inset(32px 213px 30% 31px round 0 var(--r) var(--r) 0); }
+    40%  { clip-path: inset(14px 213px 6% 12px round 0 var(--r) var(--r) 0); }
+    75%  { clip-path: inset(0 120px 0 0 round 0 var(--r) var(--r) 0); }
+    100% { clip-path: inset(0 0 0 0 round 0 var(--r) var(--r) 0); }
   }
   /* 高亮滑块：整块 accent-soft 底由这一个元素承担，切页时 transform 滑过去，
      不再靠每个 .nav-item 各自瞬间换背景。坐标系是 .side-inner（非滚动容器），
@@ -149,10 +172,11 @@
   .nav-indicator.show { opacity: 1; }
   .side-head, #nav, #nav-bottom { position: relative; z-index: 1; }
 
-  /* 边栏头：折叠按钮在 GARGANTUA 左边 */
+  /* 边栏头：折叠按钮已外移为 fixed 常驻按钮，占位 38+8 由 padding-left 让出，
+     GARGANTUA 落点与旧版完全一致（内层 x=58），也与收起态页面标题对齐 */
   .side-head {
-    display: flex; align-items: center; gap: 8px;
-    min-height: 38px; padding: 0 2px 10px;
+    display: flex; align-items: center;
+    min-height: 38px; padding: 0 2px 10px 48px;
   }
   #sidebar .brand {
     font-size: var(--title); font-weight: 800; letter-spacing: .02em;
@@ -177,17 +201,18 @@
     transition: transform .32s var(--ease);
   }
   .nav-group.collapsed svg { transform: rotate(-90deg); }
-  /* 分组折叠：display:none 无法过渡，改成 grid 1fr→0fr + 内层 overflow:hidden，
-     行高平滑收拢，箭头旋转时长与之一致。 */
+  /* 分组折叠：display:none 无法过渡，改成 grid 1fr→0fr + 内层 overflow:hidden。
+     纯遮挡、不淡出：条目不透明度恒为 1，收拢时由裁切边随下方内容上移
+     逐渐盖掉（像被滑上来的框压住），展开即反向揭开。 */
   .nav-items {
-    display: grid; grid-template-rows: 1fr; opacity: 1;
-    transition: grid-template-rows .32s var(--ease), opacity .24s var(--ease);
+    display: grid; grid-template-rows: 1fr;
+    transition: grid-template-rows .32s var(--ease);
   }
   .nav-items-inner {
     min-height: 0; overflow: hidden;
     display: flex; flex-direction: column;
   }
-  .nav-items.collapsed { grid-template-rows: 0fr; opacity: 0; }
+  .nav-items.collapsed { grid-template-rows: 0fr; }
   .nav-item {
     position: relative; z-index: 1;
     display: flex; align-items: center; gap: 10px; width: 100%;
@@ -230,16 +255,10 @@
   .side-btn:hover { color: var(--fg); }
   .side-btn:hover::before { background: var(--hover); }
   .side-btn svg { width: 21px; height: 21px; position: relative; z-index: 1; }
-  /* 浮层折叠按钮：绝对定位、常驻布局，出现/消失只做淡入淡出。
-     旧实现用 display:none↔flex 翻转：按钮一出现顶行瞬间多出 46px（按钮 38 +
-     间距 8），把页面标题猛地向右一推，和侧栏收起的左滑打架——这就是标题"闪"的
-     根源。改为脱离文档流后顶行宽度恒定，按钮只影响自己的透明度。 */
-  #float-toggle {
-    position: absolute; left: var(--pad); top: 13px;
-    opacity: 0; pointer-events: none;
-    transition: opacity .22s var(--ease);
-  }
-  #float-toggle.show { opacity: 1; pointer-events: auto; }
+  /* 折叠按钮：fixed 常驻窗口左上（12,13），与边栏裁切收敛点逐像素重合。
+     它不属于边栏/顶栏任何会被裁切的层，收起全程原地可见，彻底取代旧的
+     「边栏内按钮 + 浮层按钮」双按钮交接。 */
+  #side-toggle { position: fixed; left: 12px; top: 13px; z-index: 40; }
   /* 标题盒高度与边栏那个 38px 的折叠按钮对齐：两边的文字垂直中心都在 y=32，
      这样 GARGANTUA 与页面标题永远在同一条水平线上（含边栏收起/展开两种状态）。 */
   .page-title {
@@ -249,16 +268,30 @@
     /* 与侧栏宽度动画同时长，两个方向的位移叠加后依然平滑 */
     transition: transform .36s var(--ease);
   }
-  /* 收起态标题让出浮层按钮的位置：位移量写死 46px（按钮 38 + 间距 8），
-     用 transform 过渡（不触发重排）。距离是常量，与窗口宽度、标题文字无关，
-     彻底消除旧布局方案里的瞬跳/闪烁。 */
-  html[data-side="collapsed"] .page-title { transform: translateX(46px); }
+  /* 收起态标题让出 fixed 按钮（12..50）+ 8 间距：落点 x=58 = 基线 18 + 40。
+     位移量写死 40px，用 transform 过渡（不触发重排）；距离是常量，
+     与窗口宽度、标题文字无关，不出现布局跳变。 */
+  html[data-side="collapsed"] .page-title { transform: translateX(40px); }
   #pages { flex: 1; overflow: hidden; }
   .page { display: none; height: 100%; }
   .page.active { display: flex; flex-direction: column; }
   /* 左右边距严格相等：滚动条占 9px，所以右侧 padding 预先减掉它 */
   .page { padding: 0 var(--pad) 16px; }
   .page.scroll { overflow-y: auto; padding-right: calc(var(--pad) - var(--sbw)); }
+  /* 顶部渐变磨砂条：上滚溢出的内容在滚动区顶端不再硬切消失，而是透过一条
+     sticky 磨砂条渐隐（backdrop-filter 负责磨砂，mask-image 负责向下渐隐）。
+     仅滚动后出现（.scrolled 由 JS 维护），静止在顶部时不模糊首屏内容。 */
+  .page.scroll::before {
+    content: ""; position: sticky; top: 0; z-index: 5;
+    display: block; height: 26px; margin-bottom: -26px;
+    pointer-events: none;
+    backdrop-filter: blur(14px) saturate(1.4);
+    -webkit-backdrop-filter: blur(14px) saturate(1.4);
+    mask-image: linear-gradient(to bottom, #000 20%, transparent);
+    -webkit-mask-image: linear-gradient(to bottom, #000 20%, transparent);
+    opacity: 0; transition: opacity .25s var(--ease);
+  }
+  .page.scroll.scrolled::before { opacity: 1; }
 
   .sec-head {
     display: flex; align-items: center; justify-content: space-between;
@@ -293,6 +326,10 @@
   .act.danger:hover { filter: brightness(1.08); }
   .act.xs { padding: 5px 12px; font-size: 12px; }
   .act svg { width: 15px; height: 15px; }
+  /* 嵌在面板里的按钮用内层同心圆角：外框 --r、内框 --r-in，内外才协调 */
+  .card .act, .dep-card .act, .set-row .act, .modal-foot .act {
+    border-radius: var(--r-in);
+  }
 
   /* ---------- 卡片 ---------- */
   .card {
@@ -321,7 +358,7 @@
   input, select, textarea {
     appearance: none; -webkit-appearance: none;
     background: var(--sunken); color: var(--fg);
-    border: 1px solid var(--border); border-radius: var(--r);
+    border: 1px solid var(--border); border-radius: var(--r-in);
     padding: 8px 12px; width: 100%; outline: none;
     font-family: inherit; font-size: 13px; line-height: 1.4;
     transition: border-color .15s var(--ease), box-shadow .15s var(--ease),
@@ -357,7 +394,7 @@
     min-width: 0; max-width: 100%; cursor: pointer;
   }
   .file-pick .file-btn {
-    flex-shrink: 0; padding: 8px 14px; border-radius: var(--r);
+    flex-shrink: 0; padding: 8px 14px; border-radius: var(--r-in);
     background: var(--fill); color: var(--fg);
     font-size: 12.5px; font-weight: 600;
     transition: background .15s var(--ease);
@@ -403,12 +440,11 @@
     color: var(--fg3); background: transparent;
   }
   tbody td { padding: 8px 14px; border: none; }
-  /* 交替底色与悬停加深都落在 td 上：背景放 tr 上没法给两端切圆角，
-     放 td 上行首/行尾各切一半，整行看起来就是一块圆角高亮。 */
+  /* 交替底色与悬停加深都落在 td 上。行贴满容器、方角：容器自带圆角 +
+     overflow:hidden 统一裁出四角——行内再切同半径圆角会「框中框」，
+     内框显得更圆、外框更尖，macOS 列表风格就是方行 + 圆壳。 */
   tbody tr:nth-child(odd) td { background: var(--row-alt); }
   tbody tr:hover td { background: var(--row-hover); }
-  tbody tr:hover td:first-child { border-radius: var(--r) 0 0 var(--r); }
-  tbody tr:hover td:last-child  { border-radius: 0 var(--r) var(--r) 0; }
   th.right, td.right { text-align: right; }
   .mono {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -502,11 +538,11 @@
   }
   .mon-sub.warn { color: var(--amber); }
   .mon-bar {
-    flex: 1; min-width: 80px; height: 32px; border-radius: var(--r);
+    flex: 1; min-width: 80px; height: 48px; border-radius: var(--r-in);
     background: var(--track); overflow: hidden;
   }
   .mon-fill {
-    height: 100%; border-radius: var(--r);
+    height: 100%; border-radius: var(--r-in);
     background: linear-gradient(90deg, var(--accent), var(--accent-2));
     /* DOM 复用后每轮只改 width，这里的过渡才真的生效；此前每次
        innerHTML 重建，新元素直接以最终宽度出生，表现为「突然改变」。 */
@@ -567,7 +603,7 @@
     background: var(--sunken); border-radius: var(--r);
   }
   .seg button {
-    padding: 7px 15px; border-radius: var(--r);
+    padding: 7px 15px; border-radius: var(--r-in);
     font-size: 13px; font-weight: 600; color: var(--fg2);
     transition: background .15s var(--ease), color .15s var(--ease);
   }
@@ -586,7 +622,7 @@
   .queue-item {
     display: flex; align-items: center; justify-content: space-between;
     gap: 12px; padding: 10px 14px; margin-bottom: 6px;
-    background: var(--fill); border-radius: var(--r);
+    background: var(--fill); border-radius: var(--r-in);
   }
   .queue-item .name {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -625,7 +661,7 @@
   #input-tools label { color: var(--fg2); font-size: 12px; }
   #input-tools input[type=number] { width: 72px; }
   #send-btn {
-    margin-left: auto; width: 34px; height: 34px; border-radius: var(--r);
+    margin-left: auto; width: 34px; height: 34px; border-radius: var(--r-in);
     background: var(--accent); color: var(--on-accent); font-size: 16px; font-weight: 700;
     display: flex; align-items: center; justify-content: center;
   }
@@ -665,7 +701,7 @@
   .token-palette { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
   .token-palette button {
     background: var(--fill); color: var(--fg2);
-    border-radius: var(--r); padding: 5px 12px;
+    border-radius: var(--r-in); padding: 5px 12px;
     font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
   .token-palette button:hover { background: var(--fill-2); color: var(--fg); }
