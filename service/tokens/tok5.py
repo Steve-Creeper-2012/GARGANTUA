@@ -4,14 +4,16 @@
 # 2026-10-28 定案，取代 tok-32（spec.py 第 5b 节是唯一事实来源）。
 #
 # 三层表示，本模块负责全部互转：
-#   1) 字符流（人类可读，27 个符号）：
+#   1) 字符流（人类可读，27 个单字符 + 4 个原子绑定 token）：
 #        {t:C732}                  文本 token（ID 大写十六进制、自界定）
 #        {w:<2132 hex>}            音频 token（533 采样 × 16 bit）
 #        {v:<10240 hex>x:10y:24}   视觉 patch（32×32 × RGBA 各 10 bit）
 #        {a|b|c}                   一个时间步内多个元素，| 分隔
 #        <5>                       扩展系统 token（有嵌入、不进 loss）
+#        <model>/<user>/<model/>/<user/>  原子绑定 token（各占一个码位 27-30，
+#                                     而非多字符；编码/解码整串当一码）
 #   2) 位流（.tokens 落盘）：5 bit/字符，MSB-first；末字符后跟终止符码
-#      27，再补零到字节边界。
+#      31，再补零到字节边界。
 #   3) 元素模型（进程内）：
 #        {"kind":"text",   "id": int}
 #        {"kind":"wave",   "hex": str}                 # 定长 2132
@@ -58,20 +60,46 @@ class Tok5Error(ValueError):
 # ---------------------------------------------------------------------------
 # 1. 字符 ↔ 位流
 # ---------------------------------------------------------------------------
+def _iter_codes(text: str):
+    """把字符流拆成 5-bit 码序列（生成器）。
+
+    27 个单字符 → 各自的字符码（0-26）；整串 <model>/<user>/<model/>/
+    <user/> → 原子绑定 token 码（27-30），占一个码位而非逐字符。
+    """
+    bound = spec.T5_BOUND_NAME_TO_CODE
+    # 按长度降序匹配，避免 <model> 误吞 <model/> 的前缀
+    bound_order = sorted(bound, key=len, reverse=True)
+    code_of = spec.T5_CHAR_CODE
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "<":
+            matched = None
+            for name in bound_order:
+                if text.startswith(name, i):
+                    matched = name
+                    break
+            if matched is not None:
+                yield bound[matched]
+                i += len(matched)
+                continue
+        code = code_of.get(ch)
+        if code is None:
+            raise Tok5Error(
+                f"位置 {i} 出现字符集外字符 {ch!r}"
+                f"（token-5 只允许 {spec.T5_CHARS}）")
+        yield code
+        i += 1
+
+
 def encode_chars(text: str) -> bytes:
     """字符流 → 5 bit/字符 的位流（末尾终止符 + 零填充）。"""
     if not isinstance(text, str):
         raise Tok5Error(f"字符流必须是字符串，得到 {type(text).__name__}")
+    out = bytearray()
     acc = 0
     nbits = 0
-    out = bytearray()
-    code_of = spec.T5_CHAR_CODE
-    for pos, ch in enumerate(text):
-        code = code_of.get(ch)
-        if code is None:
-            raise Tok5Error(
-                f"位置 {pos} 出现字符集外字符 {ch!r}"
-                f"（token-5 只允许 {spec.T5_CHARS}）")
+    for code in _iter_codes(text):
         acc = (acc << spec.T5_BITS_PER_CHAR) | code
         nbits += spec.T5_BITS_PER_CHAR
         while nbits >= 8:
@@ -106,15 +134,9 @@ class BitWriter:
     def write_chars(self, text: str) -> None:
         if self._closed:
             raise Tok5Error("BitWriter 已关闭")
-        code_of = spec.T5_CHAR_CODE
         buf = bytearray()
         acc, nbits = self._acc, self._nbits
-        for pos, ch in enumerate(text):
-            code = code_of.get(ch)
-            if code is None:
-                raise Tok5Error(
-                    f"位置 {pos} 出现字符集外字符 {ch!r}"
-                    f"（token-5 只允许 {spec.T5_CHARS}）")
+        for code in _iter_codes(text):
             acc = (acc << spec.T5_BITS_PER_CHAR) | code
             nbits += spec.T5_BITS_PER_CHAR
             while nbits >= 8:
@@ -144,12 +166,17 @@ class BitWriter:
 
 
 def decode_chars(data: bytes) -> str:
-    """位流 → 字符流（遇到终止符码 27 停止；缺终止符视为截断）。"""
+    """位流 → 字符流（遇到终止符码 31 停止；缺终止符视为截断）。
+
+    码 27-30 是原子绑定 token，还原成各自的多字符展示名
+    <model>/<user>/<model/>/<user/>；码 0-26 是单字符。
+    """
     if isinstance(data, (bytearray, memoryview)):
         data = bytes(data)
     if not isinstance(data, bytes):
         raise Tok5Error(f"tokens 数据必须是 bytes，得到 {type(data).__name__}")
     chars = spec.T5_CHARS
+    bound = spec.T5_BOUND_TOKENS
     acc = 0
     nbits = 0
     out: list = []
@@ -162,6 +189,9 @@ def decode_chars(data: bytes) -> str:
             acc &= (1 << nbits) - 1
             if code == spec.T5_END_CODE:
                 return "".join(out)
+            if 27 <= code <= 30:
+                out.append(bound[code])
+                continue
             if code >= len(chars):
                 raise Tok5Error(f"未定义的字符码 {code}（文件损坏或不是 token-5）")
             out.append(chars[code])
@@ -258,7 +288,12 @@ def element_to_chars(el: dict) -> str:
     if kind == "text":
         return "t:" + _id_hex(_check_id(el["id"], "文本 token"))
     if kind == "ext":
-        return "<" + _id_hex(_check_id(el["id"], "扩展系统 token")) + ">"
+        tid = _check_id(el["id"], "扩展系统 token")
+        # 绑定 token（<model>/<user>/<model/>/<user/>）写出名字而非 <id>
+        nm = spec.T5_BOUND_ID_TO_NAME.get(tid)
+        if nm is not None:
+            return nm
+        return "<" + _id_hex(tid) + ">"
     if kind == "wave":
         return "w:" + el["hex"].upper()
     if kind == "visual":
@@ -384,9 +419,17 @@ def parse_items(text: str) -> list:
             if j < 0:
                 raise Tok5Error(f"位置 {i}: '<' 未闭合")
             body = text[i + 1:j]
+            name = "<" + body + ">"
+            if name in spec.T5_NAME_TO_BOUND_ID:
+                # 原子绑定 token：<model>/<user>/<model/>/<user/> → 对应 ext ID
+                items.append({"kind": "ext",
+                              "id": spec.T5_NAME_TO_BOUND_ID[name]})
+                i = j + 1
+                continue
             if not body or any(ch not in _HEX_CHARS for ch in body):
                 raise Tok5Error(
-                    f"位置 {i}: 扩展 token 必须是 <十六进制 ID>，"
+                    f"位置 {i}: 扩展 token 必须是 <十六进制 ID> 或绑定 token"
+                    f"（{sorted(spec.T5_NAME_TO_BOUND_ID)}），"
                     f"得到 {text[i:j + 1]!r}")
             items.append({"kind": "ext", "id": int(body, 16)})
             i = j + 1

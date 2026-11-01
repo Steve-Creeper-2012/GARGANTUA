@@ -3,7 +3,7 @@
 # GARGANTUA — 两种 token 存档格式的端到端验证脚本
 # ---------------------------------------------------------------------------
 # 验证内容：
-#   A. token-5（.tokens 二进制）：27 个符号、5 bit/字符的位流
+#   A. token-5（.tokens 二进制）：27 个单字符 + 4 个原子绑定 token、5 bit/字符的位流
 #      - 与同一文本的 UTF-8 字节对比（证明是不同编码）
 #      - 用【不依赖 tokens 包】的裸位循环解析（证明格式自描述）
 #      - 文本 / 音频 / 视觉三类载荷的定长约束与往返
@@ -45,8 +45,12 @@ def section(title):
 
 
 def _independent_decode(data: bytes) -> str:
-    """不 import tokens 的裸解码器：每 5 bit 一个字符，码 27 终止。"""
-    chars = "0123456789{}<>|:wtvABCDEFxy"     # 与 spec 第 5b 节一致
+    """不 import tokens 的裸解码器：每 5 bit 一个字符，码 T5_END_CODE 终止。
+
+    码 27-30 还原成原子绑定 token 的展示名（与 spec 第 5b 节一致）。
+    """
+    chars = spec.T5_CHARS                            # 与 spec 第 5b 节一致
+    bound = spec.T5_BOUND_TOKENS
     acc = nbits = 0
     out = []
     for byte in data:
@@ -56,8 +60,11 @@ def _independent_decode(data: bytes) -> str:
             nbits -= 5
             code = (acc >> nbits) & 0x1F
             acc &= (1 << nbits) - 1
-            if code == 27:
+            if code == spec.T5_END_CODE:
                 return "".join(out)
+            if 27 <= code <= 30:
+                out.append(bound[code])
+                continue
             out.append(chars[code])
     raise AssertionError("缺少终止符")
 
@@ -87,7 +94,7 @@ def verify_tok5():
     independent = _independent_decode(data)
     print(f"\n独立读取器（裸位循环）: {independent[:40]}…")
     assert independent == chars, "独立读取结果与编码不一致"
-    print("  → 格式自描述：按「5 bit/字符 + 终止符 27」即可解析 ✓")
+    print("  → 格式自描述：按「5 bit/字符 + 终止符 %d」即可解析 ✓" % spec.T5_END_CODE)
 
     # 文件读写
     with tempfile.TemporaryDirectory() as d:

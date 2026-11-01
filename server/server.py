@@ -705,6 +705,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/vocab/source": app.api_vocab_source,
             "/api/vocab/fork": app.api_vocab_fork,
             "/api/vocab/copy": app.api_vocab_fork,
+            "/api/vocab/create": app.api_vocab_create,
             "/api/vocab/delete": app.api_vocab_delete,
             "/api/system/install-optional": app.api_system_install_optional,
             "/api/system/install": app.api_system_install,

@@ -8,7 +8,7 @@
 #   system   不可见系统（{ } | 时间步边界与分隔）
 #
 # 格式：
-#   .tokens       token-5 位流（27 个符号 × 5 bit，终止符码 27）——tok5.py
+#   .tokens       token-5 位流（27 个单字符 + 4 个原子绑定 token，5 bit/字符，终止符码 31）——tok5.py
 #                 文本 {t:NNNNN} / 音频 {w:HEX} / 视觉 {v:HEXx:..y:..}
 #                 扩展系统 token <NNNNN>；{ } | 是结构字符不是 token
 #   .tokenvector  向量存档（UTF-8，dim+precision 头，{} | 结构）——tokenvector.py

@@ -13,7 +13,7 @@
 #   GET  /api/vocab/*        词表文件夹 API（list/regions/query/source，
 #                            见下方 TokensApi 的方法注释）
 #
-# 格式（spec 第 5b 节）：27 个符号、5 bit/字符；{ } 包裹时间步，| 分隔
+# 格式（spec 第 5b 节）：27 个单字符 + 4 个原子绑定 token（码 0-30）、5 bit/字符；{ } 包裹时间步，| 分隔
 # 步内元素；{t:<id>} 文本、{w:<hex>} 音频、{v:<hex>x:..y:..} 视觉、
 # <id> 扩展系统 token。结构字符本身不是 token。
 #
@@ -272,6 +272,14 @@ class TokensApi:
         if not new_name:
             raise ValueError("缺少 new_name")
         return 200, create_vocab(new_name, source=name)
+
+    def api_vocab_create(self, body):
+        """创建空词表（仅架构契约头，从零开始）。"""
+        from vocab_presets import create_empty_vocab
+        name = body.get("name")
+        if not name:
+            raise ValueError("缺少 name")
+        return 200, create_empty_vocab(name)
 
     def api_vocab_delete(self, body):
         """删除词表（main 不可删）。"""

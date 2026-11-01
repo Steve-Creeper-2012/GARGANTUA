@@ -326,10 +326,6 @@
         <div id="infer-wrap">
           <div id="infer-main">
             <div id="chat-history">
-              <div id="chat-empty">
-                <div class="big">GARGANTUA</div>
-                <div>尽管问（当前版本推理仅支持文本 prompt）</div>
-              </div>
             </div>
             <div id="input-dock">
               <div id="input-box">
@@ -387,8 +383,6 @@
           每个音元是一个时间步；音频 token 是投影向量（无离散 ID），存档用 .tokenvector 格式。
         </div>
         <div class="row" style="margin-top:0">
-          <label>用哪个词表来转换</label>
-          <select id="audio-vocab" style="width:auto;min-width:160px"></select>
           <label class="file-pick" for="audio-file">
             <input type="file" id="audio-file" accept=".wav,.mp3,.flac,.ogg,audio/*">
             <span class="file-btn">选择文件</span>
@@ -406,8 +400,6 @@
           视觉 token 是投影向量（无离散 ID），存档用 .tokenvector 格式。
         </div>
         <div class="row" style="margin-top:0">
-          <label>用哪个词表来转换</label>
-          <select id="image-vocab" style="width:auto;min-width:160px"></select>
           <label class="file-pick" for="image-file">
             <input type="file" id="image-file" accept="image/*">
             <span class="file-btn">选择文件</span>
@@ -429,8 +421,6 @@
           该 {} 内平铺该帧全部 patch token 与该帧音频 token。
         </div>
         <div class="row" style="margin-top:0">
-          <label>用哪个词表来转换</label>
-          <select id="video-vocab" style="width:auto;min-width:160px"></select>
           <label class="file-pick" for="video-file">
             <input type="file" id="video-file" accept="video/*,.gif,.webp">
             <span class="file-btn">选择文件</span>

@@ -41,9 +41,12 @@
 #     的 geometrize_256_v1（service/prims/ 内 vendored，转换器为 Rust/wgpu）；
 #     MIDI 输出 token 暂时删除。
 #
-# 定案记录（2026-10-28，steve 拍板，token-5 编码）：
-#   - .tokens 改为 token-5：27 个符号（0-9 { } < > | : w t v A-F x y），
-#     5 bit/字符，位流落盘，末字符后跟终止符码 27。
+# 定案记录（2026-10-28，steve 拍板，token-5 编码；2026-10-31 修订绑定 token）：
+#   - .tokens 改为 token-5：27 个单字符（0-9 { } < > | : w t v A-F x y）+ 4 个
+#     原子绑定 token（<model> <user> <model/> <user/>，各占一个 5-bit 码位
+#     27-30），5 bit/字符（2^5=32 码位，码 31 为终止符），位流落盘，末字符后
+#     跟终止符码 31。4 个绑定 token 分别映射到扩展系统 token ID
+#     （<model>=3、<user>=1、<model/>=4、<user/>=2，与词表契约头一致）。
 #   - {} 内是正常 token（用户 token）：可见、有向量坐标、进 loss。
 #     <id> 是扩展系统 token：有嵌入但没有位置坐标（位置嵌入的职责交给
 #     它们，KDA 自学位置关系），不进 loss、不显示为内容。
@@ -371,7 +374,10 @@ AUDIO_SAMPLES_PER_TOKEN = 533        # 533 采样/token ≈ 30 tok/s
 #   <id>                   扩展系统 token（有嵌入、不进 loss、不可显示）
 #   { } |                  结构字符（不是独立 token，不占位置、不进 loss）
 #
-# —— 字符集：27 个符号，5 bit/字符 ——
+# —— 字符集：27 个单字符（码 0-26）+ 4 个原子绑定 token（码 27-30）——
+#   5 bit/字符（2^5 = 32 码位）。码 31 为流终止符，不对应任何字符。
+#
+#   —— 27 个单字符（T5_CHARS，码即下表顺序 0..26）——
 #   '0'-'9'  数字（坐标十进制 / ID 十六进制数字位；ID 另用 'A'-'F'）
 #   '{' '}'  时间步边界
 #   '<' '>'  扩展系统 token 边界
@@ -382,20 +388,34 @@ AUDIO_SAMPLES_PER_TOKEN = 533        # 533 采样/token ≈ 30 tok/s
 #   'v'      视觉载荷标识（visual）
 #   'A'-'F'  十六进制字母（大写；小写不属于字符集）
 #   'x' 'y'  视觉坐标标识
-#   没有空格，没有其它字母。字符码即上表顺序 0..26；码 27 是流终止符
-#   （不是字符），28..31 保留。
+#   没有空格，没有其它字母（w/t/v/x/y 是仅有的小写，只作载荷/坐标标识）。
+#
+#   —— 4 个原子绑定 token（码 27-30，各占一个 5-bit 码位，不是多字符）——
+#   编码时把字符流里的整串 <model>/<user>/<model/>/<user/> 当作一个码位；
+#   解码时码 27/28/29/30 还原成各自的多字符展示名（见 T5_BOUND_TOKENS）。
+#   它们分别绑定到扩展系统 token 的 ID：<model>=3、<user>=1、<model/>=4、
+#   <user/>=2（与词表契约头里的名字一致），所以既能被位流当作原子字符存，
+#   又能在元素层当作普通 ext 元素（带 ID）参与编解码。
 T5_CHARS = "0123456789{}<>|:wtvABCDEFxy"
-T5_ALPHABET_SIZE = len(T5_CHARS)          # 27
+T5_ALPHABET_SIZE = 27                     # 单字符码 0..26（绑定 token 不计入）
 T5_BITS_PER_CHAR = 5
-T5_END_CODE = 27                          # 终止符：不是字符，解码到此为止
+T5_END_CODE = 31                          # 终止符：码 31（2^5-1），解码到此为止
 T5_CHAR_CODE = {c: i for i, c in enumerate(T5_CHARS)}
+# 原子绑定 token：码位 → 多字符展示名（编码/解码的原子单元）
+T5_BOUND_TOKENS = {27: "<model>", 28: "<user>", 29: "<model/>", 30: "<user/>"}
+# 绑定 token 名字 → 码位（编码时整串匹配）
+T5_BOUND_NAME_TO_CODE = {"<model>": 27, "<user>": 28, "<model/>": 29, "<user/>": 30}
+# 绑定 token 名字 → 扩展系统 token ID（解析为元素用）
+T5_NAME_TO_BOUND_ID = {"<model>": 3, "<user>": 1, "<model/>": 4, "<user/>": 2}
+# 扩展系统 token ID → 绑定 token 名字（元素→字符流时写出名字而非 <id>）
+T5_BOUND_ID_TO_NAME = {3: "<model>", 1: "<user>", 4: "<model/>", 2: "<user/>"}
 T5_HEX_CHARS = "0123456789ABCDEF"
 
 # —— 载荷尺寸 ——
 # 文本/扩展 token 的 ID：**大写十六进制、自界定**——{t:...} 里读到 '}' 或
 # '|' 为止，<...> 里读到 '>' 为止。长度因词表而异（小词表 ID 短、大词表
 # ID 长），格式本身不给 ID 定宽、定上限；前导零允许（<00005> 就是 5）。
-# 十六进制必须大写：5 bit 字符表只有 27 个码位，装不下小写 a-f。
+# 十六进制必须大写：5 bit 字符表只有 31 个码位，装不下小写 a-f。
 # 坐标（{v:...x:N y:M} 的 N/M）仍是自界定十进制。
 T5_COORD_LIMIT = 100_000        # x/y 坐标防呆上界（自界定十进制）
 

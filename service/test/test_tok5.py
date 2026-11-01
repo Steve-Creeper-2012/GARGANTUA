@@ -2,7 +2,8 @@
 # GARGANTUA v1 — test_tok5.py：token-5 编码契约回归
 # ---------------------------------------------------------------------------
 # 覆盖 spec 第 5b 节的全部硬约束：
-#   - 字符集恰好 27 个符号，5 bit/字符，终止符码 27
+#   - 字符集 27 个单字符 + 4 个原子绑定 token（<model>/<user>/<model/>/<user/>，
+#     码 27-30），5 bit/字符，终止符码 31
 #   - {t:NNNNN} 文本 / {w:HEX} 音频（2132）/ {v:HEXx:..y:..} 视觉（10240）
 #   - <NNNNN> 扩展系统 token（不在 {} 内）
 #   - 结构：{} 非空、| 位置合法、括号配对、游离字符拒绝
@@ -36,15 +37,33 @@ _VS = len(Vocab.global_vocab())
 
 
 class TestAlphabet(unittest.TestCase):
-    def test_alphabet_is_27_unique_symbols(self):
+    def test_alphabet_is_27_single_chars(self):
+        # 27 个单字符（码 0-26），外加 4 个原子绑定 token（码 27-30）
         self.assertEqual(len(spec.T5_CHARS), 27)
         self.assertEqual(len(set(spec.T5_CHARS)), 27)
         self.assertEqual(spec.T5_ALPHABET_SIZE, 27)
-        # 没有空格、没有小写字母（除 w/t/v/x/y）
         for ch in spec.T5_CHARS:
             self.assertNotEqual(ch, " ")
+        # 仅有的小写：w/t/v/x/y（载荷/坐标标识）
         self.assertEqual({c for c in spec.T5_CHARS if c.islower()},
                          {"w", "t", "v", "x", "y"})
+
+    def test_bound_tokens_defined(self):
+        # 4 个绑定 token：码 27-30，名字与词表 ID 一致
+        self.assertEqual(spec.T5_BOUND_TOKENS,
+                         {27: "<model>", 28: "<user>",
+                          29: "<model/>", 30: "<user/>"})
+        self.assertEqual(set(spec.T5_BOUND_TOKENS), {27, 28, 29, 30})
+        # 名字↔码 与 名字↔ID 互逆
+        self.assertEqual({spec.T5_BOUND_NAME_TO_CODE[n]
+                          for n in spec.T5_NAME_TO_BOUND_ID},
+                         {27, 28, 29, 30})
+        for name, tid in spec.T5_NAME_TO_BOUND_ID.items():
+            self.assertEqual(spec.T5_BOUND_ID_TO_NAME[tid], name)
+        # 词表契约头里的 ID：<user>=1 <user/>=2 <model>=3 <model/>=4
+        self.assertEqual(spec.T5_NAME_TO_BOUND_ID,
+                         {"<model>": 3, "<user>": 1,
+                          "<model/>": 4, "<user/>": 2})
 
     def test_required_symbols_present(self):
         for ch in "0123456789{}<>|:wtvABCDEFxy":
@@ -68,10 +87,21 @@ class TestBitstream(unittest.TestCase):
             tok5.decode_chars(data[:-1])     # 砍掉终止符
 
     def test_non_alphabet_char_rejected(self):
-        # 位流层只校验字符集：空格 / 小写字母 / 大写 T 都不在 27 个符号里
+        # 位流层只校验单字符集：空格 / 小写字母 / 大写 T 都不在 27 个单字符里
         for bad in ("{t:00001 }", "abc", "{T:00001}", "{}é"):
             with self.assertRaises(tok5.Tok5Error):
                 tok5.encode_chars(bad)
+
+    def test_bound_tokens_roundtrip_in_bitstream(self):
+        # 4 个原子绑定 token：整串当一码，编解码对称
+        s = "<model><user><model/><user/>"
+        self.assertEqual(tok5.decode_chars(tok5.encode_chars(s)), s)
+        # 与单字符混排：绑定 token 与 {t:} 共存
+        mixed = "{t:00001}<model>|<user/>{t:00002}"
+        self.assertEqual(tok5.decode_chars(tok5.encode_chars(mixed)), mixed)
+        # 一个绑定 token 只消耗 5 bit（一个码位），不是逐字符
+        data = tok5.encode_chars("<model>")
+        self.assertEqual(tok5.decode_chars(data), "<model>")
         # 语法层：ID 是自界定十六进制——非 hex 字符（G）终止并报错；
         # hex 字母（A-F，大小写都收）是合法 ID 数字
         with self.assertRaises(tok5.Tok5Error):
@@ -139,6 +169,44 @@ class TestElements(unittest.TestCase):
         for s in bad:
             with self.assertRaises(tok5.Tok5Error, msg=s):
                 tok5.parse_items(s)
+
+
+class TestBoundTokens(unittest.TestCase):
+    def test_element_to_chars_uses_names(self):
+        # 绑定 ID 写出名字而非 <id>
+        self.assertEqual(tok5.element_to_chars(tok5.ext(3)), "<model>")
+        self.assertEqual(tok5.element_to_chars(tok5.ext(1)), "<user>")
+        self.assertEqual(tok5.element_to_chars(tok5.ext(4)), "<model/>")
+        self.assertEqual(tok5.element_to_chars(tok5.ext(2)), "<user/>")
+        # 非绑定扩展 ID 仍是 <id>
+        self.assertEqual(tok5.element_to_chars(tok5.ext(5)), "<5>")
+
+    def test_parse_items_recognizes_names(self):
+        self.assertEqual(tok5.parse_items("<model>"),
+                         [{"kind": "ext", "id": 3}])
+        self.assertEqual(tok5.parse_items("<user/>"),
+                         [{"kind": "ext", "id": 2}])
+        # <model/> 不能被 <model> 前缀吞掉：两者应分别解析
+        self.assertEqual(tok5.parse_items("<model><model/>"),
+                         [{"kind": "ext", "id": 3},
+                          {"kind": "ext", "id": 4}])
+
+    def test_bound_token_full_roundtrip(self):
+        items = [tok5.step(tok5.text(1)),
+                 {"kind": "ext", "id": 3},
+                 tok5.step(tok5.text(2), tok5.text(3)),
+                 {"kind": "ext", "id": 1},
+                 {"kind": "ext", "id": 4},
+                 {"kind": "ext", "id": 2}]
+        back = tok5.loads(tok5.dumps(items))
+        self.assertEqual(back, items)
+
+    def test_bound_token_in_display(self):
+        # to_display 不带 name_of 时显示 <id>，绑定名只在字符/位流层
+        self.assertEqual(tok5.to_display([{"kind": "ext", "id": 3}]), "<3>")
+        # 经字符流往返仍认得出名字
+        s = tok5.items_to_chars([{"kind": "ext", "id": 3}])
+        self.assertEqual(s, "<model>")
 
 
 class TestWavePayload(unittest.TestCase):

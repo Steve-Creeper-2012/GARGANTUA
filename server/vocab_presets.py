@@ -403,6 +403,51 @@ def create_vocab(name: str, source: str = BASE) -> dict:
             "vocab_size": int(cfg.get("vocab_size", 0))}
 
 
+def create_empty_vocab(name: str) -> dict:
+    """创建一张「空词表」：只含架构契约头（special/system/draw），
+    不含任何用户 token。满足 .vfc 的全部不变量（ID 连续 0..HEAD_SIZE-1、
+    头契约完整），用户可在其上从零增删。base 不可被空词表覆盖。
+
+    「空」指无用户内容；契约头是格式硬约束，无法省略。
+    """
+    if name == BASE:
+        raise ValueError("不能用「空词表」覆盖 base 预设")
+    bad = _valid_name(name)
+    if bad:
+        raise ValueError(bad)
+    ensure_base()
+    with _LOCK:
+        d = vocab_dir(name)
+        if (d / VOCAB_FILE_NAME).exists():
+            raise ValueError(f"词表已存在: {name}")
+        if d.exists() and any(d.iterdir()):
+            raise ValueError(f"目标目录已存在且非空: {name}")
+        d.mkdir(parents=True, exist_ok=True)
+        entries = vfc.head_entries()
+        vfc.write_vfc(str(vocab_vfc_path(name)), entries)
+        regions = [
+            {"region": "special", "category": "special",
+             "size": spec.SPECIAL_SIZE},
+            {"region": "system", "category": "system",
+             "size": spec.SYSTEM_SIZE},
+            {"region": "draw", "category": "special",
+             "size": spec.MODAL_SIZE},
+        ]
+        if sum(r["size"] for r in regions) != len(entries):
+            regions = [{"region": "visible", "category": "regular",
+                        "size": len(entries)}]
+        write_config(name, {
+            "name": name,
+            "format": VOCAB_FOLDER_FORMAT,
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "source": None,
+            "description": "空词表（仅架构契约头，从零开始）",
+            "is_main": False,
+            "regions": regions,
+            "vocab_size": len(entries),
+        })
+    return {"name": name, "vocab_size": len(entries)}
+
 
 def delete_vocab(name: str) -> None:
     """删除一个词表（base 不可删）。"""

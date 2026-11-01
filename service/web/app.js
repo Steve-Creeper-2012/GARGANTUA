@@ -329,8 +329,14 @@ function positionIndicator(animate) {
   NAV_INDICATOR.classList.add("show");
   NAV_INDICATOR.style.width = r.width + "px";
   NAV_INDICATOR.style.height = r.height + "px";
+  // .nav-indicator 是 .side-inner 的 abs 子元素（position:relative + 1px border）。
+  // getBoundingClientRect() 返回 border-box，而 abs 定位 top/left:0 落在 padding-box
+  // 顶点 = border-box 顶点 + border 宽，故需减去 host 的 border 宽抵消 1px 偏移，
+  // 否则高亮块比 hover 背景低/右 1px。
+  const dx = r.left - hr.left - host.clientLeft;
+  const dy = r.top - hr.top - host.clientTop;
   NAV_INDICATOR.style.transform =
-    `translate(${(r.left - hr.left).toFixed(2)}px, ${(r.top - hr.top).toFixed(2)}px)`;
+    `translate(${dx.toFixed(2)}px, ${dy.toFixed(2)}px)`;
   if (!animate) {
     void NAV_INDICATOR.offsetHeight;          // 强制 reflow 让上面的 none 生效
     NAV_INDICATOR.style.transition = "";
@@ -842,8 +848,8 @@ function b64ToBytes(b64) {
 const _IDHEX = n => Number(n).toString(16).toUpperCase();
 
 function stepsToToken5(steps, bound) {
-  const openTag = bound === "user" ? "<1>" : "<3>";   // <user> / <model>
-  const closeTag = bound === "user" ? "<2>" : "<4>";  // <user/> / <model/>
+  const openTag = bound === "user" ? "<user>" : "<model>";   // <user> / <model>
+  const closeTag = bound === "user" ? "<user/>" : "<model/>";  // <user/> / <model/>
   const parts = [openTag];
   for (const st of steps) {
     const ids = st.token_ids || [];
@@ -1139,7 +1145,7 @@ $("audio-encode").onclick = async () => {
   $("audio-out").textContent = "编码中…";
   try {
     const r = await api("/api/codec/audio", {audio_b64: await fileToB64(f),
-                             filename: f.name, vocab: $("audio-vocab").value},
+                             filename: f.name},
                         {timeout: API_UPLOAD_TIMEOUT_MS});
     $("audio-out").textContent =
       `# 音元数 ${r.n_tokens}，时长 ${r.duration_s}s\n` + r.token5;
@@ -1151,7 +1157,7 @@ $("image-encode").onclick = async () => {
   $("image-out").textContent = "编码中…";
   try {
     const r = await api("/api/codec/image",
-                        {image_b64: await fileToB64(f), vocab: $("image-vocab").value},
+                        {image_b64: await fileToB64(f)},
                           {timeout: API_UPLOAD_TIMEOUT_MS});
     const st = r.steps[0];
     $("image-out").textContent =
@@ -1165,7 +1171,7 @@ $("video-encode").onclick = async () => {
   $("video-out").textContent = "编码中（ffmpeg 抽帧 + 提取音轨）…";
   try {
     const r = await api("/api/codec/video", {video_b64: await fileToB64(f),
-                             filename: f.name, vocab: $("video-vocab").value},
+                             filename: f.name},
                         {timeout: API_UPLOAD_TIMEOUT_MS});
     $("video-stats").textContent =
       `帧数: ${r.n_frames}　总 patches: ${r.total_patches}　音元: ${r.n_audio_tokens}`;
@@ -1199,12 +1205,12 @@ $("prims-convert").onclick = async () => {
 /* ---------- Token 编辑器 ----------
    调色板：扩展系统 token（<0>..<5>，也可直接写名字）+ 结构字符。 */
 const TOKEN_PALETTE = [
-  {label:"<user>",    insert:"<1>"},
-  {label:"<user/>",   insert:"<2>"},
-  {label:"<model>",   insert:"<3>"},
-  {label:"<model/>",  insert:"<4>"},
-  {label:"<stop>",    insert:"<5>"},
-  {label:"<caps>",    insert:"<0>"},
+  {label:"<user>",    insert:"<user>"},
+  {label:"<user/>",   insert:"<user/>"},
+  {label:"<model>",   insert:"<model>"},
+  {label:"<model/>",  insert:"<model/>"},
+  {label:"<stop>",    insert:"<stop>"},
+  {label:"<caps>",    insert:"<caps>"},
   {label:"时间步 {",  insert:"{"},
   {label:"时间步 }",  insert:"}"},
   {label:"步内 |",    insert:"|"},
@@ -1282,8 +1288,8 @@ const VOCAB = {
   write: "this",  // this | fork
 };
 /* 转换器四页 + 建模页「词表预设」+ Token 编辑器导出共用同一份词表列表 */
-const VOCAB_SELECTS = ["text-vocab", "audio-vocab", "image-vocab",
-                       "video-vocab", "model-vocab", "json-vocab"];
+const VOCAB_SELECTS = ["text-vocab",
+                       "model-vocab", "json-vocab"];
 const MAIN_WHY =
   "main 词表是全站基准：模型维度、不可见区契约、系统 token 都锚在它身上，"
   + "直接改动会牵连所有已建模型。请 Fork 出一份新词表，再在新词表上编辑。";
@@ -1343,6 +1349,9 @@ async function refreshVocabList() {
     const main = VOCAB.list.find(v => v.is_main);
     VOCAB.active = (main || VOCAB.list[0]).name;
     VOCAB.tabs = [VOCAB.active];
+  } else if (VOCAB.active && !VOCAB.tabs.includes(VOCAB.active)) {
+    // 自动打开的 base 等：确保 active 一定落在标签页条上
+    VOCAB.tabs.push(VOCAB.active);
   }
   renderVocabTabs();
   return VOCAB.list;
@@ -1371,19 +1380,39 @@ function renderVocabTabs() {
 }
 function renderVocabMenu() {
   const menu = $("vtab-menu");
+  // ＋ 入口永远提供「新建空词表」：即便列表为空也能从零建一张
+  const head = `<button class="it create" data-new-empty="1">` +
+    `<span>＋ 新建空词表</span><span class="sub">仅契约头·从零开始</span></button>`;
   if (!VOCAB.list.length) {
-    menu.innerHTML = `<div class="empty">没有可用词表</div>`;
-    return;
+    menu.innerHTML = head + `<div class="empty">还没有任何词表</div>`;
+  } else {
+    menu.innerHTML = head + VOCAB.list.map(v => {
+      const opened = VOCAB.tabs.includes(v.name);
+      return `<button class="it${opened ? " opened" : ""}" data-open="${esc(v.name)}">` +
+        `<span>${esc(v.name)}${v.is_main ? ' <span class="badge">main</span>' : ""}</span>` +
+        `<span class="sub">${opened ? "已打开" : (v.vocab_size || "")}</span></button>`;
+    }).join("");
   }
-  menu.innerHTML = VOCAB.list.map(v => {
-    const opened = VOCAB.tabs.includes(v.name);
-    return `<button class="it${opened ? " opened" : ""}" data-open="${esc(v.name)}">` +
-      `<span>${esc(v.name)}${v.is_main ? ' <span class="badge">main</span>' : ""}</span>` +
-      `<span class="sub">${opened ? "已打开" : (v.vocab_size || "")}</span></button>`;
-  }).join("");
+  const nb = menu.querySelector("[data-new-empty]");
+  if (nb) nb.onclick = () => { vocabMenuClose(); vocabCreateEmpty(); };
   menu.querySelectorAll("[data-open]").forEach(b => {
     b.onclick = () => { vocabMenuClose(); vocabActivate(b.dataset.open); };
   });
+}
+
+/* ＋ 菜单的「新建空词表」：命名 → 后端建空词表 → 打开成标签页 */
+async function vocabCreateEmpty() {
+  const nn = await uiPrompt("新建空词表", "新词表名字：",
+                            vocabSuggestName("vocab", "_new"));
+  if (!nn) return;
+  try {
+    const r = await api("/api/vocab/create", {name: nn});
+    toast("已创建空词表 " + nn, false);
+    await refreshVocabList();
+    await vocabActivate(nn);
+  } catch (e) {
+    toast("创建失败: " + e.message, true);
+  }
 }
 async function vocabActivate(name) {
   if (!VOCAB.tabs.includes(name)) VOCAB.tabs.push(name);
