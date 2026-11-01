@@ -637,9 +637,9 @@ class AddTokenTest(unittest.TestCase):
         tid = self.v.add_token("<mood>", "special")
         v2 = Vocab.load(self.copy)
         self.assertEqual(v2.special_ids["<mood>"], tid)
-        # .vfc 正文里确实多了一行（尖括号形态、行号即新 ID）
+        # .vfc 正文里确实多了一行（尖括号形态、行号即新 ID；ID 十六进制）
         lines = self.copy.read_text(encoding="utf-8").splitlines()
-        self.assertIn(f"<mood>:{tid}", lines)
+        self.assertIn(f"<mood>:{tid:X}", lines)
 
     def test_len_grows_and_stays_dense(self):
         """新契约：词表必须占满——加 token 长度 +1、ID 恒连续。"""

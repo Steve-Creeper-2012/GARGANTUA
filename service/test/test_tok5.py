@@ -72,9 +72,12 @@ class TestBitstream(unittest.TestCase):
         for bad in ("{t:00001 }", "abc", "{T:00001}", "{}é"):
             with self.assertRaises(tok5.Tok5Error):
                 tok5.encode_chars(bad)
-        # 语法层：hex 字母能进字符集，但不是合法 ID 数字
+        # 语法层：ID 是自界定十六进制——非 hex 字符（G）终止并报错；
+        # hex 字母（A-F，大小写都收）是合法 ID 数字
         with self.assertRaises(tok5.Tok5Error):
-            tok5.parse_items("{t:0000A}")
+            tok5.parse_items("{t:0000G}")
+        self.assertEqual(tok5.parse_items("{t:0000A}")[0]["elements"][0],
+                         tok5.text(0xA))
 
     def test_bitwidth_is_five(self):
         # 8 个字符 = 40 bit = 5 字节（+ 终止符 5 bit → 6 字节）
@@ -84,16 +87,25 @@ class TestBitstream(unittest.TestCase):
 
 
 class TestElements(unittest.TestCase):
-    def test_text_id_must_be_five_digits(self):
-        self.assertEqual(tok5.element_to_chars(tok5.text(1)), "t:00001")
-        with self.assertRaises(tok5.Tok5Error):
-            tok5.parse_items("{t:0001}")        # 4 位
-        with self.assertRaises(tok5.Tok5Error):
-            tok5.parse_items("{t:000001}")      # 6 位
+    def test_text_id_is_self_delimiting_hex(self):
+        # 2026-10-31：ID 是自界定十六进制（读到 } / | 为止），不定宽——
+        # 长度因词表而异，前导零允许，大小写都收、写出统一大写
+        self.assertEqual(tok5.element_to_chars(tok5.text(1)), "t:1")
+        self.assertEqual(tok5.element_to_chars(tok5.text(0xC732)),
+                         "t:C732")
+        self.assertEqual(
+            tok5.parse_items("{t:0001}")[0]["elements"][0], tok5.text(1))
+        self.assertEqual(
+            tok5.parse_items("{t:000001}")[0]["elements"][0], tok5.text(1))
+        self.assertEqual(
+            tok5.parse_items("{t:C732}")[0]["elements"][0], tok5.text(50994))
+        self.assertEqual(
+            tok5.parse_items("{t:c732}")[0]["elements"][0],
+            tok5.text(50994))
 
     def test_text_id_bounds(self):
-        # 新契约：tok5 的上界是落盘格式的硬上界（5 位十进制），不再是
-        # 某张具体词表的长度——词表长度每个词表各自声明
+        # ID 上界 = spec.MAX_VOCAB_SIZE（RAM 防呆，非格式约束——自界定
+        # 十六进制对宽度没有限制）；词表长度每个词表各自声明
         self.assertEqual(tok5.text(tok5.ID_LIMIT - 1)["id"],
                          tok5.ID_LIMIT - 1)
         with self.assertRaises(tok5.Tok5Error):
@@ -196,7 +208,7 @@ class TestVisualPayload(unittest.TestCase):
 class TestDisplay(unittest.TestCase):
     def test_display_uses_long_markers(self):
         items = [tok5.step(tok5.text(1)), {"kind": "ext", "id": 5}]
-        self.assertEqual(tok5.to_display(items), "{text: 00001}<00005>")
+        self.assertEqual(tok5.to_display(items), "{text: 1}<5>")
 
     def test_display_roundtrip(self):
         items = [{"kind": "ext", "id": 1},

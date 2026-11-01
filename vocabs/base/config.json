@@ -1,7 +1,7 @@
 {
   "name": "base",
   "format": "gargantua-vocab-folder-v1",
-  "created": "2026-10-31 12:27:04",
+  "created": "2026-10-31 20:07:32",
   "source": null,
   "description": "基础词表（系统预设，不可直接编辑）",
   "is_main": true,

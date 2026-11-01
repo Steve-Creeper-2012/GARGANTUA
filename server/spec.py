@@ -48,7 +48,8 @@
 #     <id> 是扩展系统 token：有嵌入但没有位置坐标（位置嵌入的职责交给
 #     它们，KDA 自学位置关系），不进 loss、不显示为内容。
 #     { } | 是结构字符，本身不是 token。
-#   - 文本 token 写作 {t:<5 位十进制 ID>}，显示为 {text: 00001}。
+#   - 文本 token 写作 {t:<十六进制 ID>}（自界定，长度因词表而异），
+#     显示为 {text: C732}。
 #   - 音频：533 采样 × 16 bit 顺序拼接 → 2132 个 hex 字符，{w:...}；
 #     末尾不足 533 的残段直接丢弃。
 #   - 视觉：patch 32×32，逐行、行内从左到右，每像素 RGBA 各 10 bit
@@ -217,9 +218,10 @@ DRAW_BEGIN = MODAL_BEGIN                       # 9（旧：96）
 # 可见区从这里开始；头内不允许任何空位（空位同样吃 embedding 行）。
 HEAD_SIZE = SPECIAL_SIZE + SYSTEM_SIZE + MODAL_SIZE     # 2970（旧：12384）
 
-# 词表长度安全上界。**这不是 spec 规定的长度**——词表多长由各词表的
-# config.json 说了算。上界来自 token-5 的 .tokens 落盘格式：文本/扩展
-# token 的 ID 占 5 位十进制（T5_ID_DIGITS），故 ID 最大 99999。
+# 词表长度防呆上界。**这不是 spec 规定的长度**——词表多长由各词表的
+# config.json 说了算，token ID 是自界定十六进制（见第 5b 节），格式本身
+# 对 ID 宽度没有任何限制。这个数只防 RAM 炸弹：每个 ID 占 wte + lm_head
+# 两行 1024 维 fp32 ≈ 8KB，10 万 ID ≈ 800MB，再往上就该严肃对待了。
 MAX_VOCAB_SIZE = 100_000
 
 # 目录/文件命名（目录树契约，见第 9 节）
@@ -370,7 +372,7 @@ AUDIO_SAMPLES_PER_TOKEN = 533        # 533 采样/token ≈ 30 tok/s
 #   { } |                  结构字符（不是独立 token，不占位置、不进 loss）
 #
 # —— 字符集：27 个符号，5 bit/字符 ——
-#   '0'-'9'  十进制数字（ID / 坐标 / 十六进制数字位）
+#   '0'-'9'  数字（坐标十进制 / ID 十六进制数字位；ID 另用 'A'-'F'）
 #   '{' '}'  时间步边界
 #   '<' '>'  扩展系统 token 边界
 #   '|'      步内 token 分隔 / patch 分隔
@@ -389,10 +391,13 @@ T5_END_CODE = 27                          # 终止符：不是字符，解码到
 T5_CHAR_CODE = {c: i for i, c in enumerate(T5_CHARS)}
 T5_HEX_CHARS = "0123456789ABCDEF"
 
-# —— 载荷尺寸（全部定长，解码无需分隔符）——
-# 文本/扩展 token 的 ID：定长 5 位十进制（VOCAB_SIZE_PADDED = 88704 < 10^5）
-T5_ID_DIGITS = 5
-T5_ID_LIMIT = 10 ** T5_ID_DIGITS          # 100000
+# —— 载荷尺寸 ——
+# 文本/扩展 token 的 ID：**大写十六进制、自界定**——{t:...} 里读到 '}' 或
+# '|' 为止，<...> 里读到 '>' 为止。长度因词表而异（小词表 ID 短、大词表
+# ID 长），格式本身不给 ID 定宽、定上限；前导零允许（<00005> 就是 5）。
+# 十六进制必须大写：5 bit 字符表只有 27 个码位，装不下小写 a-f。
+# 坐标（{v:...x:N y:M} 的 N/M）仍是自界定十进制。
+T5_COORD_LIMIT = 100_000        # x/y 坐标防呆上界（自界定十进制）
 
 # 音频：每 token 恰好 533 个采样点，16 bit 有符号 PCM（mp3/flac 解码后的
 # 通用形态），按时间顺序拼接 → 533*16 = 8528 bit = 2132 个十六进制字符。
@@ -469,9 +474,11 @@ DTYPE = "float32"            # 训练/推理默认 FP32（x86_64 mac 无 CUDA）
 #                  fast_shape_render/（逐字照搬的第三方 Rust/wgpu 转换器，
 #                  未改动；setup.sh 用 environment/rust 隔离构建）+
 #                  upstream/（上游仓库完整留档）
-#   models/        models/NAME/{model.<uuid>.safetensors, config.json, vocab.txt?}
-#                  （config.json 是 manifest：它的 "weights" 指向哪个权重文件，
-#                    读者就加载哪个；发布 = 单文件原子替换）
+#   models/        models/NAME/{config.json, weights/, vocab/}
+#                  （config.json 是 manifest：它的 "weights"/
+#                    "weights_discrete_embed"/"weights_continuous_embed" 指向
+#                    weights/ 下的三个 safetensors，读者加载哪个由它说了算；
+#                    vocab/ 是建模时整目录复制的词表副本 vocab.vfc + config.json）
 #   data/          data/queue/（待训练）+ data/done/（已训练归档）
 #   logs/          auto_train.jsonl 等运行日志
 #
@@ -486,19 +493,15 @@ DTYPE = "float32"            # 训练/推理默认 FP32（x86_64 mac 无 CUDA）
 #   PyTorch CPU 分配器在进程内不向 OS 归还内存——所以「按需」必须是
 #   进程级的，进程退出才是真省内存。
 #
-# 每模型词表（vocab.txt）：
-#   models/NAME/vocab.txt 是 v2 扁平词表（2026-10-27 审计修复 H1）：
-#   首行魔数 "#gargantua-vocab-v2"，其后每行 "<ID>\t<JSON 字符串>"，ID
-#   显式给出，落在 [HEAD_SIZE, MAX_VOCAB_SIZE)（不可见区
-#   [0, HEAD_SIZE) 是 special/system/draw 固定 token 的架构契约——
-#   <stop>/<caps>/{ } |/图元输出 token 的 ID 由上面的常量按 ID 定位，
-#   decode 的停止/大小写逻辑靠它们，自定义词表不得占用）。未列出的 ID
-#   即空位（可被「添加 token」回收）；重复 ID / 重复文本拒绝（反查歧义）。
-#   词表正文是 .vfc（一行一个 token，见 tokens/vfc.py）
-#   时自动就地升级，ID 映射不变。
-#   扁平词表的可见部分全部按 regular 处理；special/system 查表映射取自
-#   固定 head，单字母 regular token 兼作 fallback（英文拼写兜底）。
-#   没有 vocab.txt 的模型用全局词表 service/tokens/vocab.json。
+# 每模型词表（2026-10-30 契约）：
+#   models/NAME/vocab/ 是建模时从选定词表（vocabs/<name>/）整目录复制的
+#   副本（vocab.vfc + config.json）——即使多个模型复用同一词表也各自持有
+#   一份，用户误删共享词表不让模型报废。正文格式见 tokens/vfc.py：
+#   UTF-8、一行一个 token、`内容:ID`，ID 是十六进制（大小写不限，写出
+#   统一大写），恰好连续 0..N-1；前 HEAD_SIZE 个 ID 是 special/system/draw
+#   架构契约（<stop>/<caps>/{ } |/图元输出 token 按 ID 定位，decode 的
+#   停止/大小写逻辑靠它们），不可删改。词表长度（N）与分区表住同目录的
+#   config.json，每个词表可以不同。
 #   切换活动模型时，server / infer / train 进程各自 set_model_vocab()。
 #
 # 启动链（唯一入口）：

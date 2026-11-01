@@ -5,11 +5,11 @@
 #
 # 三层表示，本模块负责全部互转：
 #   1) 字符流（人类可读，27 个符号）：
-#        {t:00001}                 文本 token
+#        {t:C732}                  文本 token（ID 大写十六进制、自界定）
 #        {w:<2132 hex>}            音频 token（533 采样 × 16 bit）
 #        {v:<10240 hex>x:10y:24}   视觉 patch（32×32 × RGBA 各 10 bit）
 #        {a|b|c}                   一个时间步内多个元素，| 分隔
-#        <00005>                   扩展系统 token（有嵌入、不进 loss）
+#        <5>                       扩展系统 token（有嵌入、不进 loss）
 #   2) 位流（.tokens 落盘）：5 bit/字符，MSB-first；末字符后跟终止符码
 #      27，再补零到字节边界。
 #   3) 元素模型（进程内）：
@@ -27,7 +27,7 @@
 #   from tokens.tok5 import dumps, loads, read_file, write_file, to_display
 #   data  = dumps(items)              # → bytes（.tokens）
 #   items = loads(data)               # → 流
-#   print(to_display(items))          # → "{text: 00001}{visual: ... x: 0 y: 0}"
+#   print(to_display(items))          # → "{text: C732}{visual: ... x: 0 y: 0}"
 #   CLI：python tokens/tok5.py in.tokens out.txt   （二进制 → 可读文本）
 #        python tokens/tok5.py in.txt out.tokens   （可读文本 → 二进制）
 # ===========================================================================
@@ -42,11 +42,12 @@ import spec
 
 # 词表上界：文本/扩展 token 的 ID 必须 < MAX_VOCAB_SIZE。
 # 注意这不是「词表有多长」——词表长度每个词表不同，由各自的 config.json
-# 声明（2026-10-30 契约重构）。这里是 token-5 落盘格式能编码的硬上界：
-# ID 在字符流里占 5 位十进制，最大 99999。
+# 声明（2026-10-30 契约重构）；ID 在字符流里是自界定十六进制，宽度不受
+# 格式限制，这个数只是与 spec 对齐的防呆上界（RAM，见 spec.py）。
 ID_LIMIT = spec.MAX_VOCAB_SIZE
 
-_HEX = frozenset(spec.T5_HEX_CHARS)
+_HEX = frozenset(spec.T5_HEX_CHARS)         # 波形/视觉载荷：定长大写
+_HEX_CHARS = frozenset("0123456789ABCDEFabcdef")   # ID 解析：大小写都收
 _DIGITS = frozenset("0123456789")
 
 
@@ -92,7 +93,7 @@ def encode_chars(text: str) -> bytes:
 class BitWriter:
     """增量写 token-5 位流（推理边生成边落盘用）。
 
-    用法：w = BitWriter(fh); w.write_chars("{t:00001}"); w.close()
+    用法：w = BitWriter(fh); w.write_chars("{t:C732}"); w.close()
     close() 写终止符并补零到字节边界；重复 close 安全。
     """
 
@@ -233,8 +234,8 @@ def _check_id(v, what: str) -> int:
 def _check_coord(v, axis: str) -> int:
     if isinstance(v, bool) or not isinstance(v, int):
         raise Tok5Error(f"坐标 {axis} 必须是整数，得到 {v!r}")
-    if not (0 <= v < spec.T5_ID_LIMIT):
-        raise Tok5Error(f"坐标 {axis}={v} 越界 [0, {spec.T5_ID_LIMIT})")
+    if not (0 <= v < spec.T5_COORD_LIMIT):
+        raise Tok5Error(f"坐标 {axis}={v} 越界 [0, {spec.T5_COORD_LIMIT})")
     return v
 
 
@@ -244,8 +245,9 @@ def _check_hex(h: str, what: str) -> None:
         raise Tok5Error(f"{what} 含非十六进制字符 {bad!r}")
 
 
-def _id5(v: int) -> str:
-    return "%0*d" % (spec.T5_ID_DIGITS, v)
+def _id_hex(v: int) -> str:
+    """ID → 大写十六进制文本（不定宽：长度随 ID 值/词表自然变化）。"""
+    return format(v, "X")
 
 
 # ---------------------------------------------------------------------------
@@ -254,9 +256,9 @@ def _id5(v: int) -> str:
 def element_to_chars(el: dict) -> str:
     kind = el.get("kind")
     if kind == "text":
-        return "t:" + _id5(_check_id(el["id"], "文本 token"))
+        return "t:" + _id_hex(_check_id(el["id"], "文本 token"))
     if kind == "ext":
-        return "<" + _id5(_check_id(el["id"], "扩展系统 token")) + ">"
+        return "<" + _id_hex(_check_id(el["id"], "扩展系统 token")) + ">"
     if kind == "wave":
         return "w:" + el["hex"].upper()
     if kind == "visual":
@@ -275,7 +277,7 @@ def _parse_element(s: str, i: int):
     if c == "t":
         if i + 1 >= n or s[i + 1] != ":":
             raise Tok5Error(f"位置 {i}: 文本元素缺少 ':'")
-        tid, j = _parse_id5(s, i + 2, "文本 token")
+        tid, j = _parse_hex_id(s, i + 2, "文本 token")
         return text(tid), j
     if c == "w":
         if i + 1 >= n or s[i + 1] != ":":
@@ -305,15 +307,19 @@ def _parse_element(s: str, i: int):
         f"（只能是 t / w / v）")
 
 
-def _parse_id5(s: str, i: int, what: str):
-    j = i + spec.T5_ID_DIGITS
-    if j > len(s):
-        raise Tok5Error(f"位置 {i}: {what} ID 长度不足 {spec.T5_ID_DIGITS} 位")
-    frag = s[i:j]
-    if any(ch not in _DIGITS for ch in frag):
-        raise Tok5Error(f"位置 {i}: {what} ID 必须是 {spec.T5_ID_DIGITS} 位十进制，"
-                        f"得到 {frag!r}")
-    return int(frag), j
+def _parse_hex_id(s: str, i: int, what: str):
+    """自界定十六进制 ID：从位置 i 读到第一个非 hex 字符。
+
+    {t:...} 里以 '}' / '|' 收尾、<...> 里以 '>' 收尾——这些结构字符都不
+    是 hex 字符，贪心读取天然自界定，ID 宽度随词表自然变化。至少一位。
+    解析大小写都收（用户手敲小写很常见），写出统一大写（见 _id_hex）。
+    """
+    j = i
+    while j < len(s) and s[j] in _HEX_CHARS:
+        j += 1
+    if j == i:
+        raise Tok5Error(f"位置 {i}: {what} 缺少十六进制 ID")
+    return int(s[i:j], 16), j
 
 
 def _parse_uint(s: str, i: int, what: str):
@@ -377,12 +383,12 @@ def parse_items(text: str) -> list:
             j = text.find(">", i + 1)
             if j < 0:
                 raise Tok5Error(f"位置 {i}: '<' 未闭合")
-            tid, k = _parse_id5(text, i + 1, "扩展系统 token")
-            if k != j:
+            body = text[i + 1:j]
+            if not body or any(ch not in _HEX_CHARS for ch in body):
                 raise Tok5Error(
-                    f"位置 {i}: 扩展 token 必须是 <{spec.T5_ID_DIGITS} 位十进制>，"
+                    f"位置 {i}: 扩展 token 必须是 <十六进制 ID>，"
                     f"得到 {text[i:j + 1]!r}")
-            items.append({"kind": "ext", "id": tid})
+            items.append({"kind": "ext", "id": int(body, 16)})
             i = j + 1
         elif c == "}":
             raise Tok5Error(f"位置 {i}: '}}' 出现在时间步之外")
@@ -530,23 +536,23 @@ _SHORT_MARK = {v: k for k, v in _DISPLAY_MARK.items()}
 
 
 def to_display(items, name_of=None) -> str:
-    """流 → 可读文本：{text: 00001} / {wave: HEX} / {visual: HEX x: 1 y: 2}。
+    """流 → 可读文本：{text: C732} / {wave: HEX} / {visual: HEX x: 1 y: 2}。
 
-    name_of: 可选 callable(id) -> str，把扩展 token 的 ID 映射回名字
-    （如 5 → "<stop>"）；缺省显示 <00005>。
+    ID 是大写十六进制（不定宽）。name_of: 可选 callable(id) -> str，把
+    扩展 token 的 ID 映射回名字（如 5 → "<stop>"）；缺省显示 <5>。
     """
     out: list = []
     for it in items:
         if it.get("kind") == "ext":
             tid = it["id"]
             nm = name_of(tid) if name_of else None
-            out.append(nm if nm else "<%s>" % _id5(tid))
+            out.append(nm if nm else "<%s>" % _id_hex(tid))
             continue
         parts = []
         for el in it.get("elements", []):
             k = el["kind"]
             if k == "text":
-                parts.append("text: " + _id5(el["id"]))
+                parts.append("text: " + _id_hex(el["id"]))
             elif k == "wave":
                 parts.append("wave: " + el["hex"].upper())
             elif k == "visual":
@@ -585,10 +591,11 @@ def vocab_id_of(v):
 
 
 def parse_display(s: str, id_of=None) -> list:
-    """可读文本 → 流。同时接受紧凑形式（{t:00001}）与显示形式。
+    """可读文本 → 流。同时接受紧凑形式（{t:C732}）与显示形式。
 
-    id_of: 可选 callable(name) -> id，把 "<stop>" 这类名字解析回 ID；
-    解析不出则报错（缺省只接受 <00005> 数字形式）。
+    ID 是十六进制（大小写都收，不定宽）。id_of: 可选 callable(name) -> id，
+    把 "<stop>" 这类名字解析回 ID；解析不出则报错（缺省只接受 <5> 这类
+    纯十六进制数字形式）。
     """
     if not isinstance(s, str):
         raise Tok5Error(f"文本必须是字符串，得到 {type(s).__name__}")
@@ -605,14 +612,14 @@ def parse_display(s: str, id_of=None) -> list:
                 if j < 0:
                     raise Tok5Error(f"位置 {i}: '<' 未闭合")
                 body = t[i + 1:j]
-                if len(body) == spec.T5_ID_DIGITS and body.isdigit():
+                if body and all(ch in _HEX_CHARS for ch in body):
                     out_chars.append(t[i:j + 1])
                 else:
                     tid = id_of("<" + body + ">")
                     if tid is None:
                         raise Tok5Error(
                             f"未知扩展 token <{body}>（词表里没有这个名字）")
-                    out_chars.append("<" + _id5(tid) + ">")
+                    out_chars.append("<" + _id_hex(tid) + ">")
                 i = j + 1
             else:
                 out_chars.append(t[i])

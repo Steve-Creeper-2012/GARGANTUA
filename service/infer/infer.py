@@ -225,9 +225,9 @@ class IdArchive:
             chars = []
             for i in ids:
                 if self._is_invisible(i):
-                    chars.append("<%05d>" % i)
+                    chars.append("<%X>" % i)       # ID 大写十六进制（spec 5b）
                 else:
-                    chars.append("{t:%05d}" % i)
+                    chars.append("{t:%X}" % i)
             self._w.write_chars("".join(chars))
             self._fh.flush()
             self.n_tokens += len(ids)

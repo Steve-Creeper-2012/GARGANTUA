@@ -519,7 +519,7 @@ class TestServer(unittest.TestCase):
         items = tok5.loads(base64.b64decode(j["tokens_b64"]))
         self.assertEqual(len(items), 5)
         self.assertTrue(all(it["kind"] == "step" for it in items))
-        # display 形式：{text: 00001}
+        # display 形式：{text: C732}（ID 为十六进制）
         code, jd = http("POST", self.port, "/api/tokens/encode",
                         {"text": "Hello World", "format": "display"})
         self.assertEqual(code, 200)
@@ -552,9 +552,10 @@ class TestServer(unittest.TestCase):
         code, j9 = http("POST", self.port, "/api/tokens/decode",
                         {"tokens_b64": "not-base64!!"})
         self.assertEqual(code, 400)
-        # Token 编辑器 → .tokens 导出（token-5 文本）
+        # Token 编辑器 → .tokens 导出（token-5 文本；ID 十六进制，
+        # C766 = 十进制 51046）
         code, je = http("POST", self.port, "/api/tokens/export",
-                        {"text": "<00001>{text: 51046}<00002>"})
+                        {"text": "<00001>{text: C766}<00002>"})
         self.assertEqual(code, 200)
         self.assertEqual(je["n_steps"], 1)
         self.assertEqual(je["n_tokens"], 1)

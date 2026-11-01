@@ -16,7 +16,7 @@
 #
 # 脚本（均可 `python tokens/X.py` 或 `python -m tokens.X`）：
 #   enctok  文本 → token ID 流（hex / token-5 .tokens）
-#   dectok  token-5 .tokens → 可读文本（{text: 00001} …）
+#   dectok  token-5 .tokens → 可读文本（{text: C732} …）
 #   tok5    token-5 编解码（字符 / 位流 / 元素 / 时间步流）
 #   gts     历史编辑器格式（.gts，tok-32 时代）→ token ID 流，保留只读
 #   tokenset .tokens 训练流 → (ids, step_ids)

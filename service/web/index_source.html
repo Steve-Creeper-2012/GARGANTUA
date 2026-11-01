@@ -476,9 +476,9 @@
       <!-- ==================== Token 编辑器 ==================== -->
       <section class="page" id="p-json">
         <div class="hint" style="margin-bottom:10px">
-          token-5 编码：{} 为时间步原子，步内元素以 | 分隔。{text: 00001} 文本 token（有向量、进 loss）；
+          token-5 编码：{} 为时间步原子，步内元素以 | 分隔。{text: C732} 文本 token（有向量、进 loss，ID 为十六进制）；
           {wave: HEX} 音频（533 采样）；{visual: HEX x: 1 y: 2} 视觉 patch（32×32，RGBA 各 10 bit）。
-          &lt;00005&gt; 是扩展系统 token（有嵌入、不进 loss），也可直接写名字如 &lt;stop&gt;。
+          &lt;5&gt; 是扩展系统 token（有嵌入、不进 loss），也可直接写名字如 &lt;stop&gt;。
           { } | 本身不是 token。词表查询与增删统一在「词表」页。
         </div>
         <div class="row">
@@ -491,7 +491,7 @@
           <span class="hint" id="json-msg"></span>
         </div>
         <div class="token-palette" id="json-palette"></div>
-        <div id="json-editor" contenteditable="true" spellcheck="false">&lt;00001&gt;{text: 50994}{text: 12419}{text: 22152}{text: 22175}&lt;00002&gt;</div>
+        <div id="json-editor" contenteditable="true" spellcheck="false">&lt;1&gt;{text: C732}{text: 3083}{text: 5688}{text: 569F}&lt;2&gt;</div>
       </section>
 
       <!-- ==================== 设置 ==================== -->

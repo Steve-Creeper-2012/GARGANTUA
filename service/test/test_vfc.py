@@ -98,7 +98,7 @@ class HeadContractTest(unittest.TestCase):
         self.assertEqual(lines[1], "<caps>:0")
         self.assertEqual(lines[7], '"{":6')
         self.assertEqual(lines[10], "<cx:0>:9")
-        self.assertEqual(lines[1 + _H - 1], "<draw:special:2>:2969")
+        self.assertEqual(lines[1 + _H - 1], "<draw:special:2>:B99")
 
 
 class RoundTripTest(unittest.TestCase):
@@ -173,28 +173,28 @@ class QuoteChoiceTest(unittest.TestCase):
     """序列化时的引号选择。"""
 
     def test_default_is_double_quote(self):
-        self.assertEqual(_lines_of(["hello"])[0], '"hello":%d' % _H)
+        self.assertEqual(_lines_of(["hello"])[0], '"hello":%X' % _H)
 
     def test_double_quote_in_text_uses_single(self):
-        self.assertEqual(_lines_of(['wor"ld'])[0], "'wor\"ld':%d" % _H)
+        self.assertEqual(_lines_of(['wor"ld'])[0], "'wor\"ld':%X" % _H)
 
     def test_single_quote_in_text_uses_double(self):
-        self.assertEqual(_lines_of(["it's"])[0], '"it\'s":%d' % _H)
+        self.assertEqual(_lines_of(["it's"])[0], '"it\'s":%X' % _H)
 
     def test_both_quotes_uses_double_and_escapes(self):
         self.assertEqual(_lines_of(['he"llo\'w'])[0],
-                         '"he\\"llo\'w":%d' % _H)
+                         '"he\\"llo\'w":%X' % _H)
 
     def test_unclosed_quote_is_error(self):
-        errs = vfc.validate_vfc(vfc.MAGIC + NL + '"unterminated:%d' % _H)
+        errs = vfc.validate_vfc(vfc.MAGIC + NL + '"unterminated:%X' % _H)
         self.assertTrue(any("引号未闭合" in e["message"] for e in errs))
 
     def test_control_chars_are_escaped(self):
         lines = _lines_of(["a" + NL + "b", "x\ty", "r\rn", "\x00"])
-        self.assertEqual(lines[0], '"a\\nb":%d' % _H)
-        self.assertEqual(lines[1], '"x\\ty":%d' % (_H + 1))
-        self.assertEqual(lines[2], '"r\\rn":%d' % (_H + 2))
-        self.assertEqual(lines[3], '"\\u0000":%d' % (_H + 3))
+        self.assertEqual(lines[0], '"a\\nb":%X' % _H)
+        self.assertEqual(lines[1], '"x\\ty":%X' % (_H + 1))
+        self.assertEqual(lines[2], '"r\\rn":%X' % (_H + 2))
+        self.assertEqual(lines[3], '"\\u0000":%X' % (_H + 3))
 
     def test_backslash_and_u_escape_roundtrip(self):
         entries = _with_extra(["back\\slash", "é", "\U0001f600"])
@@ -205,7 +205,7 @@ class QuoteChoiceTest(unittest.TestCase):
 
     def test_surrogate_pair_escape(self):
         text = vfc.MAGIC + NL + NL.join(
-            vfc.dumps_vfc(_HEAD).split(NL)[1:]) + NL + '"\\ud83d\\ude00":%d' % _H
+            vfc.dumps_vfc(_HEAD).split(NL)[1:]) + NL + '"\\ud83d\\ude00":%X' % _H
         self.assertEqual(vfc.parse_vfc(text)[_H][1], "\U0001f600")
 
 
@@ -229,7 +229,8 @@ class SyntaxErrorTest(unittest.TestCase):
         self._assert_rejected('"hello"', "缺少")
 
     def test_id_not_a_number(self):
-        self._assert_rejected('"hello":abc', "数字")
+        # xyz 含非 hex 字符（x）→ 拒绝；abc 全是 hex 字符，现在是合法 ID
+        self._assert_rejected('"hello":xyz', "数字")
 
     def test_space_after_colon(self):
         self._assert_rejected('"hello": 12', "数字")
@@ -238,27 +239,27 @@ class SyntaxErrorTest(unittest.TestCase):
         self._assert_rejected('"hello":-1', "数字")
 
     def test_unclosed_quote(self):
-        self._assert_rejected('"hello:%d' % _H, "引号未闭合")
+        self._assert_rejected('"hello:%X' % _H, "引号未闭合")
 
     def test_mismatched_quotes(self):
-        self._assert_rejected('"hello\':%d' % _H, "引号未闭合")
+        self._assert_rejected('"hello\':%X' % _H, "引号未闭合")
 
     def test_unclosed_angle_bracket(self):
         self._assert_rejected("<model:%d" % _H, "尖括号未闭合")
 
     def test_illegal_escape(self):
-        self._assert_rejected('"a\\db":%d' % _H, "非法转义")
+        self._assert_rejected('"a\\db":%X' % _H, "非法转义")
 
     def test_illegal_escape_b_and_f(self):
         # \b \f \/ 是 JSON 接受的，但 .vfc 严格模式一律拒绝
-        self._assert_rejected('"a\\bb":%d' % _H, "非法转义")
-        self._assert_rejected('"a\\fb":%d' % _H, "非法转义")
+        self._assert_rejected('"a\\bb":%X' % _H, "非法转义")
+        self._assert_rejected('"a\\fb":%X' % _H, "非法转义")
 
     def test_trailing_backslash(self):
-        self._assert_rejected('"ab\\":%d' % _H, "反斜杠")
+        self._assert_rejected('"ab\\":%X' % _H, "反斜杠")
 
     def test_empty_text(self):
-        self._assert_rejected('"":%d' % _H, "不得为空")
+        self._assert_rejected('"":%X' % _H, "不得为空")
 
     def test_illegal_angled_name(self):
         self._assert_rejected("<1bad>:%d" % _H, "名字非法")
@@ -269,18 +270,18 @@ class SyntaxErrorTest(unittest.TestCase):
         self._assert_rejected("hello:%d" % _H, "包裹")
 
     def test_id_over_upper_bound(self):
-        self._assert_rejected('"x":%d' % spec.MAX_VOCAB_SIZE, "越界")
+        self._assert_rejected('"x":%X' % spec.MAX_VOCAB_SIZE, "越界")
 
     def test_lone_low_surrogate(self):
-        self._assert_rejected('"\\udc00":%d' % _H, "代理")
+        self._assert_rejected('"\\udc00":%X' % _H, "代理")
 
     def test_bad_u_escape(self):
-        self._assert_rejected('"\\uZZZZ":%d' % _H, "十六进制")
-        self._assert_rejected('"\\u12":%d' % _H, "十六进制")
+        self._assert_rejected('"\\uZZZZ":%X' % _H, "十六进制")
+        self._assert_rejected('"\\u12":%X' % _H, "十六进制")
 
     def test_parse_vfc_raises_with_line(self):
         with self.assertRaises(vfc.VfcError) as cm:
-            vfc.parse_vfc(vfc.MAGIC + NL + '"hello":abc' + NL)
+            vfc.parse_vfc(vfc.MAGIC + NL + '"hello":xyz' + NL)
         self.assertEqual(cm.exception.line, 2)
         self.assertIsInstance(cm.exception, ValueError)
 
@@ -349,7 +350,8 @@ class HeadViolationTest(unittest.TestCase):
         shifted = []
         for line in lines:
             name, _, tid = line.rpartition(":")
-            shifted.append(f"{name}:{int(tid) + 1}")
+            # ID 是十六进制（2026-10-31）：按 16 进制解析、16 进制写回
+            shifted.append(f"{name}:{int(tid, 16) + 1:X}")
         errs = vfc.validate_vfc(vfc.MAGIC + NL + NL.join(shifted) + NL)
         self.assertTrue(any("架构契约头第 1 条 ID 应为 0" in e["message"]
                             for e in errs), errs)

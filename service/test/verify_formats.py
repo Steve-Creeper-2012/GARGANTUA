@@ -116,7 +116,7 @@ def verify_tok5():
     print(f"  视觉 {spec.PATCH_PIXELS} 像素 × {spec.T5_PIXEL_BITS} bit "
           f"→ {len(patch)} hex 字符 ✓")
     assert len(patch) == spec.T5_PATCH_HEX
-    for bad in ("{t:0001}", "{}", "{t:00001", "t:00001"):
+    for bad in ("{t:GG}", "{}", "{t:00001", "t:00001"):
         try:
             tok5.parse_items(bad)
             raise AssertionError(f"未拒绝: {bad}")

@@ -836,13 +836,14 @@ function b64ToBytes(b64) {
   }
   return out.subarray(0, p);
 }
-/* token-5 文本（spec 第 5b 节）：{text: NNNNN} / {wave: HEX} / {visual: HEX x: 1 y: 2}
-   音频/视觉的 hex 载荷一律由后端生成（r.token5），前端只在没有后端文本时兜底。 */
-const _ID5 = n => String(n).padStart(5, "0");
+/* token-5 文本（spec 第 5b 节）：{text: C732} / {wave: HEX} / {visual: HEX x: 1 y: 2}
+   音频/视觉的 hex 载荷一律由后端生成（r.token5），前端只在没有后端文本时兜底。
+   ID 是大写十六进制、不定宽（2026-10-31 契约）。 */
+const _IDHEX = n => Number(n).toString(16).toUpperCase();
 
 function stepsToToken5(steps, bound) {
-  const openTag = bound === "user" ? "<00001>" : "<00003>";   // <user> / <model>
-  const closeTag = bound === "user" ? "<00002>" : "<00004>";  // <user/> / <model/>
+  const openTag = bound === "user" ? "<1>" : "<3>";   // <user> / <model>
+  const closeTag = bound === "user" ? "<2>" : "<4>";  // <user/> / <model/>
   const parts = [openTag];
   for (const st of steps) {
     const ids = st.token_ids || [];
@@ -850,10 +851,10 @@ function stepsToToken5(steps, bound) {
     if (st.modality === "draw") {
       // 绘图：一个图元 = 9 个 token = 一个时间步
       for (let j = 0; j + 9 <= ids.length; j += 9)
-        parts.push("{" + ids.slice(j, j + 9).map(t => "text: " + _ID5(t)).join(" | ") + "}");
+        parts.push("{" + ids.slice(j, j + 9).map(t => "text: " + _IDHEX(t)).join(" | ") + "}");
       continue;
     }
-    for (const id of ids) parts.push("{text: " + _ID5(id) + "}");
+    for (const id of ids) parts.push("{text: " + _IDHEX(id) + "}");
   }
   parts.push(closeTag);
   return parts.join("");
@@ -1196,14 +1197,14 @@ $("prims-convert").onclick = async () => {
 };
 
 /* ---------- Token 编辑器 ----------
-   调色板：扩展系统 token（<00000>..<00005>，也可直接写名字）+ 结构字符。 */
+   调色板：扩展系统 token（<0>..<5>，也可直接写名字）+ 结构字符。 */
 const TOKEN_PALETTE = [
-  {label:"<user>",    insert:"<00001>"},
-  {label:"<user/>",   insert:"<00002>"},
-  {label:"<model>",   insert:"<00003>"},
-  {label:"<model/>",  insert:"<00004>"},
-  {label:"<stop>",    insert:"<00005>"},
-  {label:"<caps>",    insert:"<00000>"},
+  {label:"<user>",    insert:"<1>"},
+  {label:"<user/>",   insert:"<2>"},
+  {label:"<model>",   insert:"<3>"},
+  {label:"<model/>",  insert:"<4>"},
+  {label:"<stop>",    insert:"<5>"},
+  {label:"<caps>",    insert:"<0>"},
   {label:"时间步 {",  insert:"{"},
   {label:"时间步 }",  insert:"}"},
   {label:"步内 |",    insert:"|"},

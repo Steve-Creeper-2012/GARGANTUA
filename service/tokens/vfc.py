@@ -8,11 +8,13 @@
 #
 # —— 格式 ——
 # 编码 UTF-8，一行一个 token，每行严格是 `内容:ID`：
-#   "hello":12384        可显示 token（双引号包裹）
-#   'hello':12385        可显示 token（单引号包裹，与上行语义相同）
+#   "hello":A1B2         可显示 token（双引号包裹）
+#   'hello':A1B3         可显示 token（单引号包裹，与上行语义相同）
 #   <model>:3            不可显示标记（尖括号包裹）
 #   <cx:0>:9             不可显示标记（draw 图元；尖括号内允许 ':'）
-# 冒号必须是半角，且后面**直接跟数字**（不允许空格）。
+# ID 是**十六进制**（2026-10-31 steve 定案：所有 token 的 ID 都是 16 进
+# 制，长度因不同词表而异），解析大小写都收、写出统一大写。冒号必须半
+# 角，且后面直接跟十六进制数字（不允许空格）。
 #
 # —— 为什么要用两种包裹形态 ——
 # 词表里同时存在「文本内容」与「不可显示标记」两类条目：`<stop>` 是一个
@@ -77,8 +79,9 @@ import spec
 MAGIC = "#gargantua-vfc-v1"
 
 # ID 上界：spec.MAX_VOCAB_SIZE = 100000。它不是 spec 规定的词表长度
-# （长度由每个词表的 config.json 声明），而是 token-5 的 .tokens 落盘格式
-# 给的硬上界——文本/扩展 token 的 ID 只占 5 位十进制，故 ID 最大 99999。
+# （长度由每个词表的 config.json 声明），也不是格式约束（ID 是自界定
+# 十六进制，宽度不限）——纯粹是 RAM 防呆上界（每 ID 约 8KB embedding，
+# 见 spec.py），与 tok5 的 ID_LIMIT 对齐。
 MAX_VOCAB_SIZE = spec.MAX_VOCAB_SIZE
 
 # system 区：spec 有 SYSTEM_CHARS；旧版没有，退回三个 TS_* 常量
@@ -92,8 +95,9 @@ _NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_./:-]*\Z")
 # 不可显示条目的 text 形态：必须是 `<名字>`（含尖括号）
 _ANGLED_TEXT_RE = re.compile(r"<[A-Za-z_][A-Za-z0-9_./:-]*>\Z")
 
-# 行尾 `:<ID>`：冒号后紧跟十进制数字，直到行尾（不允许空格/符号）
-_TAIL_RE = re.compile(r"^(.*):([0-9]+)\Z")
+# 行尾 `:<ID>`：冒号后紧跟十六进制数字（0-9/A-F/a-f），直到行尾（不允许
+# 空格/符号）；解析大小写都收，写出统一大写。
+_TAIL_RE = re.compile(r"^(.*):([0-9A-Fa-f]+)\Z")
 
 # 头部契约错误最多报这么多条：ID 错位会让后续行全部对不上，逐行报 2970 条
 # 没有任何排查价值，截断即可（其余错误类型不受此限制）。
@@ -348,13 +352,13 @@ def _dump_entry(entry) -> str:
             f"token 文本含孤立代理项，无法编码为 UTF-8（ID {tid}）")
     if visible:
         quote = _pick_quote(text)
-        return quote + _escape(text, quote) + quote + f":{tid}"
+        return quote + _escape(text, quote) + quote + f":{tid:X}"
     # 不可显示：text 自带尖括号，原样写出后接 :ID（不二次加括号）
     if not _ANGLED_TEXT_RE.match(text):
         raise VfcError(
             f"不可显示 token 的 text 必须是 <名字> 形态（名字匹配 "
             f"[A-Za-z_][A-Za-z0-9_./:-]*）: {text!r}")
-    return f"{text}:{tid}"
+    return f"{text}:{tid:X}"
 
 
 def dumps_vfc(entries) -> str:
@@ -390,10 +394,10 @@ def _scan(text: str, source: str):
         m = _TAIL_RE.match(line)
         if not m:
             if ":" in line:
-                msg = ("冒号后必须紧跟十进制数字 ID"
-                       "（不允许空格、正负号或其它字符）")
+                msg = ("冒号后必须紧跟十六进制数字 ID"
+                       "（0-9/A-F/a-f，不允许空格、正负号或其它字符）")
             else:
-                msg = "缺少 `:<ID>` 后缀（半角冒号 + 数字）"
+                msg = "缺少 `:<ID>` 后缀（半角冒号 + 十六进制数字）"
             errors.append(_Err(lineno, f"{source}:{lineno} {msg}"))
             continue
         body, id_s = m.group(1), m.group(2)
@@ -434,7 +438,7 @@ def _scan(text: str, source: str):
                 f"或尖括号（不可显示标记）包裹: {line}"))
             continue
 
-        tid = int(id_s)
+        tid = int(id_s, 16)
         if tid >= MAX_VOCAB_SIZE:
             errors.append(_Err(
                 lineno,
