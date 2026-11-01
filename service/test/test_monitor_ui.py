@@ -64,7 +64,7 @@ class TestIsGargantuaArgs(unittest.TestCase):
 
     def test_other_gargantua_copy_hits(self):
         # 从别的 GARGANTUA 副本目录启动：ps 路径不含当前 ROOT
-        args = "/usr/bin/python3 /Users/steve/backup/GARGANTUA/server/window.py"
+        args = "/usr/bin/python3 /opt/backup/GARGANTUA/server/window.py"
         mine, name = mon._is_gargantua_args(args, "/usr/bin/python3", ROOT)
         self.assertTrue(mine)
         self.assertEqual(name, "window.py")
@@ -100,7 +100,7 @@ class TestIsGargantuaArgs(unittest.TestCase):
     # ---- 排除 ----
     def test_zsh_shell_command_not_hits(self):
         # zsh -c 整段命令是一个参数，不以 .py 结尾 → 无脚本 → 不命中
-        args = ('/bin/zsh -c "cd /Users/steve/Desktop/GARGANTUA '
+        args = ('/bin/zsh -c "cd /opt/GARGANTUA '
                 '&& python3 server/server.py && echo done"')
         mine, name = mon._is_gargantua_args(args, "/bin/zsh", ROOT)
         self.assertFalse(mine)
@@ -108,7 +108,7 @@ class TestIsGargantuaArgs(unittest.TestCase):
 
     def test_electron_not_hits(self):
         args = ("/Applications/Electron.app/Contents/MacOS/Electron "
-                "/Users/steve/Desktop/GARGANTUA/project")
+                "/opt/GARGANTUA/project")
         mine, _ = mon._is_gargantua_args(args, args.split()[0], ROOT)
         self.assertFalse(mine)
 
@@ -350,7 +350,7 @@ class TestGargantuaProcesses(unittest.TestCase):
             "  102   3.0   51200 /usr/bin/python3 "
             + os.path.join(ROOT, "service", "window", "window.py") + "\n"
             "  103   0.0    4096 /bin/zsh -c "
-            "\"cd /Users/x/GARGANTUA && python3 server/server.py\"\n"
+            "\"cd /opt/GARGANTUA && python3 server/server.py\"\n"
         )
         with mock.patch.object(mon, "_run", return_value=ps), \
              mock.patch.object(mon, "_mem_stat",
@@ -399,7 +399,7 @@ class TestGargantuaProcesses(unittest.TestCase):
 
     def test_other_copy_marked_external(self):
         # 其它副本进程：宽松列表显示并标 external=True；严格列表不含它
-        other = "/Users/x/GARGANTUA-v1.1.2/server/server.py"
+        other = "/opt/GARGANTUA-v1.1.2/server/server.py"
         ps = ("  301  1.0  4096 /usr/bin/python3 " + other + "\n"
               "  302  1.0  4096 /usr/bin/python3 "
               + os.path.join(ROOT, "server", "server.py") + "\n")
@@ -415,7 +415,7 @@ class TestGargantuaProcesses(unittest.TestCase):
 
     def test_kill_rejects_external_pid(self):
         # 越权防线：外部副本 pid 虽在宽松列表里，kill 白名单必须拒绝
-        other = "/Users/x/GARGANTUA-v1.1.2/server/server.py"
+        other = "/opt/GARGANTUA-v1.1.2/server/server.py"
         ps = "  301  1.0  4096 /usr/bin/python3 " + other + "\n"
         with mock.patch.object(mon, "_run", return_value=ps), \
              mock.patch.object(mon, "_mem_stat", return_value=(0, None)):

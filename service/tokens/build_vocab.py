@@ -164,7 +164,13 @@ def load_english_words(words_file: str | None = None,
                 limit,
             )
             if words:
-                return words, source_desc or f"file:{p}"
+                if source_desc:
+                    return words, source_desc
+                # 默认 bundled 词表：只记相对名，避免把本机绝对路径写进会被
+                # git 跟踪提交的 config.json（service/tokens/ 是仓库一部分）。
+                if p.resolve() == WORDS_PATH.resolve():
+                    return words, "file:words_en.txt"
+                return words, f"file:{p}"
             errors.append(f"local file {p} yielded no valid words")
         else:
             errors.append(f"local file not found: {p}")

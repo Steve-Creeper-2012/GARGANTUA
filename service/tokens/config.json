@@ -65,7 +65,7 @@
   "append_region": "extra",
   "user_added": [],
   "sources": {
-    "english": "file:/Users/steve/Desktop/GARGANTUA/service/tokens/words_en.txt",
+    "english": "file:words_en.txt",
     "english_word_count": 30000,
     "emoji": "Unicode 16.0.0 emoji-data.txt (Emoji=Yes, 非 ASCII) + Emoji_Component 组件字符",
     "emoji_count": 1517,
