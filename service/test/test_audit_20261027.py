@@ -30,11 +30,17 @@ import torch
 
 import model as model_mod
 import spec
+from tokens import vfc
 from common import make_batch
+
+
+from tokens.vocab import Vocab as _Vocab
+_VS = len(_Vocab.global_vocab())   # 新契约：词表长度不再由 spec 钉死
 
 
 def small_model(**kw):
     torch.manual_seed(0)
+    kw.setdefault("vocab_size", _VS)
     return model_mod.Gargantua(n_enc_blocks=1, n_dec_blocks=1, **kw)
 
 
@@ -171,7 +177,7 @@ class TestDtypeChain(unittest.TestCase):
     """H3：非 FP32 精度下前向/投影/压缩视图不再 dtype 断链。"""
 
     def _forward_train(self, m, n=40):
-        ids = torch.randint(0, spec.VOCAB_SIZE_PADDED, (1, n))
+        ids = torch.randint(0, m.n_vocab, (1, n))
         steps = torch.arange(n).unsqueeze(0)
         half = n // 2
         dec_ids = torch.cat([ids[:, half - 1:half], ids[:, half:n - 1]], 1)
@@ -318,92 +324,55 @@ def tearDownModule():
 
 
 class TestVocabFileFormat(unittest.TestCase):
-    """H1：扁平词表 v2（显式 ID + JSON 转义），reserved 不再落盘。"""
+    """H1：词表文件格式——正文是 .vfc（一行一个 token），词表必须占满。"""
 
-    def test_base_has_no_reserved_and_free_slots(self):
+    def test_base_has_no_reserved_and_is_full(self):
         import vocab_presets as vp
         from tokens.vocab import Vocab
-        entries = vp.read_flat_entries(vp.BASE)
+        entries = vfc.read_vfc(str(vp.vocab_vfc_path(vp.BASE)))
         self.assertGreater(len(entries), 60000)
-        self.assertEqual([t for _, t in entries
+        self.assertEqual([t for _, t, _v in entries
                           if t.startswith("<reserved:")], [])
-        v = Vocab.from_entries(entries, vp.vocab_txt_path(vp.BASE))
-        # 旧实现 base 加载后 free_slots=0，任何「添加 token」必然失败
-        self.assertGreater(v.free_slots("regular"), 1000)
-        self.assertEqual(vp.preset_occupancy(vp.BASE)["free"],
-                         v.free_slots("regular"))
+        v = Vocab.load(vp.vocab_vfc_path(vp.BASE))
+        # 新契约：词表必须占满——长度即真实长度，没有「空闲槽位」概念
+        self.assertEqual(len(v), len(entries))
+        occ = vp.vocab_occupancy(vp.BASE)
+        self.assertEqual(occ["vocab_size"], len(v))
+        self.assertEqual(occ["vocab_size"],
+                         occ["visible_size"] + occ["invisible_size"])
 
     def test_newline_and_cr_tokens_survive(self):
         """token 自身的 \\n / \\r 必须无损往返（旧格式会变成空行、ID 前移）。"""
         import vocab_presets as vp
         from tokens.vocab import Vocab
-        v = Vocab.from_entries(vp.read_flat_entries(vp.BASE),
-                               vp.vocab_txt_path(vp.BASE))
-        self.assertEqual(v.token_to_id.get("\n"), spec.WHITESPACE_BEGIN + 2)
-        self.assertEqual(v.token_to_id.get("\r"), spec.WHITESPACE_BEGIN + 3)
+        v = Vocab.load(vp.vocab_vfc_path(vp.BASE))
+        reg = {r["region"]: r for r in v.regions}
+        wb = reg["whitespace"]["begin"]
+        self.assertEqual(v.token_to_id.get("\n"), wb + 2)
+        self.assertEqual(v.token_to_id.get("\r"), wb + 3)
         # 空行吞掉后 ID 会整体前移 2 位——用「中」这类位置敏感的 token 兜底
         self.assertEqual(v.token_to_id.get("中"),
-                         spec.CJK_BEGIN + (ord("中") - 0x4E00))
+                         reg["cjk"]["begin"] + (ord("中") - 0x4E00))
 
     def test_preset_roundtrip_with_control_chars(self):
         import vocab_presets as vp
-        vp.create_preset("ctrlp")
+        vp.create_vocab("ctrlp")
         tok = "tab\there\nnewline"
-        res = vp.add_token("ctrlp", tok)
-        got = dict((t, i) for i, t in vp.read_flat_entries("ctrlp"))
+        res = vp.add_token_to("ctrlp", tok)
+        got = {t: i for i, t, _v in
+               vfc.read_vfc(str(vp.vocab_vfc_path("ctrlp")))}
         self.assertEqual(got[tok], res["id"])
-        self.assertEqual(vp.preset_occupancy("ctrlp")["used"],
-                         vp.preset_occupancy(vp.BASE)["used"] + 1)
-
-    def test_legacy_v1_file_upgrades_without_shifting_ids(self):
-        """v1（位置式）就地升级为 v2：ID 映射一个都不动。"""
-        import tempfile
-        import os
-        import common
-        tmp = tempfile.mkdtemp(prefix="garg_v1_")
-        try:
-            p = os.path.join(tmp, "vocab.txt")
-            with open(p, "w", encoding="utf-8") as f:
-                f.write("alpha\nbeta\ngamma\n")
-            entries, legacy = common.read_flat_vocab_file(p)
-            self.assertTrue(legacy)
-            self.assertEqual([i for i, _ in entries],
-                             [spec.INVISIBLE_END + k for k in range(3)])
-            # 升级后再读：同一批 ID，格式已变 v2
-            entries2, legacy2 = common.migrate_flat_vocab_file(p)
-            self.assertTrue(legacy2)
-            self.assertEqual(entries2, entries)
-            with open(p, encoding="utf-8") as f:
-                self.assertTrue(
-                    f.readline().startswith(common.VOCAB_FILE_MAGIC))
-            self.assertFalse(common.read_flat_vocab_file(p)[1])
-        finally:
-            import shutil
-            shutil.rmtree(tmp, ignore_errors=True)
-
-    def test_v2_rejects_bad_ids_and_duplicates(self):
-        import common
-        bad = common.VOCAB_FILE_MAGIC + "\n" + "1\t\"x\"\n"
-        with self.assertRaises(ValueError):
-            common.parse_flat_vocab(bad, "t.txt")
-        dup = (common.VOCAB_FILE_MAGIC + "\n"
-               + f'{spec.INVISIBLE_END}\t"x"\n'
-               + f'{spec.INVISIBLE_END + 1}\t"x"\n')
-        with self.assertRaises(ValueError):
-            common.parse_flat_vocab(dup, "t.txt")
-        bad_json = common.VOCAB_FILE_MAGIC + "\n" + f'{spec.INVISIBLE_END}\t"x\n'
-        with self.assertRaises(ValueError):
-            common.parse_flat_vocab(bad_json, "t.txt")
+        self.assertEqual(len(vp.load_vocab("ctrlp")),
+                         len(vp.load_vocab(vp.BASE)) + 1)
 
 
 class TestFlatVocabSpecials(unittest.TestCase):
-    """H2：每模型扁平词表的 special / system / fallback 不再为空。"""
+    """H2：词表（含每模型独立副本）的 special / system / fallback 齐全。"""
 
     def test_special_and_fallback_populated(self):
         import vocab_presets as vp
         from tokens.vocab import Vocab
-        v = Vocab.from_entries(vp.read_flat_entries(vp.BASE),
-                               vp.vocab_txt_path(vp.BASE))
+        v = Vocab.load(vp.vocab_vfc_path(vp.BASE))
         self.assertEqual(v.special_ids.get("<stop>"), spec.STOP_ID)
         self.assertEqual(v.special_ids.get("<caps>"), 0)
         self.assertEqual(v.system_ids.get("{"), spec.TS_OPEN_ID)
@@ -416,8 +385,7 @@ class TestFlatVocabSpecials(unittest.TestCase):
         import vocab_presets as vp
         from tokens.vocab import Vocab
         from tokens import enctok
-        v = Vocab.from_entries(vp.read_flat_entries(vp.BASE),
-                               vp.vocab_txt_path(vp.BASE))
+        v = Vocab.load(vp.vocab_vfc_path(vp.BASE))
         ids, skipped = enctok.encode_text("zzzzq", v)
         self.assertEqual(skipped, [])
         self.assertEqual(ids, [v.fallback_ids["z"]] * 4 + [v.fallback_ids["q"]])
@@ -427,8 +395,7 @@ class TestFlatVocabSpecials(unittest.TestCase):
         import vocab_presets as vp
         from tokens.vocab import Vocab
         from tokens import gts
-        v = Vocab.from_entries(vp.read_flat_entries(vp.BASE),
-                               vp.vocab_txt_path(vp.BASE))
+        v = Vocab.load(vp.vocab_vfc_path(vp.BASE))
         out = gts.parse_gts("{<user>hi<stop>}", vocab=v)
         self.assertEqual(out[0], spec.TS_OPEN_ID)
         self.assertIn(spec.STOP_ID, out)
@@ -440,7 +407,7 @@ class TestFlatVocabSpecials(unittest.TestCase):
         from tokens import gts
         v = Vocab.from_tokens(["自定义词", "hello"])
         out = gts.parse_gts("{自定义词}", vocab=v)
-        self.assertEqual(out, [spec.TS_OPEN_ID, spec.INVISIBLE_END,
+        self.assertEqual(out, [spec.TS_OPEN_ID, spec.HEAD_SIZE,
                                spec.TS_CLOSE_ID])
 
 
@@ -558,8 +525,10 @@ class TestFrontendTaskState(unittest.TestCase):
         self.assertIn("ACTIVE_MODEL", "\n".join(code))
 
     def test_vocab_select_keeps_selection(self):
+        # 2026-10-30 重构后词表列表来自 /api/vocab/list（VOCAB.list），
+        # 断言跟随新实现：下拉刷新后保留用户已选中的词表
         src = self._src()
-        self.assertIn("presets.some(p => p.name === prev)", src)
+        self.assertIn("VOCAB.list.some(v => v.name === prev)", src)
 
 
 def minify_html_of(src: str) -> str:

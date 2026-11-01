@@ -34,6 +34,56 @@ import spec
 
 
 # ===========================================================================
+# 词表长度（2026-10-30 词表契约重构）
+# ---------------------------------------------------------------------------
+# 旧实现把 wte / lm_head 的长度钉死在 spec.VOCAB_SIZE_PADDED 上，于是
+# 「一个模型只能配一个词表」——换词表必然形状不符。新契约里词表长度是
+# **每个模型自己的属性**，写在 models/NAME/vocab/config.json 里，由
+# common.build_model 读出后显式传给本类的 vocab_size 参数。
+#
+# spec 侧的历史别名逐级兜底（老 spec 有 VOCAB_SIZE_PADDED / VOCAB_SIZE
+# 两个名字，任一存在就沿用）。两个都不存在说明 spec 已彻底不再规定词表
+# 长度，此时「默认该多大」是未定义问题：显式报错远好过悄悄造出一个形状
+# 错的模型——后者会在几步之后用一个看不懂的 load_state_dict RuntimeError
+# 崩掉，排查成本高得多。
+# ===========================================================================
+_DEFAULT_VOCAB_SPEC_ATTRS = ("VOCAB_SIZE_PADDED", "VOCAB_SIZE")
+
+
+def default_vocab_size() -> int:
+    """spec 规定的默认词表长度；新 spec 不再钉死长度时抛 ValueError。"""
+    for attr in _DEFAULT_VOCAB_SPEC_ATTRS:
+        v = getattr(spec, attr, None)
+        if isinstance(v, int) and not isinstance(v, bool) and v >= 1:
+            return v
+    raise ValueError(
+        "Gargantua 需要词表长度：spec 已不再规定固定词表长度（无 "
+        f"{' / '.join(_DEFAULT_VOCAB_SPEC_ATTRS)}），请显式传入 vocab_size"
+        "——通常取自 models/NAME/vocab/config.json")
+
+
+def check_vocab_size(v) -> int:
+    """vocab_size 必须是 ≥1 的整数。
+
+    bool 单独挡掉（它是 int 子类但语义不是长度）；非整数值的 float 也拒
+    ——静默截断会让 config 里写 88704.5 这种笔误变成一个形状微妙错误、
+    还能正常训练的好几百 MB 模型。 """
+    if isinstance(v, bool):
+        raise ValueError(f"vocab_size 必须是整数，不能是布尔值: {v!r}")
+    if isinstance(v, int):
+        n = v
+    elif isinstance(v, float):
+        if not v.is_integer():
+            raise ValueError(f"vocab_size 必须是整数: {v!r}")
+        n = int(v)
+    else:
+        raise ValueError(f"vocab_size 必须是整数: {v!r}")
+    if n < 1:
+        raise ValueError(f"vocab_size 必须 ≥ 1: {n}")
+    return n
+
+
+# ===========================================================================
 # 基础组件
 # ===========================================================================
 class RMSNorm(nn.Module):
@@ -752,7 +802,8 @@ class Gargantua(nn.Module):
                  ctx_full: int | None = None,
                  ctx_compress: int | None = None,
                  csa_ratio: int | None = None,
-                 hca_ratio: int | None = None):
+                 hca_ratio: int | None = None,
+                 vocab_size: int | None = None):
         super().__init__()
         D = spec.D_MODEL
         n_enc = n_enc_blocks if n_enc_blocks is not None else spec.N_ENC_BLOCKS
@@ -767,10 +818,13 @@ class Gargantua(nn.Module):
                           else int(csa_ratio))
         self.hca_ratio = (spec.HCA_RATIO if hca_ratio is None
                           else int(hca_ratio))
+        # —— 词表长度（每个模型可以不同；None 才回退 spec 默认）——
+        self.n_vocab = (default_vocab_size() if vocab_size is None
+                        else check_vocab_size(vocab_size))
         # —— 词表 embedding（不绑定；查表类，可放 CPU）——
-        self.wte = nn.Embedding(spec.VOCAB_SIZE_PADDED, D)
+        self.wte = nn.Embedding(self.n_vocab, D)
         self.type_emb = nn.Embedding(spec.NUM_TYPES, D)
-        self.lm_head = nn.Linear(D, spec.VOCAB_SIZE_PADDED, bias=False)
+        self.lm_head = nn.Linear(D, self.n_vocab, bias=False)
         # —— 模态输入投影（embedding 不统一，各自投影到 d_model）——
         self.visual_proj = nn.Linear(spec.PATCH_VEC_DIM, D, bias=False)
         self.visual_coord_x = nn.Embedding(256, D)   # 2D 位置嵌入（加性，非 embed token）

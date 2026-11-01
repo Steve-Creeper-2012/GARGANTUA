@@ -8,8 +8,13 @@
 #   （load_state_dict 直接 RuntimeError，已实测复现）。
 #   本模块把「模型目录契约」收敛成单一实现，所有入口共用：
 #     models/NAME/
-#       ├── model.safetensors   权重（safetensors）
-#       └── config.json         {"n_enc_blocks": int, "n_dec_blocks": int, ...}
+#       ├── config.json    manifest：{"weights": ..., "weights_discrete_embed":
+#       │                  ..., "weights_continuous_embed": ..., 
+#       │                  "vocab_size": int, "vocab_source": str, ...}
+#       ├── weights/       三个 safetensors：主权重 / 离散 embed / 连续 embed
+#       └── vocab/         vocab.vfc + config.json（每模型一份独立副本）
+#   2026-10-30 词表契约重构：权重按「使用方式」拆成三个文件（见下方
+#   WEIGHTS_DIRNAME 一节），词表从 vocab.txt 升级为 vocab/ 目录。
 # ===========================================================================
 from __future__ import annotations
 
@@ -18,6 +23,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import uuid
@@ -28,21 +34,61 @@ from safetensors.torch import load_file, save_file
 
 import spec
 
-CKPT_NAME = "model.safetensors"
 CONFIG_NAME = "config.json"
 # 初始化互斥锁文件（H4）：覆盖「冲突检查—写入—发布」全程，跨进程生效。
 # init.py 子进程与 server 的 train start 用同一把锁，杜绝「初始化写到一半
 # 训练已经开始读」的权重/config 不配套。
 INIT_LOCK_NAME = ".model-init.lock"
 
+# ---------------------------------------------------------------------------
+# 模型文件夹布局（2026-10-30 词表契约重构）
+# ---------------------------------------------------------------------------
+# models/NAME/
+#   config.json                          manifest：唯一事实源
+#   weights/
+#     model.<uuid>.safetensors            主权重（transformer 主体）
+#     embed_discrete.<uuid>.safetensors    离散 token 的 embedding（wte）
+#     embed_continuous.<uuid>.safetensors  连续 token 的 embedding（视觉/音频投影）
+#   vocab/                               词表（即使与别人共用也各存一份副本）
+#     vocab.vfc
+#     config.json
+#
+# 为什么要拆三个文件：离散 embedding 是查表（forward 只取一行，放在 CPU
+# RAM 里开销可接受），连续投影（视觉/音频 linear）每次前向都要真算矩阵乘、
+# 必须留在 VRAM，主体权重又是优化器视角的另一回事。合成一个 blob 之后三
+# 者被迫同生共死，加载侧无法按设备分层放置。
+#
+# 为什么 vocab 要整目录复制：多个模型复用同一个 vocabs/<preset>/ 时，用户
+# 在前端删掉那个共享词表，依赖它的所有模型会一起报废（权重里 embedding
+# 行数对得上一个都不剩）。每个模型各存一份副本，删源不影响已建模型。
+WEIGHTS_DIRNAME = "weights"
+VOCAB_DIRNAME = "vocab"
+VOCAB_VFC_NAME = "vocab.vfc"
+MAIN_WEIGHTS_PREFIX = "model"
+DISCRETE_EMBED_PREFIX = "embed_discrete"
+CONTINUOUS_EMBED_PREFIX = "embed_continuous"
+# 全部允许出现在 weights/ 下的权重文件前缀——回收旧文件时按这张表枚举，
+# 新增一类权重只需在这里加一个前缀。
+CKPT_PREFIXES = (MAIN_WEIGHTS_PREFIX, DISCRETE_EMBED_PREFIX,
+                 CONTINUOUS_EMBED_PREFIX)
+# config.json 里指向三个权重文件的键名
+WEIGHTS_KEYS = ("weights", "weights_discrete_embed",
+                "weights_continuous_embed")
+
+# state_dict 分组规则（按 key 前缀匹配，不硬编码完整 key 列表——将来新增
+# 离散/连续 embedding 子模块只要沿用同一前缀就不会漏）:
+#   离散 embedding：wte（词表 token 查表，forward 只取一行）
+#   连续 embedding：视觉 patch 投影 + 2D 坐标嵌入、音频波形投影
+#   （server/model.py 里的确切子模块名：visual_proj / visual_coord_x /
+#    visual_coord_y / audio_proj）
+_DISCRETE_EMBED_KEY_PREFIXES = ("wte.",)
+_CONTINUOUS_EMBED_KEY_PREFIXES = ("visual_proj.", "visual_coord_x.",
+                                  "visual_coord_y.", "audio_proj.")
+
 # 每模型词表文件（2026-10-24，steve：每个模型可以有不同的 vocab 词表）。
-# 语义：扁平可见 token 列表，ID 落在 [INVISIBLE_END, VOCAB_SIZE_PADDED)
-# （不可见区 [0, INVISIBLE_END) 是 special/system/modal 固定 token 的架构
 # 契约，自定义词表不占用）；不允许重复（反查歧义）。没有 vocab.txt 的
 # 模型用全局词表 service/tokens/vocab.json。
 # 2026-10-27：文件格式升级为 v2（显式 ID + JSON 转义），详见下方
-# VOCAB_FILE_MAGIC 一节；v1 位置式文件读入时自动升级。
-VOCAB_TXT_NAME = "vocab.txt"
 
 # 推理 API/CLI 层硬上限：CPU 上单步是全序列重解码，2048 已是宽松保护值。
 # 定义在 common（server 与服务进程共用），避免 server 为拿一个常量去
@@ -123,6 +169,150 @@ def validate_ctx_config(ctx_full=None, ctx_compress=None, csa_ratio=None,
             "hca_ratio": hr}
 
 
+def model_vocab_dir(model_dir: str) -> str:
+    """模型目录的词表目录 models/NAME/vocab（不一定存在）。"""
+    return os.path.join(model_dir, VOCAB_DIRNAME)
+
+
+def install_model_vocab(model_dir: str, src_dir: str) -> Optional[int]:
+    """把词表目录 src 的 vocab.vfc + config.json 复制进 models/NAME/vocab/。
+
+    返回该词表声明的 vocab_size（取自 vocab/config.json；读不到返回
+    None）。即使多个模型共用同一个词表预设也各自复制一份——共享词表被
+    用户在别处删掉，依赖它的模型会一起报废（权重里 embedding 的行数对
+    应的就是这份词表）。复制是纯文件级的，不解析 .vfc 内容：格式归
+    tokens/vfc.py 解释，本模块只负责「模型目录里必须有一份」。
+    """
+    dst = model_vocab_dir(model_dir)
+    os.makedirs(dst, exist_ok=True)
+    for fname in (VOCAB_VFC_NAME, CONFIG_NAME):
+        src = os.path.join(src_dir, fname)
+        if not os.path.isfile(src):
+            _warn(f"词表源文件缺失，跳过: {src}")
+            continue
+        _atomic_copy(src, os.path.join(dst, fname))
+    try:
+        with open(os.path.join(dst, CONFIG_NAME), encoding="utf-8") as f:
+            v = json.load(f).get("vocab_size")
+    except Exception:
+        return None
+    # 正文是词表长度的唯一事实源：config 可能过期（用户手工改过 vfc 但没
+    # 走 _sync_config）。能解析就以正文条数为准，解析失败才退回 config 声明
+    # ——长度错了会造出一个 wte 行数不对的模型，几步训练之后才炸。
+    try:
+        from tokens import vfc as _vfc
+        n = len(_vfc.read_vfc(os.path.join(dst, VOCAB_VFC_NAME)))
+        if n >= 1:
+            return n
+    except Exception as e:
+        _warn(f"{dst}/{VOCAB_VFC_NAME} 解析失败，改用 config 的 vocab_size: {e}")
+    try:
+        return _vocab_size_int(v)
+    except ValueError:
+        _warn(f"{dst}/{CONFIG_NAME} 的 vocab_size={v!r} 非法")
+        return None
+
+
+def _atomic_copy(src: str, dst: str) -> None:
+    """tmp + fsync + replace 复制文件（复制过程中崩溃不会留下半个词表）。"""
+    tmp = f"{dst}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(src, "rb") as fi:
+            with open(tmp, "wb") as fo:
+                shutil.copyfileobj(fi, fo)
+                fo.flush()
+                os.fsync(fo.fileno())
+        os.replace(tmp, dst)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _vocab_size_int(v) -> int:
+    """词表长度必须是 ≥1 的整数（bool 拒绝；非整数 float 拒绝，别截断）。"""
+    if isinstance(v, bool):
+        raise ValueError(f"必须是整数，不能是布尔值: {v!r}")
+    if isinstance(v, int):
+        n = v
+    elif isinstance(v, float):
+        if not v.is_integer():
+            raise ValueError(f"必须是整数: {v!r}")
+        n = int(v)
+    else:
+        raise ValueError(f"必须是整数: {v!r}")
+    if n < 1:
+        raise ValueError(f"必须 ≥ 1: {n}")
+    return n
+
+
+def _wte_rows(model_dir: str) -> Optional[int]:
+    """已有权重里 wte.weight 的行数 = 该模型实际在用的词表长度。
+
+    给「config 里没写 vocab_size 的旧目录」兜底：权重自己是词表长度的
+    最终事实源，比任何外部声明都准。safetensors 的 safe_open 只读文件
+    头（几百字节），不必把几百 MB 的 embedding 读进内存。
+    """
+    from safetensors import safe_open
+    cfg = read_config(model_dir)
+    candidates = (_manifest_path(model_dir,
+                                 cfg.get(WEIGHTS_KEYS[1])),   # 新布局：先查分散式
+                  resolve_weights_path(model_dir))            # 旧布局：单文件
+    for path in candidates:
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            with safe_open(path, framework="pt") as f:
+                if "wte.weight" in list(f.keys()):
+                    return int(f.get_slice("wte.weight").get_shape()[0])
+        except Exception as e:
+            _warn(f"{path} 读取 wte.weight 形状失败（{e}）")
+    return None
+
+
+def model_vocab_size(model_dir: str) -> int:
+    """模型词表长度（优先级从高到低）：
+
+         1. models/NAME/vocab/config.json 的 "vocab_size"（词表自己声明）
+         2. models/NAME/config.json 的 "vocab_size"（模型创建时记下的）
+         3. 已有权重的 wte.weight 行数（旧目录没有前两项时的唯一可靠来源）
+         4. spec 默认（老 spec 的 VOCAB_SIZE_PADDED / VOCAB_SIZE；都没有 →
+            抛 ValueError，因为「默认多大」在新契约下是未定义问题）
+
+    任一层读取失败 / 类型非法都只是告警并继续向下一层回退——词表长度是
+    模型能不能加载的前提，不能因为某一个文件写错就让整个目录报废；但每
+    一层都必须说出来，否则排障时不知道长度到底从哪来的。 """
+    for path, label in ((os.path.join(model_vocab_dir(model_dir),
+                                      CONFIG_NAME), "vocab/config.json"),
+                        (os.path.join(model_dir, CONFIG_NAME),
+                         "config.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            _warn(f"{label} 读取失败（{e}），词表长度向下一层回退")
+            continue
+        if not isinstance(cfg, dict):
+            _warn(f"{label} 不是 JSON 对象，词表长度向下一层回退")
+            continue
+        if cfg.get("vocab_size") is None:
+            continue
+        try:
+            return _vocab_size_int(cfg["vocab_size"])
+        except ValueError:
+            _warn(f"{label} 的 vocab_size={cfg['vocab_size']!r} 非法，"
+                  f"词表长度向下一层回退")
+    rows = _wte_rows(model_dir)
+    if rows:
+        return rows
+    from model import default_vocab_size   # 延迟 import：避免 common → model 循环
+    return default_vocab_size()
+
+
 def _ctx_from_cfg(cfg: dict) -> dict:
     """从 config.json 读上下文配置：逐字段容错（坏值告警 + 回退默认），
     与 _block_count 的策略一致；跨字段约束（hca≥csa）不满足时两个比例
@@ -156,172 +346,6 @@ def _ctx_from_cfg(cfg: dict) -> dict:
 def read_ctx_config(model_dir: str) -> dict:
     """模型目录的上下文长度配置（config.json 驱动，缺失即默认）。 """
     return _ctx_from_cfg(read_config(model_dir))
-
-
-def model_vocab_path(model_dir: str) -> str:
-    """模型目录的 vocab.txt 路径（不一定存在）。"""
-    return os.path.join(model_dir, VOCAB_TXT_NAME)
-
-
-# ---------------------------------------------------------------------------
-# 扁平词表文件格式（2026-10-27 审计修复 H1）
-# ---------------------------------------------------------------------------
-# v1（旧，位置式）：一行一个 token，第 N 行 → ID = INVISIBLE_END + N。
-#   两个致命缺陷：
-#     1. 无法表示 token 自身的 "\n" / "\r"——写出即变成空行，读回被跳过，
-#        其后所有 ID 整体前移（base 预设实测前移 2 位）；
-#     2. 把 reserved 占位符当作真实 token 导出，加载后可见区被占满
-#        （free_slots=0），任何「添加 token」必然失败。
-# v2（当前）：首行魔数，其后每行 "<ID>\t<JSON 字符串>"，显式 ID。
-#   - 未列出的 ID 即空位（reserved），可被「添加 token」回收；
-#   - token 文本走 JSON 转义，换行/回车/制表符/引号无损往返；
-#   - 显式 ID 让「软删占位」「新增」「重排文件行序」都不会令其它 token
-#     漂移，也不需要为占位符付出容量。
-VOCAB_FILE_MAGIC = "#gargantua-vocab-v2"
-
-
-def escape_vocab_token(tok: str) -> str:
-    """token → 单行 JSON 字面量（换行等控制字符转义为 \\n 等）。"""
-    return json.dumps(tok, ensure_ascii=False)
-
-
-def unescape_vocab_token(text: str) -> str:
-    """JSON 字面量 → token 文本。"""
-    return json.loads(text)
-
-
-def dumps_flat_vocab(entries) -> str:
-    """[(id, token)] → v2 文件文本（含魔数，末尾换行）。"""
-    lines = [VOCAB_FILE_MAGIC]
-    lines.extend(f"{int(tid)}\t{escape_vocab_token(tok)}"
-                 for tid, tok in entries)
-    return "\n".join(lines) + "\n"
-
-
-def parse_flat_vocab(text: str, source: str = "vocab.txt"):
-    """解析扁平词表文本 → ([(id, token)], is_legacy)。
-
-    带魔数 → v2，按显式 ID 解析；不带魔数 → v1，按行号位置解析
-    （第 N 个非空行 → INVISIBLE_END + N），保证旧文件仍可读。
-    重复 ID / 重复 token / 越界 / 条目超上限一律 ValueError。
-    """
-    raw_lines = text.split("\n")
-    if raw_lines and raw_lines[0].strip() == VOCAB_FILE_MAGIC:
-        entries = []
-        seen_ids, seen_tok = set(), set()
-        for lineno, raw in enumerate(raw_lines[1:], 2):
-            line = raw.rstrip("\r")
-            if not line.strip():
-                continue
-            tid_s, sep, payload = line.partition("\t")
-            if not sep:
-                raise ValueError(f"{source}:{lineno} 缺少制表符分隔: {line!r}")
-            try:
-                tid = int(tid_s)
-                tok = unescape_vocab_token(payload)
-            except Exception as e:
-                raise ValueError(f"{source}:{lineno} 解析失败: {e}")
-            if not (spec.INVISIBLE_END <= tid < spec.VOCAB_SIZE_PADDED):
-                raise ValueError(
-                    f"{source}:{lineno} token ID {tid} 越界 "
-                    f"[{spec.INVISIBLE_END}, {spec.VOCAB_SIZE_PADDED})")
-            if tid in seen_ids:
-                raise ValueError(f"{source}:{lineno} token ID 重复: {tid}")
-            if not isinstance(tok, str) or not tok:
-                raise ValueError(f"{source}:{lineno} token 文本非法: {tok!r}")
-            if tok in seen_tok:
-                raise ValueError(
-                    f"{source}:{lineno} token 重复: {tok!r}"
-                    f"（反查歧义，拒绝加载）")
-            seen_ids.add(tid)
-            seen_tok.add(tok)
-            entries.append((tid, tok))
-        entries.sort(key=lambda e: e[0])
-        return entries, False
-
-    # ---- v1：位置式 ----
-    entries = []
-    seen = set()
-    idx = 0
-    for lineno, raw in enumerate(raw_lines, 1):
-        tok = raw.rstrip("\r")
-        if not tok:
-            continue                        # 空行跳过，不占 ID（旧语义）
-        if tok in seen:
-            raise ValueError(
-                f"{source}:{lineno} token 重复: {tok!r}"
-                f"（反查歧义，拒绝加载）")
-        seen.add(tok)
-        entries.append((spec.INVISIBLE_END + idx, tok))
-        idx += 1
-    limit = spec.VOCAB_SIZE_PADDED - spec.INVISIBLE_END
-    if len(entries) > limit:
-        raise ValueError(
-            f"{source}: {len(entries)} 个 token 超过上限 {limit}"
-            f"（VOCAB_SIZE_PADDED - INVISIBLE_END）")
-    return entries, True
-
-
-def read_flat_vocab_file(path: str):
-    """读任意扁平词表文件（vocab.txt）→ ([(id, token)], is_legacy)。"""
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
-    return parse_flat_vocab(text, source=path)
-
-
-def write_flat_vocab_file(path: str, entries) -> None:
-    """原子写 v2 扁平词表（唯一临时文件 + fsync + replace）。"""
-    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(dumps_flat_vocab(entries))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-
-
-def migrate_flat_vocab_file(path: str):
-    """把 v1 文件就地升级为 v2，**保持当前生效的 ID 映射不变**。
-
-    返回 (entries, migrated)。升级只换表示法、不重排 ID：对已训练模型
-    来说，ID ↔ 权重行的对应关系一个都不动（旧文件里被空行吞掉的
-    "\\n"/"\\r" 保持丢失状态，因为它们本来就没进入过任何权重行）。
-    """
-    entries, legacy = read_flat_vocab_file(path)
-    if not legacy:
-        return entries, False
-    try:
-        write_flat_vocab_file(path, entries)
-    except OSError as e:                    # 只读目录：内存里照常可用
-        _warn(f"{path} 旧格式升级失败（只读？），按旧语义继续: {e}")
-        return entries, False
-    return entries, True
-
-
-def read_model_vocab_entries(model_dir: str):
-    """模型目录 vocab.txt → ([(id, token)], is_legacy)；不存在返回 None。
-
-    旧格式（v1）会被就地升级为 v2（ID 映射不变），避免「读一次就漂移」
-    的历史问题。条目数上限 VOCAB_SIZE_PADDED - INVISIBLE_END。
-    """
-    path = model_vocab_path(model_dir)
-    if not os.path.exists(path):
-        return None
-    return migrate_flat_vocab_file(path)
-
-
-def read_model_vocab(model_dir: str) -> Optional[list]:
-    """读模型目录的 vocab.txt → token 列表（按 ID 升序）；不存在返回 None。"""
-    got = read_model_vocab_entries(model_dir)
-    if got is None:
-        return None
-    return [t for _, t in got[0]]
 
 
 def _warn(msg: str) -> None:
@@ -391,26 +415,31 @@ def build_model(model_dir: str):
     这是 train / infer / auto_train / server 共用的唯一构建入口，
     保证「创建时的 block 数」与「加载时的 block 数」永远一致。
     2026-10-23：上下文长度（ctx_full/ctx_compress/CSA/HCA）同样由
-    config.json 驱动，缺省回退 spec 默认值。 """
+    config.json 驱动，缺省回退 spec 默认值。
+    2026-10-30：词表长度同样由「模型目录里的词表配置」驱动
+    （model_vocab_size）——build_model 被 infer/train 在 set_model_vocab()
+    之前调用，所以它不能依赖进程里已加载的词表，必须自己读目录。 """
     from model import Gargantua          # 延迟 import：避免 common → model 循环
     cfg = read_config(model_dir)
     m = Gargantua(n_enc_blocks=_block_count(cfg, "n_enc_blocks",
                                             spec.N_ENC_BLOCKS),
                   n_dec_blocks=_block_count(cfg, "n_dec_blocks",
                                             spec.N_DEC_BLOCKS),
+                  vocab_size=model_vocab_size(model_dir),
                   **_ctx_from_cfg(cfg))
-    ckpt = resolve_weights_path(model_dir)
-    if os.path.exists(ckpt):
+    sd = load_model_state_dict(model_dir)
+    if sd:
         try:
-            m.load_state_dict(load_file(ckpt))
+            m.load_state_dict(sd)
         except RuntimeError as e:
             # 2026-10-23 审计修复（P2）：config 与权重不一致（block 数/
             # 上下文配置被手改）此前抛 RuntimeError → HTTP 500 且报文
-            # 是大段 missing keys；转成 ValueError（→400）并给结论
+            # 是大段 missing keys；转成 ValueError（→400）并给结论。
+            # 2026-10-30：词表长度不一致（换过 vocab/ 但没重训）同样落到这里。
             first = str(e).splitlines()[0] if str(e) else "结构不匹配"
             raise ValueError(
                 f"模型目录的 config.json 与权重不匹配"
-                f"（block 数或上下文配置被修改过）: {first}")
+                f"（block 数、上下文配置或词表长度被修改过）: {first}")
     # 2026-10-25：按 config["dtype"] 施加模型精度（fp64/32/16/bf16 原生；
     # fp8/int8/int4/int2 在 CPU 上以 fp32 容器 + 权重量化模拟——损耗但能跑）。
     # 坏值防御性回退 fp32 并告警，不让单个错 dtype 把服务进程打崩。
@@ -424,30 +453,137 @@ def build_model(model_dir: str):
 
 
 # ---------------------------------------------------------------------------
-# 检查点发布（2026-10-27 审计修复 M1/H4）
+# 权重分组（save / load 共用的唯一真相源，2026-10-30 词表契约重构）
+# ---------------------------------------------------------------------------
+def split_state_dict(sd: dict) -> tuple:
+    """state_dict → (主权重, 离散 embedding, 连续 embedding)。
+
+    三个分组必须【恰好覆盖】入参的每一个 key：不重（if/elif 天然互斥）、
+    不漏（else 兜住其余全部）。save 侧按这个结果拆三个文件，load 侧再按
+    同样的规则合回去——两边共用同一份规则才不会出现「写进去的参数读不
+    回来」。断言把这条不变量固化下来，将来动前缀表时立刻暴露。
+    """
+    main, disc, cont = {}, {}, {}
+    for k, v in sd.items():
+        if k.startswith(_DISCRETE_EMBED_KEY_PREFIXES):
+            disc[k] = v
+        elif k.startswith(_CONTINUOUS_EMBED_KEY_PREFIXES):
+            cont[k] = v
+        else:
+            main[k] = v
+    if set(main) | set(disc) | set(cont) != set(sd) or len(sd) != \
+            len(main) + len(disc) + len(cont):
+        raise AssertionError("split_state_dict 分组必须不重不漏地覆盖所有 key")
+    return main, disc, cont
+
+
+# ---------------------------------------------------------------------------
+# 检查点发布（2026-10-27 审计修复 M1/H4；2026-10-30 拆三文件）
 # ---------------------------------------------------------------------------
 # 旧实现先 replace 权重再写 config：进程在两次 replace 之间崩溃会留下
 # 「新权重 + 旧 config」的结构不匹配目录。现在改为版本化快照 + manifest：
-#   1. 权重完整写入 model.<uuid>.safetensors（tmp + replace，单文件原子）；
-#   2. config.json 作为 manifest 原子指向该权重文件（tmp + fsync + replace，
-#      单文件原子）——(config, weights) 通过单文件替换实现整体原子；
+#   1. 权重按 split_state_dict 拆成三份，各自写进 weights/（tmp + fsync +
+#      replace，单文件原子）；
+#   2. config.json 作为 manifest 原子指向这三个文件（tmp + fsync + replace，
+#      单文件原子）——(config, 三个权重) 通过单文件替换实现整体原子；
 #   3. 回收 manifest 之外的旧权重文件。
-# 兼容旧目录：config 无 "weights" 键时回退 model.safetensors。
-def resolve_weights_path(model_dir: str) -> str:
-    """config.json 的 manifest → 权重文件路径；旧目录回退 model.safetensors。"""
-    w = read_config(model_dir).get("weights")
-    if isinstance(w, str) and w:
-        p = os.path.join(model_dir, w)
-        if os.path.exists(p):
-            return p
-    return os.path.join(model_dir, CKPT_NAME)
+# 兼容旧目录：config 无 "weights_discrete_embed" 时按「一个文件装全部」读。
+def _atomic_save_file(sd: dict, path: str) -> None:
+    """tmp + fsync + replace 写单个 safetensors（带 UUID，并发写互不覆盖）。
+
+    save_file 自己 close 文件后就返回了，数据安全与否取决于 page cache 何
+    时回写；这里重新打开同一个 inode fsync 一次，确保 replace 之前字节已
+    在盘上——否则断电后会得到一个「manifest 指向了文件名、但内容还没落
+    盘」的目录，比干脆没有这个文件更难排查。
+    """
+    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        save_file(sd, tmp)
+        with open(tmp, "rb") as f:
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _manifest_path(model_dir: str, rel) -> Optional[str]:
+    """config.json 里的相对路径 → 绝对路径；非字符串/绝对路径/含 ".." 一律
+    拒绝（返回 None + 告警）。
+
+    manifest 是被当路径用的字符串：一旦 config.json 被手改成
+    "../../etc/passwd" 或某个绝对路径，拼接后的读权就跑出模型目录了。这
+    里按「只允许向下的、干净的 POSIX 相对分量」收紧（不必要的安全加固，
+    但成本一行：本来就要判断有没有值）。
+    """
+    if not isinstance(rel, str) or not rel:
+        return None
+    parts = rel.replace("\\", "/").split("/")
+    if os.path.isabs(rel) or not parts or \
+            any(p in ("", ".", "..") for p in parts):
+        _warn(f"config.json 的权重路径非法，已忽略: {rel!r}")
+        return None
+    return os.path.join(model_dir, *parts)
+
+
+def resolve_weights_path(model_dir: str) -> Optional[str]:
+    """config.json 的 manifest → 主权重文件路径；manifest 缺失/非法/文件
+    不存在时返回 None（调用方按「无权重」处理，不猜别的文件名）。"""
+    p = _manifest_path(model_dir, read_config(model_dir).get("weights"))
+    if p and os.path.exists(p):
+        return p
+    return None
+
+
+def load_model_state_dict(model_dir: str) -> dict:
+    """读模型目录的完整 state_dict：manifest 指向的三个权重文件合并。
+
+    合并顺序无所谓——三个分组的 key 两两不相交（split_state_dict 的不变
+    量）。缺少任何一份时该分组的参数保持随机初始化，最终的形状冲突由
+    load_state_dict 的 strict 校验统一报出。没有可加载的权重时返回 {}。
+    """
+    main_path = resolve_weights_path(model_dir)
+    if main_path is None:
+        return {}
+    sd = dict(load_file(main_path))
+    cfg = read_config(model_dir)
+    for key in WEIGHTS_KEYS[1:]:
+        p = _manifest_path(model_dir, cfg.get(key))
+        if p and os.path.exists(p):
+            sd.update(load_file(p))
+    return sd
+
+
+def _recycle_old_weights(model_dir: str, cfg: dict) -> None:
+    """回收 manifest 之外的旧权重文件。
+
+    每次 save 都生成新的 UUID 文件名（读者永远只读 manifest 指向的那一
+    份，旧文件纯属垃圾）。不回收的话训练集每存一次就多一份几百 MB，很
+    快撑爆磁盘。三个前缀全覆盖，漏一个前缀就等于漏一类文件。
+    """
+    keep = set()
+    for key in WEIGHTS_KEYS:
+        p = _manifest_path(model_dir, cfg.get(key))
+        if p:
+            keep.add(os.path.basename(p))
+    wdir = os.path.join(model_dir, WEIGHTS_DIRNAME)
+    for prefix in CKPT_PREFIXES:
+        for old in glob.glob(os.path.join(wdir, f"{prefix}.*.safetensors")):
+            if os.path.basename(old) not in keep:
+                try:
+                    os.unlink(old)
+                except OSError:
+                    pass
 
 
 def model_exists(model_dir: str) -> bool:
-    """模型目录是否包含可加载的模型（manifest 或旧式权重文件存在）。"""
-    if os.path.exists(os.path.join(model_dir, CONFIG_NAME)):
-        return True
-    return bool(glob.glob(os.path.join(model_dir, "model*.safetensors")))
+    """模型目录是否包含可加载的模型（config.json + manifest 权重）。"""
+    if not os.path.exists(os.path.join(model_dir, CONFIG_NAME)):
+        return False
+    return resolve_weights_path(model_dir) is not None
 
 
 @contextlib.contextmanager
@@ -492,18 +628,27 @@ def model_init_lock(model_dir: str, timeout: float = 600.0,
 
 
 def save_checkpoint(model_dir: str, model, config: dict) -> None:
-    """权重 + config.json 以「版本化快照 + manifest」原子发布。
+    """权重（三个文件）+ config.json 以「版本化快照 + manifest」原子发布。
 
-    config.json 是唯一事实源：它指向哪个权重文件，读者就加载哪个——
-    单文件原子替换让 (config, weights) 永远自洽。临时文件带 UUID，
-    并发写互不覆盖；写后回收旧权重。"""
+    config.json 是唯一事实源：它指向哪三个权重文件，读者就加载哪三个——
+    单文件原子替换让 (config, weights) 永远自洽。临时文件带 UUID，并发
+    写互不覆盖；写后回收旧权重。"""
     os.makedirs(model_dir, exist_ok=True)
-    weights_name = f"model.{uuid.uuid4().hex}.safetensors"
-    tmp = os.path.join(model_dir, weights_name + ".tmp")
-    save_file(model.state_dict(), tmp)
-    os.replace(tmp, os.path.join(model_dir, weights_name))
+    wdir = os.path.join(model_dir, WEIGHTS_DIRNAME)
+    os.makedirs(wdir, exist_ok=True)
+    main_sd, disc_sd, cont_sd = split_state_dict(model.state_dict())
     cfg = dict(config)
-    cfg["weights"] = weights_name
+    plan = ((MAIN_WEIGHTS_PREFIX, main_sd, WEIGHTS_KEYS[0]),
+            (DISCRETE_EMBED_PREFIX, disc_sd, WEIGHTS_KEYS[1]),
+            (CONTINUOUS_EMBED_PREFIX, cont_sd, WEIGHTS_KEYS[2]))
+    for prefix, sd, key in plan:
+        # 空分组不写文件：写了也是个合法但无内容的 safetensors，反而让
+        # manifest 多一个必须存在、却毫无意义的指针。
+        if not sd:
+            continue
+        name = f"{prefix}.{uuid.uuid4().hex}.safetensors"
+        _atomic_save_file(sd, os.path.join(wdir, name))
+        cfg[key] = f"{WEIGHTS_DIRNAME}/{name}"
     tmp_cfg = os.path.join(model_dir,
                            f"{CONFIG_NAME}.{uuid.uuid4().hex}.tmp")
     with open(tmp_cfg, "w", encoding="utf-8") as f:
@@ -511,14 +656,7 @@ def save_checkpoint(model_dir: str, model, config: dict) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_cfg, os.path.join(model_dir, CONFIG_NAME))
-    # 回收旧权重（manifest 之外的 model*.safetensors）
-    keep = {weights_name}
-    for old in glob.glob(os.path.join(model_dir, "model*.safetensors")):
-        if os.path.basename(old) not in keep:
-            try:
-                os.unlink(old)
-            except OSError:
-                pass
+    _recycle_old_weights(model_dir, cfg)
 
 
 # ---------------------------------------------------------------------------

@@ -174,77 +174,95 @@
         </div>
       </section>
 
-      <!-- ==================== 词表 ==================== -->
+      <!-- ==================== 词表 ====================
+           一个标签页 = 一个「视图」，关掉只是关视图，不删词表文件。
+           分区表按接口返回渲染：不同词表的区块划分可以完全不同。 -->
       <section class="page scroll" id="p-vocab">
+        <!-- 标签页条：每个已打开的词表一个页签，最右 + 号拉出全部词表 -->
+        <div class="vtab-bar">
+          <div class="vtab-strip" id="vtab-strip"></div>
+          <div class="vtab-add-wrap">
+            <button class="vtab-add" id="vtab-add" title="打开其它词表"
+                    aria-label="打开其它词表">＋</button>
+            <div class="vtab-menu" id="vtab-menu" hidden></div>
+          </div>
+        </div>
+        <div class="hint" id="vtab-note">加载中…</div>
+
+        <!-- 第 1 块：分区展示 -->
         <div class="card">
-          <div class="card-head"><span class="card-title">ID 区间占用（自动归类）</span>
+          <div class="card-head"><span class="card-title">分区与占用</span>
             <span class="note" id="vocab-bar-note"></span></div>
           <canvas class="chart" id="vocab-bar" width="1200" height="44"></canvas>
           <div class="table-wrap" style="margin-top:12px">
             <table id="vocab-regions">
-              <thead><tr><th>子区</th><th>大类</th><th>ID 区间</th><th>容量</th><th>已用</th><th>占用率</th></tr></thead>
+              <thead><tr><th>子区</th><th>大类</th><th>ID 区间</th><th>容量</th>
+                <th>已用</th><th>占用率</th><th>示例 token</th></tr></thead>
               <tbody></tbody>
             </table>
           </div>
         </div>
 
+        <!-- 第 2 块：增删 token（表单式 / 文本式两种模式） -->
         <div class="card">
-          <div class="card-head"><span class="card-title">全局词表：查询 / 添加 token</span></div>
-          <div class="row">
-            <input class="grow" id="vocab-q" type="search" autocomplete="off"
-                   placeholder="搜索词表 token（如 hello / 你 / cx / shape）">
-            <button class="act sec" id="vocab-search">搜索</button>
-            <span class="hint" id="vocab-msg"></span>
+          <div class="card-head">
+            <span class="card-title">增删 token</span>
+            <div class="seg" id="vocab-mode-seg">
+              <button data-v="form">表单式</button>
+              <button data-v="text">文本式（.vfc）</button>
+            </div>
           </div>
-          <div class="hint" id="vocab-hits"></div>
-          <div class="row">
-            <input class="grow" id="vocab-add-token" type="text" autocomplete="off"
-                   placeholder="新 token 文本（如 𠀀 / &lt;mood&gt; / { ）">
-            <select id="vocab-add-cat" title="四类：regular 常规可见 / fallback 可见 / special 特殊 / system 系统">
-              <option value="regular">regular 常规可见</option>
-              <option value="fallback">fallback 可见</option>
-              <option value="special">special 特殊</option>
-              <option value="system">system 系统</option>
-            </select>
-            <button class="act" id="vocab-add">添加 token</button>
-            <span class="hint" id="vocab-add-msg"></span>
+
+          <div class="vrow">
+            <span class="vlabel">改动写入</span>
+            <div class="seg" id="vocab-write-seg">
+              <button data-v="this">直接改当前词表</button>
+              <button data-v="fork">Fork 一份再改</button>
+            </div>
+            <span class="hint" id="vocab-write-note"></span>
           </div>
-          <div class="hint">添加前全局查重（同文本已存在即拒绝）；新 token 占用该类预留槽位，写入词表文件，模型维度不变。</div>
+
+          <!-- 模式一：表单式 -->
+          <div id="vocab-pane-form">
+            <div class="row">
+              <input class="grow" id="vtok-token" type="text" autocomplete="off"
+                     placeholder="token 文本（如 hello / 你 / &lt;mood&gt; / { ）">
+              <select id="vtok-cat" style="width:auto"
+                      title="可显示 = 引号包裹形态；不可显示 = 尖括号包裹形态">
+                <option value="regular">regular 可显示</option>
+                <option value="special">special 不可显示</option>
+              </select>
+              <button class="act" id="vtok-add">添加</button>
+              <button class="act sec" id="vtok-remove">删除</button>
+              <button class="act sec" id="vtok-query">查询</button>
+            </div>
+            <div class="hint" id="vtok-msg"></div>
+            <div class="hint">查询只读，不改动词表；添加 / 删除会写入词表文件。
+              只有「可显示 / 不可显示」两种形态可选：可显示且为单个 a–z 字母的 token 会自动兼作 fallback；
+              { } | 属架构契约头，后端会拒绝添加。</div>
+          </div>
+
+          <!-- 模式二：文本式（裸文本编辑区，保存时做语法校验） -->
+          <div id="vocab-pane-text" hidden>
+            <div class="hint">直接改 .vfc 源文本。保存时后端会做语法校验，
+              不合法则拒绝写入并逐条指出行号与原因——失败时你写的内容会原样留在编辑区。
+              文件开头那一段是固定的架构契约头：不要增删或改顺序，否则保存会被逐条驳回。</div>
+            <textarea id="vsrc-text" class="vsrc" spellcheck="false" wrap="off"
+                      placeholder="载入中…"></textarea>
+            <div class="row">
+              <button class="act" id="vsrc-save">保存</button>
+              <button class="act sec" id="vsrc-reload">重新载入</button>
+              <span class="hint" id="vsrc-msg"></span>
+            </div>
+            <div class="verr" id="vsrc-err" hidden></div>
+          </div>
         </div>
 
-        <div class="card flush">
-          <div class="card-head"><span class="card-title">词表预设（每个从基础词表 fork，独立隔离、可增删）</span></div>
-          <div class="row" style="padding:0 2px">
-            <input type="text" id="vocab-new-name" placeholder="新预设名（字母/数字/_-）" style="max-width:240px">
-            <label class="hint">源预设</label>
-            <select id="vocab-new-source" style="width:auto;min-width:140px"></select>
-            <button class="act" id="vocab-create-preset">创建预设</button>
-            <span class="hint" id="vocab-create-msg"></span>
-          </div>
-          <div class="table-wrap" style="margin-top:10px">
-            <table id="vocab-presets">
-              <thead><tr><th>名称</th><th>已用 / 容量</th><th class="right">操作</th></tr></thead>
-              <tbody></tbody>
-            </table>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-head"><span class="card-title">预设内增删 token（软删保留 ID 位置）</span></div>
-          <div class="row">
-            <select id="vocab-token-preset" style="width:auto;min-width:140px"></select>
-            <input class="grow" id="preset-add-token" type="text" autocomplete="off" placeholder="新增 token 文本">
-            <select id="preset-add-cat" title="四类任选" style="width:auto">
-              <option value="regular">regular 常规可见</option>
-              <option value="fallback">fallback 可见</option>
-              <option value="special">special 特殊</option>
-              <option value="system">system 系统</option>
-            </select>
-            <button class="act" id="preset-add">添加</button>
-            <input class="grow" id="preset-remove-token" type="text" autocomplete="off" placeholder="删除 token 文本">
-            <button class="act sec" id="preset-remove">删除</button>
-            <span class="hint" id="preset-token-msg"></span>
-          </div>
+        <!-- 第 3 块：词表级操作 -->
+        <div class="row">
+          <button class="act danger" id="vocab-del">删除该词表</button>
+          <button class="act sec" id="vocab-dup">复制该词表</button>
+          <span class="hint" id="vocab-foot-msg"></span>
         </div>
       </section>
 
@@ -349,11 +367,8 @@
       <!-- ==================== 文本 ==================== -->
       <section class="page" id="p-text">
         <div class="row" style="margin-top:0">
-          <label>谁的输入 / 输出</label>
-          <select id="text-bound" style="width:auto">
-            <option value="user">用户输入 &lt;user&gt;</option>
-            <option value="model" selected>模型输出 &lt;model&gt;</option>
-          </select>
+          <label>用哪个词表来转换</label>
+          <select id="text-vocab" style="width:auto;min-width:160px"></select>
           <button class="act" id="text-encode">编码</button>
           <span class="hint">输出为 token 时间步格式：{}=一个时间步，{} 内 token 以 | 分隔</span>
         </div>
@@ -372,11 +387,8 @@
           每个音元是一个时间步；音频 token 是投影向量（无离散 ID），存档用 .tokenvector 格式。
         </div>
         <div class="row" style="margin-top:0">
-          <label>谁的输入 / 输出</label>
-          <select id="audio-bound" style="width:auto">
-            <option value="user" selected>用户输入 &lt;user&gt;</option>
-            <option value="model">模型输出 &lt;model&gt;</option>
-          </select>
+          <label>用哪个词表来转换</label>
+          <select id="audio-vocab" style="width:auto;min-width:160px"></select>
           <label class="file-pick" for="audio-file">
             <input type="file" id="audio-file" accept=".wav,.mp3,.flac,.ogg,audio/*">
             <span class="file-btn">选择文件</span>
@@ -394,11 +406,8 @@
           视觉 token 是投影向量（无离散 ID），存档用 .tokenvector 格式。
         </div>
         <div class="row" style="margin-top:0">
-          <label>谁的输入 / 输出</label>
-          <select id="image-bound" style="width:auto">
-            <option value="user" selected>用户输入 &lt;user&gt;</option>
-            <option value="model">模型输出 &lt;model&gt;</option>
-          </select>
+          <label>用哪个词表来转换</label>
+          <select id="image-vocab" style="width:auto;min-width:160px"></select>
           <label class="file-pick" for="image-file">
             <input type="file" id="image-file" accept="image/*">
             <span class="file-btn">选择文件</span>
@@ -420,11 +429,8 @@
           该 {} 内平铺该帧全部 patch token 与该帧音频 token。
         </div>
         <div class="row" style="margin-top:0">
-          <label>谁的输入 / 输出</label>
-          <select id="video-bound" style="width:auto">
-            <option value="user" selected>用户输入 &lt;user&gt;</option>
-            <option value="model">模型输出 &lt;model&gt;</option>
-          </select>
+          <label>用哪个词表来转换</label>
+          <select id="video-vocab" style="width:auto;min-width:160px"></select>
           <label class="file-pick" for="video-file">
             <input type="file" id="video-file" accept="video/*,.gif,.webp">
             <span class="file-btn">选择文件</span>
@@ -480,6 +486,8 @@
           <button class="act sec" id="json-minify">压缩</button>
           <button class="act sec" id="json-copy">复制</button>
           <button class="act" id="json-export">导出 .tokens</button>
+          <select id="json-vocab" style="width:auto;min-width:160px"
+                  title="导出时按哪个词表解析 token 名（&lt;stop&gt; 等）与校验 ID"></select>
           <span class="hint" id="json-msg"></span>
         </div>
         <div class="token-palette" id="json-palette"></div>

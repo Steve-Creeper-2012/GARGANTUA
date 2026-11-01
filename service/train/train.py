@@ -36,7 +36,8 @@ else:
 import boot
 boot.bootstrap()
 import spec
-from common import (CKPT_NAME, build_model, read_config, save_checkpoint,
+from common import (build_model, read_config, resolve_weights_path,
+                    save_checkpoint,
                     validate_block_size)
 from muon import build_optimizers
 from tokens.tokenset import load_corpus
@@ -119,9 +120,9 @@ def main():
                   + (f"  (跳过 {skipped} 窗)" if skipped else ""))
         if step % args.save_every == 0:
             save_checkpoint(args.model, m, _config_dict(args, m))
-            print(f"[train] saved {os.path.join(args.model, CKPT_NAME)}")
+            print(f"[train] saved {resolve_weights_path(args.model)}")
     save_checkpoint(args.model, m, _config_dict(args, m))
-    print(f"[train] done, saved {os.path.join(args.model, CKPT_NAME)}")
+    print(f"[train] done, saved {resolve_weights_path(args.model)}")
 
 
 def _config_dict(args, m) -> dict:
@@ -138,7 +139,9 @@ def _config_dict(args, m) -> dict:
         "d_model": spec.D_MODEL, "head_dim": spec.HEAD_DIM,
         "n_enc_blocks": len(m.enc_blocks),
         "n_dec_blocks": len(m.dec_blocks),
-        "vocab_size_padded": spec.VOCAB_SIZE_PADDED,
+        # 2026-10-30：词表长度是每个模型自己的属性（不再有全局 pad 值）。
+        # 以模型实例为准——训练中途换过词表时，这里记录的是实际在训的形状。
+        "vocab_size": int(getattr(m, "n_vocab", 0) or 0),
         "ctx_full": getattr(m, "ctx_full", spec.CTX_FULL),
         "ctx_compress": getattr(m, "ctx_compress", spec.CTX_COMPRESS),
         "csa_ratio": getattr(m, "csa_ratio", spec.CSA_RATIO),

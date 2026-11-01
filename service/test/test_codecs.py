@@ -273,7 +273,10 @@ class TestDrawCodec(unittest.TestCase):
         self.assertEqual(ids[7], b + spec.DRAW_G_OFFSET + 35)      # 70//2
         self.assertEqual(ids[8], b + spec.DRAW_B_OFFSET + 40)      # 80//2
         for t in ids:
-            self.assertTrue(0 <= t < spec.VOCAB_SIZE_PADDED)
+            # 图元 token 落在架构契约头的 DRAW 区（新契约：词表长度不再
+            # 全局钉死，但 DRAW 区的位置与大小仍是 spec 冻结契约）
+            self.assertTrue(
+                spec.DRAW_BEGIN <= t < spec.DRAW_BEGIN + spec.DRAW_VOCAB_SIZE)
 
     def test_theta_over_90_swaps_size(self):
         # theta ≥ 90°：归一到 [0,90) 并交换宽高（与仓库 encode 一致）

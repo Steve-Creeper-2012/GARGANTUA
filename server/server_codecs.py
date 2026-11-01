@@ -30,15 +30,33 @@ from server_util import num_param
 MAX_PRIMITIVES = 1000
 
 
-def token5_text(steps) -> str:
+def token5_text(steps, vocab=None) -> str:
     """Steps → token-5 可读文本（{text: 00001} / {wave: HEX} / {visual: …}）。
 
     前端不再自己拼格式：hex 载荷（2132 / 10240 字符）在 JS 里拼既慢又容易
     和 Python 侧的位序不一致，统一由后端给出唯一真相。
+
+    vocab 决定「哪些 ID 渲染成扩展系统 token 名字」；转换器选哪个词表就
+    传哪个，缺省用进程词表。
     """
     from tokens.vocab import get_vocab
-    items = tok5.from_steps(steps)
-    return tok5.to_display(items, name_of=tok5.vocab_name_of(get_vocab()))
+    v = vocab if vocab is not None else get_vocab()
+    items = tok5.from_steps(steps, vocab=v)
+    return tok5.to_display(items, name_of=tok5.vocab_name_of(v))
+
+
+def codec_vocab(body):
+    """转换器请求体里的 vocab 名 → 词表；缺省用进程词表。
+
+    词表不存在/名字非法 → ValueError（→400），不会静默回退到全局词表
+    ——用户明确选了 A 词表却用 B 编码，比报错危险得多。
+    """
+    name = body.get("vocab")
+    if not name:
+        from tokens.vocab import get_vocab
+        return get_vocab()
+    from vocab_presets import load_vocab
+    return load_vocab(name)
 
 
 class CodecApi:
@@ -48,19 +66,22 @@ class CodecApi:
         b64 = body.get("image_b64")
         if not b64:
             raise ValueError("缺少 image_b64")
+        v = codec_vocab(body)
         step = image_codec.image_to_step(b64_to_pil(b64))
         if len(step["meta"]["patches"]) > MAX_PATCHES_TOTAL:
             raise ValueError(
                 f"patch 数超限: {len(step['meta']['patches'])} > "
                 f"{MAX_PATCHES_TOTAL}")
         return 200, {"steps": [step_to_json(step)],
-                     "token5": token5_text([step]),
+                     "token5": token5_text([step], v),
+                     "vocab": v.name,
                      "archive": image_codec.step_to_archive(step)}
 
     def api_codec_frames(self, body):
         frames_b64 = body.get("frames_b64")
         if not frames_b64:
             raise ValueError("缺少 frames_b64")
+        v = codec_vocab(body)
         # 2026-10-27 审计修复：帧数与像素预算在解码【之前】检查——旧实现
         # 先把全部帧完整解码成 PIL（300 帧 × 8192² 可达数十 GB）才数帧数
         if len(frames_b64) > 300:
@@ -93,13 +114,15 @@ class CodecApi:
                                     "计数；最后一帧强制全量；静止帧（逐像素相同）"
                                     "送 1 个占位 patch 并标记 static"),
                      "steps": [step_to_json(s) for s in steps],
-                     "token5": token5_text(steps)}
+                     "token5": token5_text(steps, v),
+                     "vocab": v.name}
 
     def api_codec_audio(self, body):
         """音频 → 音元 token 序列。支持 wav/mp3/flac/ogg（ffmpeg 强兼容）。"""
         b64 = body.get("audio_b64")
         if not b64:
             raise ValueError("缺少 audio_b64")
+        v = codec_vocab(body)
         data = base64.b64decode(b64)
         filename = body.get("filename", "audio.wav")
         suffix = os.path.splitext(filename)[1] or ".wav"
@@ -129,7 +152,8 @@ class CodecApi:
                                 / spec.AUDIO_SR, 3),
             "filename": filename,
             "steps": [step_to_json(s) for s in steps],
-            "token5": token5_text(steps),
+            "token5": token5_text(steps, v),
+            "vocab": v.name,
         }
 
     def api_codec_draw(self, body):
@@ -193,15 +217,18 @@ class CodecApi:
         # TypeError → HTTP 500，违反 400 入参契约
         if not isinstance(text, str):
             raise ValueError(f"text 必须是字符串: {type(text).__name__}")
-        steps = text_encode(text)
+        v = codec_vocab(body)
+        steps = text_encode(text, vocab=v)
         return 200, {"steps": [step_to_json(s) for s in steps],
-                     "token5": token5_text(steps)}
+                     "token5": token5_text(steps, v),
+                     "vocab": v.name}
 
     # ---------------- video codec ----------------
     def api_codec_video(self, body):
         b64 = body.get("video_b64")
         if not b64:
             raise ValueError("缺少 video_b64")
+        v = codec_vocab(body)
         data = base64.b64decode(b64)
         suffix = os.path.splitext(body.get("filename", ".mp4"))[1] or ".mp4"
         # 2026-10-27 审计修复：临时文件的清理从创建起就受 try/finally
@@ -251,7 +278,6 @@ class CodecApi:
                         els.append(tok5.wave(a["meta"]["samples"]))
                 if els:
                     frames_token5.append(tok5.step(els))
-            from tokens.vocab import get_vocab
             return 200, {
                 "n_frames": len(frames),
                 "n_audio_tokens": len(audio_steps),
@@ -259,8 +285,8 @@ class CodecApi:
                 "audio_truncated": audio_truncated,
                 "steps": combined,
                 "token5": tok5.to_display(
-                    frames_token5,
-                    name_of=tok5.vocab_name_of(get_vocab())),
+                    frames_token5, name_of=tok5.vocab_name_of(v)),
+                "vocab": v.name,
             }
         finally:
             if vpath:

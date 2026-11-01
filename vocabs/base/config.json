@@ -1,0 +1,66 @@
+{
+  "name": "base",
+  "format": "gargantua-vocab-folder-v1",
+  "created": "2026-10-31 12:27:04",
+  "source": null,
+  "description": "基础词表（系统预设，不可直接编辑）",
+  "is_main": true,
+  "regions": [
+    {
+      "region": "special",
+      "category": "special",
+      "size": 6
+    },
+    {
+      "region": "system",
+      "category": "system",
+      "size": 3
+    },
+    {
+      "region": "draw",
+      "category": "special",
+      "size": 2961
+    },
+    {
+      "region": "digit",
+      "category": "regular",
+      "size": 10
+    },
+    {
+      "region": "whitespace",
+      "category": "regular",
+      "size": 6
+    },
+    {
+      "region": "symbol",
+      "category": "regular",
+      "size": 7263
+    },
+    {
+      "region": "emoji",
+      "category": "regular",
+      "size": 1517
+    },
+    {
+      "region": "cjk",
+      "category": "regular",
+      "size": 27584
+    },
+    {
+      "region": "english",
+      "category": "regular",
+      "size": 30000
+    },
+    {
+      "region": "extra",
+      "category": "regular",
+      "size": 0
+    },
+    {
+      "region": "fallback",
+      "category": "fallback",
+      "size": 26
+    }
+  ],
+  "vocab_size": 69376
+}

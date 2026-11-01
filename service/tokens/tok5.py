@@ -40,8 +40,11 @@ from pathlib import Path
 
 import spec
 
-# 词表上界：文本/扩展 token 的 ID 必须 < VOCAB_SIZE_PADDED
-ID_LIMIT = spec.VOCAB_SIZE_PADDED
+# 词表上界：文本/扩展 token 的 ID 必须 < MAX_VOCAB_SIZE。
+# 注意这不是「词表有多长」——词表长度每个词表不同，由各自的 config.json
+# 声明（2026-10-30 契约重构）。这里是 token-5 落盘格式能编码的硬上界：
+# ID 在字符流里占 5 位十进制，最大 99999。
+ID_LIMIT = spec.MAX_VOCAB_SIZE
 
 _HEX = frozenset(spec.T5_HEX_CHARS)
 _DIGITS = frozenset("0123456789")
@@ -561,7 +564,10 @@ def vocab_name_of(v):
     可见区 ID 返回 None（那些是普通文本 token，显示成 {text: NNNNN}）。
     """
     def f(tid: int):
-        if 0 <= tid < spec.INVISIBLE_END:
+        # 2026-10-30：不可显示不再靠「ID < HEAD_SIZE」这个固定边界
+        # 判断——用户可以把新的不可显示 token 追加到任意 ID。以词表自身
+        # 记录的形态为准。
+        if v.is_invisible(tid):
             name = v.id_to_token[tid]
             return None if name.startswith("<reserved:") else name
         return None
@@ -636,24 +642,29 @@ def _samples_to_int16(payload) -> list:
     return [int(v) for v in payload]
 
 
-def from_steps(steps) -> list:
+def from_steps(steps, vocab=None) -> list:
     """旧 List[Step] → token-5 流。
 
+    vocab 缺省用进程词表；它决定「哪些 ID 是不可显示 token」（见
+    vocab_name_of）——不要用固定边界判断。
+
     Step = {"token_ids", "type", "modality", "meta"}：
-      - text：token_ids → {t:}；ID 落在不可见区（< INVISIBLE_END）的按
-        扩展系统 token <id> 写出
+      - text：token_ids → {t:}；不可显示 ID 按扩展系统 token <id> 写出
       - audio：meta["samples"]（533 个采样）→ {w:}；末尾不足 533 的
         残段直接丢弃（spec 5b：每个音频 token 必须恰好 533 采样）
       - visual：meta["patches"]（x/y/vec 4096 字节）→ {v:...x:..y:..}
       - mixed：同一步内视觉 + 音频，视觉在前、音频在后
     """
+    if vocab is None:
+        from tokens.vocab import get_vocab
+        vocab = get_vocab()
     items: list = []
     for st in steps:
         modality = st.get("modality", "text")
         meta = st.get("meta") or {}
         if modality == "text":
             for tid in st.get("token_ids") or []:
-                if tid < spec.INVISIBLE_END:
+                if vocab.is_invisible(int(tid)):
                     items.append({"kind": "ext", "id": int(tid)})
                 else:
                     items.append(step(text(int(tid))))

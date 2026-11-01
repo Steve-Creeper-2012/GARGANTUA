@@ -74,18 +74,13 @@ def _run(args) -> dict:
         except ValueError as e:
             raise SystemExit(f"[init] {e}")
     dtype_name = args.dtype or "fp32"
-    # 2026-10-25：词表预设（每个模型从选定预设 seed 出 vocab.txt）
-    from vocab_presets import validate_preset, seed_model_vocab
+    # 2026-10-25：词表预设（每个模型从选定预设 seed 出自己的词表）
+    from vocab_presets import validate_vocab, vocab_dir
+    from common import CONFIG_NAME, install_model_vocab
     try:
-        preset_name = validate_preset(args.vocab)
+        preset_name = validate_vocab(args.vocab)
     except ValueError as e:
         raise SystemExit(f"[init] {e}")
-
-    torch.manual_seed(args.seed)
-    t0 = time.time()
-    m = Gargantua(n_enc_blocks=args.enc_blocks, n_dec_blocks=args.dec_blocks,
-                  **ctx)
-    n = sum(p.numel() for p in m.parameters())
 
     d = os.path.join(args.out, args.name)
     # 2026-10-27 审计修复（H4）：冲突检查—写入—发布全程持跨进程锁。
@@ -95,6 +90,24 @@ def _run(args) -> dict:
     with model_init_lock(d):
         if model_exists(d) and not args.force:
             raise SystemExit(f"[init] {d} 已存在，拒绝覆盖（--force 强制）")
+        # 2026-10-30 词表契约重构：先把词表整目录复制进 models/NAME/vocab/。
+        # 顺序不能反——模型本体的 wte / lm_head 行数由词表长度决定，必须
+        # 先落到 vocabs 目录里拿到 vocab_size，才能构造出形状正确的模型。
+        src_vocab = str(vocab_dir(preset_name))
+        vocab_size = install_model_vocab(d, src_vocab)
+        if vocab_size is None:
+            raise SystemExit(
+                f"[init] 词表预设 {preset_name!r} 没有声明 vocab_size："
+                f"{src_vocab}/{CONFIG_NAME} 缺失或字段非法。"
+                f"该预设还是旧格式（只有 vocab.txt），请用 .vfc 生成器"
+                f"重新导出后再建模")
+
+        torch.manual_seed(args.seed)
+        t0 = time.time()
+        m = Gargantua(n_enc_blocks=args.enc_blocks,
+                      n_dec_blocks=args.dec_blocks,
+                      vocab_size=vocab_size, **ctx)
+        n = sum(p.numel() for p in m.parameters())
         config = {
             "name": args.name,
             "created": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -105,7 +118,10 @@ def _run(args) -> dict:
                              else spec.N_ENC_BLOCKS),
             "n_dec_blocks": (args.dec_blocks if args.dec_blocks is not None
                              else spec.N_DEC_BLOCKS),
-            "vocab_size_padded": spec.VOCAB_SIZE_PADDED,
+            # 2026-10-30：词表长度（每个模型可以不同；common.model_vocab_size
+            # 据此构造 wte / lm_head 的形状）。旧的 "vocab_size_padded" 键随之
+            # 退役——长度不再「pad」到一个全局固定值，就是词表的真实长度。
+            "vocab_size": vocab_size,
             # 上下文长度（建模期可选；CSA/HCA 是同一段压缩区内容的两个视图）
             "ctx_full": ctx["ctx_full"],
             "ctx_compress": ctx["ctx_compress"],
@@ -117,8 +133,8 @@ def _run(args) -> dict:
             "vocab_preset": preset_name,
         }
         save_checkpoint(d, m, config)
-        # 2026-10-25：把选定词表预设的 vocab.txt 复制进模型目录（独立副本）
-        seed_model_vocab(d, preset_name)
+        # 词表已在建模之前复制进 models/NAME/vocab/（见上方 install_model_vocab）
+        # ——这里不再重复 seed：重复复制会覆盖用户在建模期间可能做的改动。
     _say(f"[init] 词表预设: {preset_name}  dtype: {dtype_name}")
     total_ctx = ctx["ctx_full"] + ctx["ctx_compress"]
     _say(f"[init] {d}  params={n/1e6:.1f}M  ({time.time()-t0:.1f}s)")

@@ -63,6 +63,10 @@ from PIL import Image
 ROOT = boot.project_root()   # 2026-10-24：项目根（旧布局曾是 service/）
 
 import spec
+from tokens.vocab import Vocab
+
+# 新契约：spec 不再钉死词表长度，显式取全局词表长度
+_VS = len(Vocab.global_vocab())
 import common
 import model as model_mod
 import server as srv
@@ -456,7 +460,8 @@ class TestAuditMisc(unittest.TestCase):
         # missing keys；转成 ValueError（→400）并给结论
         tmp = tempfile.mkdtemp(prefix="garg_audit_mdl_")
         try:
-            m = Gargantua(n_enc_blocks=1, n_dec_blocks=1)
+            m = Gargantua(n_enc_blocks=1, n_dec_blocks=1,
+                          vocab_size=_VS)
             save_checkpoint(tmp, m, {"name": "x", "n_enc_blocks": 1,
                                      "n_dec_blocks": 1})
             del m

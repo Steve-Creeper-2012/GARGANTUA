@@ -101,8 +101,13 @@ def encode_text(text: str, vocab=None):
     if not isinstance(text, str):
         raise ValueError(f"输入必须是字符串，得到 {type(text).__name__}")
     v = vocab if vocab is not None else get_vocab()
-    flat = getattr(v, "flat", False)
-    max_match = getattr(v, "_max_match", 1) if flat else 1
+    # 2026-10-31 修复：旧实现用 `flat` 属性门控贪心多字匹配，但词表契约
+    # 重构后 Vocab 不再有 flat——自定义词表的多字 token（中文词/短语）
+    # 全部编码不出来，skipped 逐字报未收录（gts 导出直接 GtsError）。
+    # 新契约下所有词表同一个类，统一按 _max_match 贪心：全局词表实测
+    # 69376 条中没有任何「非 ASCII 字母开头的多字 token」（多字英文词由
+    # 上面的词段路径处理，到不了这里），所以对全局词表零行为变化。
+    max_match = getattr(v, "_max_match", 1)
     ids: list = []
     skipped: list = []
     i, n = 0, len(text)
@@ -118,9 +123,9 @@ def encode_text(text: str, vocab=None):
             skipped.extend(wskip)
             i = j
             continue
-        if flat and max_match > 1:
-            # 扁平词表：贪心最长匹配——多字符 token（中文词/短语）才能
-            # 被文本编码产出；全局词表无此分支（单字符 + 英文词段策略）
+        if max_match > 1:
+            # 贪心最长匹配——多字符 token（中文词/短语）才能被文本编码
+            # 产出；英文词段在上面已按整词/fallback 处理，不会进这里
             hit = None
             for L in range(min(max_match, n - i), 1, -1):
                 tid = v.regular_ids.get(text[i:i + L])

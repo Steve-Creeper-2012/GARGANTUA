@@ -5,7 +5,7 @@
 #   1. 服务按需启动（server_services.ServiceSupervisor + JSON-lines 协议）
 #      ——用 stub 服务脚本测，不起 torch、不建模型，秒级完成；
 #        真实 infer/train serve 模式由 test_server.py 的 HTTP 集成测试覆盖。
-#   2. 每模型词表 vocab.txt（common.read_model_vocab + Vocab.from_tokens）
+#   2. 每模型词表 vocab/vocab.vfc（Vocab.load + set_model_vocab）
 #      ——ID 布局（不可见区保真）、守卫、编解码往返、贪心最长匹配、
 #        add_token 持久化、进程级覆盖不污染全局词表。
 # 运行：cd <ROOT> && python -m unittest service.test.test_services -v
@@ -33,7 +33,7 @@ boot.bootstrap()
 import spec
 import server_services
 import common
-from common import read_model_vocab
+from tokens import vfc
 from tokens.vocab import (Vocab, clear_model_vocab, get_vocab,
                           reset_vocab_cache, set_model_vocab)
 
@@ -190,8 +190,10 @@ class TestModelVocabTxt(unittest.TestCase):
     # ---------------- 布局与不可见区 ----------------
     def test_flat_layout_preserves_invisible_region(self):
         v = Vocab.from_tokens(["hello", "world"])
-        self.assertEqual(len(v), spec.VOCAB_SIZE_PADDED)
-        base = spec.INVISIBLE_END
+        # 新契约：from_tokens 造的是「头部 + 内容」的紧凑词表，不再
+        # padding 到全局固定长度——但头部契约原样保留
+        self.assertEqual(len(v), spec.HEAD_SIZE + 2)
+        base = spec.HEAD_SIZE
         self.assertEqual(v.token_to_id["hello"], base)
         self.assertEqual(v.token_to_id["world"], base + 1)
         # 不可见区固定 token 原样保真（<stop>/{ } | 的 ID 是架构契约）
@@ -211,9 +213,11 @@ class TestModelVocabTxt(unittest.TestCase):
             Vocab.from_tokens(["a", "b", "a"])
 
     def test_flat_vocab_rejects_over_limit(self):
-        limit = spec.VOCAB_SIZE_PADDED - spec.INVISIBLE_END
+        # 新契约：上界是安全硬上限 MAX_VOCAB_SIZE（含头部），不再有
+        # 「预留槽位」概念——词表必须占满，长度即真实长度
         with self.assertRaises(ValueError):
-            Vocab.from_tokens(["x"] * (limit + 1))
+            Vocab.from_tokens(
+                ["x"] * (spec.MAX_VOCAB_SIZE - spec.HEAD_SIZE + 1))
 
     # ---------------- 编解码 ----------------
     def test_encode_decode_roundtrip_and_greedy_match(self):
@@ -251,59 +255,51 @@ class TestModelVocabTxt(unittest.TestCase):
         self.assertIn(ids[1], get_vocab().regular_ids.values())
 
     # ---------------- 持久化与覆盖 ----------------
-    def test_add_token_persists_to_vocab_txt(self):
+    def test_add_token_persists_to_vocab_vfc(self):
         tmp = tempfile.mkdtemp(prefix="garg_vocab_")
         try:
-            p = os.path.join(tmp, "vocab.txt")
-            with open(p, "w", encoding="utf-8") as f:
-                f.write("alpha\nbeta\n")
-            v = Vocab.from_tokens(["alpha", "beta"], p)
+            p = os.path.join(tmp, "vocab.vfc")
+            base = vfc.head_entries() + [
+                (vfc.head_size() + i, t, True)
+                for i, t in enumerate(["alpha", "beta"])]
+            vfc.write_vfc(p, base)
+            v = Vocab.load(p)
             slot = v.add_token("gamma", "regular")
-            # 扁平词表优先吃 EXTRA 区（用户新增 token 的专用区）
-            self.assertEqual(slot, spec.EXTRA_BEGIN)
-            # 落盘是 v2 显式 ID 格式，且只含真实 token
-            entries, legacy = common.read_flat_vocab_file(p)
-            self.assertFalse(legacy)
-            self.assertEqual(entries, [(spec.INVISIBLE_END, "alpha"),
-                                       (spec.INVISIBLE_END + 1, "beta"),
-                                       (slot, "gamma")])
+            # 无分区元数据的词表：新 token 追加到正文末尾，ID 连续
+            self.assertEqual(slot, vfc.head_size() + 2)
+            # 落盘是 .vfc 格式，且只含真实 token
+            entries = vfc.read_vfc(p)
+            self.assertEqual([e[1] for e in entries][-3:],
+                             ["alpha", "beta", "gamma"])
+            self.assertEqual([e[0] for e in entries],
+                             list(range(len(entries))))
             # 重新加载应看到新 token，且原 ID 不漂移
-            v2 = Vocab.from_entries(common.read_model_vocab_entries(tmp)[0], p)
+            v2 = Vocab.load(p)
             self.assertEqual(v2.token_to_id["gamma"], slot)
-            self.assertEqual(v2.token_to_id["alpha"], spec.INVISIBLE_END)
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-
-    def test_read_model_vocab_contract(self):
-        tmp = tempfile.mkdtemp(prefix="garg_vocab_")
-        try:
-            self.assertIsNone(read_model_vocab(tmp))      # 没有 → None
-            p = os.path.join(tmp, "vocab.txt")
-            with open(p, "w", encoding="utf-8") as f:
-                f.write("a\n\nb\r\nc\n")                    # 空行/CRLF
-            self.assertEqual(read_model_vocab(tmp), ["a", "b", "c"])
-            with open(p, "w", encoding="utf-8") as f:
-                f.write("a\nb\na\n")
-            with self.assertRaises(ValueError):
-                read_model_vocab(tmp)
+            self.assertEqual(v2.token_to_id["alpha"], vfc.head_size())
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_set_model_vocab_switches_and_clears(self):
+        # 2026-10-31 新契约：模型词表是 models/NAME/vocab/vocab.vfc
+        #（旧 vocab.txt 不再读取）——set_model_vocab(model_dir) 应加载它
         tmp = tempfile.mkdtemp(prefix="garg_vocab_")
         try:
-            p = os.path.join(tmp, "vocab.txt")
-            with open(p, "w", encoding="utf-8") as f:
-                f.write("onlytok\n")
+            vdir = os.path.join(tmp, "vocab")
+            os.makedirs(vdir)
+            vfc.write_vfc(os.path.join(vdir, spec.VOCAB_FILE_NAME),
+                          vfc.head_entries()
+                          + [(vfc.head_size(), "onlytok", True)])
             set_model_vocab(tmp)
-            self.assertTrue(get_vocab().flat)
             self.assertEqual(get_vocab().lookup("onlytok"),
-                             spec.INVISIBLE_END)
-            # 没有 vocab.txt 的目录 → 清退全局
+                             spec.HEAD_SIZE)
+            # 没有 vocab 的目录 → 清退全局（用「全局词表里没有模型私有
+            # token」来验证真的切回去了）
             tmp2 = tempfile.mkdtemp(prefix="garg_vocab2_")
             try:
                 set_model_vocab(tmp2)
-                self.assertFalse(getattr(get_vocab(), "flat", False))
+                self.assertIsNone(get_vocab().token_to_id.get("onlytok"))
+                self.assertEqual(get_vocab().name, "base")
             finally:
                 shutil.rmtree(tmp2, ignore_errors=True)
         finally:

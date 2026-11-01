@@ -21,13 +21,18 @@ import torch.nn.functional as F
 
 import spec
 import model
+from tokens.vocab import Vocab
+
+# 新契约：spec 不再钉死词表长度；本文件测的是全尺寸模型（5.27 亿参数
+# 预算按全局词表长度计），显式传入与重构前固定默认等价的长度。
+_VS = len(Vocab.global_vocab())
 
 
 class TestShapes(unittest.TestCase):
     """ 形状与参数量。 """
 
     def test_total_params_in_budget(self):
-        m = model.Gargantua()
+        m = model.Gargantua(vocab_size=_VS)
         n = sum(p.numel() for p in m.parameters())
         # 预算 ~500M，允许上浮（embedding 不绑定 + 527.9M 实测基线）
         self.assertGreater(n, 450e6)
@@ -46,13 +51,13 @@ class TestShapes(unittest.TestCase):
 
     def test_forward_train_and_backward(self):
         torch.manual_seed(0)
-        m = model.Gargantua()
+        m = model.Gargantua(vocab_size=_VS)
         ids_in = torch.randint(64, 70000, (1, 6))
         steps_in = torch.arange(6).unsqueeze(0)
         ids_t = torch.randint(64, 70000, (1, 4))
         steps_t = torch.arange(6, 10).unsqueeze(0)
         logits = m.forward_train(ids_in, steps_in, ids_t, steps_t)
-        self.assertEqual(logits.shape, (1, 4, spec.VOCAB_SIZE_PADDED))
+        self.assertEqual(logits.shape, (1, 4, m.n_vocab))
         loss = F.cross_entropy(logits.view(-1, logits.shape[-1]),
                                torch.randint(64, 70000, (4,)))
         loss.backward()
@@ -204,7 +209,7 @@ class TestSharedKV(unittest.TestCase):
     """ 统一 KV 流：滑窗整步丢弃、双层视图、图元 9:1 就地压缩。"""
 
     def _mk(self):
-        m = model.Gargantua()
+        m = model.Gargantua(vocab_size=_VS)
         return model.SharedKV(m.csa_compressor, m.hca_compressor, m.draw_packer)
 
     def test_eviction_step_atomic(self):
@@ -266,7 +271,7 @@ class TestMultimodalAssemble(unittest.TestCase):
         from tokens.audio_codec import waveform_to_steps
         from tokens.text_codec import encode as text_encode
 
-        m = model.Gargantua()
+        m = model.Gargantua(vocab_size=_VS)
         steps = list(text_encode("你好"))
         steps.append(image_to_step(Image.new("RGBA", (64, 64), (200, 30, 30, 255))))
         steps.append(waveform_to_steps(np.zeros(600, dtype=np.int16))[0])
@@ -280,11 +285,11 @@ class TestMultimodalAssemble(unittest.TestCase):
         from PIL import Image
         from tokens.image_codec import image_to_step
         torch.manual_seed(0)
-        m = model.Gargantua()
+        m = model.Gargantua(vocab_size=_VS)
         steps = [image_to_step(Image.new("RGBA", (64, 64), (1, 2, 3, 255)))]
         emb, sids = m.assemble_embeddings(steps)
         logits = m.forward_train_embeddings(emb, sids, emb, sids + 1)
-        self.assertEqual(logits.shape, (1, 4, spec.VOCAB_SIZE_PADDED))
+        self.assertEqual(logits.shape, (1, 4, m.n_vocab))
         logits.float().mean().backward()          # 梯度能回穿视觉投影
         self.assertIsNotNone(m.visual_proj.weight.grad)
 

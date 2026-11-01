@@ -35,7 +35,12 @@ from PIL import Image
 import spec
 from common import make_batch, make_batch_emb
 from tokens import audio_codec, image_codec, tok5, tokenset
+from tokens.vocab import Vocab
 from train_step import forward_window, window_index, window_loss
+
+# 新契约：spec 不再钉死词表长度。generate() 会对真实文本走全局词表编码
+# （ID 可达 6.9 万），所以这里的模型必须按全局词表长度开 embedding。
+_VS = len(Vocab.global_vocab())
 
 
 def _multimodal_items():
@@ -157,7 +162,7 @@ class TestMultimodalTrainStep(unittest.TestCase):
     def setUpClass(cls):
         import model as model_mod
         torch.manual_seed(0)
-        cls.m = model_mod.Gargantua(n_enc_blocks=1, n_dec_blocks=1)
+        cls.m = model_mod.Gargantua(n_enc_blocks=1, n_dec_blocks=1, vocab_size=_VS)
         cls.m.train()
 
     def setUp(self):
@@ -197,7 +202,7 @@ class TestMultimodalGenerate(unittest.TestCase):
     def setUpClass(cls):
         import model as model_mod
         torch.manual_seed(0)
-        cls.m = model_mod.Gargantua(n_enc_blocks=1, n_dec_blocks=1)
+        cls.m = model_mod.Gargantua(n_enc_blocks=1, n_dec_blocks=1, vocab_size=_VS)
         cls.m.eval()
 
     def test_media_prefix_and_archive_order(self):

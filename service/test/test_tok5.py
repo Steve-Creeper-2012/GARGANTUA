@@ -28,6 +28,11 @@ import unittest
 
 import spec
 from tokens import tok5
+from tokens.vocab import Vocab
+
+# 新契约：spec 不再钉死词表长度。这些结构测试沿用全局词表长度
+# （与重构前的固定默认一致），合成 ID（如 50994）也落在其内。
+_VS = len(Vocab.global_vocab())
 
 
 class TestAlphabet(unittest.TestCase):
@@ -87,10 +92,12 @@ class TestElements(unittest.TestCase):
             tok5.parse_items("{t:000001}")      # 6 位
 
     def test_text_id_bounds(self):
-        self.assertEqual(tok5.text(spec.VOCAB_SIZE_PADDED - 1)["id"],
-                         spec.VOCAB_SIZE_PADDED - 1)
+        # 新契约：tok5 的上界是落盘格式的硬上界（5 位十进制），不再是
+        # 某张具体词表的长度——词表长度每个词表各自声明
+        self.assertEqual(tok5.text(tok5.ID_LIMIT - 1)["id"],
+                         tok5.ID_LIMIT - 1)
         with self.assertRaises(tok5.Tok5Error):
-            tok5.text(spec.VOCAB_SIZE_PADDED)
+            tok5.text(tok5.ID_LIMIT)
         with self.assertRaises(tok5.Tok5Error):
             tok5.text(-1)
 
@@ -310,7 +317,7 @@ class TestProjectionBridge(unittest.TestCase):
     def test_both_projections_are_single_linear_to_d_model(self):
         import torch.nn as nn
         import model as model_mod
-        m = model_mod.Gargantua(n_enc_blocks=1, n_dec_blocks=1)
+        m = model_mod.Gargantua(n_enc_blocks=1, n_dec_blocks=1, vocab_size=_VS)
         for name, in_dim in (("visual_proj", spec.PATCH_VEC_DIM),
                              ("audio_proj", spec.AUDIO_SAMPLES_PER_TOKEN)):
             lin = getattr(m, name)
@@ -322,7 +329,7 @@ class TestProjectionBridge(unittest.TestCase):
 
     def test_visual_and_audio_share_the_same_d_model(self):
         import model as model_mod
-        m = model_mod.Gargantua(n_enc_blocks=1, n_dec_blocks=1)
+        m = model_mod.Gargantua(n_enc_blocks=1, n_dec_blocks=1, vocab_size=_VS)
         self.assertEqual(m.visual_proj.out_features,
                          m.audio_proj.out_features)
         self.assertEqual(m.visual_proj.out_features, m.wte.embedding_dim)
@@ -330,7 +337,7 @@ class TestProjectionBridge(unittest.TestCase):
     def test_payload_reaches_projection_with_expected_shape(self):
         import torch
         import model as model_mod
-        m = model_mod.Gargantua(n_enc_blocks=1, n_dec_blocks=1)
+        m = model_mod.Gargantua(n_enc_blocks=1, n_dec_blocks=1, vocab_size=_VS)
         items = [
             tok5.step(tok5.visual([7] * spec.PATCH_VEC_DIM, 0, 0),
                       tok5.visual([9] * spec.PATCH_VEC_DIM, 1, 0)),
@@ -346,7 +353,7 @@ class TestProjectionBridge(unittest.TestCase):
 
     def test_mixed_frame_keeps_patch_then_audio_order(self):
         import model as model_mod
-        m = model_mod.Gargantua(n_enc_blocks=1, n_dec_blocks=1)
+        m = model_mod.Gargantua(n_enc_blocks=1, n_dec_blocks=1, vocab_size=_VS)
         items = [tok5.step(
             tok5.visual([1] * spec.PATCH_VEC_DIM, 0, 0),
             tok5.wave([2] * spec.AUDIO_SAMPLES_PER_TOKEN))]
@@ -359,14 +366,14 @@ class TestProjectionBridge(unittest.TestCase):
     def test_multimodal_forward_runs(self):
         """多模态教师强制前向可跑通（logits 落在词表维度）。"""
         import model as model_mod
-        m = model_mod.Gargantua(n_enc_blocks=1, n_dec_blocks=1)
+        m = model_mod.Gargantua(n_enc_blocks=1, n_dec_blocks=1, vocab_size=_VS)
         items = [tok5.step(tok5.visual([3] * spec.PATCH_VEC_DIM, 0, 0)),
                  tok5.step(tok5.text(50994))]
         steps = tok5.to_steps(items)
         emb, sids = m.assemble_embeddings(steps)
         logits = m.forward_train_embeddings(emb, sids, emb, sids)
         self.assertEqual(tuple(logits.shape),
-                         (1, 2, spec.VOCAB_SIZE_PADDED))
+                         (1, 2, m.n_vocab))
 
 
 if __name__ == "__main__":

@@ -55,6 +55,26 @@
 #     （40 bit），共 40960 bit → 10240 个 hex 字符，写作
 #     {v:<hex>x:<gx>y:<gy>}，同帧多个 patch 用 | 分隔。
 #
+# 定案记录（2026-10-30，steve 拍板，词表契约重构）：
+#   - 新格式 .vfc（vocabulary for converting）：UTF-8、一行一个 token、
+#     每行「内容:ID」，可显示用引号包裹、不可显示用 <> 包裹；编码 .tokens
+#     时读取。解释器见 tokens/vfc.py。
+#   - **词表长度不再由 spec 固定**：删除 VOCAB_SIZE / VOCAB_SIZE_PADDED /
+#     REGULAR_END / FALLBACK_BEGIN 以及可见区各固定 SIZE 上限。具体长度
+#     每个词表可以 vary，声明在该词表目录的 config.json 里。
+#   - **词表必须占满**：ID 严格连续 0..N-1，不允许任何空位（空位也占
+#     一个 embedding 行，白吃 RAM 且有副作用）。删除 token 走紧凑化
+#     （后续 ID 整体前移），不再是软删占位。
+#   - 架构契约头（special/system/modal-draw）的名字与顺序保持冻结，
+#     但**去掉历史预留空位**：SPECIAL_SIZE 64→6、SYSTEM_SIZE 32→3、
+#     MODAL_SIZE 12288→2961，故 HEAD_SIZE 12384→2970。
+#     头对所有词表一致，所以按 ID 定位（STOP_ID / TS_*_ID / DRAW_BEGIN）
+#     的语义不变——只是数值变了。
+#   - 每个词表是一个文件夹：<name>/{vocab.vfc, config.json}。
+#   - 每个模型是一个文件夹：<name>/{config.json, weights/, vocab/}
+#     （weights 拆三个 safetensors：主权重 / 离散 embedding / 连续
+#     投影；vocab 即使复用也整目录复制，防误删共享词表致模型报废）。
+#
 # 定案记录（2026-10-25，steve 拍板，内部流程对齐）：
 #   - block 内顺序改为 KDA → KDA → KDA → MLA-CSA → MLA-HCA → FFN → AttnRes
 #     （三个 KDA 连续，CSA 在前、HCA 在后）。
@@ -75,99 +95,48 @@
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# 1. 词表布局（32-bit ID，四大类，只可在各类 RESERVE 段内消耗）
+# 1. 词表布局
 # ---------------------------------------------------------------------------
-# 大类划分（enctok 只查 regular/fallback 两类；special/system 不可见，
+# 【2026-10-30 词表契约重构 —— 与旧版的根本差别】
+#
+# 旧版：spec 钉死 12 个固定大小的可见子区（合计 88690），再 pad 到 64 倍数
+#   得 VOCAB_SIZE_PADDED = 88704。实际基础词表只有约 6.6 万条真实 token，
+#   剩下全是 `<reserved:N>` 空位。空位照样占一个 embedding 行（wte 与
+#   lm_head 各 1024 维），纯属白吃 RAM，且会让 logits 里出现一堆永远
+#   不该被采样到的死行（副作用）。
+#
+# 新版：
+#   1) **词表长度不由 spec 规定**。删掉 VOCAB_SIZE / VOCAB_SIZE_PADDED /
+#      REGULAR_END / FALLBACK_BEGIN 与各可见区固定 SIZE。长度由每个词表
+#      目录下的 config.json 的 "vocab_size" 声明——每个词表可以 vary。
+#   2) **词表必须占满**：ID 严格连续 0..N-1，一个空位都不留。删除 token
+#      走紧凑化（其后的 ID 整体前移），不再是软删占位 `<del:N>`。
+#   3) spec 只冻结**架构契约头**：special / system / modal(draw) 三类
+#      不可见 token 的名字、顺序与 ID。头对所有词表一模一样。
+#
+# 为什么可以压缩头：头里原先有大量"预留"空位（SPECIAL 58 个、SYSTEM
+# 29 个、MODAL 9327 个），它们没有对应任何 token，纯粹是历史占位。
+# 压缩只改变**数值**，不改变**语义**——spec.TS_OPEN_ID 依然是"`{` 的
+# ID"。由于头对所有词表相同，按 ID 定位的 dectok / gts / draw_codec
+# 逻辑全部原样成立，一个函数签名都不用动（这一条是动工前专门核过的）。
+#
+# 大类划分（enctok 只查 regular/fallback 两类；special/system 不可显示，
 # 不参与文本编码）：
-#   regular  常规可见：数字 / 空白 / 符号 / emoji / 中文 / 英文词
-#   fallback 可见：a–z 26 个字母（常规未收录时逐字母兜底）
-#   special  特殊（不可见）：<caps> <user> <model> <stop> 等
-#   （<pad> 已删除：GARGANTUA 无 padding 批次；图元侧的 pad bin 由仓库
-#    布局自带的 special bin 承担）
-#   system   系统（不可见）：{ } | 时间步边界与步内分隔
-# 同一字符串在全词表内唯一（单字母词 a/i 不收录，由 fallback 承担），
-# token_to_id 反查无歧义。
-SPECIAL_TOKENS = [
-    "<caps>",                 # 大写标记：其后单词/字母首字母大写
-    "<user>", "<user/>",      # 用户输入段边界（TYPE_USER）
-    "<model>", "<model/>",    # 模型输出段边界（TYPE_MODEL）
-    "<stop>",                 # 生成停止标记：模型输出即停止
-]
-SPECIAL_BEGIN = 0x00000000
-SPECIAL_SIZE = 64             # 6 个已用 + 58 预留
+#   regular  可显示常规：数字 / 空白 / 符号 / emoji / 中文 / 英文词
+#   fallback 可显示兜底：a–z 26 个字母（常规未收录时逐字母兜底）
+#   special  不可显示特殊：<caps> <user> <model> <stop> 等
+#   system   不可显示系统：{ } | 时间步边界与步内分隔（架构契约头内）
+# 同一字符串在全词表内唯一，token_to_id 反查无歧义。
+#
+# 在 .vfc 文件里，这两类形态就是：可显示 = 引号包裹，不可显示 = <> 包裹
+# （见 tokens/vfc.py）。
 
-# 生成停止 token：模型输出该 token 即停止生成（落在 SPECIAL 区，
-# 不占用任何内容 token 区间；词表长度与模型输出维度均不变）
-STOP_TOKEN = "<stop>"
-STOP_ID = SPECIAL_TOKENS.index(STOP_TOKEN)   # 5
-
-# —— 系统 token（不可见，system 类：时间步结构）——
-# 显示即字面量：{ = 时间步开始，} = 时间步结束，| = 步内 token 分隔。
-TS_OPEN = "{"
-TS_CLOSE = "}"
-TS_SEP = "|"
-SYSTEM_BEGIN = SPECIAL_BEGIN + SPECIAL_SIZE   # 64
-SYSTEM_SIZE = 32               # 3 个已用 + 29 预留
-TS_OPEN_ID = SYSTEM_BEGIN + 0
-TS_CLOSE_ID = SYSTEM_BEGIN + 1
-TS_SEP_ID = SYSTEM_BEGIN + 2
-
-# —— 模态输出预留（图元 DRAW；token 布局照搬 primitive-operation-painter
-#    geometrize_256_v1）——
-# 这个区间的 token 是模型输出侧离散 token，归类为 special（不可见），
-# 但不通过「添加 token」功能开放（属预留演进位）。
-MODAL_BEGIN = SYSTEM_BEGIN + SYSTEM_SIZE      # 96
-MODAL_SIZE = 12288             # DRAW 2961 + 9327 预留
-
-DIGIT_BEGIN = MODAL_BEGIN + MODAL_SIZE        # 12384–12393：字符 '0'..'9'
-DIGIT_SIZE = 10
-
-WHITESPACE_BEGIN = DIGIT_BEGIN + DIGIT_SIZE   # 12394–12401
-WHITESPACE_CHARS = [" ", "\t", "\n", "\r", "\u00a0", "\u3000"]
-WHITESPACE_SIZE = 8
-
-SYMBOL_BEGIN = WHITESPACE_BEGIN + WHITESPACE_SIZE   # 12402
-# 全部 Unicode P*/S* 类码点（半角 + 全角 + 各平面符号，排除 emoji 区），
-# 另含全角字母数字（U+FF10–FF19 / U+FF21–FF3A / U+FF41–FF5A 共 62 个，
-# 保证全角文本无损 roundtrip）。
-SYMBOL_SIZE = 7680
-
-EMOJI_BEGIN = SYMBOL_BEGIN + SYMBOL_SIZE      # 20082
-# Unicode Emoji=Yes 属性码点（排除 ASCII 键帽基字符 # * 0–9——它们已在
-# SYMBOL/DIGIT 区）；ZWJ / VS16 / 肤色修饰等组件字符一并收录，ZWJ
-# 序列由多个 emoji token 组成。
-EMOJI_SIZE = 2048
-
-CJK_BEGIN = EMOJI_BEGIN + EMOJI_SIZE          # 22130
-# 中文单字：基本区 U+4E00–U+9FFF（20992）+ 扩展A U+3400–U+4DBF（6592）。
-# 扩展B 及以后暂不收录（未映射字符由 enctok 跳过并记录，可后续添加）。
-CJK_SIZE = 28672
-
-ENGLISH_BEGIN = CJK_BEGIN + CJK_SIZE          # 50802
-# 常用英文词 30000 个，全小写 [a-z]+（允许一个撇号后缀，如 don't）。
-# 单字母词（a / i）不收录——由 fallback 字母区承担，杜绝同文本双 ID。
-# 词源：hermitdave/FrequencyWords（经上一版词表按词频序提取）。
-ENGLISH_SIZE = 32768
-
-EXTRA_BEGIN = ENGLISH_BEGIN + ENGLISH_SIZE    # 83570
-# 用户新增常规可见 token 的分配区（「添加 token」功能消耗此区尾段）。
-EXTRA_SIZE = 4096
-REGULAR_END = EXTRA_BEGIN + EXTRA_SIZE        # 87666
-
-# —— fallback 可见区（a–z）——
-FALLBACK_BEGIN = REGULAR_END                  # 87666
-FALLBACK_LETTERS = "abcdefghijklmnopqrstuvwxyz"
-FALLBACK_SIZE = 1024            # 26 个已用 + 998 预留
-
-VOCAB_SIZE = FALLBACK_BEGIN + FALLBACK_SIZE   # 88690
-# 为矩阵对齐补齐到 64 的倍数
-VOCAB_SIZE_PADDED = (VOCAB_SIZE + 63) // 64 * 64  # 88704（尾部 reserved）
-
-# 不可见区总边界（SPECIAL + SYSTEM + MODAL）
-INVISIBLE_END = MODAL_BEGIN + MODAL_SIZE      # 12384
-
-# —— 图元输出 token（照搬 wonderfulearth/primitive-operation-painter
-#    geometrize_256_v1 布局；仅输出侧，视觉输入像素参数不入词表走投影）——
+# ---------------------------------------------------------------------------
+# 1a. 图元输出 token 布局（先定义：MODAL_SIZE 依赖 DRAW_VOCAB_SIZE）
+# ---------------------------------------------------------------------------
+# 照搬 wonderfulearth/primitive-operation-painter geometrize_256_v1。
+# 仅输出侧——视觉输入的像素参数不入词表，走线性投影。
+#
 # 每个图元 = 9 个 token，字段序（cx, cy, theta, w, h, shape, r, g, b）；
 # 各字段是独立 bin 区间（token ID = DRAW_BEGIN + 字段 offset + bin）：
 #   cx/cy  [0,256) px   ×2/bin   → 512 bins
@@ -176,11 +145,11 @@ INVISIBLE_END = MODAL_BEGIN + MODAL_SIZE      # 12384
 #   shape  -1=背景 0=矩形 1=椭圆（bin = shape_type+1，256 bins）
 #   r/g/b  0-255 //2（各 128 bins）
 #   special 3 bins（仓库布局自带：pad + 2 预留）
-DRAW_BEGIN = MODAL_BEGIN                    # 96
 DRAW_TOKENS_PER_PRIMITIVE = 9               # cx, cy, theta, w, h, shape, r, g, b
 DRAW_FIELD_ORDER = ("cx", "cy", "theta", "w", "h", "shape", "r", "g", "b")
 DRAW_CSV_COLUMNS = ("image_name", "cx", "cy", "w", "h", "shape_type",
                     "theta", "r", "g", "b")
+DRAW_SHAPES = ("background", "rectangle", "ellipse")   # shape_type -1/0/1
 XY_BINS_PER_PIXEL = 2
 ANGLE_BINS_PER_DEGREE = 3
 SIZE_BINS_PER_PIXEL = 4
@@ -192,20 +161,95 @@ DRAW_H_BINS = 512
 DRAW_SHAPE_BINS = 256
 DRAW_COLOR_BINS = 128
 DRAW_SPECIAL_BINS = 3
-DRAW_SHAPES = ("background", "rectangle", "ellipse")   # shape_type -1/0/1
-# 字段 offset（相对 DRAW_BEGIN）
+# 字段 offset（相对 DRAW_BEGIN）——由上面的 bin 数累加而来，与 base 无关。
+# 所以 DRAW_BEGIN 变成运行时值也不影响这段算术（draw_codec 直接用
+# `b + offset + bin`，b 一变自动跟随）。
 DRAW_X_OFFSET = 0
 DRAW_Y_OFFSET = DRAW_X_OFFSET + DRAW_X_BINS            # 512
 DRAW_ANGLE_OFFSET = DRAW_Y_OFFSET + DRAW_Y_BINS        # 1024
 DRAW_W_OFFSET = DRAW_ANGLE_OFFSET + DRAW_ANGLE_BINS    # 1294
-DRAW_H_OFFSET = DRAW_W_OFFSET + DRAW_W_BINS            # 1806
-DRAW_SHAPE_OFFSET = DRAW_H_OFFSET + DRAW_H_BINS        # 2318
+DRAW_H_OFFSET = DRAW_W_OFFSET + DRAW_W_BINS             # 1806
+DRAW_SHAPE_OFFSET = DRAW_H_OFFSET + DRAW_H_BINS         # 2318
 DRAW_R_OFFSET = DRAW_SHAPE_OFFSET + DRAW_SHAPE_BINS    # 2574
 DRAW_G_OFFSET = DRAW_R_OFFSET + DRAW_COLOR_BINS        # 2702
 DRAW_B_OFFSET = DRAW_G_OFFSET + DRAW_COLOR_BINS        # 2830
 DRAW_SPECIAL_OFFSET = DRAW_B_OFFSET + DRAW_COLOR_BINS  # 2958
 DRAW_VOCAB_SIZE = DRAW_SPECIAL_OFFSET + DRAW_SPECIAL_BINS   # 2961
-DRAW_SIZE = 4096            # 2961 已用 + 1135 预留（图元方案演进空间）
+
+# ---------------------------------------------------------------------------
+# 1b. 架构契约头（冻结：名字 + 顺序 + ID；所有词表共享，不得占用/重排）
+# ---------------------------------------------------------------------------
+# —— special 特殊（不可显示）——
+SPECIAL_TOKENS = [
+    "<caps>",                 # 大写标记：其后单词/字母首字母大写
+    "<user>", "<user/>",      # 用户输入段边界（TYPE_USER）
+    "<model>", "<model/>",    # 模型输出段边界（TYPE_MODEL）
+    "<stop>",                 # 生成停止标记：模型输出即停止
+]
+SPECIAL_BEGIN = 0x00000000
+# 旧值 64（6 已用 + 58 预留）→ 现在不留预留：按实际收录数排布
+SPECIAL_SIZE = len(SPECIAL_TOKENS)           # 6
+
+# 生成停止 token：模型输出该 token 即停止生成
+STOP_TOKEN = "<stop>"
+STOP_ID = SPECIAL_TOKENS.index(STOP_TOKEN)   # 5（与旧版一致）
+
+# —— system 系统（不可显示，时间步结构）——
+# 显示即字面量：{ = 时间步开始，} = 时间步结束，| = 步内 token 分隔。
+TS_OPEN = "{"
+TS_CLOSE = "}"
+TS_SEP = "|"
+SYSTEM_CHARS = [TS_OPEN, TS_CLOSE, TS_SEP]
+SYSTEM_BEGIN = SPECIAL_BEGIN + SPECIAL_SIZE   # 6（旧：64）
+# 旧值 32（3 已用 + 29 预留）→ 按实际收录数
+SYSTEM_SIZE = len(SYSTEM_CHARS)               # 3
+TS_OPEN_ID = SYSTEM_BEGIN + 0                  # 6（旧：64）
+TS_CLOSE_ID = SYSTEM_BEGIN + 1                 # 7（旧：65）
+TS_SEP_ID = SYSTEM_BEGIN + 2                   # 8（旧：66）
+
+# —— modal 模态输出（图元 DRAW；token 布局见 1a）——
+MODAL_BEGIN = SYSTEM_BEGIN + SYSTEM_SIZE      # 9（旧：96）
+# 旧值 12288（DRAW 2961 + 9327 预留）→ 只留实际用到的
+MODAL_SIZE = DRAW_VOCAB_SIZE                   # 2961
+DRAW_BEGIN = MODAL_BEGIN                       # 9（旧：96）
+
+# 架构契约头长度 = special + system + modal。**所有词表共享、固定**。
+# 可见区从这里开始；头内不允许任何空位（空位同样吃 embedding 行）。
+HEAD_SIZE = SPECIAL_SIZE + SYSTEM_SIZE + MODAL_SIZE     # 2970（旧：12384）
+
+# 词表长度安全上界。**这不是 spec 规定的长度**——词表多长由各词表的
+# config.json 说了算。上界来自 token-5 的 .tokens 落盘格式：文本/扩展
+# token 的 ID 占 5 位十进制（T5_ID_DIGITS），故 ID 最大 99999。
+MAX_VOCAB_SIZE = 100_000
+
+# 目录/文件命名（目录树契约，见第 9 节）
+VOCAB_DIR_NAME = "vocab"          # 模型目录内的词表子目录
+VOCAB_FILE_NAME = "vocab.vfc"      # 词表文件名（.vfc 格式）
+WEIGHTS_DIR_NAME = "weights"       # 模型目录内的权重子目录
+VOCAB_CONFIG_NAME = "config.json"   # 词表配置（含 vocab_size）
+
+# ---------------------------------------------------------------------------
+# 1c. 可见区：子区顺序与字符来源（**长度不固定**，由词表 config.json 决定）
+# ---------------------------------------------------------------------------
+# 可见区从 HEAD_SIZE 起，各子区按 VISIBLE_REGION_ORDER 的顺序**连续**
+# 排布；每个子区的长度 = 它实际收录的 token 数，不带任何预留。
+# 因此**不同词表的分区表是不同的**——这正是前端词表页要渲染的"分区"。
+VISIBLE_REGION_ORDER = ("digit", "whitespace", "symbol", "emoji",
+                        "cjk", "english", "extra", "fallback")
+
+# 各类字符来源（build_vocab.py 生成基础词表时取用；**不是长度上限**）
+WHITESPACE_CHARS = [" ", "\t", "\n", "\r", "\u00a0", "\u3000"]
+FALLBACK_LETTERS = "abcdefghijklmnopqrstuvwxyz"
+# 子区 → 大类的归属（category_of 用）
+REGION_CATEGORY = {
+    "digit": "regular", "whitespace": "regular", "symbol": "regular",
+    "emoji": "regular", "cjk": "regular", "english": "regular",
+    "extra": "regular", "fallback": "fallback",
+}
+
+# 2026-10-24：MIDI 输出 token 暂时删除（steve：研究后再定），midi_codec
+# 与 /api/codec/midi 一并移除；如恢复从 git 历史取回。
+
 
 # 2026-10-24：MIDI 输出 token 暂时删除（steve：研究后再定），midi_codec
 # 与 /api/codec/midi 一并移除；如恢复从 git 历史取回。
@@ -445,12 +489,12 @@ DTYPE = "float32"            # 训练/推理默认 FP32（x86_64 mac 无 CUDA）
 # 每模型词表（vocab.txt）：
 #   models/NAME/vocab.txt 是 v2 扁平词表（2026-10-27 审计修复 H1）：
 #   首行魔数 "#gargantua-vocab-v2"，其后每行 "<ID>\t<JSON 字符串>"，ID
-#   显式给出，落在 [INVISIBLE_END, VOCAB_SIZE_PADDED)（不可见区
-#   [0, INVISIBLE_END) 是 special/system/modal 固定 token 的架构契约——
+#   显式给出，落在 [HEAD_SIZE, MAX_VOCAB_SIZE)（不可见区
+#   [0, HEAD_SIZE) 是 special/system/draw 固定 token 的架构契约——
 #   <stop>/<caps>/{ } |/图元输出 token 的 ID 由上面的常量按 ID 定位，
 #   decode 的停止/大小写逻辑靠它们，自定义词表不得占用）。未列出的 ID
 #   即空位（可被「添加 token」回收）；重复 ID / 重复文本拒绝（反查歧义）。
-#   旧 v1 位置式文件（一行一个 token，第 N 行 → INVISIBLE_END + N）读入
+#   词表正文是 .vfc（一行一个 token，见 tokens/vfc.py）
 #   时自动就地升级，ID 映射不变。
 #   扁平词表的可见部分全部按 regular 处理；special/system 查表映射取自
 #   固定 head，单字母 regular token 兼作 fallback（英文拼写兜底）。

@@ -53,7 +53,7 @@ else:
 import boot
 boot.bootstrap()
 import spec
-from common import (CKPT_NAME, MAX_NEW_TOKENS, MAX_PROMPT_TOKENS,
+from common import (MAX_NEW_TOKENS, MAX_PROMPT_TOKENS,
                     build_model, model_exists)
 from tokens import tok5
 from tokens.text_codec import encode as text_encode, decode as text_decode
@@ -170,7 +170,8 @@ def _decode_media(items):
 class IdArchive:
     """一次推理的 token id 存档（.tokens + .json 元数据）。 """
 
-    def __init__(self, model_dir: str = "", root: str | None = None):
+    def __init__(self, model_dir: str = "", root: str | None = None,
+                 vocab=None):
         self.model_dir = model_dir or ""
         self.root = Path(root) if root else (
             Path(boot.project_root()) / "logs" / "infer_archive")
@@ -179,6 +180,19 @@ class IdArchive:
         self._w: tok5.BitWriter | None = None
         self._disabled = False
         self.n_tokens = 0
+        self._vocab = vocab
+
+    def _is_invisible(self, i: int) -> bool:
+        """该 ID 是否不可显示。
+
+        2026-10-30：不再用「i < HEAD_SIZE」这个固定边界——用户可以把
+        新的不可显示 token 追加到任意 ID。以词表自身记录的形态为准。
+        vocab 延迟到首次调用时才解析：IdArchive 可能在 set_model_vocab()
+        之前就被构造出来（见 generate() 与 load_model() 的调用顺序）。"""
+        if self._vocab is None:
+            from tokens.vocab import get_vocab
+            self._vocab = get_vocab()
+        return self._vocab.is_invisible(i)
 
     def _ensure(self) -> bool:
         if self._fh is not None:
@@ -201,9 +215,8 @@ class IdArchive:
     def add(self, ids) -> None:
         """把一批 token id 以「一 token 一步」写入存档并 flush。
 
-        不可见区（< INVISIBLE_END）的 id 按扩展系统 token 写成 <NNNNN>，
-        其余写成 {t:NNNNN}——与 token-5 语义一致（后者才是有向量的内容
-        token）。
+        不可显示 token 的 id 按扩展系统 token 写成 <NNNNN>，其余写成
+        {t:NNNNN}——与 token-5 语义一致（后者才是有向量的内容 token）。
         """
         ids = [int(i) for i in ids]
         if not ids or not self._ensure():
@@ -211,7 +224,7 @@ class IdArchive:
         try:
             chars = []
             for i in ids:
-                if i < spec.INVISIBLE_END:
+                if self._is_invisible(i):
                     chars.append("<%05d>" % i)
                 else:
                     chars.append("{t:%05d}" % i)
@@ -433,7 +446,7 @@ def generate(m, prompt: str, max_new: int = 32,
 
 
 def _load_model(model_dir: str):
-    """加载模型 + 应用该模型的词表（vocab.txt 覆盖，2026-10-24）。
+    """加载模型 + 应用该模型的词表（vocab/vocab.vfc 覆盖，2026-10-30 契约）。
 
     缺权重文件必须显式报错：build_model 静默用随机初始化会让手误的
     路径产出「看似正常」的乱码输出（审查记录 P2）。"""

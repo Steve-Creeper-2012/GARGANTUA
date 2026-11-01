@@ -1,16 +1,24 @@
 # ===========================================================================
-# GARGANTUA v1 — vocab_presets.py：多词表预设管理（2026-10-25）
+# GARGANTUA v1 — vocab_presets.py：多词表管理（2026-10-30 契约重构）
 # ---------------------------------------------------------------------------
-# 用户要求：允许用户创建多个词表预设，每个都从基础词表（现有全局词表）fork
-# 出来，彼此独立隔离、可独立增删。创建模型时从选定预设 seed 出
-# models/NAME/vocab.txt。
+# 每个词表是一个**文件夹**：
+#     vocabs/<name>/
+#       vocab.vfc      词表正文（.vfc 格式，见 tokens/vfc.py）
+#       config.json    词表配置（含 vocab_size 与分区表）
 #
-# 存储：vocabs/<name>/vocab.txt（扁平可见 token 列表，v2 格式带显式 ID；
-# 见 common.VOCAB_FILE_MAGIC）。base 为系统预设，由全局 vocab.json 的
-# 可见区派生——只导出真实 token，reserved 占位符不落盘。
+# - base 是系统预设（main），**禁止直接编辑/删除**；要改就先 Fork 一份。
+# - Fork = 整目录复制（vfc + config），新词表与源彼此独立、可独立增删。
+# - 创建模型时把选定词表的**两个文件都复制**进 models/NAME/vocab/
+#   （即使多个模型复用同一词表也各自持有一份——否则用户误删共享词表，
+#    模型就彻底不能工作了）。
 #
-# 增删：复用 tokens.vocab.Vocab（flat 模式）的 add_token / remove_token；
-# remove_token 走软删（<del:N> 占位符），保留 ID 位置。
+# 词表不变量（由 tokens/vfc.py 与 tokens/vocab.py 强制）：
+#   - ID 严格连续 0..N-1，**不允许空位**（空位也要占一个 embedding 行）
+#   - token 文本全表唯一
+#   - 前 HEAD_SIZE 个 ID 是架构契约头（special/system/draw），不可删改
+#
+# 安全：所有路径拼接都先过 vocab_dir() 的名字校验 + realpath 前缀校验，
+# 防止 HTTP 入参 name / new_name 穿越写出到任意 vocab.vfc。
 # ===========================================================================
 from __future__ import annotations
 
@@ -19,37 +27,74 @@ import os
 import shutil
 import sys
 import threading
+import time
+import uuid
 from pathlib import Path
 
 import spec
-from common import (VOCAB_FILE_MAGIC, read_flat_vocab_file,
-                    write_flat_vocab_file)
-from tokens.vocab import DEL_MARKER, Vocab
+from tokens import vfc
+from tokens.vocab import (VOCAB_DIR_NAME, VOCAB_FILE_NAME,
+                          DEFAULT_APPEND_REGION, Vocab, model_vocab_dir)
+
+# 词表目录下的配置文件名
+VOCAB_CONFIG_NAME = spec.VOCAB_CONFIG_NAME
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VOCABS_DIR = PROJECT_ROOT / "vocabs"
 BASE = "base"
-GLOBAL_VOCAB_JSON = PROJECT_ROOT / "service" / "tokens" / "vocab.json"
+VOCAB_FOLDER_FORMAT = "gargantua-vocab-folder-v1"
 
-_LOCK = threading.Lock()
+GLOBAL_VOCAB_DIR = PROJECT_ROOT / "service" / "tokens"
+GLOBAL_VOCAB_VFC = GLOBAL_VOCAB_DIR / VOCAB_FILE_NAME
+
+# 词表级互斥：create/delete/write 会在内部互相调用（write_vocab_text →
+# create_vocab），必须是可重入锁，否则同一线程自锁死。
+_LOCK = threading.RLock()
+
+# ---------------------------------------------------------------------------
+# Vocab 实例缓存（2026-10-31 性能）
+# ---------------------------------------------------------------------------
+# load_vocab 每次全量解析 .vfc（base ≈ 6.9 万行，含转义/唯一性/契约头
+# 校验，数百毫秒级），而 regions/query/occupancy/list 全都走它——一次
+# 页面刷新能解析七八遍。按 (mtime_ns, size) 键控缓存：文件没变就直接复
+# 用。写路径（add/remove/fork 写入）落盘后 mtime 必变 → 缓存自然失效，
+# 所以失效逻辑是自洽的；只有读路径共享实例，且读路径不变异词表。
+_CACHE_LIMIT = 8
+_VCACHE: dict = {}
+_VCACHE_ORDER: list = []
 
 
-def _valid_name(name) -> str | None:
-    if not name or not isinstance(name, str):
-        return "词表预设名不能为空"
-    if len(name) > 64:
-        return "词表预设名过长（>64）"
-    import re
-    if re.search(r'[^A-Za-z0-9_-]', name):
-        return "词表预设名只能含字母/数字/下划线/连字符"
-    if name in (".", ".."):
-        return "非法名称"
+def _cache_get(key: str, sig: tuple):
+    hit = _VCACHE.get(key)
+    if hit and hit[0] == sig:
+        return hit[1]
     return None
 
 
+def _cache_put(key: str, sig: tuple, v) -> None:
+    if key not in _VCACHE:
+        _VCACHE_ORDER.append(key)
+        while len(_VCACHE_ORDER) > _CACHE_LIMIT:
+            _VCACHE.pop(_VCACHE_ORDER.pop(0), None)
+    _VCACHE[key] = (sig, v)
+
+
 # ---------------------------------------------------------------------------
-# 读取 / 写入扁平词表文件
+# 名字校验 / 路径安全
 # ---------------------------------------------------------------------------
+def _valid_name(name) -> str | None:
+    if not name or not isinstance(name, str):
+        return "词表名不能为空"
+    if len(name) > 64:
+        return "词表名过长（>64）"
+    if name in (".", ".."):
+        return "非法名称"
+    for ch in name:
+        if not (ch.isascii() and (ch.isalnum() or ch in "_-")):
+            return "词表名只能含字母/数字/下划线/连字符"
+    return None
+
+
 def _assert_within_vocabs(name, path) -> None:
     """realpath 前缀校验：解析符号链接后路径仍须落在 VOCABS_DIR 内。"""
     base = os.path.realpath(VOCABS_DIR)
@@ -59,288 +104,519 @@ def _assert_within_vocabs(name, path) -> None:
     except ValueError:          # 跨盘符 / 混合绝对相对路径：无公共前缀
         inside = False
     if not inside:
-        raise ValueError(f"非法词表预设名: {name!r}")
+        raise ValueError(f"非法词表名: {name!r}")
 
 
-def preset_dir(name) -> Path:
-    # 统一底层强制校验（2026-10-30 安全修复）：所有预设读写入口都经由这里
-    # 拼路径——vocab_txt_path 直接调用它，validate_preset / create_preset /
-    # delete_preset / ensure_base / _write_preset 也都用它。此前只有
-    # create_preset / delete_preset 校验 name，HTTP 入参的 name / source /
-    # --vocab 可传 "../models/alpha" 在其余入口穿越写出到任意 vocab.txt。
-    # 在这里拦一次即可覆盖全部调用者，避免逐处补校验再次遗漏。
-    # 一律抛 ValueError：server.do_POST 把 ValueError 统一映射为 400。
+def vocab_dir(name) -> Path:
+    """vocabs/<name>/ —— 所有词表读写的唯一路径入口（统一在此校验）。"""
     if _valid_name(name) is not None:
-        raise ValueError(f"非法词表预设名: {name!r}")
+        raise ValueError(f"非法词表名: {name!r}")
     p = VOCABS_DIR / name
     _assert_within_vocabs(name, p)   # 防 name 为符号链接目录绕过
     return p
 
 
-def vocab_txt_path(name) -> Path:
-    p = preset_dir(name) / "vocab.txt"
-    # 目录层已校验；这里再对最终 vocab.txt 做一次前缀校验（纵深防御，
-    # 防目录内 vocab.txt 被换成指向外部文件的符号链接）。
+def vocab_vfc_path(name) -> Path:
+    """词表正文文件路径：vocabs/<name>/vocab.vfc。"""
+    p = vocab_dir(name) / VOCAB_FILE_NAME
+    # 目录层已校验；这里再对最终文件做一次前缀校验（纵深防御，防目录内
+    # vocab.vfc 被换成指向外部文件的符号链接）。
     _assert_within_vocabs(name, p)
     return p
 
 
-def read_flat_entries(name: str) -> list:
-    """读预设的条目 [(id, token)]（v2 显式 ID；旧格式文件就地升级）。"""
-    p = vocab_txt_path(name)
+def config_path(name) -> Path:
+    p = vocab_dir(name) / VOCAB_CONFIG_NAME
+    _assert_within_vocabs(name, p)
+    return p
+
+
+# ---------------------------------------------------------------------------
+# config.json 读写
+# ---------------------------------------------------------------------------
+def _write_json_atomic(path: Path, data: dict) -> None:
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def read_config(name: str) -> dict:
+    """读 vocabs/<name>/config.json；缺失/损坏返回 {}。"""
+    p = config_path(name)
     if not p.is_file():
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception as e:
+        print(f"[vocab_presets] config.json 读取失败（{name}）: {e}",
+              file=sys.stderr)
+        return {}
+
+
+def write_config(name: str, cfg: dict) -> None:
+    vocab_dir(name).mkdir(parents=True, exist_ok=True)
+    _write_json_atomic(config_path(name), cfg)
+
+
+def _regions_from_cfg(cfg: dict) -> list:
+    rs = cfg.get("regions")
+    if not isinstance(rs, list) or not rs:
         return []
-    return read_flat_vocab_file(str(p))[0]
-
-
-def read_flat_tokens(name: str) -> list:
-    """读预设的 token 文本列表（按 ID 升序；展示/断言用）。"""
-    return [t for _, t in read_flat_entries(name)]
-
-
-def _used_count(name: str) -> int:
-    """已用槽位：真实 token（排除 reserved 空位与 <del:N> 软删占位）。"""
-    return sum(1 for t in read_flat_tokens(name)
-               if not t.startswith(DEL_MARKER)
-               and not t.startswith("<reserved:"))
-
-
-def _global_visible_entries() -> list:
-    """全局词表可见区的真实 token（排除 reserved 占位符），带全局 ID。"""
-    data = json.loads(GLOBAL_VOCAB_JSON.read_text(encoding="utf-8"))
     out = []
-    for i in range(spec.INVISIBLE_END, spec.VOCAB_SIZE_PADDED):
-        t = data["id_to_token"][i]
-        if t.startswith("<reserved:"):
+    for r in rs:
+        if not isinstance(r, dict):
             continue
-        out.append((i, t))
+        out.append({"region": str(r.get("region", "?")),
+                    "category": str(r.get("category", "regular")),
+                    "size": max(int(r.get("size", 0)), 0)})
     return out
 
 
-def _write_preset(name: str, entries) -> None:
-    preset_dir(name).mkdir(parents=True, exist_ok=True)
-    write_flat_vocab_file(str(vocab_txt_path(name)), entries)
+def _sync_config(name: str, n: int | None = None) -> dict:
+    """按当前 vocab.vfc 的实际内容刷新 config.json。
 
+    两件事：
+      1. `vocab_size` 与正文条数对齐（正文是唯一事实源）；
+      2. 各分区 size 之和必须等于正文条数。不等时**只调整 extra 区**的
+         size 补齐差额，而不是把整张分区表塌成一个 "visible" 区——后者
+         会让用户每次手工编辑正文（模式二）就丢掉全部分区信息。
+         假定「正文编辑的增删落在 extra 区」，这是模式二最常见的情形；
+         若用户删的是 cjk 区中间某行，分区边界会偏一点（表格仍自洽），
+         属于可接受的近似，远好过整表消失。
 
-def _is_unmodified_seed(entries) -> bool:
-    """旧文件是否只是「全局可见区 join 出来的副本」（无用户改动）。"""
-    g = _global_visible_entries()
-    gset = {t for _, t in g}
-    toks = [t for _, t in entries]
-    if not toks:
-        return True
-    if len(toks) > len(g):
-        return False                       # 多出来的只能是用户新增
-    if not all(t in gset for t in toks):
-        return False
-    # 旧格式必然丢掉 "\n"/"\r" 这类无法用行表示的 token（数量极少）
-    return len(g) - len(toks) <= 8
-
-
-def _upgrade_preset(name: str) -> bool:
-    """把旧格式（v1）预设升级为 v2；返回是否发生了升级。
-
-    base 与「未编辑过的 fork」按全局可见区重写——它们的 ID 本就应与全局
-    一致，旧文件里被空行吞掉的 "\\n"/"\\r" 与 reserved 占位符一并清掉。
-    用户改过的预设只换表示法、不重排 ID（已训练的权重行对应关系不动）。
+    n 可传入已统计好的正文条数（调用方刚解析过 .vfc 时避免二次全量
+    解析——base ≈ 6.9 万行，一次解析数百毫秒）。
     """
-    txt = vocab_txt_path(name)
-    # 快路径：已是 v2 就只读首行，避免每次列预设都全文解析 6 万条
-    with open(txt, encoding="utf-8") as f:
-        if f.readline().strip() == VOCAB_FILE_MAGIC:
-            return False
-    entries, legacy = read_flat_vocab_file(str(txt))
-    if not legacy:
-        return False
-    real = [(i, t) for i, t in entries if not t.startswith("<reserved:")]
-    if _is_unmodified_seed(real):
-        _write_preset(name, _global_visible_entries())
-    else:
-        print(f"[vocab_presets] {name}: 旧格式词表就地升级（ID 保持不变）",
-              file=sys.stderr)
-        _write_preset(name, real)
-    return True
+    if n is None:
+        n = sum(1 for _ in vfc.read_vfc(str(vocab_vfc_path(name))))
+    cfg = read_config(name)
+    regions = _regions_from_cfg(cfg)
+    total = sum(r["size"] for r in regions)
+    if not regions:
+        regions = [{"region": "visible", "category": "regular", "size": n}]
+    elif total != n:
+        delta = n - total
+        target = next((r for r in regions if r["region"] == "extra"), None)
+        if target is None:
+            target = {"region": "extra", "category": "regular", "size": 0}
+            regions.append(target)
+        target["size"] = max(target["size"] + delta, 0)
+        # 极端情况下 extra 被压到 0 还差（用户删得比 extra 还多）：把剩余
+        # 差额摊到最后一个非空区，保证 sum == n 这条硬约束成立。
+        rest = n - sum(r["size"] for r in regions)
+        if rest:
+            for r in reversed(regions):
+                if r["size"] + rest >= 0:
+                    r["size"] += rest
+                    break
+    cfg["name"] = name
+    cfg["format"] = VOCAB_FOLDER_FORMAT
+    cfg["is_main"] = (name == BASE)
+    cfg["regions"] = regions
+    cfg["vocab_size"] = n
+    old = read_config(name)
+    if old != cfg:                    # 内容没变就不写盘（list 每次都会调）
+        write_config(name, cfg)
+    return cfg
+
+
+def save_vocab_config(name: str, v: Vocab) -> None:
+    """把内存词表的分区表写进 config.json。
+
+    调用前提：正文已经落盘（Vocab.add_token / remove_token 内部会写
+    .vfc）。这里只同步元数据，顺序上永远「先正文、后配置」——配置里的
+    vocab_size 不会指向一份还没写下去的正文。
+    """
+    cfg = read_config(name)
+    cfg["name"] = name
+    cfg["format"] = VOCAB_FOLDER_FORMAT
+    cfg["is_main"] = (name == BASE)
+    cfg["regions"] = [{"region": r["region"], "category": r["category"],
+                       "size": r["size"]} for r in v.regions]
+    cfg["vocab_size"] = len(v)
+    write_config(name, cfg)
 
 
 # ---------------------------------------------------------------------------
-# 预设生命周期
+# 全局基础词表 → base 预设
 # ---------------------------------------------------------------------------
+def _global_config() -> dict:
+    """全局词表的 config.json（分区表 / user_added 重放源）。"""
+    p = GLOBAL_VOCAB_DIR / "config.json"
+    if not p.is_file():
+        return {}
+    try:
+        cfg = json.loads(p.read_text(encoding="utf-8"))
+        return cfg if isinstance(cfg, dict) else {}
+    except (ValueError, OSError) as e:
+        print(f"[vocab_presets] {p} 读取失败: {e}", file=sys.stderr)
+        return {}
+
+
+def _global_regions() -> list:
+    """全局词表的分区表（从 build_vocab 产出的 config 里取）。"""
+    rs = _global_config().get("regions")
+    if isinstance(rs, list) and rs:
+        return [{"region": str(r.get("region", "?")),
+                 "category": str(r.get("category", "regular")),
+                 "size": max(int(r.get("size", 0)), 0)}
+                for r in rs if isinstance(r, dict)]
+    return []
+
+
 def ensure_base() -> None:
-    """确保 base 预设存在：从全局 vocab.json 的可见区派生。幂等。
+    """确保 base 词表存在（从全局基础词表派生）。幂等。
 
-    2026-10-27 审计修复（H1）：只导出真实 token（显式 ID + JSON 转义），
-    不再把 9914 个 reserved 占位符写进文件——旧实现让可见区一上来就被
-    占满（free_slots=0），任何「添加 token」都必然失败，且 token 自身的
-    "\\n"/"\\r" 会把整段 ID 顶前 2 位。旧格式文件在首次访问时就地升级。
+    派生规则：正文逐条复制全局 vocab.vfc（已经是连续编号且带头部契约），
+    分区表取全局 meta 的 regions；两者条数不一致时以正文为准兜底。
+
+    已存在时的健康检查（2026-10-31 性能版）：只做 mtime 比较而不是每次
+    全量解析 .vfc —— config.json 比 vocab.vfc 新 = 上次同步后正文没被
+    手改过，直接返回（本函数被每个词表 API 调用，全量解析会把每个请求
+    拖慢数百毫秒）。mtime 拿不到时保守起见照旧同步。
     """
-    d = preset_dir(BASE)
-    txt = vocab_txt_path(BASE)
-    if txt.is_file():
-        _upgrade_preset(BASE)
+    d = vocab_dir(BASE)
+    txt = vocab_vfc_path(BASE)
+    if txt.is_file() and config_path(BASE).is_file():
+        try:
+            drift = txt.stat().st_mtime > config_path(BASE).stat().st_mtime
+        except OSError:
+            drift = True
+        if not drift:
+            return
+        _sync_config(BASE)
         return
     d.mkdir(parents=True, exist_ok=True)
-    _write_preset(BASE, _global_visible_entries())
+    entries = Vocab.global_vocab().to_entries()
+    vfc.write_vfc(str(txt), entries)
+    regions = _global_regions()
+    if sum(r["size"] for r in regions) != len(entries):
+        regions = [{"region": "visible", "category": "regular",
+                    "size": len(entries)}]
+    write_config(BASE, {
+        "name": BASE,
+        "format": VOCAB_FOLDER_FORMAT,
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source": None,
+        "description": "基础词表（系统预设，不可直接编辑）",
+        "is_main": True,
+        "regions": regions,
+        "vocab_size": len(entries),
+    })
 
 
-def list_presets() -> list:
-    """列出所有预设：[{name, used, capacity, is_base}]。"""
+# ---------------------------------------------------------------------------
+# 列出 / 创建（Fork）/ 复制 / 删除
+# ---------------------------------------------------------------------------
+def list_vocabs() -> list:
+    """列出所有词表：[{name, vocab_size, visible_size, invisible_size,
+    is_main, source, description}]。"""
     ensure_base()
     out = []
-    if VOCABS_DIR.is_dir():
-        for child in sorted(VOCABS_DIR.iterdir()):
-            if not child.is_dir():
+    if not VOCABS_DIR.is_dir():
+        return out
+    for child in sorted(VOCABS_DIR.iterdir()):
+        if not child.is_dir():
+            continue
+        if _valid_name(child.name) is not None:
+            continue                      # 跳过非法名目录（底层会拒这些名字）
+        txt = child / VOCAB_FILE_NAME
+        if not txt.is_file():
+            continue
+        cfg = read_config(child.name)
+        # 快路径：config.json 比 vocab.vfc 新 → 上次同步后正文没被改过，
+        # 直接信 config 的 vocab_size，省一次全量解析。条数以正文为事实
+        # 源，所以任何疑似漂移（正文更新）都走慢路径重解析 + 重同步。
+        n = None
+        cfg_file = child / VOCAB_CONFIG_NAME
+        try:
+            drifted = txt.stat().st_mtime > cfg_file.stat().st_mtime
+        except OSError:
+            drifted = True
+        decl = cfg.get("vocab_size")
+        if not drifted and isinstance(decl, int) and not isinstance(
+                decl, bool) and decl >= 1:
+            n = decl
+        else:
+            try:
+                n = sum(1 for _ in vfc.read_vfc(str(txt)))
+            except vfc.VfcError as e:
+                print(f"[vocab_presets] 跳过损坏词表 {child.name}: {e}",
+                      file=sys.stderr)
                 continue
-            # 跳过非法名目录：底层 preset_dir/vocab_txt_path 会拒这些名字，
-            # 这里不拦会让 _upgrade_preset 抛 ValueError，列预设接口变 500。
-            if _valid_name(child.name) is not None:
-                continue
-            txt = child / "vocab.txt"
-            if not txt.is_file():
-                continue
-            _upgrade_preset(child.name)
-            out.append({
-                "name": child.name,
-                "used": _used_count(child.name),
-                "capacity": spec.VOCAB_SIZE_PADDED - spec.INVISIBLE_END,
-                "is_base": child.name == BASE,
-            })
+            cfg = _sync_config(child.name, n=n)
+        out.append({
+            "name": child.name,
+            "vocab_size": n,
+            "visible_size": max(n - spec.HEAD_SIZE, 0),
+            "invisible_size": min(n, spec.HEAD_SIZE),
+            "is_main": child.name == BASE,
+            "source": cfg.get("source"),
+            "description": cfg.get("description", ""),
+        })
     return out
 
 
-def create_preset(name: str, source: str = BASE) -> dict:
-    """从 source 预设 fork 出一个新预设（独立隔离，复制 token 列表）。"""
+def create_vocab(name: str, source: str = BASE) -> dict:
+    """从 source 词表 Fork 出新词表（整目录复制，彼此独立）。"""
     bad = _valid_name(name)
     if bad:
         raise ValueError(bad)
-    if (preset_dir(name) / "vocab.txt").exists():
-        raise ValueError(f"词表预设已存在: {name}")
     ensure_base()
-    src = vocab_txt_path(source)
-    if not src.is_file():
-        raise ValueError(f"源预设不存在: {source}")
-    if source != BASE:
-        _upgrade_preset(source)
-    preset_dir(name).mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(src, vocab_txt_path(name))
-    return {"name": name, "source": source, "used": _used_count(name),
-            "capacity": spec.VOCAB_SIZE_PADDED - spec.INVISIBLE_END}
+    with _LOCK:
+        src_dir = vocab_dir(source)
+        if not (src_dir / VOCAB_FILE_NAME).is_file():
+            raise ValueError(f"源词表不存在: {source}")
+        dst_dir = vocab_dir(name)
+        if dst_dir.exists():
+            # 只认「已经是一张词表」的目录；空目录/残留目录不该阻止创建，
+            # 但也不能 copytree 到已存在目录（会 FileExistsError → 500）。
+            if (dst_dir / VOCAB_FILE_NAME).exists():
+                raise ValueError(f"词表已存在: {name}")
+            if any(dst_dir.iterdir()):
+                raise ValueError(f"目标目录已存在且非空: {name}")
+            dst_dir.rmdir()
+        dst_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src_dir, dst_dir)
+        cfg = read_config(name)
+        cfg["name"] = name
+        cfg["source"] = source
+        cfg["is_main"] = False
+        cfg["created"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        # 描述不继承源词表：fork 出来的是一张新表，「基础词表（系统预设）」
+        # 这种描述跟它没关系，还会误导用户以为它也是 main。
+        cfg["description"] = f"从 {source} fork"
+        write_config(name, cfg)
+    return {"name": name, "source": source,
+            "vocab_size": int(cfg.get("vocab_size", 0))}
 
 
-def delete_preset(name: str) -> None:
-    """删除一个用户预设（base 不可删）。"""
+
+def delete_vocab(name: str) -> None:
+    """删除一个词表（base 不可删）。"""
     if name == BASE:
-        raise ValueError("base 预设不可删除")
+        raise ValueError(
+            "base 词表不可删除：它是系统预设，其它词表都由它 fork 而来")
     bad = _valid_name(name)
     if bad:
         raise ValueError(bad)
-    d = preset_dir(name)
-    if not d.is_dir():
-        raise ValueError(f"词表预设不存在: {name}")
-    shutil.rmtree(d)
+    with _LOCK:
+        d = vocab_dir(name)
+        if not d.is_dir():
+            raise ValueError(f"词表不存在: {name}")
+        shutil.rmtree(d)
 
 
 # ---------------------------------------------------------------------------
-# 增删 token（复用 tokens.vocab 的 flat 语义）
+# 载入词表 / 读取与写回正文（编辑器模式二用）
 # ---------------------------------------------------------------------------
-def add_token(name: str, text: str, category: str = "regular") -> dict:
+def load_vocab(name: str, fresh: bool = False) -> Vocab:
+    """载入词表（含头部契约与连续性校验）。
+
+    fresh=True 跳过缓存拿全新实例：写路径（add/remove）会通过
+    Vocab.add_token 的 __dict__.update **就地变异**实例——共享缓存实例
+    会把变异暴露给并发读线程（属性逐个换新，中途读到的组合不一致）。
+    读路径共享实例是安全的：它们不变异。
+    """
     ensure_base()
-    v = Vocab.from_entries(read_flat_entries(name), vocab_txt_path(name))
-    tid = v.add_token(text, category)
-    return {"token": text, "id": tid, "category": category,
-            "vocab": name, "used": _used_count(name)}
+    p = vocab_vfc_path(name)
+    if not fresh:
+        try:
+            st = p.stat()
+            sig = (st.st_mtime_ns, st.st_size)
+            hit = _cache_get(str(p), sig)
+            if hit is not None:
+                return hit
+        except OSError:
+            pass
+    v = Vocab.load(p)
+    if not fresh:
+        try:
+            st = p.stat()
+            _cache_put(str(p), (st.st_mtime_ns, st.st_size), v)
+        except OSError:
+            pass
+    return v
 
 
-def remove_token(name: str, text: str) -> dict:
+def read_vocab_text(name: str) -> str:
+    """返回 vocab.vfc 的原文（供文本编辑器显示）。"""
     ensure_base()
-    v = Vocab.from_entries(read_flat_entries(name), vocab_txt_path(name))
-    tid = v.remove_token(text)
-    return {"token": text, "id": tid, "vocab": name,
-            "used": _used_count(name)}
+    return vocab_vfc_path(name).read_text(encoding="utf-8")
+
+
+def write_vocab_text(name: str, text: str, mode: str = "this",
+                     new_name: str | None = None) -> str:
+    """校验并写回 .vfc 正文；返回实际写入的词表名。
+
+    mode="this"  直接改 name 这个词表（name 是 main → 拒绝）
+    mode="fork"  从 name fork 出新词表再写入（new_name 必填）
+
+    校验失败抛 ValueError（→400），携带逐行错误列表（见 VfcError.errors）。
+    """
+    ensure_base()
+    if mode not in ("this", "fork"):
+        raise ValueError(f"mode 必须是 this/fork: {mode!r}")
+    if not isinstance(text, str):
+        raise ValueError(f"text 必须是字符串: {type(text).__name__}")
+    if len(text) > spec.MAX_VOCAB_SIZE * 64:
+        # 粗粒度守卫：正常文件每行远小于 64 字节
+        raise ValueError("词表正文过长")
+
+    errs = vfc.validate_vfc(text, source=str(vocab_vfc_path(name)))
+    if errs:
+        raise VfcListError(errs)
+
+    with _LOCK:
+        if mode == "fork":
+            if not new_name:
+                raise ValueError("fork 模式必须提供 new_name")
+            create_vocab(new_name, source=name)
+            target = new_name
+        else:
+            if name == BASE:
+                raise ValueError(
+                    "main 词表不可直接编辑：它是系统预设，被其它词表与模型共享。"
+                    "请改用 Fork（先复制一份再改），或选择另一个派生词表。")
+            target = name
+
+        vfc.write_vfc(str(vocab_vfc_path(target)), vfc.parse_vfc(text))
+        _sync_config(target)
+    return target
+
+
+class VfcListError(ValueError):
+    """批量语法错误：携带 errors 列表，供前端逐行高亮。"""
+
+    def __init__(self, errors):
+        self.errors = errors
+        super().__init__("; ".join(
+            (f"第 {e['line']} 行：{e['message']}" if e.get("line")
+             else e["message"])
+            for e in errors[:5]))
 
 
 # ---------------------------------------------------------------------------
-# 模型 seed：把选定预设的 vocab.txt 复制进新模型目录
+# 增删 token
+# ---------------------------------------------------------------------------
+def _require_editable(name: str) -> None:
+    """直接编辑的闸门：main 词表必须先 Fork。"""
+    if name == BASE:
+        raise ValueError(
+            "main 词表不可直接编辑：它是系统预设，任何改动都会影响由它 fork "
+            "出去的其它词表与已建模型。请先 Fork 出一份再编辑。")
+
+
+def add_token_to(name: str, text: str, category: str = "regular") -> dict:
+    """给词表加一个 token（紧凑插入指定子区末尾，不留空位）。"""
+    ensure_base()
+    _require_editable(name)
+    with _LOCK:
+        v = load_vocab(name, fresh=True)   # 写路径：实例会被就地变异
+        tid = v.add_token(text, category)
+        save_vocab_config(name, v)
+    return {"vocab": name, "token": text, "category": category, "id": tid,
+            "vocab_size": len(v)}
+
+
+def remove_token_from(name: str, text: str) -> dict:
+    """从词表删一个 token（其后 ID 整体前移，不留空位）。"""
+    ensure_base()
+    _require_editable(name)
+    with _LOCK:
+        v = load_vocab(name, fresh=True)   # 写路径：实例会被就地变异
+        tid = v.remove_token(text)
+        save_vocab_config(name, v)
+    return {"vocab": name, "token": text, "id": tid,
+            "vocab_size": len(v)}
+
+
+def query_token(name: str, text: str) -> dict:
+    """在词表里查一个 token（可显示与不可显示都查）。
+
+    用 token_to_id 而不是 lookup()：后者只覆盖可显示 token（enctok 的
+    编码语义），而「查询」这个功能对 <stop> / <caps> 同样有意义。
+    """
+    ensure_base()
+    v = load_vocab(name)
+    tid = v.token_to_id.get(text)
+    if tid is None and not text.startswith("<"):
+        # 允许用裸名查不可显示 token（stop → <stop>）
+        tid = v.special_ids.get(f"<{text}>")
+    return {"vocab": name, "token": text, "found": tid is not None,
+            "id": tid, "category": (v.category_of(tid)
+                                    if tid is not None else None),
+            "invisible": (v.is_invisible(tid) if tid is not None else None)}
+
+
+# ---------------------------------------------------------------------------
+# 模型 seed：整目录复制
 # ---------------------------------------------------------------------------
 def seed_model_vocab(model_dir: str, preset_name: str | None = None) -> None:
-    """把预设 vocab.txt 复制到 models/NAME/vocab.txt。
-    preset_name 缺省/为 base → 用 base；其余用 vocabs/<name>/vocab.txt。"""
+    """把词表的 vocab.vfc + config.json 复制进 models/NAME/vocab/。
+
+    即使多个模型复用同一词表也各自持有一份——用户误删共享词表不该让模型
+    报废（steve 2026-10-30 定的契约）。
+    """
     name = preset_name or BASE
     ensure_base()
-    src = vocab_txt_path(name)
-    if not src.is_file():
-        raise ValueError(f"词表预设不存在: {name}")
+    src_dir = vocab_dir(name)
+    if not (src_dir / VOCAB_FILE_NAME).is_file():
+        raise ValueError(f"词表不存在: {name}")
+    dst_dir = model_vocab_dir(model_dir)
+    if dst_dir.exists():
+        shutil.rmtree(dst_dir)
     os.makedirs(model_dir, exist_ok=True)
-    shutil.copyfile(src, os.path.join(model_dir, "vocab.txt"))
+    shutil.copytree(src_dir, dst_dir)
+    cfg = read_config(name)
+    return {"preset": name, "vocab_size": int(cfg.get("vocab_size", 0))}
 
 
-# ---------------------------------------------------------------------------
-# 区间占用（给前端「词表」页面）：全局 12 子区 → 4 大类，含 used/padded
-# ---------------------------------------------------------------------------
-def global_ranges() -> dict:
-    """返回全局词表的区间占用：12 个子区，归类到 4 大类，含 used/padded。"""
-    v = Vocab()  # 全局词表
-    id_to_token = v.id_to_token
-
-    def used_in(begin: int, end: int) -> int:
-        return sum(1 for i in range(begin, end)
-                   if not id_to_token[i].startswith("<reserved:"))
-
-    # 子区定义（与 build_vocab.py meta["ranges"] 同源，全部取自 spec）
-    sub = [
-        ("special", "special", spec.SPECIAL_BEGIN, spec.SPECIAL_SIZE),
-        ("system", "system", spec.SYSTEM_BEGIN, spec.SYSTEM_SIZE),
-        ("modal(draw)", "special", spec.MODAL_BEGIN, spec.MODAL_SIZE),
-        ("digit", "regular", spec.DIGIT_BEGIN, spec.DIGIT_SIZE),
-        ("whitespace", "regular", spec.WHITESPACE_BEGIN, spec.WHITESPACE_SIZE),
-        ("symbol", "regular", spec.SYMBOL_BEGIN, spec.SYMBOL_SIZE),
-        ("emoji", "regular", spec.EMOJI_BEGIN, spec.EMOJI_SIZE),
-        ("cjk", "regular", spec.CJK_BEGIN, spec.CJK_SIZE),
-        ("english", "regular", spec.ENGLISH_BEGIN, spec.ENGLISH_SIZE),
-        ("extra", "regular", spec.EXTRA_BEGIN, spec.EXTRA_SIZE),
-        ("fallback", "fallback", spec.FALLBACK_BEGIN, spec.FALLBACK_SIZE),
-    ]
-    regions = []
-    for name, cat, begin, size in sub:
-        regions.append({
-            "region": name, "category": cat,
-            "begin": begin, "size": size,
-            "used": used_in(begin, begin + size),
-            "padded": size,
-        })
-    return {
-        "vocab_size_padded": spec.VOCAB_SIZE_PADDED,
-        "invisible_end": spec.INVISIBLE_END,
-        "regular_end": spec.REGULAR_END,
-        "categories": ["regular", "fallback", "special", "system"],
-        "regions": regions,
-        "category_totals": {
-            "regular": sum(r["used"] for r in regions
-                          if r["category"] == "regular"),
-            "fallback": sum(r["used"] for r in regions
-                           if r["category"] == "fallback"),
-            "special": sum(r["used"] for r in regions
-                          if r["category"] == "special"),
-            "system": sum(r["used"] for r in regions
-                         if r["category"] == "system"),
-        },
-    }
-
-
-def preset_occupancy(name: str) -> dict:
-    """某个预设的可见区占用（used = 真实 token 数）。"""
-    used = _used_count(name)
-    capacity = spec.VOCAB_SIZE_PADDED - spec.INVISIBLE_END
-    return {"name": name, "used": used, "capacity": capacity,
-            "free": capacity - used}
-
-
-# ---------------------------------------------------------------------------
-# 模型创建时：config 记录 vocab 来源 + dtype（common.build_model 据此施加）
-# ---------------------------------------------------------------------------
-def validate_preset(name: str | None) -> str:
-    """解析模型创建时指定的词表预设名；缺省/base → base。"""
+def validate_vocab(name: str | None) -> str:
+    """解析创建模型时指定的词表名；缺省/base → base。"""
     if name is None or name == BASE:
         return BASE
-    if not (preset_dir(name) / "vocab.txt").is_file():
-        raise ValueError(f"词表预设不存在: {name}")
+    if not (vocab_dir(name) / VOCAB_FILE_NAME).is_file():
+        raise ValueError(f"词表不存在: {name}")
     return name
+
+
+def vocab_occupancy(name: str) -> dict:
+    """某个词表的占用统计（前端标签页「分区」区用）。
+
+    每个分区额外带 samples（该区前几个 token 文本）：前端表格要回答
+    「这一块到底覆盖什么 token」，光给 ID 区间对用户没有意义。
+    """
+    ensure_base()
+    v = load_vocab(name)
+    n = len(v)
+    regions = []
+    for r in v.regions:
+        begin, size = r["begin"], r["size"]
+        samples = []
+        for i in range(begin, min(begin + size, n)):
+            t = v.id_to_token[i]
+            if t.startswith("<reserved:"):
+                continue
+            samples.append(t if len(t) <= 16 else t[:15] + "…")
+            if len(samples) >= 4:
+                break
+        regions.append({**r, "samples": samples})
+    return {"name": name, "vocab_size": n,
+            "visible_size": max(n - spec.HEAD_SIZE, 0),
+            "invisible_size": min(n, spec.HEAD_SIZE),
+            "is_main": name == BASE,
+            "regions": regions,
+            "category_totals": v.category_totals()}

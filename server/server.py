@@ -66,7 +66,7 @@ from server_media import (MAX_IMAGE_DIM, MAX_PATCHES_TOTAL, b64_to_pil,
 from server_codecs import CodecApi
 from server_monitor import MonitorApi
 from server_train import TrainApi
-from server_tokens import TokensApi
+from server_tokens import TokensApi, resolve_vocab_query
 from server_services import ServiceError, ServiceSupervisor
 from server_util import num_param, optional_install_cmd, pip_index_args
 
@@ -189,9 +189,9 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi):
 
         # 2026-10-25：词表预设 + 精度提前校验（非法 → 400，避免提交失败任务）
         if body.get("vocab"):
-            from vocab_presets import validate_preset
+            from vocab_presets import validate_vocab
             try:
-                validate_preset(body["vocab"])
+                validate_vocab(body["vocab"])
             except ValueError as e:
                 raise ValueError(f"vocab: {e}")
         if body.get("dtype"):
@@ -458,9 +458,9 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi):
         return 202, {"task_id": tid}
 
     def api_vocab(self, query):
-        from tokens.vocab import get_vocab
         q = (query.get("q", [""])[0] or "").lower()
-        v = get_vocab()
+        # 2026-10-30：支持 ?name=<词表>，否则沿用进程当前词表。
+        v = resolve_vocab_query(query)
         hits = []
         if q:
             for i, tok in enumerate(v.id_to_token):
@@ -473,6 +473,7 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi):
                     break
         from tokens.vocab import CATEGORIES
         return 200, {"q": q, "hits": hits, "vocab_size": len(v),
+                     "name": v.name,
                      "categories": list(CATEGORIES)}
 
 
@@ -551,9 +552,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_error_json(self, code, msg):
+    def _send_error_json(self, code, msg, extra=None):
         try:
-            self._send_json({"error": msg}, code)
+            obj = {"error": msg}
+            if extra:
+                obj.update(extra)
+            self._send_json(obj, code)
         except Exception:
             pass
 
@@ -656,11 +660,14 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/vocab":
                 _code, obj = app.api_vocab(query)
                 self._send_json(obj, _code)
-            elif path == "/api/vocab/ranges":
-                _code, obj = app.api_vocab_ranges(query)
+            elif path == "/api/vocab/list":
+                _code, obj = app.api_vocab_list(query)
                 self._send_json(obj, _code)
-            elif path == "/api/vocab/presets":
-                _code, obj = app.api_vocab_presets({})
+            elif path == "/api/vocab/regions":
+                _code, obj = app.api_vocab_regions(query)
+                self._send_json(obj, _code)
+            elif path == "/api/vocab/source":
+                _code, obj = app.api_vocab_source_get(query)
                 self._send_json(obj, _code)
             elif path in ("/app.css", "/app.js"):
                 self._serve_static(path.lstrip("/"))
@@ -694,9 +701,11 @@ class Handler(BaseHTTPRequestHandler):
             "/api/tokens/encode": app.api_tokens_encode,
             "/api/tokens/decode": app.api_tokens_decode,
             "/api/tokens/export": app.api_tokens_export,
-            "/api/vocab/add": app.api_vocab_add,
-            "/api/vocab/presets": app.api_vocab_presets,
-            "/api/vocab/preset/token": app.api_vocab_preset_token,
+            "/api/vocab/token": app.api_vocab_token,
+            "/api/vocab/source": app.api_vocab_source,
+            "/api/vocab/fork": app.api_vocab_fork,
+            "/api/vocab/copy": app.api_vocab_fork,
+            "/api/vocab/delete": app.api_vocab_delete,
             "/api/system/install-optional": app.api_system_install_optional,
             "/api/system/install": app.api_system_install,
             "/api/system/kill": app.api_system_kill,
@@ -720,7 +729,11 @@ class Handler(BaseHTTPRequestHandler):
                 binascii.Error) as e:
             # 审计 L2：base64 错值抛 binascii.Error、类型混淆抛 TypeError，
             # 都属入参问题，应 400 而不是 500（5xx 会误报成服务端故障）
-            self._send_error_json(400, str(e))
+            # .vfc 校验失败（VfcListError）带 errors[] 逐行列表，一并透传
+            # 给前端做行级高亮——只回一句拼接字符串，用户没法定位。
+            extra = ({"errors": e.errors}
+                     if isinstance(getattr(e, "errors", None), list) else None)
+            self._send_error_json(400, str(e), extra)
         except RuntimeError as e:
             self._send_error_json(500, str(e))
         except Exception as e:

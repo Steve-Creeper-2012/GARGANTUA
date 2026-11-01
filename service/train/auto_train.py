@@ -58,7 +58,7 @@ else:
 import boot
 boot.bootstrap()
 import spec
-from common import (CKPT_NAME, build_model, model_exists,
+from common import (build_model, model_exists,
                     read_config, save_checkpoint, validate_block_size,
                     validate_steps)
 from muon import build_optimizers

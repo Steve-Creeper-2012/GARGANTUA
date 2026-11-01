@@ -1,0 +1,76 @@
+{
+  "name": "base",
+  "format": "gargantua-vocab-folder-v1",
+  "is_main": true,
+  "built_at": "2026-10-31T21:46:39Z",
+  "vocab_size": 69376,
+  "head_size": 2970,
+  "regions": [
+    {
+      "region": "special",
+      "category": "special",
+      "size": 6
+    },
+    {
+      "region": "system",
+      "category": "system",
+      "size": 3
+    },
+    {
+      "region": "draw",
+      "category": "special",
+      "size": 2961
+    },
+    {
+      "region": "digit",
+      "category": "regular",
+      "size": 10
+    },
+    {
+      "region": "whitespace",
+      "category": "regular",
+      "size": 6
+    },
+    {
+      "region": "symbol",
+      "category": "regular",
+      "size": 7263
+    },
+    {
+      "region": "emoji",
+      "category": "regular",
+      "size": 1517
+    },
+    {
+      "region": "cjk",
+      "category": "regular",
+      "size": 27584
+    },
+    {
+      "region": "english",
+      "category": "regular",
+      "size": 30000
+    },
+    {
+      "region": "extra",
+      "category": "regular",
+      "size": 0
+    },
+    {
+      "region": "fallback",
+      "category": "fallback",
+      "size": 26
+    }
+  ],
+  "append_region": "extra",
+  "user_added": [],
+  "sources": {
+    "english": "file:/Users/steve/Desktop/GARGANTUA/service/tokens/words_en.txt",
+    "english_word_count": 30000,
+    "emoji": "Unicode 16.0.0 emoji-data.txt (Emoji=Yes, 非 ASCII) + Emoji_Component 组件字符",
+    "emoji_count": 1517,
+    "symbol": "Unicode P*/S* 类码点（UCD 15.0.0）排除 emoji + 全角字母数字",
+    "symbol_count": 7263,
+    "unidata_version": "15.0.0"
+  }
+}

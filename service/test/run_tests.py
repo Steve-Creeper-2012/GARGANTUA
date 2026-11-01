@@ -62,6 +62,9 @@ SUITES = [
     # 2026-10-29 新增：词表预设名路径穿越（任意 vocab.txt 写）防护（16 项）
     ("test_vocab_preset_path", "service.test.test_vocab_preset_path", 600,
      "unittest"),
+    # 2026-10-30 词表契约重构：.vfc 格式 + 模型文件夹契约
+    ("test_vfc", "service.test.test_vfc", 300, "unittest"),
+    ("test_model_folder", "service.test.test_model_folder", 600, "unittest"),
     ("verify_formats", "service/test/verify_formats.py", 600, "script"),
 ]
 

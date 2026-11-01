@@ -2,7 +2,7 @@
 时间步结构、.tokenvector 格式与添加 token。
 
 运行：cd ROOT && python -m unittest service.test.test_tokens -v
-前置：tokens/vocab.json 已由 tokens/build_vocab.py 生成。
+前置：tokens/vocab.vfc 已由 tokens/build_vocab.py 生成。
 """
 from __future__ import annotations
 
@@ -31,32 +31,49 @@ ROOT = Path(boot.project_root())   # 2026-10-24：项目根
 
 import spec  # noqa: E402
 from tokens import dectok, enctok, text_codec, timestep, tok32, tokenvector
-from tokens.build_vocab import EN_WORD_RE, build_tokens  # noqa: E402
-from tokens.vocab import (CATEGORIES, VOCAB_PATH, Vocab,  # noqa: E402
+from tokens import vfc  # noqa: E402
+from tokens.build_vocab import build_entries  # noqa: E402
+from tokens.vocab import (CATEGORIES, GLOBAL_VOCAB_VFC, Vocab,  # noqa: E402
                           get_vocab)
 
 
+def _tokens(words, user_added=None):
+    """build_entries 的 id_to_token 视图（旧 build_tokens 的等价替身）。"""
+    entries, _regions, _applied = build_entries(words, user_added)
+    return [t for _i, t, _v in entries]
+
+
 def setUpModule():
-    if not VOCAB_PATH.is_file():
+    if not GLOBAL_VOCAB_VFC.is_file():
         raise RuntimeError(
-            f"{VOCAB_PATH} 不存在，请先运行：python tokens/build_vocab.py"
+            f"{GLOBAL_VOCAB_VFC} 不存在，请先运行：python tokens/build_vocab.py"
         )
 
 
 class VocabLayoutTest(unittest.TestCase):
-    """词表区间与 spec 常数一致性（tok-32 四类布局）。"""
+    """词表布局一致性（2026-10-30 契约：分区表住在词表 config 里）。
+
+    架构契约头（special / system / draw）的位置与大小仍由 spec 冻结；
+    可见区各子区的边界不再是 spec 常数，从词表自身的分区表取。
+    """
 
     @classmethod
     def setUpClass(cls):
         cls.v: Vocab = get_vocab()
         cls.t = cls.v.id_to_token
+        cls.reg = {r["region"]: r for r in cls.v.regions}
 
     def test_total_size(self):
-        self.assertEqual(len(self.t), spec.VOCAB_SIZE_PADDED)
-        self.assertEqual(spec.VOCAB_SIZE_PADDED % 64, 0)
-        self.assertEqual(spec.VOCAB_SIZE, spec.FALLBACK_BEGIN
-                         + spec.FALLBACK_SIZE)
-        self.assertEqual(spec.INVISIBLE_END, spec.DIGIT_BEGIN)
+        # 新契约：不再有全局 padding；分区表必须严丝合缝盖满全表
+        covered = 0
+        for r in self.v.regions:
+            self.assertEqual(r["begin"], covered)
+            covered += r["size"]
+        self.assertEqual(covered, len(self.t))
+        self.assertEqual(self.v.config.get("vocab_size"), len(self.t))
+        # 头部仍是架构契约
+        self.assertEqual(covered - spec.HEAD_SIZE, len(self.t)
+                         - spec.HEAD_SIZE)
 
     def test_special_region(self):
         # <pad> 已删除（2026-10-24，steve 拍板）
@@ -68,20 +85,17 @@ class VocabLayoutTest(unittest.TestCase):
         for i, tok in enumerate(spec.SPECIAL_TOKENS):
             self.assertEqual(self.t[i], tok)
         self.assertEqual(self.t[spec.STOP_ID], spec.STOP_TOKEN)
-        for i in range(len(spec.SPECIAL_TOKENS), spec.SPECIAL_SIZE):
-            self.assertEqual(self.t[i], f"<reserved:{i}>")
+        # 紧凑头部：special 区之后直接是 system，没有 reserved 空位
+        self.assertNotIn("<reserved:6>", self.t[:spec.HEAD_SIZE])
 
     def test_system_region(self):
-        # 系统 token：{ } | （不可见，时间步结构）
+        # 系统 token：{ } | （时间步结构字符，按 ID 定位）
         self.assertEqual(self.t[spec.TS_OPEN_ID], spec.TS_OPEN)
         self.assertEqual(self.t[spec.TS_CLOSE_ID], spec.TS_CLOSE)
         self.assertEqual(self.t[spec.TS_SEP_ID], spec.TS_SEP)
         self.assertEqual(self.v.system_ids[spec.TS_OPEN], spec.TS_OPEN_ID)
         self.assertEqual(self.v.category_of(spec.TS_OPEN_ID), "system")
         self.assertEqual(self.v.category_of(spec.TS_SEP_ID), "system")
-        for i in range(3, spec.SYSTEM_SIZE):
-            self.assertEqual(self.t[spec.SYSTEM_BEGIN + i],
-                             f"<reserved:{spec.SYSTEM_BEGIN + i}>")
 
     def test_modal_region_draw_layout(self):
         # 图元 token 照搬 geometrize_256_v1：字段 bin 区间 + special 3
@@ -99,9 +113,7 @@ class VocabLayoutTest(unittest.TestCase):
                          "<draw:special:0>")
         self.assertEqual(self.t[b + spec.DRAW_SPECIAL_OFFSET + 2],
                          "<draw:special:2>")
-        # 之后是 reserved，直到 MODAL 区尾
-        self.assertEqual(self.t[b + spec.DRAW_VOCAB_SIZE],
-                         f"<reserved:{b + spec.DRAW_VOCAB_SIZE}>")
+        # 紧凑头部：draw 区之后直接是可见区，没有 reserved 空位
         # MIDI 已暂时删除
         self.assertFalse(hasattr(spec, "MIDI_BEGIN"))
         self.assertEqual(self.v.category_of(b + spec.DRAW_X_OFFSET),
@@ -111,15 +123,16 @@ class VocabLayoutTest(unittest.TestCase):
         self.assertEqual(spec.DRAW_TOKENS_PER_PRIMITIVE, 9)
 
     def test_digit_region(self):
+        b = self.reg["digit"]["begin"]
         for d in range(10):
-            self.assertEqual(self.t[spec.DIGIT_BEGIN + d], str(d))
+            self.assertEqual(self.t[b + d], str(d))
 
     def test_whitespace_region(self):
+        b = self.reg["whitespace"]["begin"]
         for i, ch in enumerate(spec.WHITESPACE_CHARS):
-            self.assertEqual(self.t[spec.WHITESPACE_BEGIN + i], ch)
+            self.assertEqual(self.t[b + i], ch)
 
     def test_symbol_region(self):
-        b = spec.SYMBOL_BEGIN
         # 半角 ASCII 标点（P*/S* 类码点按码点升序，字母数字不在其中）
         for ch in ("!", "~", "@", "#", "$", "%", "^", "&", "*", "(", ")",
                    "-", "_", "=", "+", "[", "]", "{", "}", "\\", "|",
@@ -128,45 +141,40 @@ class VocabLayoutTest(unittest.TestCase):
         # 全角符号与全角字母数字
         for ch in ("！", "，", "。", "、", "「", "」", "　", "１", "Ａ", "ａ"):
             self.assertIn(ch, self.v.regular_ids)
-        # 区域尾部是 reserved
-        self.assertTrue(
-            self.t[spec.SYMBOL_BEGIN + spec.SYMBOL_SIZE - 1]
-            .startswith("<reserved:"))
 
     def test_emoji_region(self):
-        b = spec.EMOJI_BEGIN
+        b = self.reg["emoji"]["begin"]
         self.assertEqual(self.t[b], "\u00a9")            # ©
         self.assertIn("\U0001F600", self.v.regular_ids)   # 😀
         self.assertIn("\U0001F1E6", self.v.regular_ids)   # 🇦 区域指示符
         self.assertIn("\u200D", self.v.regular_ids)       # ZWJ
         self.assertIn("\uFE0F", self.v.regular_ids)       # VS16
         # ASCII 键帽基字符归属 SYMBOL/DIGIT 区，不进 emoji 区
-        self.assertLess(self.v.regular_ids["#"], spec.EMOJI_BEGIN)
-        self.assertLess(self.v.regular_ids["*"], spec.EMOJI_BEGIN)
+        self.assertLess(self.v.regular_ids["#"], b)
+        self.assertLess(self.v.regular_ids["*"], b)
 
     def test_cjk_boundaries(self):
-        b = spec.CJK_BEGIN
+        b = self.reg["cjk"]["begin"]
         self.assertEqual(self.t[b], "\u4e00")             # 一
         self.assertEqual(self.t[b + 20991], "\u9fff")
         self.assertEqual(self.t[b + 20992], "\u3400")     # 㐀
         self.assertEqual(self.t[b + 27584 - 1], "\u4dbf")   # 最后一个实字
-        self.assertTrue(self.t[b + 27584].startswith("<reserved:"))
         self.assertEqual(self.v.regular_ids["\u4e16"], b + (0x4E16 - 0x4E00))
-        self.assertEqual(b + spec.CJK_SIZE, spec.ENGLISH_BEGIN)
 
     def test_english_region(self):
-        n = self.v.meta["english_word_count"]
-        self.assertEqual(n, 30000)
-        self.assertLessEqual(n, spec.ENGLISH_SIZE)
+        reg = self.reg["english"]
+        self.assertEqual(reg["size"], 30000)
         self.assertIn("hello", self.v.regular_ids)
         self.assertIn("world", self.v.regular_ids)
-        # 单字母词不收录（由 fallback 承担，保证全表文本唯一）
+        # 单字母词不单独收录（由 fallback 字母承担）：全表唯一的 "a"/"i"
+        # token 就是 fallback 字母本身，而不是 english 区的词条
         for w in ("a", "i"):
-            self.assertNotIn(w, self.v.regular_ids)
-            self.assertIn(w, self.v.fallback_ids)
+            self.assertIsNotNone(self.v.fallback_ids.get(w))
+            self.assertEqual(self.v.regular_ids.get(w),
+                             self.v.fallback_ids.get(w))
 
     def test_fallback_region(self):
-        b = spec.FALLBACK_BEGIN
+        b = self.reg["fallback"]["begin"]
         for i, ch in enumerate(spec.FALLBACK_LETTERS):
             self.assertEqual(self.t[b + i], ch)
             self.assertEqual(self.v.fallback_ids[ch], b + i)
@@ -194,70 +202,72 @@ class VocabLayoutTest(unittest.TestCase):
         self.assertIsNone(self.v.lookup("\u4dbf\u4dbf\u4dbf"))  # 未收录
 
     def test_category_of(self):
-        self.assertEqual(self.v.category_of(spec.DIGIT_BEGIN), "regular")
-        self.assertEqual(self.v.category_of(spec.CJK_BEGIN), "regular")
-        self.assertEqual(self.v.category_of(spec.FALLBACK_BEGIN), "fallback")
+        self.assertEqual(self.v.category_of(self.reg["digit"]["begin"]),
+                         "regular")
+        self.assertEqual(self.v.category_of(self.reg["cjk"]["begin"]),
+                         "regular")
+        self.assertEqual(self.v.category_of(self.reg["fallback"]["begin"]),
+                         "fallback")
         self.assertEqual(self.v.category_of(spec.TS_OPEN_ID), "system")
         self.assertEqual(self.v.category_of(spec.SPECIAL_BEGIN + 1),
                          "special")
         self.assertEqual(self.v.category_of(spec.DRAW_BEGIN), "special")
 
-    def test_meta_consistency(self):
-        m = self.v.meta
-        self.assertEqual(m["format"], "tok-32")
-        self.assertEqual(m["id_bits"], 32)
-        self.assertEqual(m["vocab_size"], spec.VOCAB_SIZE)
-        self.assertEqual(m["vocab_size_padded"], spec.VOCAB_SIZE_PADDED)
-        self.assertEqual(m["english_word_count"], 30000)
-        self.assertEqual(m["emoji_count"], 1517)   # 1419 Emoji + 98 组件
-        self.assertEqual(m["symbol_count"], 7263)
-        r = m["ranges"]
-        for key in ("special", "system", "modal", "digit", "whitespace",
-                    "symbol", "emoji", "cjk", "english", "extra", "fallback",
-                    "draw"):
-            self.assertIn(key, r)
-        self.assertNotIn("midi", r)
-        self.assertEqual(r["draw"]["tokens_per_primitive"], 9)
-        self.assertEqual(r["emoji"]["begin"], spec.EMOJI_BEGIN)
-        self.assertEqual(r["fallback"]["begin"], spec.FALLBACK_BEGIN)
+    def test_config_consistency(self):
+        """新契约：config.json 是分区表的唯一事实源，必须与正文一致。"""
+        cfg = self.v.config
+        self.assertEqual(cfg.get("vocab_size"), len(self.t))
+        regions = cfg.get("regions") or []
+        self.assertEqual(sum(r["size"] for r in regions), len(self.t))
 
 
 class BuildIdempotentTest(unittest.TestCase):
     """构建可重跑幂等：同一输入 → 同一 id_to_token；user_added 重放。"""
 
+    @classmethod
+    def setUpClass(cls):
+        cls.reg = {r["region"]: r for r in get_vocab().regions}
+
     def test_build_tokens_idempotent(self):
         v = get_vocab()
-        words = [v.id_to_token[spec.ENGLISH_BEGIN + i]
-                 for i in range(v.meta["english_word_count"])]
-        t1 = build_tokens(words)
-        t2 = build_tokens(words)
+        reg = self.reg["english"]
+        words = [v.id_to_token[reg["begin"] + i]
+                 for i in range(reg["size"])]
+        t1 = _tokens(words)
+        t2 = _tokens(words)
         self.assertEqual(t1, t2)
         self.assertEqual(t1, v.id_to_token)
 
     def test_build_tokens_small_wordlist(self):
         words = ["hello", "world", "don't"]
-        t1 = build_tokens(words)
-        t2 = build_tokens(words)
+        t1 = _tokens(words)
+        t2 = _tokens(words)
         self.assertEqual(t1, t2)
-        b = spec.ENGLISH_BEGIN
-        self.assertEqual(t1[b:b + 3], words)
-        self.assertEqual(t1[b + 3], f"<reserved:{b + 3}>")
-        self.assertEqual(len(t1), spec.VOCAB_SIZE_PADDED)
+        # 新契约：分区按内容收紧，不再预留空位——全表没有 reserved
+        self.assertFalse(any(x.startswith("<reserved:") for x in t1))
+        # 3 个词恰好占满 english 区（各 1 行），紧跟着就是 fallback 字母
+        self.assertIn("hello", t1)
+        self.assertIn("don't", t1)
+        self.assertEqual(t1[-26:], list(spec.FALLBACK_LETTERS))
+        # 头部契约原样保留
+        self.assertEqual(t1[spec.DRAW_BEGIN], "<cx:0>")
+        self.assertEqual(t1[spec.HEAD_SIZE], "0")
 
     def test_user_added_replay(self):
-        # 重建时 user_added 条目按原 ID 重放
+        # 重建时 user_added 条目统一落进 extra 区（ID 由构建时分配）
         v = get_vocab()
-        words = [v.id_to_token[spec.ENGLISH_BEGIN + i]
-                 for i in range(v.meta["english_word_count"])]
-        entries = [{"text": "\u4dbf\u4dbf", "category": "regular",
-                    "id": spec.EXTRA_BEGIN},
-                   {"text": "<mood>", "category": "special",
-                    "id": spec.SPECIAL_BEGIN + len(spec.SPECIAL_TOKENS)}]
-        t = build_tokens(words, entries)
-        self.assertEqual(t[spec.EXTRA_BEGIN], "\u4dbf\u4dbf")
-        self.assertEqual(t[spec.SPECIAL_BEGIN + len(spec.SPECIAL_TOKENS)],
-                         "<mood>")
-        self.assertEqual(len(t), spec.VOCAB_SIZE_PADDED)
+        reg = self.reg["english"]
+        words = [v.id_to_token[reg["begin"] + i]
+                 for i in range(reg["size"])]
+        t = _tokens(words, [{"text": "\u4dbf\u4dbf"},
+                            {"text": "<mood>"}])
+        base = _tokens(words)
+        self.assertEqual(len(t), len(base) + 2)
+        self.assertIn("\u4dbf\u4dbf", t)
+        self.assertIn("<mood>", t)
+        # 重放稳定：再建一次结果一致
+        self.assertEqual(t, _tokens(
+            words, [{"text": "\u4dbf\u4dbf"}, {"text": "<mood>"}]))
 
 
 CAPS_ID = spec.SPECIAL_BEGIN + spec.SPECIAL_TOKENS.index("<caps>")
@@ -285,6 +295,7 @@ class CodecTest(unittest.TestCase):
     def test_roundtrip_mixed_cjk_english_digit(self):
         steps = self.assertRoundtrip("\u4f60\u597d world 123")
         v = get_vocab()
+        db = {r["region"]: r for r in v.regions}["digit"]["begin"]
         ids = [st["token_ids"][0] for st in steps]
         self.assertEqual(
             ids,
@@ -292,8 +303,7 @@ class CodecTest(unittest.TestCase):
                 v.regular_ids["\u4f60"], v.regular_ids["\u597d"],
                 v.regular_ids[" "], v.regular_ids["world"],
                 v.regular_ids[" "],
-                spec.DIGIT_BEGIN + 1, spec.DIGIT_BEGIN + 2,
-                spec.DIGIT_BEGIN + 3,
+                db + 1, db + 2, db + 3,
             ],
         )
 
@@ -383,7 +393,8 @@ class CodecTest(unittest.TestCase):
         self.assertEqual(text_codec.decode(mixed), "Of")
 
     def test_decode_ids_errors(self):
-        for bad in (["x"], [True], [-1], [spec.VOCAB_SIZE_PADDED]):
+        n = len(get_vocab())
+        for bad in (["x"], [True], [-1], [n]):
             with self.assertRaises(ValueError):
                 text_codec.decode_ids(bad)
 
@@ -392,7 +403,8 @@ class EncDecScriptTest(unittest.TestCase):
     """tok32 / enctok / dectok 脚本行为。"""
 
     def test_tok32_roundtrip(self):
-        ids = [0, 1, 64, 12384, 88689, spec.VOCAB_SIZE_PADDED - 1]
+        # tok32 是历史读取工具：32 位裸容器，上界是格式硬上限而非词表长度
+        ids = [0, 1, 64, 12384, 88689, spec.MAX_VOCAB_SIZE - 1]
         data = tok32.encode_ids(ids)
         self.assertEqual(len(data), len(ids) * 4)
         self.assertEqual(tok32.decode_ids(data), ids)
@@ -560,33 +572,47 @@ class TokenVectorTest(unittest.TestCase):
 
 
 class AddTokenTest(unittest.TestCase):
-    """添加 token：四类任选、全局查重、reserved 槽分配、持久化。
+    """添加 token：两档形态、全局查重、分区同步、持久化。
 
-    全部在临时副本上进行，不碰仓库里的 tokens/vocab.json。
+    2026-10-30 契约：category 只有 regular（可显示）/ special（不可显示）
+    两档——fallback 由「可显示的单个 a–z 字母」自动派生，system 属架构
+    契约头不接受用户添加。全部在临时副本上进行，不碰仓库里的词表。
     """
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="garg_vocab_"))
-        self.copy = self.tmp / "vocab.json"
-        shutil.copy(VOCAB_PATH, self.copy)
-        self.v = Vocab(self.copy)
+        self.copy = self.tmp / "vocab.vfc"
+        shutil.copy(GLOBAL_VOCAB_VFC, self.copy)
+        self.v = Vocab.load(self.copy)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_add_all_categories(self):
+    def test_add_regular_and_special(self):
         cases = [("\U00020000", "regular"),   # CJK 扩展B 单字
-                 ("\u00df", "fallback"),                   # ß
-                 ("<mood>", "special"),
-                 ("<ts>", "system")]
+                 ("<mood>", "special")]
         for text, cat in cases:
             tid = self.v.add_token(text, cat)
             self.assertEqual(self.v.category_of(tid), cat)
             self.assertEqual(self.v.token(tid), text)
         self.assertEqual(self.v.lookup("\U00020000"),
                          self.v.regular_ids["\U00020000"])
-        self.assertEqual(self.v.fallback_ids["\u00df"],
-                         self.v.fallback_ids["\u00df"])
+
+    def test_fallback_and_system_not_user_selectable(self):
+        # fallback 是派生类别、system 是架构契约头：都不接受用户添加
+        with self.assertRaises(ValueError):
+            self.v.add_token("ß", "fallback")
+        with self.assertRaises(ValueError):
+            self.v.add_token("<ts>", "system")
+
+    def test_single_ascii_letter_derives_fallback(self):
+        # 新增可显示的单个 a–z 字母自动兼作 fallback——但 26 个字母全在
+        # 基础词表里，这里借一个临时小词表验证派生规则本身
+        entries = vfc.head_entries() + [(vfc.head_size() + i, t, True)
+                                        for i, t in enumerate(["xy"])]
+        v = Vocab.from_entries(entries, path=self.tmp / "mini.vfc")
+        tid = v.add_token("z", "regular")
+        self.assertEqual(v.fallback_ids["z"], tid)
 
     def test_duplicate_rejected(self):
         self.v.add_token("\U00020000", "regular")
@@ -609,18 +635,23 @@ class AddTokenTest(unittest.TestCase):
 
     def test_persist_and_reload(self):
         tid = self.v.add_token("<mood>", "special")
-        v2 = Vocab(self.copy)
+        v2 = Vocab.load(self.copy)
         self.assertEqual(v2.special_ids["<mood>"], tid)
-        import json
-        meta = json.loads(self.copy.read_text(encoding="utf-8"))["meta"]
-        self.assertEqual(meta["user_added"],
-                         [{"text": "<mood>", "category": "special",
-                           "id": tid}])
+        # .vfc 正文里确实多了一行（尖括号形态、行号即新 ID）
+        lines = self.copy.read_text(encoding="utf-8").splitlines()
+        self.assertIn(f"<mood>:{tid}", lines)
 
-    def test_free_slots(self):
-        before = self.v.free_slots("regular")
-        self.v.add_token("\U00020000", "regular")
-        self.assertEqual(self.v.free_slots("regular"), before - 1)
+    def test_len_grows_and_stays_dense(self):
+        """新契约：词表必须占满——加 token 长度 +1、ID 恒连续。"""
+        before = len(self.v)
+        tid = self.v.add_token("\U00020000", "regular")
+        self.assertEqual(len(self.v), before + 1)
+        self.assertEqual([e[0] for e in self.v.to_entries()],
+                         list(range(len(self.v))))
+        self.assertEqual(self.v.token_to_id["\U00020000"], tid)
+        # 持久化后重读，新 token 仍在同一 ID 上
+        v2 = Vocab.load(self.copy)
+        self.assertEqual(v2.token_to_id["\U00020000"], tid)
 
     def test_category_list(self):
         self.assertEqual(set(CATEGORIES),

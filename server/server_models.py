@@ -22,7 +22,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import spec
-from common import (CKPT_NAME, model_exists, read_config, read_ctx_config,
+from common import (model_exists, read_config, read_ctx_config,
                     valid_model_name)
 
 

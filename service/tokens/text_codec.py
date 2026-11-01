@@ -37,10 +37,14 @@ def _step(token_id: int) -> dict:
     }
 
 
-def encode(text: str) -> list:
-    """文本 → List[Step]（每 token 独占一个时间步）。"""
+def encode(text: str, vocab=None) -> list:
+    """文本 → List[Step]（每 token 独占一个时间步）。
+
+    vocab 缺省用进程词表；转换器页「用哪个词表来转换」显式传入，
+    保证查表与输出一致（不同词表的 ID 布局不同，混用会静默错位）。
+    """
     from . import enctok          # 懒加载：保持 `python -m tokens.enctok` 干净
-    ids, skipped = enctok.encode_text(text)
+    ids, skipped = enctok.encode_text(text, vocab=vocab)
     steps = [_step(i) for i in ids]
     if skipped and steps:
         steps[-1]["meta"]["skipped"] = skipped
@@ -54,17 +58,17 @@ def _apply_case(token: str, mode: int) -> str:
 
 
 def _is_wordish(v, tid: int) -> bool:
-    """英文词 / fallback 字母 token（可被 <caps> 作用）。"""
+    """英文词 / fallback 字母 token（可被 <caps> 作用）。
+
+    新契约（2026-10-30）里所有词表都是扁平的，没有固定的 ENGLISH /
+    FALLBACK 区间可查：可见的纯 ASCII 字母词就是「词」，单个 a–z 字母
+    同时也是 fallback。不可显示 token 的文本带尖括号或不是字母，天然
+    落不进这里。
+    """
     tok = v.id_to_token[tid]
     if not tok or not tok.isascii() or not tok.isalpha():
         return False
-    if getattr(v, "flat", False):
-        return True                    # 扁平词表：可见的 ascii 字母词即可
-    if spec.ENGLISH_BEGIN <= tid < spec.ENGLISH_BEGIN + spec.ENGLISH_SIZE:
-        return True
-    if spec.FALLBACK_BEGIN <= tid < spec.FALLBACK_BEGIN + spec.FALLBACK_SIZE:
-        return True
-    return False
+    return True
 
 
 def decode_ids(ids) -> str:

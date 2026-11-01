@@ -100,10 +100,10 @@ class TrainApi:
         bad = next((e["id"] for it in items if it["kind"] == "step"
                     for e in it["elements"]
                     if e["kind"] == "text"
-                    and not (0 <= e["id"] < spec.VOCAB_SIZE_PADDED)), None)
+                    and not (0 <= e["id"] < spec.MAX_VOCAB_SIZE)), None)
         if bad is not None:
             raise ValueError(f"token ID {bad} 超出词表"
-                             f"（< {spec.VOCAB_SIZE_PADDED}）")
+                             f"（< {spec.MAX_VOCAB_SIZE}）")
         optimizer = body.get("optimizer", spec.OPTIMIZER)
         if optimizer not in ("muon", "adamw"):
             raise ValueError(f"未知优化器: {optimizer}")

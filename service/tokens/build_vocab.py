@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # ===========================================================================
-# GARGANTUA v1 — 构建 tokens/vocab.json（tok-32 四类词表）
+# GARGANTUA v1 — 构建全局基础词表 tokens/{vocab.vfc, config.json}
 # ---------------------------------------------------------------------------
 # 布局严格依照 ROOT/spec.py（冻结契约），禁止硬编码区间。
-# 生成结构：{"id_to_token": [...], "token_to_id": {...}, "meta": {...}}
-# 总长度 = spec.VOCAB_SIZE_PADDED。
+# 产物（词表文件夹契约，与 vocabs/<name>/ 完全同构）：
+#   vocab.vfc    词表正文（一行一个 token，见 tokens/vfc.py）
+#   config.json  vocab_size / regions 分区表 / user_added 重放源
+# 总长度 = 架构契约头 + 各可见子区实际收录数（不 pad、不留空位）。
 #
 # 内容来源：
 #   - emoji：内嵌 EMOJI_RANGES（Unicode 16.0.0 emoji-data.txt 的
@@ -14,8 +16,7 @@
 #     meta 记录 unidata_version 与实际数量。
 #   - 英文词：tokens/words_en.txt（bundled，hermitdave/FrequencyWords
 #     词频序前 30000，单字母词除外）；fallback 链见 load_english_words。
-#   - 用户新增 token：旧 vocab.json 的 meta["user_added"] 自动重放
-#     （原 ID 可用则原样占用，否则按类别重新分配），重建不丢数据。
+#   - 用户新增 token：config.json 的 "user_added" 自动重放，重建不丢数据。
 #
 # 用法：
 #   cd ROOT && python tokens/build_vocab.py [--words-file PATH]
@@ -48,7 +49,14 @@ import boot
 boot.bootstrap()
 import spec  # noqa: E402
 
-OUT_PATH = Path(__file__).resolve().parent / "vocab.json"
+CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+VFC_PATH = Path(__file__).resolve().parent / spec.VOCAB_FILE_NAME
+
+# 大类标签（与 tokens/vocab.py 同源，这里只用来标注分区表）
+CAT_REGULAR = "regular"
+CAT_FALLBACK = "fallback"
+CAT_SPECIAL = "special"
+CAT_SYSTEM = "system"
 WORDS_PATH = Path(__file__).resolve().parent / "words_en.txt"
 
 EN_FREQ_URL = (
@@ -81,10 +89,6 @@ FULLWIDTH_ALNUM = (
     + list(range(0xFF21, 0xFF3B))
     + list(range(0xFF41, 0xFF5B))
 )
-
-
-def _reserved(i: int) -> str:
-    return f"<reserved:{i}>"
 
 
 # ---------------------------------------------------------------------------
@@ -205,283 +209,188 @@ def load_english_words(words_file: str | None = None,
 # 用户新增 token 重放（重建不丢失）
 # ---------------------------------------------------------------------------
 def load_user_added() -> list:
-    """旧 vocab.json 的 meta["user_added"] → [{text, category, id}, ...]。"""
-    if not OUT_PATH.is_file():
+    """config.json 的 "user_added" → [{text, ...}, ...]（重建重放源）。"""
+    if not CONFIG_PATH.is_file():
         return []
     try:
-        meta = json.loads(OUT_PATH.read_text(encoding="utf-8")).get("meta", {})
+        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         return []
-    return list(meta.get("user_added", []))
+    got = cfg.get("user_added")
+    return list(got) if isinstance(got, list) else []
 
 
-def apply_user_added(tokens: list, entries: list) -> list:
-    """把用户新增 token 放回新构建的词表；返回最终生效的条目列表。"""
-    applied = []
-    alloc = {
-        "regular": (spec.EXTRA_BEGIN, spec.EXTRA_BEGIN + spec.EXTRA_SIZE),
-        "fallback": (spec.FALLBACK_BEGIN + len(spec.FALLBACK_LETTERS),
-                     spec.FALLBACK_BEGIN + spec.FALLBACK_SIZE),
-        "special": (spec.SPECIAL_BEGIN + len(spec.SPECIAL_TOKENS),
-                    spec.SPECIAL_BEGIN + spec.SPECIAL_SIZE),
-        "system": (spec.SYSTEM_BEGIN + 3,
-                   spec.SYSTEM_BEGIN + spec.SYSTEM_SIZE),
-    }
-    for e in entries:
-        text, cat = e.get("text"), e.get("category")
-        if cat not in alloc or not isinstance(text, str) or not text:
-            print(f"警告：跳过无效 user_added 条目: {e!r}", file=sys.stderr)
-            continue
-        if text in tokens:
-            print(f"警告：user_added {text!r} 与基础词表撞名，跳过",
-                  file=sys.stderr)
-            continue
-        old_id = e.get("id")
-        begin, end = alloc[cat]
-        slot = None
-        if isinstance(old_id, int) and begin <= old_id < end \
-                and tokens[old_id].startswith("<reserved:"):
-            slot = old_id
-        else:
-            slot = next((i for i in range(begin, end)
-                         if tokens[i].startswith("<reserved:")), None)
-        if slot is None:
-            print(f"警告：{cat} 类预留槽位已满，{text!r} 无法重放",
-                  file=sys.stderr)
-            continue
-        tokens[slot] = text
-        applied.append({"text": text, "category": cat, "id": slot})
-    return applied
+# 图元 DRAW 区各字段的 bin 数（顺序与 spec.DRAW_FIELD_ORDER 一致）。
+# 从 spec 取，不硬编码——spec 调整 bin 数时这里自动跟随。
+_DRAW_FIELD_SIZES = (
+    spec.DRAW_X_BINS, spec.DRAW_Y_BINS, spec.DRAW_ANGLE_BINS,
+    spec.DRAW_W_BINS, spec.DRAW_H_BINS, spec.DRAW_SHAPE_BINS,
+    spec.DRAW_COLOR_BINS, spec.DRAW_COLOR_BINS, spec.DRAW_COLOR_BINS,
+)
 
 
-# ---------------------------------------------------------------------------
-# 词表拼装（纯函数，便于幂等性测试）
-# ---------------------------------------------------------------------------
-def build_tokens(english_words, user_added: list | None = None,
-                 with_applied: bool = False):
-    """按 spec 布局拼装 id_to_token 列表（长度 = VOCAB_SIZE_PADDED）。
+def build_entries(english_words, user_added: list | None = None):
+    """按 spec 布局拼装 id_to_token 列表（**长度随内容变化，不再 pad**）。
 
-    with_applied=True 时返回 (tokens, applied_user_added)，供 meta 记录。
+    2026-10-30 契约重构：删掉所有 `pad_to(...)` 预留。可见区各子区**连续**
+    排布，长度就是它实际收录的条数，一个空位都不留——空位同样要占一个
+    embedding 行（wte 与 lm_head 各一份 1024 维），白吃 RAM，还会在
+    logits 里留下一堆永远不该被采样到的死行。
+    于是**每个词表的总长度可以不同**，真值记在词表目录的 config.json。
+
+    返回 (entries, regions, applied)：
+      entries  [(id, text, visible)]  连续编号，可直接落 .vfc
+      regions  [{region, category, size}]  各子区**大小**（begin 由累加得出）
+      applied  实际生效的 user_added 条目
     """
+    entries: list[tuple] = []
     tokens: list[str] = []
+    regions: list[dict] = []
 
-    def pad_to(end: int):
-        while len(tokens) < end:
-            tokens.append(_reserved(len(tokens)))
+    def emit(seq, region: str, category: str):
+        for _t in seq:
+            entries.append((len(entries), _t, category != CAT_SPECIAL))
+            tokens.append(_t)
+        regions.append({"region": region, "category": category,
+                        "size": len(seq)})
 
-    # 1. SPECIAL 区（0–63）：7 个特殊 token + 预留
-    assert len(tokens) == spec.SPECIAL_BEGIN
-    tokens.extend(spec.SPECIAL_TOKENS)
-    pad_to(spec.SPECIAL_BEGIN + spec.SPECIAL_SIZE)
+    # ---- 架构契约头：special / system / draw（内容与顺序由 spec 冻结）----
+    emit(list(spec.SPECIAL_TOKENS), "special", CAT_SPECIAL)
+    emit(list(getattr(spec, "SYSTEM_CHARS",
+                      (spec.TS_OPEN, spec.TS_CLOSE, spec.TS_SEP))),
+         "system", CAT_SYSTEM)
+    draw: list[str] = []
+    for _f, _sz in zip(spec.DRAW_FIELD_ORDER, _DRAW_FIELD_SIZES):
+        draw.extend(f"<{_f}:{n}>" for n in range(_sz))
+    draw.extend(f"<draw:special:{n}>"
+                for n in range(spec.DRAW_SPECIAL_BINS))
+    emit(draw, "draw", CAT_SPECIAL)
+    assert len(tokens) == spec.HEAD_SIZE, (
+        f"架构契约头长度 {len(tokens)} != HEAD_SIZE {spec.HEAD_SIZE}")
 
-    # 2. SYSTEM 区（64–95）：{ } | + 预留
-    assert len(tokens) == spec.SYSTEM_BEGIN
-    tokens.extend([spec.TS_OPEN, spec.TS_CLOSE, spec.TS_SEP])
-    pad_to(spec.SYSTEM_BEGIN + spec.SYSTEM_SIZE)
+    # ---- 可见区：各子区按 spec.VISIBLE_REGION_ORDER 连续排布 ----
+    # 用户新增 token 统一落进 extra 区（config["append_region"]）。
+    # 先按「已收录文本」去重：user_added 里若混进了基础词表本来就有的词
+    # （历史上 meta 被写脏过一次），直接重放会造出同文本双 ID，整张词表
+    # 会被 Vocab 的唯一性校验拒绝。
+    known = {t for _i, t, _v in entries}
+    extra = []
+    dropped = 0
+    for e in (user_added or []):
+        if not isinstance(e, dict):
+            continue
+        t = e.get("text")
+        if not isinstance(t, str) or not t or t in known:
+            dropped += 1
+            continue
+        known.add(t)
+        extra.append(t)
+    emit([str(d) for d in range(10)], "digit", CAT_REGULAR)
+    emit(list(spec.WHITESPACE_CHARS), "whitespace", CAT_REGULAR)
+    emit(symbol_chars(), "symbol", CAT_REGULAR)
+    emit(emoji_chars(), "emoji", CAT_REGULAR)
+    emit([chr(cp) for cp in range(0x4E00, 0x9FFF + 1)] +
+         [chr(cp) for cp in range(0x3400, 0x4DBF + 1)],
+         "cjk", CAT_REGULAR)
+    emit([str(w) for w in english_words], "english", CAT_REGULAR)
+    emit(extra, "extra", CAT_REGULAR)
+    emit(list(spec.FALLBACK_LETTERS), "fallback", CAT_FALLBACK)
 
-    # 3. MODAL 区：图元输出 token（照搬 primitive-operation-painter
-    #    geometrize_256_v1：字段序 cx cy theta w h shape r g b + special 3）
-    assert len(tokens) == spec.MODAL_BEGIN
-    b = spec.DRAW_BEGIN
-    fields = (
-        ("cx", spec.DRAW_X_BINS), ("cy", spec.DRAW_Y_BINS),
-        ("theta", spec.DRAW_ANGLE_BINS), ("w", spec.DRAW_W_BINS),
-        ("h", spec.DRAW_H_BINS), ("shape", spec.DRAW_SHAPE_BINS),
-        ("r", spec.DRAW_COLOR_BINS), ("g", spec.DRAW_COLOR_BINS),
-        ("b", spec.DRAW_COLOR_BINS),
-    )
-    offsets = (spec.DRAW_X_OFFSET, spec.DRAW_Y_OFFSET,
-               spec.DRAW_ANGLE_OFFSET, spec.DRAW_W_OFFSET,
-               spec.DRAW_H_OFFSET, spec.DRAW_SHAPE_OFFSET,
-               spec.DRAW_R_OFFSET, spec.DRAW_G_OFFSET,
-               spec.DRAW_B_OFFSET)
-    for (name, size), off in zip(fields, offsets):
-        assert len(tokens) == b + off, f"draw {name}: {len(tokens)} != {b + off}"
-        tokens.extend(f"<{name}:{n}>" for n in range(size))
-    assert len(tokens) == b + spec.DRAW_SPECIAL_OFFSET
-    # special 3 bins（仓库布局自带：pad + 2 预留）
-    tokens.extend(f"<draw:special:{n}>" for n in range(spec.DRAW_SPECIAL_BINS))
-    assert len(tokens) == b + spec.DRAW_VOCAB_SIZE
-    pad_to(spec.MODAL_BEGIN + spec.MODAL_SIZE)   # 剩余预留
+    if len(entries) > spec.MAX_VOCAB_SIZE:
+        raise ValueError(
+            f"词表长度 {len(entries)} 超过安全上界 {spec.MAX_VOCAB_SIZE}")
 
-    # 4. DIGIT 区
-    assert len(tokens) == spec.DIGIT_BEGIN
-    tokens.extend(str(d) for d in range(10))
-    assert len(tokens) == spec.DIGIT_BEGIN + spec.DIGIT_SIZE
-
-    # 5. WHITESPACE 区
-    assert len(tokens) == spec.WHITESPACE_BEGIN
-    tokens.extend(spec.WHITESPACE_CHARS)
-    pad_to(spec.WHITESPACE_BEGIN + spec.WHITESPACE_SIZE)
-
-    # 6. SYMBOL 区
-    assert len(tokens) == spec.SYMBOL_BEGIN
-    symbols = symbol_chars()
-    assert len(symbols) <= spec.SYMBOL_SIZE, (
-        f"符号数 {len(symbols)} 超出 SYMBOL_SIZE {spec.SYMBOL_SIZE}")
-    tokens.extend(symbols)
-    pad_to(spec.SYMBOL_BEGIN + spec.SYMBOL_SIZE)
-
-    # 7. EMOJI 区
-    assert len(tokens) == spec.EMOJI_BEGIN
-    emojis = emoji_chars()
-    assert len(emojis) <= spec.EMOJI_SIZE, (
-        f"emoji 数 {len(emojis)} 超出 EMOJI_SIZE {spec.EMOJI_SIZE}")
-    tokens.extend(emojis)
-    pad_to(spec.EMOJI_BEGIN + spec.EMOJI_SIZE)
-
-    # 8. CJK 区：U+4E00–U+9FFF 接 U+3400–U+4DBF（各按码点升序）
-    assert len(tokens) == spec.CJK_BEGIN
-    tokens.extend(chr(cp) for cp in range(0x4E00, 0x9FFF + 1))
-    tokens.extend(chr(cp) for cp in range(0x3400, 0x4DBF + 1))
-    pad_to(spec.CJK_BEGIN + spec.CJK_SIZE)
-
-    # 9. ENGLISH 区
-    assert len(tokens) == spec.ENGLISH_BEGIN
-    assert len(english_words) <= spec.ENGLISH_SIZE
-    for w in english_words:
-        assert EN_WORD_RE.match(w), f"非法英文词形: {w!r}"
-    tokens.extend(english_words)
-    pad_to(spec.ENGLISH_BEGIN + spec.ENGLISH_SIZE)
-
-    # 10. EXTRA 区（用户新增常规 token 的 reserved 尾段）
-    assert len(tokens) == spec.EXTRA_BEGIN
-    pad_to(spec.EXTRA_BEGIN + spec.EXTRA_SIZE)
-
-    # 11. FALLBACK 区：a–z + 预留
-    assert len(tokens) == spec.FALLBACK_BEGIN
-    tokens.extend(spec.FALLBACK_LETTERS)
-    pad_to(spec.FALLBACK_BEGIN + spec.FALLBACK_SIZE)
-
-    # 12. 尾部补齐到 64 的倍数
-    assert len(tokens) == spec.VOCAB_SIZE
-    pad_to(spec.VOCAB_SIZE_PADDED)
-    assert len(tokens) == spec.VOCAB_SIZE_PADDED
-
-    # 13. 用户新增 token 重放（整个基础词表构建完成后，只写 reserved 槽）
-    applied = apply_user_added(tokens, user_added or [])
-    if with_applied:
-        return tokens, applied
-    return tokens
+    # applied 只能取 extra 区里的条目。旧实现用 `i >= sum(regions[:7])`
+    # 当边界，而 regions[:7] 到 emoji 为止——cjk/english 全被误记成
+    # 「用户新增」，下次重建就会把它们当 extra 重放一遍（文本双 ID）。
+    extra_begin = 0
+    extra_size = 0
+    for r in regions:
+        if r["region"] == "extra":
+            extra_size = r["size"]
+            break
+        extra_begin += r["size"]
+    applied = [{"text": t, "category": "regular", "id": i}
+               for i, t, _v in entries[extra_begin:extra_begin + extra_size]]
+    if dropped:
+        print(f"[build_vocab] user_added 中 {dropped} 条与基础词表重复，"
+              f"已跳过", file=sys.stderr)
+    return entries, regions, applied
 
 
 def build_vocab(words_file: str | None = None,
                 source_desc: str | None = None) -> dict:
-    """完整构建（含英文词加载、用户 token 重放与 meta）。"""
+    """完整构建：entries + regions + config.json 内容。"""
     english_words, source = load_english_words(words_file, source_desc)
     user_added = load_user_added()
-    id_to_token, applied = build_tokens(english_words, user_added,
-                                        with_applied=True)
+    entries, regions, applied = build_entries(english_words, user_added)
+    id_to_token = [t for _i, t, _v in entries]
     # 同一字符串在全词表内唯一，唯一例外是 3 个系统 token 的显示字符
     # （{ } |）与可见符号区撞名——设计使然：text→id 经 regular 查表
     # 永远解析到可见符号 token；id→显示时两者同为字面量，无歧义。
-    token_to_id = {t: i for i, t in enumerate(id_to_token)}
     seen: dict = {}
     for i, t in enumerate(id_to_token):
         if t in seen and t not in (spec.TS_OPEN, spec.TS_CLOSE, spec.TS_SEP):
             raise AssertionError(
                 f"词表存在同文本双 ID: {t!r}（{seen[t]} 与 {i}）")
         seen.setdefault(t, i)
-    meta = {
+    config = {
+        "name": "base",
+        "format": "gargantua-vocab-folder-v1",
+        "is_main": True,
         "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "format": "tok-32",
-        "id_bits": 32,
-        "english_source": source,
-        "english_word_count": len(english_words),
-        "emoji_source": ("Unicode 16.0.0 emoji-data.txt (Emoji=Yes, 非 ASCII)"
-                         " + Emoji_Component 组件字符"),
-        "emoji_count": len(emoji_chars()),
-        "symbol_source": (f"Unicode P*/S* 类码点（UCD "
-                          f"{unicodedata.unidata_version}）排除 emoji + "
-                          f"全角字母数字"),
-        "symbol_count": len(symbol_chars()),
-        "unidata_version": unicodedata.unidata_version,
-        "vocab_size": spec.VOCAB_SIZE,
-        "vocab_size_padded": spec.VOCAB_SIZE_PADDED,
+        "vocab_size": len(id_to_token),
+        "head_size": spec.HEAD_SIZE,
+        "regions": regions,
+        "append_region": "extra",
         "user_added": applied,
-        "categories": {
-            "regular": "常规可见（数字/空白/符号/emoji/中文/英文词）",
-            "fallback": "可见 fallback（a–z）",
-            "special": "不可见特殊（<caps>/<user>/<model>/<stop> 等）",
-            "system": "不可见系统（{ } | 时间步结构）",
-        },
-        "ranges": {
-            "special": {"begin": spec.SPECIAL_BEGIN, "size": spec.SPECIAL_SIZE},
-            "system": {"begin": spec.SYSTEM_BEGIN, "size": spec.SYSTEM_SIZE},
-            "modal": {"begin": spec.MODAL_BEGIN, "size": spec.MODAL_SIZE},
-            "digit": {"begin": spec.DIGIT_BEGIN, "size": spec.DIGIT_SIZE},
-            "whitespace": {"begin": spec.WHITESPACE_BEGIN,
-                           "size": spec.WHITESPACE_SIZE},
-            "symbol": {"begin": spec.SYMBOL_BEGIN, "size": spec.SYMBOL_SIZE},
-            "emoji": {"begin": spec.EMOJI_BEGIN, "size": spec.EMOJI_SIZE},
-            "cjk": {"begin": spec.CJK_BEGIN, "size": spec.CJK_SIZE},
-            "english": {"begin": spec.ENGLISH_BEGIN, "size": spec.ENGLISH_SIZE},
-            "extra": {"begin": spec.EXTRA_BEGIN, "size": spec.EXTRA_SIZE},
-            "fallback": {"begin": spec.FALLBACK_BEGIN,
-                         "size": spec.FALLBACK_SIZE},
-            "draw": {"begin": spec.DRAW_BEGIN, "size": spec.DRAW_VOCAB_SIZE,
-                     "tokens_per_primitive": spec.DRAW_TOKENS_PER_PRIMITIVE,
-                     "field_order": list(spec.DRAW_FIELD_ORDER),
-                     "bins": {"cx": spec.DRAW_X_BINS, "cy": spec.DRAW_Y_BINS,
-                              "theta": spec.DRAW_ANGLE_BINS,
-                              "w": spec.DRAW_W_BINS, "h": spec.DRAW_H_BINS,
-                              "shape": spec.DRAW_SHAPE_BINS,
-                              "r": spec.DRAW_COLOR_BINS,
-                              "g": spec.DRAW_COLOR_BINS,
-                              "b": spec.DRAW_COLOR_BINS,
-                              "special": spec.DRAW_SPECIAL_BINS},
-                     "source": ("wonderfulearth/primitive-operation-painter "
-                                "geometrize_256_v1")},
+        "sources": {
+            "english": source,
+            "english_word_count": len(english_words),
+            "emoji": ("Unicode 16.0.0 emoji-data.txt (Emoji=Yes, 非 ASCII)"
+                      " + Emoji_Component 组件字符"),
+            "emoji_count": len(emoji_chars()),
+            "symbol": (f"Unicode P*/S* 类码点（UCD "
+                       f"{unicodedata.unidata_version}）排除 emoji + "
+                       f"全角字母数字"),
+            "symbol_count": len(symbol_chars()),
+            "unidata_version": unicodedata.unidata_version,
         },
     }
-    return {
-        "id_to_token": id_to_token,
-        "token_to_id": token_to_id,
-        "meta": meta,
-    }
+    return {"entries": entries, "regions": regions, "config": config}
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="构建 tokens/vocab.json")
+    ap = argparse.ArgumentParser(
+        description="构建全局基础词表 tokens/{vocab.vfc, config.json}")
     ap.add_argument("--words-file", default=None, help="本地英文词频文件路径")
     ap.add_argument(
         "--source-desc",
         default=None,
-        help="meta 中记录的英文词来源描述（默认按实际获取途径记录）",
-    )
-    ap.add_argument(
-        "--export-txt",
-        default=None,
-        help="顺便把词表导出为 vocab.txt（一行一个 token，行号即 ID；"
-             "可直接当作 models/NAME/vocab.txt 的起点）",
+        help="config 中记录的英文词来源描述（默认按实际获取途径记录）",
     )
     args = ap.parse_args(argv)
     vocab = build_vocab(args.words_file, args.source_desc)
-    OUT_PATH.write_text(
-        json.dumps(vocab, ensure_ascii=False, separators=(",", ":")),
+
+    from tokens import vfc as _vfc
+    # 直接用 build_entries 给出的 (id, text, visible)：visible 标记决定
+    # .vfc 里是引号还是尖括号形态，system 的 { } | 必须是引号（尖括号
+    # 里放不下非标识符），不能按「ID < HEAD_SIZE」重新推导。
+    _vfc.write_vfc(str(VFC_PATH), vocab["entries"])
+    cfg = vocab["config"]
+    CONFIG_PATH.write_text(
+        json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    if args.export_txt:
-        # 2026-10-27 审计修复（H1）：导出必须与每模型词表同格式（v2，显式
-        # ID + JSON 转义），且只导出可见区的真实 token。旧实现把整个
-        # id_to_token（含不可见区与 reserved 占位符）按行拼接，既让 ID
-        # 整体错位，又把 token 自身的 "\n"/"\r" 变成空行。
-        from common import write_flat_vocab_file
-        out = Path(args.export_txt)
-        entries = [(i, t) for i, t in
-                   enumerate(vocab["id_to_token"][spec.INVISIBLE_END:],
-                             spec.INVISIBLE_END)
-                   if not t.startswith("<reserved:")]
-        write_flat_vocab_file(str(out), entries)
-        print(f"  导出 vocab.txt : {out}（{len(entries)} 个真实 token）")
-    m = vocab["meta"]
-    print(f"已写出 {OUT_PATH}")
-    print(f"  总槽位        : {len(vocab['id_to_token'])}")
-    print(f"  英文词实收    : {m['english_word_count']}（{m['english_source']}）")
-    print(f"  emoji         : {m['emoji_count']}")
-    print(f"  符号          : {m['symbol_count']}")
-    print(f"  用户新增重放  : {len(m['user_added'])}")
-    print(f"  文件大小      : {OUT_PATH.stat().st_size} 字节")
+    src = cfg["sources"]
+    print(f"已写出 {VFC_PATH}")
+    print(f"已写出 {CONFIG_PATH}")
+    print(f"  词表长度      : {cfg['vocab_size']}")
+    print(f"  分区数        : {len(cfg['regions'])}")
+    print(f"  英文词实收    : {src['english_word_count']}（{src['english']}）")
+    print(f"  emoji         : {src['emoji_count']}")
+    print(f"  符号          : {src['symbol_count']}")
+    print(f"  用户新增重放  : {len(cfg['user_added'])}")
 
 
 if __name__ == "__main__":

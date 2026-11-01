@@ -1,8 +1,14 @@
-"""vocab_presets 模块测试：预设 CRUD、软删、seed 模型、全局区间占用。
+"""vocab_presets 模块测试：词表 CRUD、增删 token、seed 模型、占用统计。
+
+2026-10-30 词表契约重构后的形态：
+  - 词表 = vocabs/<name>/{vocab.vfc, config.json} 文件夹（不再是无上限
+    的「预留槽位 + 软删占位符」——词表必须占满，删除即前移，恒无空位）；
+  - base（main）禁止直接编辑/删除，改动必须先 Fork；
+  - seed = vocab.vfc + config.json 整目录复制进 models/NAME/vocab/。
 
 运行：cd ROOT && python -m unittest service.test.test_vocab_presets -v
-前置：tokens/vocab.json 已生成；测试把 VOCABS_DIR 重定向到临时目录，
-      不会污染项目真实的 vocabs/。
+前置：全局基础词表（service/tokens/vocab.vfc，或可迁移的 vocab.json）
+      已生成；测试把 VOCABS_DIR 重定向到临时目录，不污染真实 vocabs/。
 """
 from __future__ import annotations
 
@@ -25,17 +31,22 @@ from pathlib import Path
 
 import spec
 import vocab_presets as vp
-from tokens.vocab import DEL_MARKER, Vocab
+from tokens import vfc
 
-# 把预设存储目录重定向到临时目录，避免污染项目真实 vocabs/
+# 把词表存储目录重定向到临时目录，避免污染项目真实 vocabs/
 _ORIG_VOCABS_DIR = vp.VOCABS_DIR
 _MODULE_TMP = None
 
 
 def setUpModule():
-    if not (Path(__file__).resolve().parents[2] / "service" / "tokens"
-            / "vocab.json").is_file():
-        raise RuntimeError("tokens/vocab.json 不存在，请先运行 build_vocab.py")
+    have_global = (
+        (Path(__file__).resolve().parents[2] / "service" / "tokens"
+         / "vocab.vfc").is_file()
+        or (Path(__file__).resolve().parents[2] / "service" / "tokens"
+            / "vocab.json").is_file())
+    if not have_global:
+        raise RuntimeError(
+            "全局基础词表不存在，请先运行 build_vocab.py")
     # 模块级重定向：确保所有测试类（含 GlobalRangesTest，无自身 setUp）
     # 都写到临时目录，绝不污染项目真实的 vocabs/。
     global _MODULE_TMP
@@ -63,171 +74,214 @@ class PresetLifecycleTest(unittest.TestCase):
     # ---- base ----
     def test_ensure_base_idempotent(self):
         vp.ensure_base()
-        base_txt = vp.vocab_txt_path(vp.BASE)
+        base_txt = vp.vocab_vfc_path(vp.BASE)
         self.assertTrue(base_txt.is_file())
-        n1 = len(vp.read_flat_tokens(vp.BASE))
+        self.assertTrue(vp.config_path(vp.BASE).is_file(),
+                        "词表文件夹必须同时有 config.json")
+        n1 = len(vp.load_vocab(vp.BASE))
         vp.ensure_base()                       # 二次调用不应重建/增长
-        n2 = len(vp.read_flat_tokens(vp.BASE))
+        n2 = len(vp.load_vocab(vp.BASE))
         self.assertEqual(n1, n2)
-        self.assertGreater(n1, 0)
+        self.assertGreater(n1, spec.HEAD_SIZE)
 
     # ---- create / list ----
     def test_create_and_list(self):
         vp.ensure_base()
-        info = vp.create_preset("p1", source=vp.BASE)
+        info = vp.create_vocab("p1", source=vp.BASE)
         self.assertEqual(info["name"], "p1")
         self.assertEqual(info["source"], vp.BASE)
-        names = {p["name"] for p in vp.list_presets()}
+        self.assertEqual(info["vocab_size"],
+                         len(vp.load_vocab(vp.BASE)))
+        names = {p["name"] for p in vp.list_vocabs()}
         self.assertIn("base", names)
         self.assertIn("p1", names)
-        # 新预设与 base 同容量
-        p1 = next(p for p in vp.list_presets() if p["name"] == "p1")
-        base = next(p for p in vp.list_presets() if p["name"] == "base")
-        self.assertEqual(p1["capacity"], base["capacity"])
-        self.assertTrue(p1["is_base"] is False)
-        self.assertTrue(base["is_base"] is True)
+        # fork 出来的新词表与源同长（整目录复制）
+        p1 = next(p for p in vp.list_vocabs() if p["name"] == "p1")
+        base = next(p for p in vp.list_vocabs() if p["name"] == "base")
+        self.assertEqual(p1["vocab_size"], base["vocab_size"])
+        self.assertTrue(p1["is_main"] is False)
+        self.assertTrue(base["is_main"] is True)
 
     def test_create_invalid_name(self):
         with self.assertRaises(ValueError):
-            vp.create_preset("../evil")
+            vp.create_vocab("../evil")
         with self.assertRaises(ValueError):
-            vp.create_preset("")
+            vp.create_vocab("")
 
     def test_create_duplicate(self):
         vp.ensure_base()
-        vp.create_preset("dup")
+        vp.create_vocab("dup")
         with self.assertRaises(ValueError):
-            vp.create_preset("dup")
+            vp.create_vocab("dup")
 
     def test_create_from_missing_source(self):
         vp.ensure_base()
         with self.assertRaises(ValueError):
-            vp.create_preset("x", source="nope")
+            vp.create_vocab("x", source="nope")
 
     # ---- delete ----
     def test_delete_preset(self):
         vp.ensure_base()
-        vp.create_preset("delme")
-        vp.delete_preset("delme")
-        names = {p["name"] for p in vp.list_presets()}
+        vp.create_vocab("delme")
+        vp.delete_vocab("delme")
+        names = {p["name"] for p in vp.list_vocabs()}
         self.assertNotIn("delme", names)
 
     def test_delete_base_forbidden(self):
         vp.ensure_base()
         with self.assertRaises(ValueError):
-            vp.delete_preset(vp.BASE)
+            vp.delete_vocab(vp.BASE)
 
-    # ---- add / remove (soft delete) ----
+    # ---- add / remove（新契约：删除即前移，恒无空位）----
     def test_add_token(self):
         vp.ensure_base()
-        vp.create_preset("addp")
+        vp.create_vocab("addp")
         tok = "zzz_add_token_unique_987"
-        res = vp.add_token("addp", tok, category="regular")
+        base_size = len(vp.load_vocab(vp.BASE))
+        res = vp.add_token_to("addp", tok, category="regular")
         self.assertEqual(res["token"], tok)
         self.assertEqual(res["vocab"], "addp")
-        self.assertGreaterEqual(res["id"], spec.INVISIBLE_END)
-        # 文件里确实多了这一条（v2 显式 ID 格式）
-        entries = dict((t, i) for i, t in vp.read_flat_entries("addp"))
-        self.assertEqual(entries[tok], res["id"])
+        self.assertGreaterEqual(res["id"], spec.HEAD_SIZE)
+        # 词表确实长了 1，且查表能反查到同一 ID
+        v = vp.load_vocab("addp")
+        self.assertEqual(res["vocab_size"], base_size + 1)
+        self.assertEqual(v.token_to_id[tok], res["id"])
+        # 正文文件里也确实多了这一条
+        entries = vfc.read_vfc(str(vp.vocab_vfc_path("addp")))
+        self.assertIn(res["id"], [e[0] for e in entries])
 
-    def test_remove_token_soft_delete(self):
+    def test_add_token_to_base_forbidden(self):
+        """main 词表不可直接编辑：加 token 必须先 Fork。"""
         vp.ensure_base()
-        vp.create_preset("remp")
+        with self.assertRaises(ValueError):
+            vp.add_token_to(vp.BASE, "zzz_should_not_land")
+
+    def test_remove_token_no_hole(self):
+        vp.ensure_base()
+        vp.create_vocab("remp")
         tok = "zzz_rem_token_unique_654"
-        res = vp.add_token("remp", tok)
+        fork_size = len(vp.load_vocab("remp"))
+        res = vp.add_token_to("remp", tok)
         tid = res["id"]
-        used_before = vp.preset_occupancy("remp")["used"]
 
-        rem = vp.remove_token("remp", tok)
-        self.assertEqual(rem["id"], tid)               # 返回原 ID
-        used_after = vp.preset_occupancy("remp")["used"]
-        self.assertEqual(used_after, used_before - 1)
+        rem = vp.remove_token_from("remp", tok)
+        self.assertEqual(rem["id"], tid)               # 返回被删 ID
+        self.assertEqual(rem["vocab_size"], fork_size)  # 长度回落
 
-        # 文件里该 token 被替换为 <del:N> 占位符（保留 ID 位置）
-        flat = vp.read_flat_entries("remp")
-        self.assertNotIn(tok, [t for _, t in flat])
-        self.assertTrue(any(t.startswith(DEL_MARKER) for _, t in flat))
-
-        # 重新构建 Vocab：该 token 不可被查表
-        v = Vocab.from_entries(flat, vp.vocab_txt_path("remp"))
-        self.assertIsNone(v.lookup(tok))
-        self.assertNotIn(tok, v.token_to_id)
-        # 但 ID 位置被占位符占着，后续 token 不漂移
-        self.assertEqual(v.id_to_token[tid], f"{DEL_MARKER}{tid - spec.INVISIBLE_END}>")
+        # 新契约：不留 <del:N> 占位符——ID 整体前移，恒无空位
+        v = vp.load_vocab("remp")
+        self.assertIsNone(v.token_to_id.get(tok))
+        self.assertEqual(len(v), fork_size)
+        entries = vfc.read_vfc(str(vp.vocab_vfc_path("remp")))
+        self.assertEqual([e[0] for e in entries],
+                         list(range(len(entries))), "ID 必须严格连续")
+        self.assertFalse(any(e[1].startswith("<del:") for e in entries),
+                         "新契约不允许软删占位符残留在正文里")
 
     def test_remove_missing_token_raises(self):
         vp.ensure_base()
-        vp.create_preset("remp2")
+        vp.create_vocab("remp2")
         with self.assertRaises(ValueError):
-            vp.remove_token("remp2", "not_present_token")
+            vp.remove_token_from("remp2", "not_present_token")
 
-    # ---- validate_preset ----
-    def test_validate_preset(self):
+    # ---- query ----
+    def test_query_token(self):
         vp.ensure_base()
-        self.assertEqual(vp.validate_preset(None), vp.BASE)
-        self.assertEqual(vp.validate_preset(vp.BASE), vp.BASE)
+        vp.create_vocab("qp")
+        res = vp.add_token_to("qp", "zzz_query_token_123")
+        q = vp.query_token("qp", "zzz_query_token_123")
+        self.assertTrue(q["found"])
+        self.assertEqual(q["id"], res["id"])
+        miss = vp.query_token("qp", "zzz_never_added")
+        self.assertFalse(miss["found"])
+        self.assertIsNone(miss["id"])
+
+    # ---- validate_vocab ----
+    def test_validate_vocab(self):
+        vp.ensure_base()
+        self.assertEqual(vp.validate_vocab(None), vp.BASE)
+        self.assertEqual(vp.validate_vocab(vp.BASE), vp.BASE)
         with self.assertRaises(ValueError):
-            vp.validate_preset("does_not_exist")
-        vp.create_preset("okp")
-        self.assertEqual(vp.validate_preset("okp"), "okp")
+            vp.validate_vocab("does_not_exist")
+        vp.create_vocab("okp")
+        self.assertEqual(vp.validate_vocab("okp"), "okp")
 
     # ---- seed_model_vocab ----
     def test_seed_model_vocab(self):
         vp.ensure_base()
-        vp.create_preset("seedp")
+        vp.create_vocab("seedp")
         tok = "zzz_seed_token_unique_321"
-        res = vp.add_token("seedp", tok)
+        res = vp.add_token_to("seedp", tok)
         model_dir = self.tmp / "models" / "M1"
         vp.seed_model_vocab(str(model_dir), "seedp")
-        copied = model_dir / "vocab.txt"
-        self.assertTrue(copied.is_file())
-        # seed 合同：逐字节复制预设 vocab.txt（含 v2 魔数头）
+        # 新契约：vocab.vfc + config.json 两个文件都复制进 vocab/ 子目录
+        vdir = model_dir / "vocab"
+        self.assertTrue((vdir / "vocab.vfc").is_file())
+        self.assertTrue((vdir / "config.json").is_file())
+        # seed 合同：逐字节复制词表文件夹（含 .vfc 魔数头）
         self.assertEqual(
-            vp.vocab_txt_path("seedp").read_text(encoding="utf-8"),
-            copied.read_text(encoding="utf-8"))
-        seeded = dict((t, i) for i, t in vp.read_flat_entries("seedp"))
-        self.assertEqual(seeded.get(tok), res["id"])
+            vp.vocab_vfc_path("seedp").read_text(encoding="utf-8"),
+            (vdir / "vocab.vfc").read_text(encoding="utf-8"))
+        seeded = [e[1] for e in
+                  vfc.read_vfc(str(vdir / "vocab.vfc"))]
+        self.assertIn(tok, seeded)
+        self.assertEqual(seeded.index(tok), res["id"])
 
     def test_seed_default_is_base(self):
         vp.ensure_base()
         model_dir = self.tmp / "models" / "M2"
         vp.seed_model_vocab(str(model_dir), None)     # 缺省/base
-        copied = model_dir / "vocab.txt"
-        self.assertTrue(copied.is_file())
+        vdir = model_dir / "vocab"
+        self.assertTrue((vdir / "vocab.vfc").is_file())
         self.assertEqual(
-            vp.vocab_txt_path(vp.BASE).read_text(encoding="utf-8"),
-            copied.read_text(encoding="utf-8"))
+            vp.vocab_vfc_path(vp.BASE).read_text(encoding="utf-8"),
+            (vdir / "vocab.vfc").read_text(encoding="utf-8"))
+
+    def test_seed_replaces_stale_copy(self):
+        """重复 seed：旧副本整体替换，不残留上一轮的词表内容。"""
+        vp.ensure_base()
+        model_dir = self.tmp / "models" / "M3"
+        vp.seed_model_vocab(str(model_dir), vp.BASE)
+        vp.create_vocab("other")
+        tok = "zzz_other_token_77"
+        vp.add_token_to("other", tok)
+        vp.seed_model_vocab(str(model_dir), "other")
+        seeded = [e[1] for e in vfc.read_vfc(
+            str(model_dir / "vocab" / "vocab.vfc"))]
+        self.assertIn(tok, seeded)
+        # base 独有、other 改过的内容不该残留——用长度差异验证整体替换
+        self.assertEqual(len(seeded), len(vp.load_vocab("other")))
 
 
-class GlobalRangesTest(unittest.TestCase):
+class GlobalVocabTest(unittest.TestCase):
     """全局词表区间占用（只读，不依赖 VOCABS_DIR）。"""
 
-    def test_global_ranges(self):
-        r = vp.global_ranges()
-        self.assertEqual(r["vocab_size_padded"], spec.VOCAB_SIZE_PADDED)
-        self.assertEqual(r["invisible_end"], spec.INVISIBLE_END)
-        self.assertEqual(set(r["categories"]),
-                         {"regular", "fallback", "special", "system"})
-        # 12 个子区
-        self.assertEqual(len(r["regions"]), 11)  # 见全局布局（无独立 fallback 子区重复）
-        for reg in r["regions"]:
-            self.assertIn("region", reg)
-            self.assertIn("category", reg)
-            self.assertEqual(reg["padded"], reg["size"])
-            self.assertGreaterEqual(reg["used"], 0)
-            self.assertLessEqual(reg["used"], reg["size"])
-        # 分类合计 = 各子区 used 之和
-        tot = r["category_totals"]
-        self.assertEqual(
-            tot["regular"],
-            sum(x["used"] for x in r["regions"] if x["category"] == "regular"))
+    def test_global_vocab_config(self):
+        """全局词表 = service/tokens/{vocab.vfc, config.json}，与 base 同构。"""
+        from tokens.vocab import Vocab
+        g = Vocab.global_vocab()
+        self.assertEqual(g.name, "base")
+        self.assertEqual(g.config.get("vocab_size"), len(g))
+        regions = g.config.get("regions") or []
+        self.assertEqual(sum(r["size"] for r in regions), len(g))
+        # 分区表覆盖全表且首尾相接
+        covered = 0
+        for r in g.regions:
+            self.assertEqual(r["begin"], covered)
+            covered += r["size"]
+        self.assertEqual(covered, len(g))
 
-    def test_preset_occupancy(self):
+    def test_vocab_occupancy(self):
         vp.ensure_base()
-        occ = vp.preset_occupancy(vp.BASE)
-        self.assertEqual(occ["capacity"],
-                         spec.VOCAB_SIZE_PADDED - spec.INVISIBLE_END)
-        self.assertEqual(occ["free"], occ["capacity"] - occ["used"])
+        occ = vp.vocab_occupancy(vp.BASE)
+        self.assertEqual(occ["name"], vp.BASE)
+        self.assertTrue(occ["is_main"])
+        # 新契约：容量 = 可见 + 不可见（头部），不再有 free/capacity
+        self.assertEqual(occ["vocab_size"],
+                         occ["visible_size"] + occ["invisible_size"])
+        self.assertEqual(occ["invisible_size"], spec.HEAD_SIZE)
+        for reg in occ["regions"]:
+            self.assertIn("samples", reg)
 
 
 if __name__ == "__main__":

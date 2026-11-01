@@ -1244,8 +1244,12 @@ $("json-export").onclick = async () => {
   const msg = $("json-msg");
   msg.textContent = "导出中…";
   try {
-    const r = await api("/api/tokens/export",
-                        {text: $("json-editor").innerText});
+    const body = {text: $("json-editor").innerText};
+    // 2026-10-31 契约：Token 编辑器与四个转换器一致，按所选词表解析
+    // <stop> 这类名字与校验 ID；未选（列表没加载出来）→ 后端用进程词表
+    const v = $("json-vocab").value;
+    if (v) body.vocab = v;
+    const r = await api("/api/tokens/export", body);
     const bytes = b64ToBytes(r.tokens_b64);
     const blob = new Blob([bytes], {type: "application/octet-stream"});
     const a = document.createElement("a");
@@ -1276,9 +1280,9 @@ const VOCAB = {
   mode: "form",   // form | text
   write: "this",  // this | fork
 };
-/* 转换器四页 + 建模页「词表预设」共用同一份词表列表 */
+/* 转换器四页 + 建模页「词表预设」+ Token 编辑器导出共用同一份词表列表 */
 const VOCAB_SELECTS = ["text-vocab", "audio-vocab", "image-vocab",
-                       "video-vocab", "model-vocab"];
+                       "video-vocab", "model-vocab", "json-vocab"];
 const MAIN_WHY =
   "main 词表是全站基准：模型维度、不可见区契约、系统 token 都锚在它身上，"
   + "直接改动会牵连所有已建模型。请 Fork 出一份新词表，再在新词表上编辑。";
@@ -1461,15 +1465,18 @@ function drawVocabBar(info) {
 function renderVocabRegions(regions) {
   const tb = $("vocab-regions").querySelector("tbody");
   if (!regions.length) {
-    tb.innerHTML = `<tr><td colspan="6" class="hint">暂无分区数据</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="7" class="hint">暂无分区数据</td></tr>`;
     return;
   }
   tb.innerHTML = regions.map(rg => {
     const pct = rg.size ? (rg.used / rg.size * 100).toFixed(2) : "0.00";
+    const samples = (rg.samples || []).map(t =>
+      `<code>${esc(t)}</code>`).join(" ");
     return `<tr><td>${esc(rg.region)}</td><td>${esc(rg.category)}</td>` +
       `<td class="mono">${rg.begin}–${rg.begin + rg.size - 1}</td>` +
       `<td class="mono">${rg.size}</td><td class="mono">${rg.used}</td>` +
-      `<td class="mono">${pct}%</td></tr>`;
+      `<td class="mono">${pct}%</td>` +
+      `<td class="samples">${samples || '<span class="hint">—</span>'}</td></tr>`;
   }).join("");
 }
 /* 大类下拉写死两档：.vfc 的文件格式只有「引号包裹=可显示 / 尖括号包裹=不可显示」

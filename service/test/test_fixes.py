@@ -57,6 +57,10 @@ import torch
 
 import spec
 import model
+from tokens.vocab import Vocab
+
+# 新契约：spec 不再钉死词表长度，显式取全局词表长度
+_VS = len(Vocab.global_vocab())
 from common import (build_model, make_batch, save_checkpoint,
                     valid_model_name, validate_block_size, validate_steps)
 
@@ -68,7 +72,8 @@ def small_model():
     global _SMALL
     if _SMALL is None:
         torch.manual_seed(0)
-        _SMALL = model.Gargantua(n_enc_blocks=1, n_dec_blocks=1)
+        _SMALL = model.Gargantua(n_enc_blocks=1, n_dec_blocks=1,
+                                 vocab_size=_VS)
         _SMALL.eval()
     return _SMALL
 
@@ -104,10 +109,12 @@ class TestCheckpointContract(unittest.TestCase):
 
     def test_build_model_bad_config_falls_back(self):
         # 只有 config.json、无权重：坏 block 数应容错为默认值且不抛异常
+        # （新契约下词表长度没有全局默认，目录必须自己声明 vocab_size）
         d = os.path.join(self.tmp, "models", "badcfg")
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as f:
-            json.dump({"n_enc_blocks": "abc", "n_dec_blocks": 99}, f)
+            json.dump({"n_enc_blocks": "abc", "n_dec_blocks": 99,
+                       "vocab_size": _VS}, f)
         m3 = build_model(d)          # 不抛异常，回退默认值
         self.assertEqual(len(m3.enc_blocks), spec.N_ENC_BLOCKS)
         self.assertEqual(len(m3.dec_blocks), spec.N_DEC_BLOCKS)
@@ -632,7 +639,7 @@ class TestInferIdArchive(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="garg_arch_")
         try:
             a = IdArchive("models/demo", tmp)
-            # 真实推理的 ID 都落在可见区（>= INVISIBLE_END）
+            # 真实推理的 ID 都落在可见区（>= HEAD_SIZE）
             a.add([51046, 51047])
             a.add([51048])
             self.assertTrue(a.path is not None)
@@ -834,7 +841,11 @@ class TestStartupChain(unittest.TestCase):
             "api_codec_draw", "api_codec_text",
             "api_codec_video", "api_codec_image2prims",
             # tok-32 离散 token API（2026-10-24）
-            "api_tokens_encode", "api_tokens_decode", "api_vocab_add",
+            "api_tokens_encode", "api_tokens_decode",
+            # 词表文件夹 API（2026-10-30）
+            "api_vocab_list", "api_vocab_regions", "api_vocab_query",
+            "api_vocab_source_get", "api_vocab_token", "api_vocab_source",
+            "api_vocab_fork", "api_vocab_delete",
         }
         missing = [m for m in expected
                    if not callable(getattr(server.App, m, None))]

@@ -71,10 +71,11 @@ def read_doc(path) -> dict:
             if not ids:
                 raise TokensetError(f"{path}: 第 {k} 步没有 token（空时间步）")
             for t in ids:
-                if not (0 <= t < spec.VOCAB_SIZE_PADDED):
+                # 2026-10-30：词表长度不再由 spec 固定，改用格式硬上界
+                if not (0 <= t < spec.MAX_VOCAB_SIZE):
                     raise TokensetError(
                         f"{path}: token ID {t} 超出词表"
-                        f"（< {spec.VOCAB_SIZE_PADDED}）")
+                        f"（< {spec.MAX_VOCAB_SIZE}）")
             pos_ids.extend(ids)
             step_ids.extend([k] * len(ids))
             continue

@@ -10,8 +10,8 @@
 #   POST /api/tokens/encode  文本 → token-5 流（.tokens 二进制 b64 / 可读文本）
 #   POST /api/tokens/decode  token-5 流 → 可读文本（{text: 00001} …）
 #   POST /api/tokens/export  Token 编辑器文本（{t:}/{text:} …）→ .tokens b64
-#   POST /api/vocab/add      添加 token（regular/fallback/special/system
-#                            四类任选，全局查重，无冲突则入词表）
+#   GET  /api/vocab/*        词表文件夹 API（list/regions/query/source，
+#                            见下方 TokensApi 的方法注释）
 #
 # 格式（spec 第 5b 节）：27 个符号、5 bit/字符；{ } 包裹时间步，| 分隔
 # 步内元素；{t:<id>} 文本、{w:<hex>} 音频、{v:<hex>x:..y:..} 视觉、
@@ -21,8 +21,52 @@
 # ===========================================================================
 import base64
 
+import spec
 from tokens import enctok, tok5
 from tokens.vocab import CAT_REGULAR, CATEGORIES, get_vocab
+
+
+def _q(query, key: str, default: str = "") -> str:
+    """parse_qs 的值取第一项（GET 查询参数用）。"""
+    v = (query or {}).get(key, [""])[0]
+    return v if v else default
+
+
+def resolve_vocab_query(query):
+    """GET 查询参数里的 name → 对应词表；没有 name 就用进程当前词表。
+
+    词表名非法 / 词表不存在 → ValueError（→400）。"""
+    name = _q(query, "name")
+    if not name:
+        return get_vocab()
+    from vocab_presets import load_vocab
+    return load_vocab(name)
+
+
+def _norm_cat(cat) -> str:
+    """归一化类别：.vfc 只有「引号 / 尖括号」两种形态 → regular / special。
+
+    fallback 不是用户可选的——可显示且是单个 a–z 字母时自动兼作 fallback；
+    system 属架构契约头，不接受用户添加。"""
+    c = cat or CAT_REGULAR
+    if c == "fallback":
+        return CAT_REGULAR
+    if c not in (CAT_REGULAR, "special"):
+        raise ValueError(f"category 必须是 regular/special: {cat!r}")
+    return c
+
+
+def _body_vocab(body):
+    """POST 体里的 vocab 名 → 词表；缺省用进程当前词表。
+
+    转换器（文本/音频/图片/视频）与 Token 编辑器都带这个字段：选哪个
+    词表就按哪个词表编码/解码，而不是永远用全局词表。
+    """
+    name = body.get("vocab")
+    if not name:
+        return get_vocab()
+    from vocab_presets import load_vocab
+    return load_vocab(name)
 
 # 入参守卫（与 codec 端点的尺寸守卫同思路）
 MAX_ENCODE_CHARS = 100_000     # 单次编码文本字符上限
@@ -57,12 +101,13 @@ class TokensApi:
         fmt = body.get("format", "tokens_b64")
         if fmt not in ("tokens_b64", "display"):
             raise ValueError(f"format 必须是 tokens_b64/display: {fmt!r}")
-        ids, skipped = enctok.encode_text(text)
+        v = _body_vocab(body)
+        ids, skipped = enctok.encode_text(text, vocab=v)
         items = [tok5.step(tok5.text(i)) for i in ids]
         out = {"n_tokens": len(ids), "n_steps": len(items),
-               "skipped": skipped}
+               "skipped": skipped, "vocab": v.name}
         if fmt == "display":
-            out["display"] = tok5.to_display(items)
+            out["display"] = tok5.to_display(items, name_of=_name_of(v))
         else:
             out["tokens_b64"] = base64.b64encode(
                 tok5.dumps(items)).decode()
@@ -70,7 +115,7 @@ class TokensApi:
 
     # ---------------- token 流 → 可读形式 ----------------
     def api_tokens_decode(self, body):
-        v = get_vocab()
+        v = _body_vocab(body)
         if "tokens_b64" in body:
             b64 = body["tokens_b64"]
             if not isinstance(b64, str):
@@ -127,7 +172,7 @@ class TokensApi:
         if len(text) > MAX_ENCODE_CHARS:
             raise ValueError(
                 f"text 过长: {len(text)} > {MAX_ENCODE_CHARS} 字符")
-        v = get_vocab()
+        v = _body_vocab(body)
         try:
             items = tok5.parse_display(text, id_of=_id_of(v))
         except tok5.Tok5Error as e:
@@ -144,79 +189,95 @@ class TokensApi:
             "n_steps": sum(1 for it in items if it["kind"] == "step"),
         }
 
-    # ---------------- 添加 token ----------------
-    def api_vocab_add(self, body):
-        token = body.get("token")
-        category = body.get("category")
-        if not isinstance(token, str) or not token:
-            raise ValueError("token 必须是非空字符串")
-        if category not in CATEGORIES:
-            raise ValueError(
-                f"category 必须是 {list(CATEGORIES)} 之一: {category!r}")
-        v = get_vocab()
-        tid = v.add_token(token, category)
-        if getattr(v, "flat", False):
-            # 每模型词表（models/NAME/vocab.txt）：直接落盘到该文件，
-            # 没有 build_vocab 重放机制
-            src = getattr(v, "_path", None)
-            note = (f"已写入 {src}；该模型的 token 即用即生效"
-                    if src else "已写入模型词表")
-            free = {"regular": v.free_slots(CAT_REGULAR)}
-        else:
-            note = "已写入 vocab.json；重新运行 build_vocab.py 会自动重放"
-            free = {c: v.free_slots(c) for c in CATEGORIES}
-        return 200, {
-            "token": token,
-            "category": category,
-            "id": tid,
-            "vocab_size": len(v),
-            "free_slots": free,
-            "note": note,
-        }
+    # ==================================================================
+    # 2026-10-30 词表契约重构：多词表文件夹 API
+    # ==================================================================
+    # 词表 = vocabs/<name>/{vocab.vfc, config.json}；main（base）受保护，
+    # 编辑前必须 Fork。所有失败抛 ValueError → 400。
+    # ------------------------------------------------------------------
+    def api_vocab_list(self, query=None):
+        """列出全部词表（前端标签页条「+」的下拉数据源）。"""
+        from vocab_presets import list_vocabs
+        return 200, {"vocabs": list_vocabs(),
+                     "max_vocab_size": spec.MAX_VOCAB_SIZE}
 
-    # ---------------- 词表区间占用（前端「词表」页面） ----------------
-    def api_vocab_ranges(self, query):
-        from vocab_presets import (global_ranges, preset_occupancy,
-                                   list_presets)
-        preset = (query.get("preset", [""])[0] or None)
-        data = global_ranges()
-        data["presets"] = list_presets()
-        if preset:
-            data["selected_preset"] = preset_occupancy(preset)
-        return 200, data
+    def api_vocab_regions(self, query):
+        """某个词表的分区占用（前端「分区」表格数据源）。"""
+        from vocab_presets import vocab_occupancy
+        return 200, vocab_occupancy(_q(query, "name"))
 
-    # ---------------- 词表预设 CRUD ----------------
-    def api_vocab_presets(self, body):
-        from vocab_presets import (create_preset, delete_preset,
-                                   list_presets)
-        action = body.get("action")
-        if action == "create":
-            name = body.get("name")
-            source = body.get("source") or "base"
-            if not name:
-                raise ValueError("缺少 name")
-            return 200, create_preset(name, source)
-        if action == "delete":
-            delete_preset(body.get("name"))
-            return 200, {"presets": list_presets()}
-        # 默认：列出全部预设
-        return 200, {"presets": list_presets()}
+    def api_vocab_query(self, query):
+        """按文本查 token（GET 形态；与 POST action=query 等价）。"""
+        from vocab_presets import query_token
+        name = _q(query, "name")
+        token = _q(query, "token") or _q(query, "q")
+        if not token:
+            raise ValueError("缺少 token")
+        return 200, query_token(name, token)
 
-    # ---------------- 预设内增删 token ----------------
-    def api_vocab_preset_token(self, body):
-        from vocab_presets import add_token, remove_token
-        action = body.get("action")
+    def api_vocab_source_get(self, query):
+        """读 .vfc 原文（编辑器模式二的初始内容）。"""
+        from vocab_presets import read_vocab_text, load_vocab
+        name = _q(query, "name")
+        return 200, {"name": name,
+                     "text": read_vocab_text(name),
+                     "vocab_size": len(load_vocab(name))}
+
+    def api_vocab_token(self, body):
+        """模式一：单个 token 的 添加 / 删除 / 查询。"""
+        from vocab_presets import (add_token_to, query_token,
+                                   remove_token_from)
         name = body.get("name")
+        action = body.get("action")
         token = body.get("token")
         if not name:
             raise ValueError("缺少 name")
+        if action not in ("add", "remove", "query"):
+            raise ValueError(f"action 必须是 add/remove/query: {action!r}")
+        if not token:
+            raise ValueError("缺少 token")
+        if action == "query":
+            return 200, query_token(name, token)
         if action == "add":
-            if not token:
-                raise ValueError("缺少 token")
-            category = body.get("category", "regular")
-            return 200, add_token(name, token, category)
-        if action == "remove":
-            if not token:
-                raise ValueError("缺少 token")
-            return 200, remove_token(name, token)
-        raise ValueError(f"action 必须是 add/remove: {action!r}")
+            return 200, add_token_to(name, token,
+                                     _norm_cat(body.get("category")))
+        return 200, remove_token_from(name, token)
+
+    def api_vocab_source(self, body):
+        """模式二：把编辑器里的 .vfc 全文校验后写回。
+
+        mode="this" 直接改（name 是 main → 拒绝，前端应先弹窗引导 Fork）；
+        mode="fork" 先 fork 成 new_name 再写入。
+        """
+        from vocab_presets import load_vocab, write_vocab_text
+        name = body.get("name")
+        text = body.get("text")
+        mode = body.get("mode") or "this"
+        if not name:
+            raise ValueError("缺少 name")
+        if text is None:
+            raise ValueError("缺少 text")
+        target = write_vocab_text(name, text, mode=mode,
+                                  new_name=body.get("new_name"))
+        return 200, {"ok": True, "name": target,
+                     "vocab_size": len(load_vocab(target))}
+
+    def api_vocab_fork(self, body):
+        """Fork / 复制词表（整目录复制）。"""
+        from vocab_presets import create_vocab
+        name = body.get("name")
+        new_name = body.get("new_name")
+        if not name:
+            raise ValueError("缺少 name")
+        if not new_name:
+            raise ValueError("缺少 new_name")
+        return 200, create_vocab(new_name, source=name)
+
+    def api_vocab_delete(self, body):
+        """删除词表（main 不可删）。"""
+        from vocab_presets import delete_vocab, list_vocabs
+        name = body.get("name")
+        if not name:
+            raise ValueError("缺少 name")
+        delete_vocab(name)
+        return 200, {"ok": True, "vocabs": list_vocabs()}

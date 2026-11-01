@@ -35,6 +35,11 @@ import wave
 
 ROOT = boot.project_root()   # 2026-10-24：项目根（旧布局曾是 service/）
 
+# 新契约：spec 不再钉死词表长度；server API 会对真实文本走全局词表编码，
+# 替身模型必须按全局词表长度开 embedding
+from tokens.vocab import Vocab
+_VS = len(Vocab.global_vocab())
+
 
 def free_port():
     s = socket.socket()
@@ -97,25 +102,25 @@ class TestServer(unittest.TestCase):
         # （API 行为，与规模无关）不符；同时顺带覆盖 config.json 的
         # block 数经 server 加载路径。
         import torch
-        from safetensors.torch import save_file
         from model import Gargantua
+        from common import save_checkpoint
         torch.manual_seed(0)
-        m = Gargantua(n_enc_blocks=1, n_dec_blocks=1)
+        m = Gargantua(n_enc_blocks=1, n_dec_blocks=1,
+                      vocab_size=_VS)
         n = sum(p.numel() for p in m.parameters())
         d = os.path.join(cls.model_dir, "tiny")
         os.makedirs(d)
-        save_file(m.state_dict(), os.path.join(d, "model.safetensors"))
-        with open(os.path.join(d, "config.json"), "w") as f:
-            json.dump({"name": "tiny", "params": n,
-                       "n_enc_blocks": 1, "n_dec_blocks": 1}, f)
+        # 2026-10-31 新契约：save_checkpoint 拆三份权重 + manifest 原子
+        # 发布（旧式裸 model.safetensors 已不被 model_exists 认可，列表
+        # 里根本看不到这个模型，auto_load 也就无从谈起）
+        save_checkpoint(d, m, {"name": "tiny", "params": n,
+                               "n_enc_blocks": 1, "n_dec_blocks": 1})
         cls.params = n
         del m
 
-        # tok-32 词表备份：test_15_vocab_add 会经 API 改写仓库里的
-        # tokens/vocab.json（server 子进程 cwd=ROOT），测后必须还原
-        cls.vocab_path = os.path.join(ROOT, "service", "tokens", "vocab.json")
-        cls.vocab_backup = os.path.join(cls.tmp, "vocab.json.bak")
-        shutil.copy(cls.vocab_path, cls.vocab_backup)
+        # 2026-10-31 新契约：词表编辑全部发生在 vocabs/<fork>/（fork →
+        # 改 → 删），不再有测试改写仓库 tokens/vocab.json 的路径，
+        # 备份/还原已无对象（旧 vocab.json 也已被 vocab.vfc 取代）。
 
         cls.port = free_port()
         cls.proc = subprocess.Popen(
@@ -145,8 +150,6 @@ class TestServer(unittest.TestCase):
             cls.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             cls.proc.kill()
-        # 还原词表（add 测试的写入不落仓库）
-        shutil.copy(cls.vocab_backup, cls.vocab_path)
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     # ------------------------------------------------------------------
@@ -377,8 +380,14 @@ class TestServer(unittest.TestCase):
                 meta = _json.load(f)
             # n_tokens 是「本次推理落盘的 token 总数」（按元素累计），而 tok5
             # 解码会把相邻单 token 步合并，steps 数量 ≠ token 数。正确不变量
-            # 是 n_tokens == 各 step 元素之和（见 infer.py IdArchive）。
-            n_step_tokens = sum(len(it.get("elements") or []) for it in steps)
+            # 是 n_tokens == step 元素之和 + ext 条目数（2026-11-01：此前只
+            # 数 step 元素——采样命中的生成 token 若是扩展系统 token（
+            # <stop> 等，约占词表 4.3%），它落盘为 kind="ext" 的条目，不进
+            # 任何 step，老不变量就少 1 → 偶发失败）。
+            n_step_tokens = (sum(len(it.get("elements") or [])
+                                 for it in steps)
+                             + sum(1 for it in items
+                                   if it.get("kind") == "ext"))
             self.assertEqual(meta["n_tokens"], n_step_tokens)
             self.assertEqual(meta["n_generated_tokens"], 1)
             self.assertGreaterEqual(meta["n_prompt_tokens"], 1)
@@ -561,42 +570,59 @@ class TestServer(unittest.TestCase):
         self.assertEqual(code, 400)
 
     def test_15_vocab_add(self):
-        # 添加 token（四类 + 查重）；server 子进程写仓库 vocab.json，
-        # tearDownClass 负责还原
-        code, j = http("POST", self.port, "/api/vocab/add",
-                       {"token": "\U00020000", "category": "regular"})
-        self.assertEqual(code, 200)
-        self.assertEqual(j["token"], "\U00020000")
-        self.assertEqual(j["category"], "regular")
-        self.assertIsInstance(j["id"], int)
-        self.assertEqual(j["vocab_size"], 88704)
-        # 重复添加 → 400
-        code, j2 = http("POST", self.port, "/api/vocab/add",
-                        {"token": "\U00020000", "category": "regular"})
-        self.assertEqual(code, 400)
-        self.assertIn("\u51b2\u7a81", j2.get("error", ""))
-        # 与基础词表撞名 → 400
-        code, j3 = http("POST", self.port, "/api/vocab/add",
-                        {"token": "hello", "category": "regular"})
-        self.assertEqual(code, 400)
-        # 非法类别 / 空文本 → 400
-        code, _ = http("POST", self.port, "/api/vocab/add",
-                       {"token": "x", "category": "bogus"})
-        self.assertEqual(code, 400)
-        code, _ = http("POST", self.port, "/api/vocab/add",
-                       {"token": "", "category": "system"})
-        self.assertEqual(code, 400)
-        # 新增后可被 enctok 收录（常规优先）
-        code, j4 = http("POST", self.port, "/api/tokens/encode",
-                        {"text": "\U00020000"})
-        self.assertEqual(code, 200)
-        self.assertEqual(j4["n_tokens"], 1)
-        self.assertEqual(j4["skipped"], [])
-        # 系统类添加
-        code, j5 = http("POST", self.port, "/api/vocab/add",
-                        {"token": "<ts>", "category": "system"})
-        self.assertEqual(code, 200)
-        self.assertEqual(j5["category"], "system")
+        # 新契约：token 必须落到具体词表；main（base）受保护，先 Fork
+        # 再加，测完删除（服务端写的是 vocabs/ 下的 fork，不碰仓库词表）
+        code, jf = http("POST", self.port, "/api/vocab/fork",
+                        {"name": "base", "new_name": "srv_test_vocab"})
+        self.assertEqual(code, 200, jf)
+        base_size = jf["vocab_size"]
+        try:
+            code, j = http("POST", self.port, "/api/vocab/token",
+                           {"name": "srv_test_vocab", "action": "add",
+                            "token": "\U00020000", "category": "regular"})
+            self.assertEqual(code, 200)
+            self.assertEqual(j["token"], "\U00020000")
+            self.assertEqual(j["category"], "regular")
+            self.assertIsInstance(j["id"], int)
+            self.assertEqual(j["vocab_size"], base_size + 1)
+            # 重复添加 → 400
+            code, j2 = http("POST", self.port, "/api/vocab/token",
+                            {"name": "srv_test_vocab", "action": "add",
+                             "token": "\U00020000", "category": "regular"})
+            self.assertEqual(code, 400)
+            self.assertIn("\u51b2\u7a81", j2.get("error", ""))
+            # 与基础词表撞名 → 400
+            code, j3 = http("POST", self.port, "/api/vocab/token",
+                            {"name": "srv_test_vocab", "action": "add",
+                             "token": "hello", "category": "regular"})
+            self.assertEqual(code, 400)
+            # 非法类别 / 空文本 → 400
+            code, _ = http("POST", self.port, "/api/vocab/token",
+                           {"name": "srv_test_vocab", "action": "add",
+                            "token": "x", "category": "bogus"})
+            self.assertEqual(code, 400)
+            code, _ = http("POST", self.port, "/api/vocab/token",
+                           {"name": "srv_test_vocab", "action": "add",
+                            "token": "", "category": "regular"})
+            self.assertEqual(code, 400)
+            # main 直接加 → 400（先 Fork）
+            code, _ = http("POST", self.port, "/api/vocab/token",
+                           {"name": "base", "action": "add",
+                            "token": "\U00020000", "category": "regular"})
+            self.assertEqual(code, 400)
+            # 新增后可被 enctok 收录（指定词表编码，常规优先）
+            code, j4 = http("POST", self.port, "/api/tokens/encode",
+                            {"text": "\U00020000",
+                             "vocab": "srv_test_vocab"})
+            self.assertEqual(code, 200)
+            self.assertEqual(j4["n_tokens"], 1)
+            self.assertEqual(j4["skipped"], [])
+        finally:
+            code, jd = http("POST", self.port, "/api/vocab/delete",
+                            {"name": "srv_test_vocab"})
+            self.assertEqual(code, 200)
+            self.assertNotIn("srv_test_vocab",
+                             [v["name"] for v in jd["vocabs"]])
 
 
 if __name__ == "__main__":
