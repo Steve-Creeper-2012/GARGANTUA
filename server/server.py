@@ -37,6 +37,7 @@ import glob
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -55,8 +56,10 @@ else:
     raise SystemExit("找不到 GARGANTUA 项目根（start/boot.py）")
 import boot
 boot.bootstrap()
+import spec
 from common import (MAX_BLOCKS, MAX_NEW_TOKENS, model_init_lock,
-                    valid_model_name, validate_ctx_config)
+                    normalize_shared_blocks, valid_model_name,
+                    validate_ctx_config)
 from server_env import ROOT, check_environment, kill_proc
 from server_models import (ConflictError, ModelManager, TaskPool,
                            step_to_json)
@@ -65,9 +68,11 @@ from server_media import (MAX_IMAGE_DIM, MAX_PATCHES_TOTAL, b64_to_pil,
                           extract_video_frames, size_guard_pil)
 from server_codecs import CodecApi
 from server_monitor import MonitorApi
+from server_prims import PrimsApi
 from server_train import TrainApi
 from server_tokens import TokensApi, resolve_vocab_query
 from server_services import ServiceError, ServiceSupervisor
+from server_term import TermError, TermManager
 from server_util import num_param, optional_install_cmd, pip_index_args
 
 WINDOW_PY = os.path.join(ROOT, "service", "window", "window.py")
@@ -85,6 +90,73 @@ MAX_PROMPT_CHARS = 1_000_000
 # （MAX_PATCHES_TOTAL / MAX_AUDIO_TOKENS）——这里只挡明显的滥用。
 MAX_MEDIA_ITEMS = 4
 MAX_MEDIA_BYTES = 64 * 1024 * 1024
+
+
+def _read_version() -> str:
+    """项目版本（ROOT/VERSION，一行）。读不到就返回空串。
+
+    只给「关于」页的版本徽章用——不参与任何逻辑判断。
+    """
+    try:
+        with open(os.path.join(ROOT, "VERSION"), encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _draw_digit_ids():
+    """文本数字 token（"0".."9"）的 ID 表——画布声明的「数字」就是它们。
+
+    走进程当前词表（词表不存在时退回 spec 的可见区布局兜底）。
+    """
+    from tokens.draw_codec import canvas_digit_ids
+    try:
+        from tokens.vocab import get_vocab
+        return canvas_digit_ids(get_vocab())
+    except Exception:
+        return canvas_digit_ids()
+
+
+def draw_layout_payload() -> dict:
+    """图元 token 布局 = /api/status.draw_layout 的载荷（唯一构造处）。
+
+    前端「图元编辑器」要实时算 token ID，但它不许自己抄一份常量——把
+    spec 的 offset/bin 表发下去，前端只做「值 → bin」的算术（公式与
+    draw_codec 逐行对应）。test_pdraw_js 也 import 这个函数做 JS/Python
+    对拍——测试与线上永远是同一张表，改 spec 不会出现「测试用旧表」。
+    """
+    return {
+        "begin": spec.DRAW_BEGIN,
+        "tokens_per": spec.DRAW_TOKENS_PER_PRIMITIVE,
+        "canvas": {"offset": spec.DRAW_CANVAS_OFFSET,
+                   "bins": spec.DRAW_CANVAS_BINS,
+                   "markers": list(spec.DRAW_CANVAS_MARKERS)},
+        # 画布声明里的数字 = 可见区的文本数字 token 的 ID
+        "digits": _draw_digit_ids(),
+        "special_offset": spec.DRAW_SPECIAL_OFFSET,
+        "color_max": spec.DRAW_COLOR_MAX,
+        "fields": [
+            {"name": n, "offset": off, "bins": bins, "per": per}
+            for n, off, bins, per in (
+                ("x", spec.DRAW_X_OFFSET, spec.DRAW_X_BINS,
+                 spec.XY_BINS_PER_PIXEL),
+                ("y", spec.DRAW_Y_OFFSET, spec.DRAW_Y_BINS,
+                 spec.XY_BINS_PER_PIXEL),
+                ("theta", spec.DRAW_ANGLE_OFFSET,
+                 spec.DRAW_ANGLE_BINS, spec.ANGLE_BINS_PER_DEGREE),
+                ("w", spec.DRAW_W_OFFSET, spec.DRAW_W_BINS,
+                 spec.SIZE_BINS_PER_PIXEL),
+                ("h", spec.DRAW_H_OFFSET, spec.DRAW_H_BINS,
+                 spec.SIZE_BINS_PER_PIXEL),
+                ("shape", spec.DRAW_SHAPE_OFFSET,
+                 spec.DRAW_SHAPE_BINS, 1),
+                # 颜色 10 bit：1 bin = 1 个值（不再是 8bit//2 的 per=0.5）
+                ("r", spec.DRAW_R_OFFSET, spec.DRAW_COLOR_BINS, 1),
+                ("g", spec.DRAW_G_OFFSET, spec.DRAW_COLOR_BINS, 1),
+                ("b", spec.DRAW_B_OFFSET, spec.DRAW_COLOR_BINS, 1),
+            )
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +180,7 @@ class _TrainStatusProxy:
 # ---------------------------------------------------------------------------
 # 应用装配：注册表 + 任务池 + 服务监督器 + 三个 API mixin
 # ---------------------------------------------------------------------------
-class App(TrainApi, CodecApi, TokensApi, MonitorApi):
+class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
     def __init__(self, model_dir, data_dir, log_path, idle_timeout=300):
         self.mgr = ModelManager(model_dir)
         self.pool = TaskPool()
@@ -118,6 +190,8 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi):
         self.log_path = log_path
         self.supervisor = ServiceSupervisor(ROOT, idle_timeout=idle_timeout)
         self.trainer = _TrainStatusProxy(self.supervisor)
+        # 内置终端：默认 cwd = ROOT，cd 出界会被拒绝（见 server_term.py）
+        self.term = TermManager(ROOT)
         # 2026-10-27 审计修复（H11）：活动模型「检查+快照」与「切换」共用
         # 的状态锁，消除模型切换与推理提交之间的 TOCTOU
         self._state_lock = threading.RLock()
@@ -138,6 +212,36 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi):
             clear_model_vocab()
             print(f"[server] 模型词表加载失败，已清退到全局词表: {e}")
 
+    # ---------------- 内置终端（项目目录内） ----------------
+    def api_term_open(self, body):
+        s = self.term.open()
+        return 200, {"ok": True, "cwd": s.cwd, "alive": s.alive,
+                     "root": s.root}
+
+    def api_term_poll(self, query):
+        s = self.term.get()
+        return 200, {"text": s.snapshot(), "alive": s.alive,
+                     "cwd": s.cwd, "root": s.root}
+
+    def api_term_input(self, body):
+        line = body.get("line")
+        if not isinstance(line, str):
+            raise ValueError("line 必须是字符串")
+        self.term.get().submit(line)
+        return 200, {"ok": True}
+
+    def api_term_interrupt(self, body):
+        self.term.get().interrupt()
+        return 200, {"ok": True}
+
+    def api_term_clear(self, body):
+        self.term.get().clear()
+        return 200, {"ok": True}
+
+    def api_term_close(self, body):
+        self.term.close()
+        return 200, {"ok": True}
+
     # ---------------- status / models / infer ----------------
     def api_status(self):
         n_queued = sum(1 for p in glob.glob(os.path.join(self.queue_dir, "*"))
@@ -151,6 +255,15 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi):
             "queue": n_queued,
             "ctx": self.mgr.ctx,
             "kv_note": self.mgr.ctx_note(),
+            "version": _read_version(),
+            # 图元画布档位：唯一真源在 spec，前端据此填下拉框
+            "draw_canvas": {
+                "default": list(spec.DRAW_DEFAULT_CANVAS),
+                "sizes": [list(s) for s in spec.DRAW_CANVAS_SIZES],
+            },
+            # 图元 token 布局：唯一构造处在 draw_layout_payload()（test_pdraw_js
+            # 也用它对拍，保证测试与线上同表）
+            "draw_layout": draw_layout_payload(),
         }
 
     def api_models(self):
@@ -179,6 +292,18 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi):
         dec = (self._clamp_int(body["n_dec_blocks"], 1, MAX_BLOCKS,
                                "n_dec_blocks")
                if body.get("n_dec_blocks") is not None else None)
+        # 2026-11-04：enc/dec 权重模式。共享时两侧等深，归一化规则与
+        # init.py CLI 共用 common.normalize_shared_blocks（不等 → 400）。
+        share = self._bool_arg(body.get("share_enc_dec"), "share_enc_dec")
+        # 不等深直接 ValueError（HTTP 层映射 400），不当场悄悄改用户的值
+        enc, dec = normalize_shared_blocks(enc, dec, share)
+        # 2026-11-04：模型宽度建模可选（规则唯一真源在 spec.check_d_model）
+        d_model = None
+        if body.get("d_model") is not None:
+            try:
+                d_model = spec.check_d_model(body["d_model"])
+            except ValueError as e:
+                raise ValueError(f"d_model: {e}")
         # 上下文长度（完整/压缩容量 + CSA/HCA 压缩比）；
         # 缺省项取 spec 默认，非法值 → ValueError（→400）
         ctx = validate_ctx_config(
@@ -209,6 +334,10 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi):
                 argv += ["--enc-blocks", str(enc)]
             if dec is not None:
                 argv += ["--dec-blocks", str(dec)]
+            if share:
+                argv += ["--share-enc-dec"]
+            if d_model is not None:
+                argv += ["--d-model", str(d_model)]
             if body.get("overwrite"):
                 argv += ["--force"]
             # 2026-10-25：词表预设 + 精度下发给 init 子进程
@@ -248,6 +377,26 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi):
             raise ValueError(f"{name} 必须在 [{lo}, {hi}]: {v}")
         return v
 
+    @staticmethod
+    def _bool_arg(v, name):
+        """严格布尔入参：bool('false') 为 True，绝不能用 bool() 转换。
+
+        与 _clamp_int 同一套口径：认真布尔、0/1、常见字符串；其余一律
+        400，避免把 "0"/"no" 之类解释成共享权重。"""
+        if v is None:
+            return False
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, int) and v in (0, 1):
+            return bool(v)
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in ("true", "1", "on", "yes"):
+                return True
+            if s in ("false", "0", "off", "no", ""):
+                return False
+        raise ValueError(f"{name} 必须是布尔值: {v!r}")
+
     def api_model_load(self, body):
         name = body.get("name")
         if not name:
@@ -277,6 +426,48 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi):
                 raise ConflictError("训练进行中，请先停止训练再切换模型")
             res = self.mgr.load(name)      # 注册表登记：不读权重，瞬时完成
         return 200, res
+
+    def api_model_delete(self, body):
+        """删除一个模型目录（config.json + weights/ + vocab/ 一并移除）。
+
+        路径穿越防护：realpath 后必须仍在 model_dir 内。删除活动模型时先
+        杀 infer 服务（清空 fast weight / 上下文）再清空登记簿；训练中删除
+        活动模型 → 409。返回是否成功删除。"""
+        name = body.get("name")
+        if not name:
+            raise ValueError("缺少 name")
+        bad = valid_model_name(name)
+        if bad:
+            raise ValueError(bad)
+        d = os.path.realpath(os.path.join(self.mgr.model_dir, name))
+        base = os.path.realpath(self.mgr.model_dir)
+        if d != base and not d.startswith(base + os.sep):
+            raise ValueError("非法模型路径")
+        # 只要是 models/ 下的真实目录就允许删——**包括没建完的半成品**
+        # （model_exists 要求 config.json + 权重 manifest，半成品不满足，
+        # 恰恰是最该被删掉的那批）。路径穿越在上一段已挡住。
+        if not os.path.isdir(d):
+            raise FileNotFoundError(f"模型不存在: {name}")
+        if self.trainer.running and self.mgr.name == name:
+            raise ConflictError("训练进行中，请先停止训练再删除活动模型")
+        with self.mgr.lock:
+            if self.mgr.name == name:
+                self.supervisor.kill_service("infer")
+                self.mgr.name = None
+                self.mgr.params = 0
+                self.mgr.ctx = None
+        shutil.rmtree(d)
+        return 200, {"ok": True, "deleted": name}
+
+    def api_infer_reset(self, body=None):
+        """清空对话 / 上下文 / 初始化 fast weight：
+
+        infer 服务的 fast_weight 与 KV 上下文都活在进程内、跨调用持久。
+        杀掉并注销该服务进程，下次推理会拉起一个全新的干净实例——
+        等效于「重置记忆」。返回是否真有进程被终止。"""
+        killed = self.supervisor.kill_service("infer")
+        return {"ok": True, "killed_infer": killed,
+                "note": "fast weight 与上下文已重置，下次推理全新起"}
 
     def api_infer(self, body):
         prompt = body.get("prompt")
@@ -364,15 +555,11 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi):
     # 模块名 → 发行包名（importlib.metadata 认的是后者，PIL 装在 pillow 里）
     _DIST_NAME = {"PIL": "pillow", "cv2": "opencv-python"}
 
-    # 可选加速依赖：缺了主流程照跑（Pillow + ffmpeg 兜底），所以不当错误报，
-    # 而是告诉用户「它有什么用、要不要装」。不要把 str(e) 倒给前端——用户看到
-    # "No module named 'cv2'" 并不知道该不该管它。
-    _OPTIONAL_DEPS = {
-        "cv2": {"pkg": "opencv-python",
-                "why": "图像/视频解码加速（缺失时用 Pillow + ffmpeg）"},
-        "soundfile": {"pkg": "soundfile",
-                      "why": "音频解码加速（缺失时用 ffmpeg）"},
-    }
+    # 主页「Python 依赖」区的完整清单由 start/requirements/{must,necessary}.txt
+    # 声明（server/reqs.py 解析）——**所有依赖都列出来**，不分轻重：
+    # must 是启动必备（轻量），necessary 是正常工作需要（启动不检查）。
+    # 以前只列 6 个 Python 模块，pywebview / pytest / ffmpeg / rust 装了也
+    # 看不见，用户没法判断「我这个环境到底缺什么」。
 
     def api_system(self):
         import importlib.metadata as _md
@@ -382,28 +569,28 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi):
             import torch
         except Exception:
             torch = None
+        # 依赖清单是唯一真源：start/requirements/{must,necessary}.txt
+        # （server/reqs.py 负责解析）。已装的、没装的、需要但没装的，全在这里。
+        from reqs import all_requirements, dep_state
         deps = []
-        for mod in ["torch", "numpy", "PIL", "safetensors", "cv2", "soundfile"]:
-            entry = {"name": mod, "ok": False}
-            try:
-                __import__(mod)
-                entry["ok"] = True
-                try:                       # 已安装 → 带上版本号，前端直接展示
-                    entry["version"] = _md.version(
-                        self._DIST_NAME.get(mod, mod))
-                except Exception:
-                    pass
-            except Exception:
-                opt = self._OPTIONAL_DEPS.get(mod)
-                if opt:
-                    # 可选依赖：给一句人话 + pip 包名，前端渲染成「未安装 · 可选」
-                    # 并提供一键安装
-                    entry["optional"] = True
-                    entry["pkg"] = opt["pkg"]
-                    entry["why"] = opt["why"]
-                else:                      # 主依赖缺失是真问题，保留原因
-                    entry["note"] = str(sys.exc_info()[1])
-            deps.append(entry)
+        for d in all_requirements():
+            st = dep_state(d)
+            deps.append({
+                "name": d["name"],
+                "title": d.get("title") or d["name"],
+                "group": d["group"],                 # must | necessary
+                "kind": d.get("kind") or "pip",       # pip|runtime|system|toolchain
+                "min": d.get("min") or "",
+                "constraints": d.get("constraints") or [],
+                "raw": d.get("raw") or "",
+                "ok": st["ok"],
+                "version": st["version"],
+                "satisfied": st["satisfied"],
+                "install": d.get("install") or "",
+                "pack": d.get("pack") or "",
+                "module": d.get("module") or "",
+                "dist": d.get("dist") or "",
+            })
         device = "unknown"
         if torch is not None:
             device = "cpu"
@@ -411,51 +598,30 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi):
                 device = f"cuda ({torch.cuda.get_device_name(0)})"
             elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 device = "mps"
+        # environment/ 下每个文件夹 = 一个依赖包，主页「环境包」区就是它；
+        # 系统级外部命令（ffmpeg / 编译器）也在这里——它们装不进
+        # environment/，容器化时得在基础镜像里解决。
+        from server_env import detect_tools, list_env_packs
         return 200, {
             "torch": getattr(torch, "__version__", None),
             "device": device,
             "dependencies": deps,
+            "packs": list_env_packs(),
+            "tools": detect_tools(),
             "optional_missing": [d["name"] for d in deps
-                                 if d.get("optional") and not d["ok"]],
+                                 if d["group"] == "necessary" and not d["ok"]],
             "ctx": self.mgr.ctx,
             "kv_note": self.mgr.ctx_note(),
         }
 
     def api_system_install_optional(self, body):
-        """ 在 UI 里补装可选依赖（cv2 / soundfile），异步任务。
+        """ 在 UI 里补装依赖（旧的「只装可选依赖」入口，保留兼容）。
 
-        装进的是当前跑 server 的解释器；已 import 的模块不会热更新，所以返回
-        里明确要求重启。主依赖不在这里装——那是 setup 脚本的职责。 """
-        names = body.get("names") or []
-        if isinstance(names, str):
-            names = [names]
-        pkgs = []
-        for n in names:
-            opt = self._OPTIONAL_DEPS.get(n)
-            if opt is None:
-                raise ValueError(
-                    f"不支持安装: {n!r}（可选: {sorted(self._OPTIONAL_DEPS)}）")
-            if not any(d["name"] == n and d["ok"]
-                       for d in self.api_system()[1]["dependencies"]):
-                pkgs.append(opt["pkg"])
-        if not pkgs:
-            return 200, {"installed": [], "note": "都已安装，无需操作"}
-
-        def work():
-            req = os.path.join(boot.project_root(), "start",
-                               "requirements", "core.txt")
-            cmd = optional_install_cmd(sys.executable, pkgs, req)
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=900)
-            if r.returncode != 0:
-                raise RuntimeError("pip 安装失败: "
-                                   + (r.stderr or r.stdout)[-400:])
-            return {"installed": pkgs,
-                    "note": "已安装；Python 不会热更新已 import 的模块，"
-                            "重启 server 后生效"}
-
-        tid = self.pool.submit(work)
-        return 202, {"task_id": tid}
+        2026-11-01：所有依赖都走同一个安装端点（/api/system/install），
+        这个方法只是转发过去——「可选/必需」的分级现在由清单决定
+        （must.txt vs necessary.txt），不再由端点决定。
+        """
+        return self.api_system_install(body)
 
     def api_vocab(self, query):
         q = (query.get("q", [""])[0] or "").lower()
@@ -561,6 +727,20 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    def _send_file(self, abspath, ctype):
+        """按绝对路径发一个文件（调用方负责校验路径来源）。"""
+        if not os.path.isfile(abspath):
+            self._send_error_json(404, "文件不存在")
+            return
+        with open(abspath, "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store, must-revalidate")
+        self.end_headers()
+        self.wfile.write(data)
+
     def _serve_static(self, name):
         # 只放白名单里的前端资源（app.css / app.js），杜绝任意文件读取与穿越
         if name not in ("app.css", "app.js"):
@@ -655,8 +835,29 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(app.api_system_devices()[1])
             elif path == "/api/system/processes":
                 self._send_json(app.api_system_processes()[1])
+            elif path == "/api/term/poll":
+                _code, obj = app.api_term_poll(query)
+                self._send_json(obj, _code)
+            elif path == "/api/prims/log":
+                _code, obj = app.api_prims_log(query)
+                self._send_json(obj, _code)
+            elif path == "/api/prims/jobs":
+                _code, obj = app.api_prims_jobs(query)
+                self._send_json(obj, _code)
+            elif path == "/api/prims/job/live":
+                _code, obj = app.api_prims_job_live(query)
+                self._send_json(obj, _code)
+            elif path == "/api/prims/job/result":
+                _code, obj = app.api_prims_job_result(query)
+                self._send_json(obj, _code)
+            elif path == "/api/prims/job/source":
+                _code, obj = app.api_prims_job_source(query)
+                self._send_file(obj["path"], "image/png")
             elif path == "/api/system/updates":
                 self._send_json(app.api_system_updates(query)[1])
+            elif path == "/api/system/versions":
+                # 某个 pip 依赖在镜像上的全部版本（用户挑版本用）
+                self._send_json(app.api_system_versions(query)[1])
             elif path == "/api/vocab":
                 _code, obj = app.api_vocab(query)
                 self._send_json(obj, _code)
@@ -686,7 +887,9 @@ class Handler(BaseHTTPRequestHandler):
         routes = {
             "/api/model/init": app.api_model_init,
             "/api/model/load": app.api_model_load,
+            "/api/model/delete": app.api_model_delete,
             "/api/infer": app.api_infer,
+            "/api/infer/reset": app.api_infer_reset,
             "/api/train/enqueue": app.api_train_enqueue,
             "/api/train/start": app.api_train_start,
             "/api/train/stop": app.api_train_stop,
@@ -710,6 +913,14 @@ class Handler(BaseHTTPRequestHandler):
             "/api/system/install-optional": app.api_system_install_optional,
             "/api/system/install": app.api_system_install,
             "/api/system/kill": app.api_system_kill,
+            "/api/term/open": app.api_term_open,
+            "/api/term/input": app.api_term_input,
+            "/api/term/interrupt": app.api_term_interrupt,
+            "/api/term/clear": app.api_term_clear,
+            "/api/term/close": app.api_term_close,
+            "/api/prims/job/create": app.api_prims_job_create,
+            "/api/prims/job/update": app.api_prims_job_update,
+            "/api/prims/job/delete": app.api_prims_job_delete,
         }
         fn = routes.get(path)
         if fn is None:
@@ -836,6 +1047,7 @@ def main(argv=None):
         pass
     finally:
         print("[server] 正在关闭：服务子进程 → 窗口 → HTTP ……")
+        app.term.shutdown()
         app.supervisor.shutdown_all()
         kill_proc(window_proc)
         srv.server_close()

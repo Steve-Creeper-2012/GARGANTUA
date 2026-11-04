@@ -1,0 +1,17 @@
+{
+  "title": "Rust 工具链",
+  "kind": "toolchain",
+  "order": 30,
+  "why": "构建 service/prims/fast_shape_render 的 GPU 图元转换器（rustup + stable + cargo）",
+  "install": "sh service/prims/setup.sh",
+  "probe": "cargo/bin/cargo",
+  "version_arg": "--version",
+  "env": {
+    "RUSTUP_HOME": "rustup",
+    "CARGO_HOME": "cargo"
+  },
+  "contents": {
+    "rustup/": "rustup 的 toolchain 与下载缓存（RUSTUP_HOME）",
+    "cargo/": "cargo 的 registry 缓存与配置（CARGO_HOME）"
+  }
+}

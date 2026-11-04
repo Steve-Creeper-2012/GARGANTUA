@@ -76,6 +76,7 @@ def _decode_media(items):
     import os
     import tempfile
 
+    from paths import project_tmp_dir
     from server_media import (MAX_AUDIO_TOKENS, MAX_PATCHES_TOTAL,
                               b64_to_pil, decode_audio_any,
                               extract_video_audio, extract_video_frames)
@@ -100,7 +101,8 @@ def _decode_media(items):
             apath = None
             try:
                 with tempfile.NamedTemporaryFile(suffix=suffix,
-                                                 delete=False) as f:
+                                                 delete=False,
+                                                 dir=project_tmp_dir()) as f:
                     f.write(data)
                     apath = f.name
                 samples = decode_audio_any(apath, filename, spec.AUDIO_SR)
@@ -119,7 +121,8 @@ def _decode_media(items):
             vpath = None
             try:
                 with tempfile.NamedTemporaryFile(suffix=suffix,
-                                                 delete=False) as f:
+                                                 delete=False,
+                                                 dir=project_tmp_dir()) as f:
                     f.write(data)
                     vpath = f.name
                 frames = extract_video_frames(vpath)

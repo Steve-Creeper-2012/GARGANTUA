@@ -72,15 +72,38 @@ def pip_index_args() -> list:
 
 
 def optional_install_cmd(py: str, pkgs: list, req_file: str) -> list:
-    """ 装可选依赖（cv2 / soundfile）的 pip 命令。
+    """ 装依赖的 pip 命令。
 
-    **必须带 `-c start/requirements/core.txt`**：实测不带约束时，pip 解析
-    opencv-python / soundfile 会顺手把 numpy 升到 2.x，而 torch==2.2.2
-    只支持 numpy<2——一个"可选"安装就把主依赖契约悄悄破坏了，事后极难
-    排查（症状是 numpy 行为变化，没人会联想到上次装了 cv2）。
-    constraints 文件只约束版本、不会额外安装里面的包，正好合适。 """
+    **必须带 `-c <约束文件>`**：实测不带约束时，pip 解析 opencv-python /
+    soundfile 会顺手把 numpy 升到 2.x，而 torch 2.2.2 只支持 numpy<2——
+    一个"可选"安装就把主依赖契约悄悄破坏了，事后极难排查（症状是 numpy
+    行为变化，没人会联想到上次装了 cv2）。
+    constraints 文件只约束版本、不会额外安装里面的包，正好合适。
+
+    2026-11-01：约束文件改成 start/requirements/necessary.txt（清单里
+    写的是**下限** `>=`，上限才有约束力——这样用户可以装更新的版本，
+    而 numpy<2 这种硬上限仍然挡着）。
+    """
     cmd = [py, "-m", "pip", "install"]
     if req_file and os.path.exists(req_file):
         cmd += ["-c", req_file]
     cmd += pip_index_args() + list(pkgs)
     return cmd
+
+
+def constraints_file_for(py_deps: list, dest: str) -> str:
+    """把依赖清单里的**硬约束**写成一个临时 constraints 文件。
+
+    只写上限与 ==（numpy<2 这类）；下限（>=）不写——它是「默认装哪版」，
+    不是「不许装更高的」。写出来的文件给 pip 的 -c 用。
+    """
+    lines = []
+    for d in py_deps:
+        hard = [(op, v) for op, v in (d.get("constraints") or [])
+                if op in ("<", "<=", "==", "!=")]
+        if hard:
+            lines.append(d["name"] + ",".join(f"{op}{v}" for op, v in hard))
+    with open(dest, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + ("\n" if lines else ""))
+    return dest
+

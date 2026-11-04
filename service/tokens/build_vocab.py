@@ -226,13 +226,9 @@ def load_user_added() -> list:
     return list(got) if isinstance(got, list) else []
 
 
-# 图元 DRAW 区各字段的 bin 数（顺序与 spec.DRAW_FIELD_ORDER 一致）。
-# 从 spec 取，不硬编码——spec 调整 bin 数时这里自动跟随。
-_DRAW_FIELD_SIZES = (
-    spec.DRAW_X_BINS, spec.DRAW_Y_BINS, spec.DRAW_ANGLE_BINS,
-    spec.DRAW_W_BINS, spec.DRAW_H_BINS, spec.DRAW_SHAPE_BINS,
-    spec.DRAW_COLOR_BINS, spec.DRAW_COLOR_BINS, spec.DRAW_COLOR_BINS,
-)
+# 图元 DRAW 区的命名与 bin 数**不再在这里重复**：build_entries 直接调用
+# tokens.vfc.head_entries()（唯一推导处）。这里只留一句说明，防止有人
+# 又加一份副本。
 
 
 def build_entries(english_words, user_added: list | None = None):
@@ -261,16 +257,19 @@ def build_entries(english_words, user_added: list | None = None):
                         "size": len(seq)})
 
     # ---- 架构契约头：special / system / draw（内容与顺序由 spec 冻结）----
-    emit(list(spec.SPECIAL_TOKENS), "special", CAT_SPECIAL)
-    emit(list(getattr(spec, "SYSTEM_CHARS",
-                      (spec.TS_OPEN, spec.TS_CLOSE, spec.TS_SEP))),
-         "system", CAT_SYSTEM)
-    draw: list[str] = []
-    for _f, _sz in zip(spec.DRAW_FIELD_ORDER, _DRAW_FIELD_SIZES):
-        draw.extend(f"<{_f}:{n}>" for n in range(_sz))
-    draw.extend(f"<draw:special:{n}>"
-                for n in range(spec.DRAW_SPECIAL_BINS))
-    emit(draw, "draw", CAT_SPECIAL)
+    # 直接复用 vfc.head_entries()：词表头只有**一处**推导，build 与加载
+    # 永远不会分叉（曾经两边各写一份命名规则，spec 一改就一边对一边错）。
+    from tokens import vfc as _vfc
+    head = _vfc.head_entries()
+    for _hid, _htext, _hvis in head:
+        entries.append((_hid, _htext, _hvis))
+        tokens.append(_htext)
+    regions.append({"region": "special", "category": CAT_SPECIAL,
+                    "size": spec.SPECIAL_SIZE})
+    regions.append({"region": "system", "category": CAT_SYSTEM,
+                    "size": spec.SYSTEM_SIZE})
+    regions.append({"region": "draw", "category": CAT_SPECIAL,
+                    "size": spec.MODAL_SIZE})
     assert len(tokens) == spec.HEAD_SIZE, (
         f"架构契约头长度 {len(tokens)} != HEAD_SIZE {spec.HEAD_SIZE}")
 

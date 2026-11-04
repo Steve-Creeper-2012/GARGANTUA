@@ -384,7 +384,7 @@ mod tests {
     #[test]
     #[ignore = "requires local hardware GPU"]
     fn initializes_all_platform_hardware_gpus() {
-        let shader_source = crate::build_shader_source(&crate::shader_constants())
+        let shader_source = crate::build_shader_source(&crate::shader_constants(crate::W, crate::H))
             .expect("default shader constants should be valid");
         let engines = pollster::block_on(GpuEngine::discover_all(&shader_source))
             .expect("at least one platform hardware GPU should initialize");

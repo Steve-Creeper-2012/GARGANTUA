@@ -84,6 +84,28 @@ class PresetLifecycleTest(unittest.TestCase):
         self.assertEqual(n1, n2)
         self.assertGreater(n1, spec.HEAD_SIZE)
 
+    def test_ensure_base_rebuilds_on_head_drift(self):
+        """spec 改过契约头布局后，旧 base 必须被自动重建。
+
+        2026-10-31 真实事故：DRAW 区加了画布 token，磁盘上的 base 还是
+        旧头，于是**所有**词表接口 400（「契约头第 10 行应为 <cx:0>」）。
+        base 是派生资产，这里要求它自愈，而不是让用户去删目录。
+        """
+        vp.ensure_base()
+        cfg = vp.read_config(vp.BASE)
+        cfg["head_size"] = 1                   # 伪造成旧 spec 建的
+        vp.write_config(vp.BASE, cfg)
+        vp._HEAD_OK = False
+        vp.ensure_base()
+        self.assertEqual(vp.read_config(vp.BASE).get("head_size"),
+                         spec.HEAD_SIZE)
+        # 重建后必须还能正常载入（头部逐条对得上）
+        v = vp.load_vocab(vp.BASE)
+        self.assertGreater(len(v), spec.HEAD_SIZE)
+        self.assertEqual(v.id_to_token[spec.MODAL_BEGIN],
+                         "<x>")
+        vp._HEAD_OK = False                    # 别把状态漏给别的用例
+
     # ---- create / list ----
     def test_create_and_list(self):
         vp.ensure_base()

@@ -51,11 +51,13 @@
 # 重排。需要空位的场景（模型权重对齐）不通过 .vfc 表达。
 #
 # —— 架构契约头 ——
-# 文件开头 spec.HEAD_SIZE（2970）行是架构契约，名字与顺序全部从 spec.py
+# 文件开头 spec.HEAD_SIZE（9614）行是架构契约，名字与顺序全部从 spec.py
 # 推导（禁止硬编码）：
 #   [0, 6)     SPECIAL：spec.SPECIAL_TOKENS 的 6 个不可显示标记
 #   [6, 9)     SYSTEM ：spec.SYSTEM_CHARS（{ } |）
-#   [9, 2970)  DRAW   ：图元输出 token（spec.DRAW_VOCAB_SIZE = 2961 个）
+#   [9, 9614)  DRAW   ：图元输出 token（spec.DRAW_VOCAB_SIZE = 9605 个：
+#              画布定界符 4 + x 1920 + y 1080 + theta 270 + w 1920 + h 1080
+#              + shape 256 + rgb 1024×3（10 bit）+ special 3）
 # 2026-10-30 契约重构后 spec 的头也是紧凑的（不再留预留空位），所以 .vfc
 # 里的 ID **就是** spec 运行时 ID，二者一一对应，不需要任何换算。
 #
@@ -135,7 +137,9 @@ class _Err:
 # ---------------------------------------------------------------------------
 # draw 区的字段分段：用相邻 offset 的差值求段长，spec 改 bins 数量时这里
 # 自动跟随（build_vocab.py 是显式列 size 的，等价但会重复一遍常量）。
+# 2026-10-31：第 0 段是画布 token（8 档预设），其后才是 9 个图元字段。
 _DRAW_OFFSETS = (
+    spec.DRAW_CANVAS_OFFSET,
     spec.DRAW_X_OFFSET,
     spec.DRAW_Y_OFFSET,
     spec.DRAW_ANGLE_OFFSET,
@@ -151,21 +155,43 @@ _DRAW_OFFSETS = (
 # 最后一段（special bins）的字段前缀名，与 build_vocab.py 保持一致
 _DRAW_SPECIAL_PREFIX = "draw:special"
 
+# DRAW 区里三段的命名规则与其它字段不同（2026-11-01）：
+#   canvas → 4 个定界符 '<x>' '<x/>' '<y>' '<y/>'（不是 <canvas:n>）
+#   x / y  → '<x0>'…'<x1919>' / '<y0>'…'<y1079>'（1 token = 1 像素，
+#            名字就是像素号，肉眼可读）
+# 其余字段仍是 '<theta:0>' '<w:0>' '<r:0>' 这种「字段:bin」形态。
+_DRAW_NAMERS = {
+    "canvas": lambda n: spec.DRAW_CANVAS_MARKERS[n],
+    "x": lambda n: f"<x{n}>",
+    "y": lambda n: f"<y{n}>",
+}
 
-def _draw_head_names() -> list:
-    """从 spec 推导 2961 个 draw token 的名字（含尖括号），顺序即 DRAW 区布局。
 
-    名字带尖括号，与 spec.SPECIAL_TOKENS / vocab.json 的 id_to_token 拼写
-    完全一致（'<cx:0>'、'<draw:special:0>'），加载侧可直接装进 id_to_token。
+def draw_name(field: str, n: int) -> str:
+    """DRAW 区某个字段第 n 个 bin 的 token 名字（含尖括号）。"""
+    fn = _DRAW_NAMERS.get(field)
+    return fn(n) if fn else f"<{field}:{n}>"
+
+
+def draw_head_names() -> list:
+    """从 spec 推导 DRAW 区全部 token 名字（含尖括号），顺序即 DRAW 区布局。
+
+    第 0 段是 4 个画布定界符，其后 9 段是图元字段，末尾是 special bins。
+    名字与 spec.SPECIAL_TOKENS / vocab.json 的 id_to_token 拼写完全一致，
+    加载侧可直接装进 id_to_token。
     """
     names = []
-    for i, field in enumerate(spec.DRAW_FIELD_ORDER):
+    for i, field in enumerate(spec.DRAW_HEAD_FIELD_ORDER):
         size = _DRAW_OFFSETS[i + 1] - _DRAW_OFFSETS[i]
-        names.extend(f"<{field}:{n}>" for n in range(size))
+        names.extend(draw_name(field, n) for n in range(size))
     # 末尾 special bins：仓库布局自带的 pad + 2 预留
     size = _DRAW_OFFSETS[-1] - _DRAW_OFFSETS[-2]
     names.extend(f"<{_DRAW_SPECIAL_PREFIX}:{n}>" for n in range(size))
     return names
+
+
+# 兼容旧调用名（build_vocab 曾经直接用私有函数）
+_draw_head_names = draw_head_names
 
 
 def head_entries() -> list:
@@ -175,7 +201,9 @@ def head_entries() -> list:
       [0, 6)    SPECIAL：spec.SPECIAL_TOKENS（'<caps>' '<user>' '<user/>'
                 '<model>' '<model/>' '<stop>'），不可显示 → 尖括号形态；
       [6, 9)    SYSTEM ：SYSTEM_CHARS（'{' '}' '|'）；
-      [9, 2970) DRAW   ：图元输出 token，名字由 spec 的字段布局推导。
+      [9, 9614) DRAW   ：图元输出 token（第 0 段是画布声明的 4 个定界符
+                <x> <x/> <y> <y/>，其后 9 个图元字段 + 3 个 special bins），
+                名字由 spec 的字段布局推导。
 
     SYSTEM 区是一个例外：spec 把 { } | 归类为「不可显示」，但它们不是合法
     标识符（尖括号内的名字必须匹配 [A-Za-z_][A-Za-z0-9_./:-]*），无法写成
@@ -195,7 +223,7 @@ def head_entries() -> list:
     for text in SYSTEM_CHARS:
         entries.append((tid, text, True))
         tid += 1
-    for text in _draw_head_names():
+    for text in draw_head_names():
         entries.append((tid, text, False))
         tid += 1
     assert len(entries) == spec.HEAD_SIZE, (
@@ -205,7 +233,7 @@ def head_entries() -> list:
 
 
 def head_size() -> int:
-    """架构契约头的长度（= 头部条目数，当前 6 + 3 + 2961 = 2970）。
+    """架构契约头的长度（= 头部条目数，当前 6 + 3 + 9605 = 9614）。
 
     直接取 spec.HEAD_SIZE（spec 里由 SPECIAL_SIZE + SYSTEM_SIZE +
     MODAL_SIZE 算出）；head_entries 里的 assert 保证这两个推导不会因为
@@ -528,7 +556,12 @@ def _check_head(entries) -> list:
                 lineno,
                 f"架构契约头第 {i + 1} 条应为 "
                 f"{'<尖括号>' if not evisible else '<引号>'}"
-                f"{etext!r}，实际为 {text!r}"))
+                f"{etext!r}，实际为 {text!r}"
+                + ("　【提示】这一条是 spec 改过 DRAW 区布局（如新增画布 "
+                   "token / 扩 xy 轴）后的典型症状：重启 server 让新 spec "
+                   "生效；若重启后仍报，说明词表文件是旧 spec 建的，用 "
+                   "python service/tokens/build_vocab.py 重建。"
+                   if i >= spec.MODAL_BEGIN else "")))
         if len(errors) >= _MAX_HEAD_ERRORS:
             errors.append(_Err(None, "架构契约头错误过多，已截断后续报告"))
             return errors

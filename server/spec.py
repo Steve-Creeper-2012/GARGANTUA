@@ -8,7 +8,7 @@
 # 定案记录（2026-09-27，steve 拍板）：
 #   - 压缩允许在时间步【内】进行；禁止跨时间步边界压缩、禁止拆分时间步。
 #   - 规模 ~500M（允许略超）；embedding 与 lm_head 不绑定（查表可放 CPU）。
-#   - FFN 每 block 一个（GLU，d_ff=4096）。
+#   - FFN 为 GLU（d_ff=4096）；2026-11-04 起每 block 5 个（见下方定案）。
 #   - 英文词表 30K（非常用词 fallback 到 a-z 字母拼写）。
 #   - 图元种类：rectangle / ellipse(含圆) / triangle / background。
 #   - fast weight：KDA 结构带遗忘门，仅全局型；enc/dec 各自在第一个
@@ -79,9 +79,25 @@
 #     （weights 拆三个 safetensors：主权重 / 离散 embedding / 连续
 #     投影；vocab 即使复用也整目录复制，防误删共享词表致模型报废）。
 #
+# 定案记录（2026-10-31，steve 拍板，图元画布可变化）：
+#   - 图元序列最前面加**画布声明**（DRAW 区第 0 段，`<x>` 数字 `<x/>` …），
+#     先声明画多大再画；缺省/旧数据按 256×256。
+#   - x/y 轴 bin 扩到 1920 / 1080（1 token = 1 像素），即
+#     「xy 轴的 token 扩展到支持 1920×1080」。
+#   - 画布上限 1920×1080（目前最大），竖屏不在预设表里。
+#   - 步数上限取消：转换器想跑多少步就跑多少步（server 不再卡 1000）。
+#
+# 定案记录（2026-11-02，steve 拍板，w/h 取消 128px 上限）：
+#   - w/h 与 x/y 同构：1 token = 1 像素，上限 = 画布上限（1920 / 1080）。
+#     旧布局 w/h 是 4 bin/px × 512 bins → 最大 127.75 px，256 画布上一半宽
+#     的形状根本表达不出来，第三方 GPU 转换器产出的 w=256 全被截半。
+#   - 「画布变大靠更多更小的图元堆细节」这条随之作废：单个图元现在可以
+#     和画布一样大（背景/大色块本来就该是这么大）。
+#   - 代价：DRAW 区 7629 → 9605，HEAD_SIZE 7638 → 9614（词表已重建）。
+#
 # 定案记录（2026-10-25，steve 拍板，内部流程对齐）：
-#   - block 内顺序改为 KDA → KDA → KDA → MLA-CSA → MLA-HCA → FFN → AttnRes
-#     （三个 KDA 连续，CSA 在前、HCA 在后）。
+#   - block 内顺序（已被 2026-11-04 定案取代，见文件末）：
+#     KDA → KDA → KDA → MLA-CSA → MLA-HCA → FFN → AttnRes。
 #   - AttnRes = Kimi/Moonshot《Attention Residuals》(arXiv 2603.15031) 的
 #     Block AttnRes：每个子层前对「token embedding + 已完成的 block 表示 +
 #     当前 partial sum」做 softmax 注意力聚合；块内仍用标准残差累加。
@@ -96,7 +112,42 @@
 #   - KV 超出上下文上限：丢 KV，保留原始 token id 存档（不保留向量）。
 #   - 训练数据 = .tokens（tok-32，必须带 { } | 时间步结构），不再用 JSON。
 #   - Token 编辑器导出 .tokens；词表操作全部归「词表」页。
+# 定案记录（2026-11-04，steve 拍板，enc/dec 权重模式可选）：
+#   - 创建模型时可选「分离权重」（默认，v1 现状）或「共享权重」。共享 =
+#     enc_blocks[i] 与 dec_blocks[i] 逐层共用同一批参数（两侧 final norm 也
+#     一起绑定），因此**强制 n_enc_blocks == n_dec_blocks**——数量不等就
+#     没有一一对应的层可绑。
+#   - 共享的是参数对象，不是 Block 实例：encoder 双向（MLA 非因果、KDA 有
+#     反向子层），decoder 因果（步间 + 步内 token 级因果、增量推理递推
+#     状态）。这些行为差异由两个 Block 实例各自的 is_decoder / MLA.causal
+#     保留，权重共享不改变任何因果语义。
+#   - 权重落盘只存 enc 侧一份：safetensors 不允许两个 key 共享同一块
+#     storage，而且存两份等于把省下来的磁盘又吃回去。config.json 的
+#     share_enc_dec 是唯一开关，加载时按它把 dec 侧 key 镜像回内存
+#     state_dict（再 strict load）。
+#   - 旧模型目录没有该字段 → 视为分离权重，行为逐字不变。
+#
+# 定案记录（2026-11-04，steve 拍板，d_model 建模可选）：
+#   - 创建模型时可选模型宽度 d_model（默认 1024）。它只改**语义向量宽度**：
+#     wte/lm_head/type_emb/模态投影、共享 KV 流、各 block 的输入输出投影、
+#     RMSNorm 全部跟随；注意力头数/头维、MLA 低秩秩、FFN 隐藏宽度仍按
+#     本文件冻结值不变（换宽度不换架构，权重形状可控、旧目录全兼容）。
+#   - 必须是 HEAD_DIM=128 的整数倍，且落在 [D_MODEL_MIN, D_MODEL_MAX]；
+#     上界是防 RAM 炸弹（wte 与 lm_head 各 V×D 行 fp32）。
+#   - config.json 的 d_model 是加载侧的唯一依据；缺省 → 1024。
+#
+# 定案记录（2026-11-04，steve 拍板，block 子层重排）：
+#   - 顺序改为 KDA → FFN → KDA → FFN → KDA → FFN → MLA-CSA → FFN →
+#     MLA-HCA → FFN → AttnRes：每次递推/注意力之后立刻接一个 FFN 做逐位置
+#     变换，不再把三个 KDA 连着堆完再统一过一次 FFN。
+#   - 5 个 FFN 是**各自独立的 GLUFFN 实例**（不是同一层复用 5 次）；
+#     10 个计算子层各有一份 RMSNorm，最后一个 "attnres" 是块末聚合/门控。
+#   - 参数量随之上浮：默认 4+6 blocks 从 ~527M 变为 ~1.03B，权重文件约
+#     4.1GB（fp32）。建模时可用 d_model / block 数 / 共享权重控制规模。
+#   - state_dict 的 FFN 键从 enc_blocks.N.ffn_up/down 变成
+#     enc_blocks.N.ffns.i.ffn_up/down；旧检查点结构不同，需重新建模。
 # ===========================================================================
+import math
 
 # ---------------------------------------------------------------------------
 # 1. 词表布局
@@ -138,47 +189,142 @@
 # ---------------------------------------------------------------------------
 # 1a. 图元输出 token 布局（先定义：MODAL_SIZE 依赖 DRAW_VOCAB_SIZE）
 # ---------------------------------------------------------------------------
-# 照搬 wonderfulearth/primitive-operation-painter geometrize_256_v1。
+# 照搬 wonderfulearth/primitive-operation-painter geometrize_256_v1，
+# 2026-11-01 起重排 x/y 与颜色（steve 定案）。
 # 仅输出侧——视觉输入的像素参数不入词表，走线性投影。
 #
-# 每个图元 = 9 个 token，字段序（cx, cy, theta, w, h, shape, r, g, b）；
+# 一条图元序列 = 一段画布声明 + N × 9 个图元 token：
+#   <x> 数字… <x/> <y> 数字… <y/>   [x y theta w h shape r g b] ...
+# 画布声明必须在最前面（「刚开画先说画多大」），它决定 x/y 的取值范围；
+# 缺省（旧数据 / 没有画布声明）按 DRAW_DEFAULT_CANVAS = 256×256 处理。
+#
+# 画布声明用 4 个定界 token + 可见区的文本数字 token（"0".."9"）：
+#   <x> 1 9 2 0 <x/> <y> 1 0 8 0 <y/>   → 1920×1080
+# 好处是画布**不再是固定档位**：1920×1080 以内的任意尺寸都写得出来，
+# 而词表只为 4 个定界符付代价（数字 token 本来就存在）。
+#
+# 每个图元 = 9 个 token，字段序（x, y, theta, w, h, shape, r, g, b）；
 # 各字段是独立 bin 区间（token ID = DRAW_BEGIN + 字段 offset + bin）：
-#   cx/cy  [0,256) px   ×2/bin   → 512 bins
-#   theta  [0,90) 度    ×3/bin   → 270 bins（CSV 里是弧度，≥90° 交换宽高）
-#   w/h    [0,128) px   ×4/bin   → 512 bins
+#   x      [0,1920) px  1 token/px → 1920 bins（x0…x1919，从 0 起）
+#   y      [0,1080) px  1 token/px → 1080 bins（y0…y1079）
+#   theta  [0,90) 度    ×3/bin     → 270 bins（CSV 里是弧度，≥90° 交换宽高）
+#   w      [0,1920) px  1 token/px → 1920 bins（w0…w1919）
+#   h      [0,1080) px  1 token/px → 1080 bins（h0…h1079）
 #   shape  -1=背景 0=矩形 1=椭圆（bin = shape_type+1，256 bins）
-#   r/g/b  0-255 //2（各 128 bins）
+#   r/g/b  0-1023（10 bit，1 bin/值，各 1024 bins）
 #   special 3 bins（仓库布局自带：pad + 2 预留）
-DRAW_TOKENS_PER_PRIMITIVE = 9               # cx, cy, theta, w, h, shape, r, g, b
-DRAW_FIELD_ORDER = ("cx", "cy", "theta", "w", "h", "shape", "r", "g", "b")
+#
+# 为什么 x/y/w/h 全是 1 token/像素：原来 x/y 是 2 bin/px、w/h 是 4 bin/px，
+# 「token 编号 ≠ 像素」逼着人做心算，而且 w/h 被 512 bins ÷ 4 卡死在
+# 127.75 px——256 画布上一半宽的形状根本表达不出来（第三方 GPU 转换器
+# 产出的 w 最大到 256，token 化时全被截成 127.75，预览与 token 对不上）。
+# 2026-11-02 起四个几何字段统一 1 token = 1 像素、上限 = 画布上限
+# （1920 / 1080）：`w1234` 就是 1234 像素宽，任何画布尺寸都表达得下。
+#
+# 为什么颜色是 10 bit：图像侧本来就是 RGBA 各 10 bit（见第 5 节），
+# 图元输出也用 10 bit 才能无损表达同一套颜色，不再 //2 掉一半精度。
+DRAW_CANVAS_SIZES = (
+    (256, 256),      # 默认：geometrize_256_v1 原画布
+    (384, 384),
+    (512, 512),
+    (640, 480),      # 4:3
+    (768, 768),
+    (1024, 1024),
+    (1024, 576),     # 16:9
+    (1280, 720),     # 16:9
+    (1920, 1080),    # 上限（steve 2026-11-01：目前最大 1920×1080）
+)
+DRAW_DEFAULT_CANVAS = DRAW_CANVAS_SIZES[0]             # (256, 256)
+# 画布上限：x/y 轴 token 数由它推出。**不是**「只能用这几档」——
+# 具体一张图用多大，由序列开头那段画布声明说了算（见上）。
+DRAW_CANVAS_MAX_W = 1920
+DRAW_CANVAS_MAX_H = 1080
+
+# 画布声明的 4 个定界 token（DRAW 区最前面 4 个），顺序即 bin 下标
+DRAW_CANVAS_MARKERS = ("<x>", "<x/>", "<y>", "<y/>")
+DRAW_CANVAS_OPEN_X, DRAW_CANVAS_CLOSE_X, \
+    DRAW_CANVAS_OPEN_Y, DRAW_CANVAS_CLOSE_Y = DRAW_CANVAS_MARKERS
+DRAW_CANVAS_BINS = len(DRAW_CANVAS_MARKERS)            # 4
+# 画布数字用可见区的文本数字 token（"0".."9"）。可见区的第一段就是
+# digit（见 VISIBLE_REGION_ORDER），所以 ID 恰好在 HEAD_SIZE 之后连续
+# 10 个——没有词表实例时按这个位置兜底（有词表时一律查表）。
+DRAW_CANVAS_DIGITS = "0123456789"
+
+DRAW_TOKENS_PER_PRIMITIVE = 9               # x, y, theta, w, h, shape, r, g, b
+DRAW_FIELD_ORDER = ("x", "y", "theta", "w", "h", "shape", "r", "g", "b")
+# DRAW 区的字段顺序（画布在最前，其余 9 个是图元字段）。词表头按这个
+# 顺序推导名字，draw_codec 只认 DRAW_FIELD_ORDER 那 9 个。
+DRAW_HEAD_FIELD_ORDER = ("canvas",) + DRAW_FIELD_ORDER
 DRAW_CSV_COLUMNS = ("image_name", "cx", "cy", "w", "h", "shape_type",
                     "theta", "r", "g", "b")
 DRAW_SHAPES = ("background", "rectangle", "ellipse")   # shape_type -1/0/1
-XY_BINS_PER_PIXEL = 2
+XY_BINS_PER_PIXEL = 1                       # 1 token = 1 像素
 ANGLE_BINS_PER_DEGREE = 3
-SIZE_BINS_PER_PIXEL = 4
-DRAW_X_BINS = 512
-DRAW_Y_BINS = 512
+# w/h 与 x/y 同构：1 token = 1 像素，上限 = 画布上限（不是 128 那个历史值）
+SIZE_BINS_PER_PIXEL = 1
+DRAW_X_BINS = DRAW_CANVAS_MAX_W * XY_BINS_PER_PIXEL    # 1920
+DRAW_Y_BINS = DRAW_CANVAS_MAX_H * XY_BINS_PER_PIXEL    # 1080
 DRAW_ANGLE_BINS = 270
-DRAW_W_BINS = 512
-DRAW_H_BINS = 512
+DRAW_W_BINS = DRAW_CANVAS_MAX_W * SIZE_BINS_PER_PIXEL  # 1920
+DRAW_H_BINS = DRAW_CANVAS_MAX_H * SIZE_BINS_PER_PIXEL  # 1080
 DRAW_SHAPE_BINS = 256
-DRAW_COLOR_BINS = 128
+# 颜色：10 bit / 通道，1 bin 一个值（0..1023）
+DRAW_COLOR_BITS = 10
+DRAW_COLOR_BINS = 1 << DRAW_COLOR_BITS                 # 1024
+DRAW_COLOR_MAX = DRAW_COLOR_BINS - 1                   # 1023
 DRAW_SPECIAL_BINS = 3
 # 字段 offset（相对 DRAW_BEGIN）——由上面的 bin 数累加而来，与 base 无关。
 # 所以 DRAW_BEGIN 变成运行时值也不影响这段算术（draw_codec 直接用
 # `b + offset + bin`，b 一变自动跟随）。
-DRAW_X_OFFSET = 0
-DRAW_Y_OFFSET = DRAW_X_OFFSET + DRAW_X_BINS            # 512
-DRAW_ANGLE_OFFSET = DRAW_Y_OFFSET + DRAW_Y_BINS        # 1024
-DRAW_W_OFFSET = DRAW_ANGLE_OFFSET + DRAW_ANGLE_BINS    # 1294
-DRAW_H_OFFSET = DRAW_W_OFFSET + DRAW_W_BINS             # 1806
-DRAW_SHAPE_OFFSET = DRAW_H_OFFSET + DRAW_H_BINS         # 2318
-DRAW_R_OFFSET = DRAW_SHAPE_OFFSET + DRAW_SHAPE_BINS    # 2574
-DRAW_G_OFFSET = DRAW_R_OFFSET + DRAW_COLOR_BINS        # 2702
-DRAW_B_OFFSET = DRAW_G_OFFSET + DRAW_COLOR_BINS        # 2830
-DRAW_SPECIAL_OFFSET = DRAW_B_OFFSET + DRAW_COLOR_BINS  # 2958
-DRAW_VOCAB_SIZE = DRAW_SPECIAL_OFFSET + DRAW_SPECIAL_BINS   # 2961
+DRAW_CANVAS_OFFSET = 0
+DRAW_X_OFFSET = DRAW_CANVAS_OFFSET + DRAW_CANVAS_BINS  # 4
+DRAW_Y_OFFSET = DRAW_X_OFFSET + DRAW_X_BINS            # 1924
+DRAW_ANGLE_OFFSET = DRAW_Y_OFFSET + DRAW_Y_BINS        # 3004
+DRAW_W_OFFSET = DRAW_ANGLE_OFFSET + DRAW_ANGLE_BINS    # 3274
+DRAW_H_OFFSET = DRAW_W_OFFSET + DRAW_W_BINS            # 5194
+DRAW_SHAPE_OFFSET = DRAW_H_OFFSET + DRAW_H_BINS        # 6274
+DRAW_R_OFFSET = DRAW_SHAPE_OFFSET + DRAW_SHAPE_BINS    # 6530
+DRAW_G_OFFSET = DRAW_R_OFFSET + DRAW_COLOR_BINS        # 7554
+DRAW_B_OFFSET = DRAW_G_OFFSET + DRAW_COLOR_BINS        # 8578
+DRAW_SPECIAL_OFFSET = DRAW_B_OFFSET + DRAW_COLOR_BINS  # 9602
+DRAW_VOCAB_SIZE = DRAW_SPECIAL_OFFSET + DRAW_SPECIAL_BINS   # 9605
+
+
+def draw_canvas_valid(w, h) -> bool:
+    """画布尺寸是否在契约范围内（1..1920 × 1..1080）。
+
+    2026-11-01 起画布不再是固定档位——`<x>`/`<y>` 之间的数字可以是任意
+    整数，所以这里只守上下限，不查表。
+    """
+    try:
+        wi, hi = int(w), int(h)
+    except (TypeError, ValueError):
+        return False
+    return 1 <= wi <= DRAW_CANVAS_MAX_W and 1 <= hi <= DRAW_CANVAS_MAX_H
+
+
+def draw_canvas_auto(img_w, img_h):
+    """按图片长宽比取**精确比例**的画布，上限 1920×1080。
+
+    2026-11-03（steve）：原来是从 DRAW_CANVAS_SIZES 里挑「比例最接近的一档」，
+    竖图会被塞进 1024×1024 —— 比例差一大截，画面要么被拉伸、要么四周留边。
+    既然画布声明本来就支持任意尺寸，就没有理由再回到预设表：
+
+        scale = min(1920/iw, 1080/ih)   →   取整(iw*scale, ih*scale)
+
+    也就是「塞得进上限的最大同比例画布」。预设表 DRAW_CANVAS_SIZES 仍然保留，
+    给图元编辑器的下拉框用。
+    """
+    try:
+        iw, ih = float(img_w), float(img_h)
+    except (TypeError, ValueError):
+        return DRAW_DEFAULT_CANVAS
+    if iw <= 0 or ih <= 0:
+        return DRAW_DEFAULT_CANVAS
+    scale = min(DRAW_CANVAS_MAX_W / iw, DRAW_CANVAS_MAX_H / ih)
+    w = max(1, min(DRAW_CANVAS_MAX_W, int(round(iw * scale))))
+    h = max(1, min(DRAW_CANVAS_MAX_H, int(round(ih * scale))))
+    return (w, h)
 
 # ---------------------------------------------------------------------------
 # 1b. 架构契约头（冻结：名字 + 顺序 + ID；所有词表共享，不得占用/重排）
@@ -214,12 +360,12 @@ TS_SEP_ID = SYSTEM_BEGIN + 2                   # 8（旧：66）
 # —— modal 模态输出（图元 DRAW；token 布局见 1a）——
 MODAL_BEGIN = SYSTEM_BEGIN + SYSTEM_SIZE      # 9（旧：96）
 # 旧值 12288（DRAW 2961 + 9327 预留）→ 只留实际用到的
-MODAL_SIZE = DRAW_VOCAB_SIZE                   # 2961
+MODAL_SIZE = DRAW_VOCAB_SIZE                   # 9605（= DRAW_VOCAB_SIZE）
 DRAW_BEGIN = MODAL_BEGIN                       # 9（旧：96）
 
 # 架构契约头长度 = special + system + modal。**所有词表共享、固定**。
 # 可见区从这里开始；头内不允许任何空位（空位同样吃 embedding 行）。
-HEAD_SIZE = SPECIAL_SIZE + SYSTEM_SIZE + MODAL_SIZE     # 2970（旧：12384）
+HEAD_SIZE = SPECIAL_SIZE + SYSTEM_SIZE + MODAL_SIZE     # 9614（旧：12384）
 
 # 词表长度防呆上界。**这不是 spec 规定的长度**——词表多长由各词表的
 # config.json 说了算，token ID 是自界定十六进制（见第 5b 节），格式本身
@@ -272,11 +418,64 @@ NUM_TYPES = 3
 D_MODEL = 1024
 HEAD_DIM = 128
 N_HEADS = D_MODEL // HEAD_DIM                      # 8
+# 建模可选宽度（2026-11-04）：默认档位 + 合法范围，唯一真源在 check_d_model
+D_MODEL_MIN = 128
+D_MODEL_MAX = 2048          # 2× 默认；再大 embedding 会把内存吃穿
+D_MODEL_CHOICES = (256, 512, 768, 1024, 1536, 2048)
+
+
+def check_d_model(v) -> int:
+    """建模时指定的 d_model 严格校验（唯一规则，所有入口共用）。
+
+    合法返回 int；非法抛 ValueError（HTTP 层映射 400）。拒绝 bool、
+    非整数 float、非数字字符串、越界值与非 HEAD_DIM 倍数值——任何一项
+    松了都会造出 config 与权重形状对不上的模型目录。"""
+    if isinstance(v, bool):
+        raise ValueError(f"d_model 必须是整数，不能是布尔值: {v!r}")
+    if isinstance(v, int):
+        n = v
+    elif isinstance(v, float):
+        if not v.is_integer():
+            raise ValueError(f"d_model 必须是整数: {v!r}")
+        n = int(v)
+    elif isinstance(v, str):
+        s = v.strip()
+        if not s.isdigit():
+            raise ValueError(f"d_model 必须是整数: {v!r}")
+        n = int(s)
+    else:
+        raise ValueError(f"d_model 必须是整数: {v!r}")
+    if not (D_MODEL_MIN <= n <= D_MODEL_MAX):
+        raise ValueError(
+            f"d_model 必须在 [{D_MODEL_MIN}, {D_MODEL_MAX}]: {n}")
+    if n % HEAD_DIM:
+        raise ValueError(f"d_model 必须是 {HEAD_DIM} 的整数倍: {n}")
+    return n
+
 
 N_ENC_BLOCKS = 4
 N_DEC_BLOCKS = 6
-# block 内顺序（冻结，2026-10-25）：KDA×3 → MLA-CSA → MLA-HCA → FFN → AttnRes
-BLOCK_ORDER = ["kda", "kda", "kda", "mla_csa", "mla_hca", "ffn", "attnres"]
+
+# ---- enc/dec 权重模式（2026-11-04，见文件头定案记录）----
+# 默认分离：旧模型目录 / 所有未显式指定该选项的入口都保持 v1 行为。
+SHARE_ENC_DEC = False
+# 共享模式下、两侧 block 数都没给时的共同默认值。不能让 Gargantua 各自
+# 取 N_ENC_BLOCKS=4 / N_DEC_BLOCKS=6——那两个数不等，共享模型必须等深。
+SHARED_DEFAULT_BLOCKS = N_ENC_BLOCKS
+# 共享范围（state_dict 前缀对）：只绑定两个 block 栈与两侧 final norm。
+# wte / lm_head 按 spec 不绑定；type_emb / 模态投影 / fast weight 本来就
+# 是全局单份，不在此列。
+TIED_KEY_PAIRS = (("enc_blocks.", "dec_blocks."),
+                  ("enc_final_norm.", "dec_final_norm."))
+
+# block 内顺序（2026-11-04 重排）：每个 KDA/MLA 之后都紧跟一个 FFN。
+# "attnres" 不是独立计算子层，而是块末的聚合/零初始化门；其余 10 项各
+# 对应一份 RMSNorm（Block.__init__ 从这张表推导 norms 数量，并断言
+# forward 的顺序与之严格一致，防止两处脱节）。
+BLOCK_ORDER = ["kda", "ffn", "kda", "ffn", "kda", "ffn",
+               "mla_csa", "ffn", "mla_hca", "ffn", "attnres"]
+N_FFN_PER_BLOCK = sum(1 for s in BLOCK_ORDER if s == "ffn")   # 5
+N_SUBL_LAYERS = len(BLOCK_ORDER) - 1                          # 10
 
 # KDA（Kimi Linear 式：channel-wise 门控 delta 递推）
 KDA_HEAD_DIM = 128
@@ -290,7 +489,7 @@ MLA_Q_LORA_RANK = 256
 MLA_KV_LORA_RANK = 512
 MLA_V_LORA_RANK = 512
 
-# FFN（每 block 一个，GLU 结构：SiLU 门控）
+# FFN（2026-11-04：每 block 5 个独立实例，GLU 结构：SiLU 门控）
 FFN_HIDDEN = 4096
 
 # Block Attention Residual（Moonshot AttnRes, arXiv 2603.15031）
@@ -442,9 +641,11 @@ T5_CHANNEL_MAX = (1 << 10) - 1            # 1023
 # 时间步仍是原子单位：{} 必须至少含一个元素，空步非法。
 # 落盘（.tokens）：5 bit/字符的位流，末字符后跟终止符码 27，再补零到字节。
 
-# 绘图输出（仅输出，token 区间见词表布局；画布照搬仓库 256×256）
-CANVAS_W = 256
-CANVAS_H = 256
+# 绘图输出（仅输出，token 区间见词表布局）
+# 2026-10-31：画布不再钉死 256×256——序列开头的画布 token 决定尺寸，
+# 上限 1920×1080。这两个常量是**默认画布**（旧数据 / 未指定时用它）。
+CANVAS_W = DRAW_DEFAULT_CANVAS[0]
+CANVAS_H = DRAW_DEFAULT_CANVAS[1]
 DRAW_KV_COMPRESS = 9            # 输出完一个图元后 KV 就地 9:1 压成 1 向量
 
 # 音频输出：MIDI → 离散 token 暂时删除（2026-10-24，steve：研究后再定）
@@ -466,7 +667,7 @@ MUON_LR = 2e-2
 # 用 latest 不锁 patch）+ torch 2.2.2（macOS x86_64 最后官方轮子）。
 # 隔离运行时全部装在 environment/，不碰系统 Python：
 #   environment/python/  python-build-standalone 解包（setup.sh 自动下载）
-#   environment/venv/    以上述解释器建的虚拟环境（core/window/dev 依赖）
+#   environment/venv/    以上述解释器建的虚拟环境（must/necessary 依赖）
 #   environment/rust/    Rust 工具链（service/prims/setup.sh 隔离安装）
 # torch 2.2.2 最高支持 Python 3.12（3.13 无预编译轮子）——所以锁 3.12
 # 系列而不是 latest overall。
@@ -478,7 +679,8 @@ DTYPE = "float32"            # 训练/推理默认 FP32（x86_64 mac 无 CUDA）
 # 目录树（契约，新增文件必须归位）：
 #   start/
 #     terminal/    终端脚本：setup.{sh,bat}（装隔离环境）+ start.{sh,bat,command}
-#     requirements/ 分类依赖：core（必装）/ window（GUI）/ dev（测试）
+#     requirements/ 分类依赖：must（启动必备，轻量）/ necessary（正常
+#                   工作需要，启动不查；2026-11-01 起 core/window/dev 并入）
 #     boot.py      路径引导（把 server/ 与 service/* 放上 sys.path）
 #   environment/   全部依赖/工具链（与系统隔离，见第 7 节）：
 #     python/       standalone CPython（setup 脚本下载）
@@ -498,6 +700,8 @@ DTYPE = "float32"            # 训练/推理默认 FP32（x86_64 mac 无 CUDA）
 #                  （config.json 是 manifest：它的 "weights"/
 #                    "weights_discrete_embed"/"weights_continuous_embed" 指向
 #                    weights/ 下的三个 safetensors，读者加载哪个由它说了算；
+#                    "share_enc_dec" 决定是否 enc/dec 逐层共享权重（共享时
+#                    只落 enc 侧一份，加载时镜像出 dec 侧 key）；
 #                    vocab/ 是建模时整目录复制的词表副本 vocab.vfc + config.json）
 #   data/          data/queue/（待训练）+ data/done/（已训练归档）
 #   logs/          auto_train.jsonl 等运行日志

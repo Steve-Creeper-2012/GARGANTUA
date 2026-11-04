@@ -276,6 +276,48 @@ def _global_regions() -> list:
     return []
 
 
+# 本进程是否已确认 base 的契约头与当前 spec 一致（见 _base_head_ok）
+_HEAD_OK = False
+
+
+def _base_head_ok(txt) -> bool:
+    """base 的架构契约头是否与当前 spec 一致。
+
+    为什么需要这一步：spec 改过 DRAW 区布局（例如 2026-10-31 加画布
+    token）之后，磁盘上的 base 是旧 spec 建的，头部第 10 行还是 `<cx:0>`
+    而 spec 已经要求 `<canvas:0>`——之后每个词表请求都会 400，用户看到
+    的是「所有词表都坏了」。base 是**派生资产**（由全局词表生成），
+    所以这里直接判它过期、整块重建，不跟用户数据混在一起。
+    用户 fork 出去的那些词表不动（那是他们的数据，只能自己处理）。
+
+    性能：确认过一次就把 head_size 写进 config.json，之后每个请求只比
+    一个整数；老 base（没写 head_size）按正文前 12 行比对一次，每进程一次。
+    """
+    global _HEAD_OK
+    if _HEAD_OK:
+        return True
+    cfg = read_config(BASE)
+    hs = cfg.get("head_size")
+    if isinstance(hs, int) and not isinstance(hs, bool):
+        if hs != spec.HEAD_SIZE:
+            return False
+        _HEAD_OK = True
+        return True
+    # 老 base 没有 head_size：按正文头几行实际比对（只读 12 行，很便宜）
+    try:
+        with open(txt, encoding="utf-8") as f:
+            got = [next(f).rstrip("\n") for _ in range(12)]
+    except (OSError, StopIteration):
+        return True                      # 读不到就别折腾，交给后续解析报错
+    want = vfc.dumps_vfc(vfc.head_entries()).split("\n")[:12]
+    if got != want:
+        return False
+    cfg["head_size"] = spec.HEAD_SIZE
+    write_config(BASE, cfg)
+    _HEAD_OK = True
+    return True
+
+
 def ensure_base() -> None:
     """确保 base 词表存在（从全局基础词表派生）。幂等。
 
@@ -286,18 +328,28 @@ def ensure_base() -> None:
     全量解析 .vfc —— config.json 比 vocab.vfc 新 = 上次同步后正文没被
     手改过，直接返回（本函数被每个词表 API 调用，全量解析会把每个请求
     拖慢数百毫秒）。mtime 拿不到时保守起见照旧同步。
+
+    2026-10-31 补：契约头长度与 spec 对不上时**整块重建**（见
+    _base_head_ok）——否则 spec 一改 DRAW 区布局，旧 base 会让所有词表
+    接口全 400。
     """
+    global _HEAD_OK
     d = vocab_dir(BASE)
     txt = vocab_vfc_path(BASE)
     if txt.is_file() and config_path(BASE).is_file():
-        try:
-            drift = txt.stat().st_mtime > config_path(BASE).stat().st_mtime
-        except OSError:
-            drift = True
-        if not drift:
+        if _base_head_ok(txt):
+            try:
+                drift = txt.stat().st_mtime > config_path(BASE).stat().st_mtime
+            except OSError:
+                drift = True
+            if not drift:
+                return
+            _sync_config(BASE)
             return
-        _sync_config(BASE)
-        return
+        # 契约头过期：base 是派生资产，删掉重建
+        print("[vocab_presets] base 的契约头与当前 spec 不一致，重建中…",
+              file=sys.stderr)
+        shutil.rmtree(d, ignore_errors=True)
     d.mkdir(parents=True, exist_ok=True)
     entries = Vocab.global_vocab().to_entries()
     vfc.write_vfc(str(txt), entries)
@@ -314,7 +366,9 @@ def ensure_base() -> None:
         "is_main": True,
         "regions": regions,
         "vocab_size": len(entries),
+        "head_size": spec.HEAD_SIZE,
     })
+    _HEAD_OK = True
 
 
 # ---------------------------------------------------------------------------

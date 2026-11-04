@@ -13,6 +13,39 @@
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR" || exit 1
 
+# ---------------------------------------------------------------------------
+# 先「关干净」再启动（2026-11-03 起内置；原来的 重启.command 已删除）
+# ---------------------------------------------------------------------------
+# 窗口进程（service/window/window.py）和 server 是两个独立进程，界面里 ⌘Q
+# 只关窗口，server 继续在后台跑（设计如此：关窗口不该打断训练/推理）。于是
+# 「重开界面」拿到的还是旧代码的 server——新接口 404、改过的后端不生效。
+# 这里在启动前把旧的收掉，并清掉 __pycache__（被移动/改过路径的模块偶尔会
+# 拿到旧 pyc）。不删 models/ data/ logs/ environment/ 与 web/index.html。
+say() { printf '[启动] %s\n' "$*"; }
+
+if pgrep -f "$DIR/server/server.py" >/dev/null 2>&1 \
+   || pgrep -f "$DIR/service/window/window.py" >/dev/null 2>&1; then
+  say "发现旧进程，正在结束……"
+  for pat in "$DIR/server/server.py" "$DIR/service/window/window.py" \
+             "$DIR/service/.*--serve"; do
+    pkill -f "$pat" 2>/dev/null || true
+  done
+  for _ in 1 2 3 4 5 6; do
+    sleep 0.2
+    pgrep -f "$DIR/server/server.py" >/dev/null 2>&1 || break
+  done
+  for pat in "$DIR/server/server.py" "$DIR/service/window/window.py" \
+             "$DIR/service/.*--serve"; do
+    pkill -9 -f "$pat" 2>/dev/null || true
+  done
+  sleep 0.3
+  say "✓ 旧进程已结束"
+fi
+
+find "$DIR" -name "__pycache__" -type d -prune -exec rm -rf {} + 2>/dev/null
+find "$DIR" -name "*.pyc" -type f -delete 2>/dev/null
+say "✓ 缓存已清"
+
 WIN_ID=""
 if [ "${TERM_PROGRAM:-}" = "Apple_Terminal" ]; then
   WIN_ID="$(osascript -e 'tell application "Terminal" to id of front window' 2>/dev/null || true)"

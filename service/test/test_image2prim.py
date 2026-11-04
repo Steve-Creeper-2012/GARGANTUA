@@ -28,10 +28,13 @@ from prims.image_to_primitives import image_to_primitives
 
 
 def _red_circle_target(path="/tmp/garg_fit_target.png") -> Image.Image:
-    """合成靶图：灰底 + 居中红圆（用 draw_codec 渲染，保证可拟合）。"""
+    """合成靶图：灰底 + 居中红圆（用 draw_codec 渲染，保证可拟合）。
+
+    颜色按内部 10bit 写（512 → 渲染 8bit 128 灰；923/201 → 230/50 红）。
+    """
     from tokens.draw_codec import primitives_to_png
-    truth = [Primitive(0, 0, 0, 0, -1, 0.0, 128, 128, 128),
-             Primitive(128, 128, 120, 120, 1, 0.0, 230, 50, 50)]
+    truth = [Primitive(0, 0, 0, 0, -1, 0.0, 512, 512, 512),
+             Primitive(128, 128, 120, 120, 1, 0.0, 923, 201, 201)]
     primitives_to_png(truth, path)
     return Image.open(path)
 
@@ -41,12 +44,15 @@ class TestImageToPrimitives(unittest.TestCase):
         return Image.new("RGB", size, rgb)
 
     def test_background_is_mean_color(self):
-        # 纯色图：背景 = 整除平均色（8bit 直接入 token，无量化损失）
+        # 纯色图：背景 = 整除平均色。图像是 8bit，内部图元是 10bit
+        # （color_to10 升位），渲染出图时再降回来。
+        from tokens.draw_codec import color_to10
         prims, note = image_to_primitives(self._solid((40, 80, 120)),
                                           max_steps=0, backend="cpu")
         bg = prims[0]
         self.assertEqual(bg.shape_type, -1)
-        self.assertEqual((bg.r, bg.g, bg.b), (40, 80, 120))
+        self.assertEqual((bg.r, bg.g, bg.b),
+                         (color_to10(40), color_to10(80), color_to10(120)))
         self.assertEqual(len(prims), 1)          # max_steps=0 → 只有背景
 
     def test_fit_improves_and_deterministic(self):
@@ -67,16 +73,17 @@ class TestImageToPrimitives(unittest.TestCase):
                                        max_steps=4, seed=1, backend="cpu")
         ids = primitives_to_tokens(prims)
         back = tokens_to_primitives(ids)
+        # 画布声明（4 定界符 + "2 5 6" ×2 = 10）+ 每图元 9 个
         self.assertEqual(len(ids),
-                         len(prims) * spec.DRAW_TOKENS_PER_PRIMITIVE)
+                         10 + len(prims) * spec.DRAW_TOKENS_PER_PRIMITIVE)
         self.assertEqual(len(back), len(prims))
         for p in back:
             self.assertTrue(0 <= p.cx < spec.CANVAS_W)
             self.assertTrue(0 <= p.cy < spec.CANVAS_H)
             self.assertIn(p.shape_type, (-1, 0, 1))
-            self.assertTrue(0 <= p.r <= 255)
-            self.assertTrue(0 <= p.g <= 255)
-            self.assertTrue(0 <= p.b <= 255)
+            self.assertTrue(0 <= p.r <= spec.DRAW_COLOR_MAX)   # 10bit
+            self.assertTrue(0 <= p.g <= spec.DRAW_COLOR_MAX)
+            self.assertTrue(0 <= p.b <= spec.DRAW_COLOR_MAX)
         # 背景行 schema：几何清零、shape_type=-1
         self.assertEqual(back[0].shape_type, -1)
         self.assertEqual((back[0].cx, back[0].cy, back[0].w, back[0].h),

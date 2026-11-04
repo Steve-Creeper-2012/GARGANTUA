@@ -3,10 +3,13 @@
 # ---------------------------------------------------------------------------
 # 架构（冻结契约见 spec.py）：
 #   encoder-decoder，共享统一 KV 序列流，无 cross attention；
-#   block = KDA → KDA → KDA → MLA-CSA → MLA-HCA → FFN → AttnRes；
+#   block（2026-11-04）= KDA>FFN>KDA>FFN>KDA>FFN>MLA-CSA>FFN>
+#                        MLA-HCA>FFN>AttnRes（5 个独立 GLU-FFN）；
 #   AttnRes = Kimi Block AttnRes（每个子层前做深度注意力聚合）
 #             + block 末尾零初始化标量门；
 #   fast weight = 一个 KDA 层（同参数化，状态跨调用持久），enc/dec 各调一次；
+#   enc/dec 权重可分离（默认）或逐层共享（须等深）；共享只绑参数，不改
+#     encoder 双向 / decoder 因果的行为差异（2026-11-04）；
 #   双层 KV：完整区(1K)｜压缩区(3K)，CSA 4:1 检索视图 / HCA 32:1 全局视图；
 #   时间步为全局原子单位：压缩/滑窗/因果掩码均不拆分时间步。
 #
@@ -689,36 +692,75 @@ def block_attn_res(blocks: List[torch.Tensor], partial: torch.Tensor,
 
 
 # ===========================================================================
-# Block = KDA → KDA → KDA → MLA-CSA → MLA-HCA → FFN → AttnRes
+# Block（2026-11-04 重排）= KDA → FFN → KDA → FFN → KDA → FFN →
+#                          MLA-CSA → FFN → MLA-HCA → FFN → AttnRes
 # ---------------------------------------------------------------------------
 # encoder block：KDA 天然因果，靠 forward/backward 两个 KDA 子层 + 双向
 # MLA 保证双向信息流；decoder block：全部因果（步内双向由 MLA mask 负责）。
+# 每个计算子层之前都是「AttnRes 深度聚合 → RMSNorm」，之后残差累加；
+# 块末保留零初始化标量门（AttnRes 的第二半）。
 # ===========================================================================
-class Block(nn.Module):
-    def __init__(self, is_decoder: bool):
-        super().__init__()
-        self.is_decoder = is_decoder
-        # 5 个注意力/递推子层 + 1 个 FFN，顺序见 spec.BLOCK_ORDER
-        self.kda1 = KDAAttention()
-        self.kda2 = KDAAttention()
-        self.kda3 = KDAAttention()
-        self.mla_csa = MLAAttention(causal=is_decoder)
-        self.mla_hca = MLAAttention(causal=is_decoder)
-        # GLU-FFN：w1 投影到 2×hidden，chunk 后 silu(a)⊙b，再 w2 降维
-        self.ffn_up = nn.Linear(spec.D_MODEL, spec.FFN_HIDDEN * 2, bias=False)
-        self.ffn_down = nn.Linear(spec.FFN_HIDDEN, spec.D_MODEL, bias=False)
-        self.norms = nn.ModuleList([RMSNorm(spec.D_MODEL) for _ in range(6)])
-        # AttnRes：子层级深度注意力（论文 attn / mlp 两套 proj+norm）
-        # + 块末零初始化标量门（两种残差互补，2026-10-25 steve 定）
-        self.attn_res_proj = nn.Linear(spec.D_MODEL, 1, bias=False)
-        self.attn_res_norm = RMSNorm(spec.D_MODEL)
-        self.mlp_res_proj = nn.Linear(spec.D_MODEL, 1, bias=False)
-        self.mlp_res_norm = RMSNorm(spec.D_MODEL)
-        self.attn_res_gate = nn.Parameter(torch.zeros(1))
+class GLUFFN(nn.Module):
+    """一个 GLU-FFN 子层；每个 block 有 spec.N_FFN_PER_BLOCK 个独立实例。"""
 
-    def _ffn(self, x: torch.Tensor) -> torch.Tensor:
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.ffn_up = nn.Linear(d_model, spec.FFN_HIDDEN * 2, bias=False)
+        self.ffn_down = nn.Linear(spec.FFN_HIDDEN, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         a, b = self.ffn_up(x).chunk(2, dim=-1)       # GLU：SiLU(a) ⊙ b
         return self.ffn_down(F.silu(a) * b)
+
+
+class Block(nn.Module):
+    def __init__(self, is_decoder: bool, d_model: int = spec.D_MODEL):
+        super().__init__()
+        # 2026-11-04：d_model 建模可选。只改语义向量宽度；注意力头数/
+        # 头维、MLA 低秩秩、FFN 隐藏宽度仍是 spec 的冻结值（换宽度不换
+        # 架构）。内部投影的输出宽度固定 1024，所以任意合法 D 都不需要
+        # 重新推导 head/rank，输入输出侧各一对 Linear 自适应即可。
+        D = spec.check_d_model(d_model)
+        # 顺序是冻结契约，forward 是手写的——两处脱节会造出"配置说一套、
+        # 前向跑一套"的模型，构造期直接拦下
+        _EXPECTED = ("kda", "ffn", "kda", "ffn", "kda", "ffn",
+                     "mla_csa", "ffn", "mla_hca", "ffn", "attnres")
+        if tuple(spec.BLOCK_ORDER) != _EXPECTED:
+            raise RuntimeError(
+                f"spec.BLOCK_ORDER={spec.BLOCK_ORDER} 与 Block.forward 顺序不一致")
+        self.is_decoder = is_decoder
+        self.d_model = D
+        # 3 KDA + 2 MLA + 5 FFN = 10 个计算子层，各一份 RMSNorm
+        self.kda1 = KDAAttention(D)
+        self.kda2 = KDAAttention(D)
+        self.kda3 = KDAAttention(D)
+        self.mla_csa = MLAAttention(d_model=D, causal=is_decoder)
+        self.mla_hca = MLAAttention(d_model=D, causal=is_decoder)
+        self.ffns = nn.ModuleList([GLUFFN(D)
+                                   for _ in range(spec.N_FFN_PER_BLOCK)])
+        self.norms = nn.ModuleList([RMSNorm(D)
+                                    for _ in range(spec.N_SUBL_LAYERS)])
+        # AttnRes：子层级深度注意力（论文 attn / mlp 两套 proj+norm）
+        # + 块末零初始化标量门（两种残差互补，2026-10-25 steve 定）
+        self.attn_res_proj = nn.Linear(D, 1, bias=False)
+        self.attn_res_norm = RMSNorm(D)
+        self.mlp_res_proj = nn.Linear(D, 1, bias=False)
+        self.mlp_res_norm = RMSNorm(D)
+        self.attn_res_gate = nn.Parameter(torch.zeros(1))
+
+    # 兼容旧访问路径：第 1 个 FFN 的投影。用 property 而不是赋属性，
+    # 免得同一个 Parameter 被注册两次（那样 state_dict 会多出重复 key）。
+    @property
+    def ffn_up(self):
+        return self.ffns[0].ffn_up
+
+    @property
+    def ffn_down(self):
+        return self.ffns[0].ffn_down
+
+    def _ffn(self, x: torch.Tensor) -> torch.Tensor:
+        """兼容旧调用的别名：第 1 个 FFN。"""
+        return self.ffns[0](x)
 
     def _kda(self, layer: KDAAttention, name: str, normed: torch.Tensor,
              rec_state: Optional[dict], reverse: bool = False) -> torch.Tensor:
@@ -749,45 +791,86 @@ class Block(nn.Module):
         partial = x
         blocks = list(blocks) if blocks else [x]
 
-        def _res(cur):
-            if not spec.ATTNRES_ENABLED:
-                return cur
-            return block_attn_res(blocks, cur,
-                                  self.attn_res_proj, self.attn_res_norm)
-
         # x 侧步内序号（2026-10-27 S1）：同 step 内按 token 序号因果
         x_pos = (within_step_pos(x_step_ids)
                  if x_step_ids is not None else None)
-        partial = partial + self._kda(self.kda1, "kda1",
-                                      self.norms[0](_res(partial)),
-                                      rec_state)
-        partial = partial + self._kda(self.kda2, "kda2",
-                                      self.norms[1](_res(partial)),
-                                      rec_state,
-                                      reverse=not self.is_decoder)
-        partial = partial + self._kda(self.kda3, "kda3",
-                                      self.norms[2](_res(partial)),
-                                      rec_state)
-        kv_v, kv_s, kv_p = (kv_view_csa if kv_view_csa[0] is not None
-                            else (partial, x_step_ids, x_pos))
-        partial = partial + self.mla_csa(
-            self.norms[3](_res(partial)), kv_v,
-            kv_step_ids=kv_s, x_step_ids=x_step_ids,
-            kv_pos=kv_p, x_pos=x_pos)
-        kv_v, kv_s, kv_p = (kv_view_hca if kv_view_hca[0] is not None
-                            else (partial, x_step_ids, x_pos))
-        partial = partial + self.mla_hca(
-            self.norms[4](_res(partial)), kv_v,
-            kv_step_ids=kv_s, x_step_ids=x_step_ids,
-            kv_pos=kv_p, x_pos=x_pos)
-        ffn_in = (block_attn_res(blocks, partial, self.mlp_res_proj,
-                                 self.mlp_res_norm)
-                  if spec.ATTNRES_ENABLED else partial)
-        partial = partial + self._ffn(self.norms[5](ffn_in))
+        nidx = 0
+
+        def _sub(fn, is_mlp=False):
+            """一个计算子层：AttnRes 聚合 → 本层专属 RMSNorm → 子层 → 残差。
+
+            KDA/MLA 走 attn_res_*，FFN 走 mlp_res_*（两套聚合权重），
+            沿用 2026-10-25 的 AttnRes 设计；norms 按 BLOCK_ORDER 逐个
+            消费，__init__ 的断言保证顺序不会与 spec 脱节。"""
+            nonlocal partial, nidx
+            proj = self.mlp_res_proj if is_mlp else self.attn_res_proj
+            norm = self.mlp_res_norm if is_mlp else self.attn_res_norm
+            h = partial
+            if spec.ATTNRES_ENABLED:
+                h = block_attn_res(blocks, h, proj, norm)
+            h = self.norms[nidx](h)
+            nidx += 1
+            partial = partial + fn(h)
+
+        # 2026-11-04：KDA/MLA 之后紧跟一个 FFN（5 个 FFN 各自独立）
+        _sub(lambda h: self._kda(self.kda1, "kda1", h, rec_state))
+        _sub(lambda h: self.ffns[0](h), is_mlp=True)
+        _sub(lambda h: self._kda(self.kda2, "kda2", h, rec_state,
+                                 reverse=not self.is_decoder))
+        _sub(lambda h: self.ffns[1](h), is_mlp=True)
+        _sub(lambda h: self._kda(self.kda3, "kda3", h, rec_state))
+        _sub(lambda h: self.ffns[2](h), is_mlp=True)
+
+        # encoder / KV 未就绪时退化为对自身 hidden 的双向注意力
+        kv_csa = (kv_view_csa if kv_view_csa[0] is not None
+                  else (partial, x_step_ids, x_pos))
+        _sub(lambda h: self.mla_csa(
+            h, kv_csa[0], kv_step_ids=kv_csa[1], x_step_ids=x_step_ids,
+            kv_pos=kv_csa[2], x_pos=x_pos))
+        _sub(lambda h: self.ffns[3](h), is_mlp=True)
+
+        kv_hca = (kv_view_hca if kv_view_hca[0] is not None
+                  else (partial, x_step_ids, x_pos))
+        _sub(lambda h: self.mla_hca(
+            h, kv_hca[0], kv_step_ids=kv_hca[1], x_step_ids=x_step_ids,
+            kv_pos=kv_hca[2], x_pos=x_pos))
+        _sub(lambda h: self.ffns[4](h), is_mlp=True)
+
+        assert nidx == len(self.norms), "BLOCK_ORDER 与 norms 数量不一致"
+        # 块末：零初始化标量门 + 把本 block 表示交给后续 AttnRes
         if spec.ATTNRES_ENABLED:
             partial = partial + torch.tanh(self.attn_res_gate) * x0
         blocks.append(partial)
         return partial, blocks
+
+
+# ===========================================================================
+# enc/dec 逐层参数绑定（2026-11-04）
+# ---------------------------------------------------------------------------
+# 「共享权重」共享的是 nn.Parameter 对象本身，不是 Block 实例：
+#   - 两个 Block 的 is_decoder / MLA.causal 不同（encoder 双向、decoder
+#     因果），共享实例会把 encoder 的双向能力一起改掉，属语义破坏；
+#   - 共享 Parameter 后 autograd 把两次使用的梯度累加到同一张量，
+#     named_parameters()（PyTorch 默认去重）让优化器、参数计数、
+#     apply_precision 都只看到一份，天然正确。
+# 用 _parameters 字典直接赋值而不是 setattr：后者会尝试把同一个
+# Parameter 注册到两个模块上，触发 nn.Module 的重复注册保护。
+# ===========================================================================
+def tie_module_parameters(dst: nn.Module, src: nn.Module) -> None:
+    """让 dst 的每个参数/buffer 指向 src 的同一对象（结构必须同构）。"""
+    dst_mods = list(dst.named_modules())
+    src_mods = list(src.named_modules())
+    if len(dst_mods) != len(src_mods):
+        raise ValueError("参数绑定失败：两个模块的子模块数量不同")
+    for (dn, dm), (sn, sm) in zip(dst_mods, src_mods):
+        if dn != sn:
+            raise ValueError(f"参数绑定失败：子模块名不一致 {sn!r} / {dn!r}")
+        for key, p in sm._parameters.items():
+            if p is not None:
+                dm._parameters[key] = p
+        for key, b in sm._buffers.items():
+            if b is not None:
+                dm._buffers[key] = b
 
 
 # ===========================================================================
@@ -803,11 +886,27 @@ class Gargantua(nn.Module):
                  ctx_compress: int | None = None,
                  csa_ratio: int | None = None,
                  hca_ratio: int | None = None,
-                 vocab_size: int | None = None):
+                 vocab_size: int | None = None,
+                 share_enc_dec: bool = spec.SHARE_ENC_DEC,
+                 d_model: int | None = None):
         super().__init__()
-        D = spec.D_MODEL
+        # 2026-11-04：模型宽度建模可选（缺省 = spec.D_MODEL，旧目录行为不变）
+        D = (spec.D_MODEL if d_model is None
+             else spec.check_d_model(d_model))
+        self.d_model = D
         n_enc = n_enc_blocks if n_enc_blocks is not None else spec.N_ENC_BLOCKS
         n_dec = n_dec_blocks if n_dec_blocks is not None else spec.N_DEC_BLOCKS
+        # 2026-11-04：enc/dec 权重模式。共享 = 逐层绑定参数，因此两侧必须
+        # 等深；类型严格 bool（"false" 字符串被 bool() 判真会静默建出共享
+        # 模型，config 与权重的解释就对不上了）。
+        if not isinstance(share_enc_dec, bool):
+            raise ValueError(
+                f"share_enc_dec 必须是布尔值: {share_enc_dec!r}")
+        self.share_enc_dec = share_enc_dec
+        if share_enc_dec and n_enc != n_dec:
+            raise ValueError(
+                f"共享权重要求 enc blocks == dec blocks（收到 {n_enc} / {n_dec}）；"
+                f"共享模式下两侧逐层一一绑定参数")
         # —— 上下文长度配置（2026-10-23：建模时可选，None 取 spec 默认）——
         # 完整区（未压缩）+ 压缩区（同源内容的 CSA/HCA 两个视图）
         self.ctx_full = (spec.CTX_FULL if ctx_full is None
@@ -835,15 +934,34 @@ class Gargantua(nn.Module):
         self.hca_compressor = StepCompressor(self.hca_ratio, D)
         self.draw_packer = StepCompressor(spec.DRAW_KV_COMPRESS, D)  # 图元 9:1
         # —— encoder / decoder ——
-        self.enc_blocks = nn.ModuleList([Block(is_decoder=False)
+        self.enc_blocks = nn.ModuleList([Block(is_decoder=False, d_model=D)
                                          for _ in range(n_enc)])
-        self.dec_blocks = nn.ModuleList([Block(is_decoder=True)
+        self.dec_blocks = nn.ModuleList([Block(is_decoder=True, d_model=D)
                                          for _ in range(n_dec)])
         self.enc_final_norm = RMSNorm(D)
         self.dec_final_norm = RMSNorm(D)
         # —— fast weight：全局 bank，enc/dec 共享 ——
         self.fast_weight = FastWeightBank(D)
+        # 先初始化、后绑定：两侧独立各初始化一次，随机序列与 v1 逐字一致；
+        # 绑定后 dec 侧原有的 Parameter 成为孤儿被回收，dec_blocks 里的
+        # Block 实例仍保留自己的 is_decoder / MLA.causal / rec_state 语义。
         self.apply(self._init)
+        self.retie_shared_weights()
+
+    def retie_shared_weights(self) -> None:
+        """重建 enc/dec 参数绑定（任何可能替换 Parameter 的转换之后调用）。
+
+        nn.Module._apply（model.to(dtype) 走它）在 dtype 变化时可能用**新的
+        Parameter 对象**替换每个模块的 _parameters——两个绑定模块会各自
+        拿到一份，共享关系被静默打断：梯度不再累加、保存时只写 enc 侧，
+        dec 侧的训练更新直接丢失。转换前后值相同，所以重新指向 enc 侧
+        没有数值损失。common.build_model 在 apply_precision 之后调一次。
+        """
+        if not self.share_enc_dec:
+            return
+        for enc_blk, dec_blk in zip(self.enc_blocks, self.dec_blocks):
+            tie_module_parameters(dec_blk, enc_blk)
+        tie_module_parameters(self.dec_final_norm, self.enc_final_norm)
 
     @staticmethod
     def _init(m):

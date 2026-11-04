@@ -99,16 +99,26 @@ class VocabLayoutTest(unittest.TestCase):
 
     def test_modal_region_draw_layout(self):
         # 图元 token 照搬 geometrize_256_v1：字段 bin 区间 + special 3
+        # 2026-11-01：DRAW 区第 0 段是画布声明定界符 <x> <x/> <y> <y/>，
+        # x/y 是 1 token=1px（<x0>…<x1919> / <y0>…<y1079>），色 10 bit
         b = spec.DRAW_BEGIN
-        self.assertEqual(self.t[b + spec.DRAW_X_OFFSET], "<cx:0>")
-        self.assertEqual(self.t[b + spec.DRAW_X_OFFSET + 511], "<cx:511>")
+        m = spec.DRAW_CANVAS_MARKERS
+        for i, name in enumerate(m):
+            self.assertEqual(self.t[b + spec.DRAW_CANVAS_OFFSET + i], name)
+        self.assertEqual(self.t[b + spec.DRAW_X_OFFSET], "<x0>")
+        self.assertEqual(self.t[b + spec.DRAW_X_OFFSET + spec.DRAW_X_BINS - 1],
+                         "<x1919>")
+        self.assertEqual(self.t[b + spec.DRAW_Y_OFFSET], "<y0>")
+        self.assertEqual(self.t[b + spec.DRAW_Y_OFFSET + spec.DRAW_Y_BINS - 1],
+                         "<y1079>")
         self.assertEqual(self.t[b + spec.DRAW_ANGLE_OFFSET], "<theta:0>")
         self.assertEqual(self.t[b + spec.DRAW_ANGLE_OFFSET + 269],
                          "<theta:269>")
         self.assertEqual(self.t[b + spec.DRAW_W_OFFSET + 511], "<w:511>")
         self.assertEqual(self.t[b + spec.DRAW_SHAPE_OFFSET], "<shape:0>")
         self.assertEqual(self.t[b + spec.DRAW_R_OFFSET], "<r:0>")
-        self.assertEqual(self.t[b + spec.DRAW_R_OFFSET + 127], "<r:127>")
+        self.assertEqual(self.t[b + spec.DRAW_R_OFFSET + spec.DRAW_COLOR_MAX],
+                         f"<r:{spec.DRAW_COLOR_MAX}>")
         self.assertEqual(self.t[b + spec.DRAW_SPECIAL_OFFSET],
                          "<draw:special:0>")
         self.assertEqual(self.t[b + spec.DRAW_SPECIAL_OFFSET + 2],
@@ -119,7 +129,12 @@ class VocabLayoutTest(unittest.TestCase):
         self.assertEqual(self.v.category_of(b + spec.DRAW_X_OFFSET),
                          "special")
         # 布局自洽：offset 链 + 总数
-        self.assertEqual(spec.DRAW_VOCAB_SIZE, 2961)
+        self.assertEqual(
+            spec.DRAW_VOCAB_SIZE,
+            spec.DRAW_CANVAS_BINS + spec.DRAW_X_BINS + spec.DRAW_Y_BINS
+            + spec.DRAW_ANGLE_BINS + spec.DRAW_W_BINS + spec.DRAW_H_BINS
+            + spec.DRAW_SHAPE_BINS + 3 * spec.DRAW_COLOR_BINS
+            + spec.DRAW_SPECIAL_BINS)
         self.assertEqual(spec.DRAW_TOKENS_PER_PRIMITIVE, 9)
 
     def test_digit_region(self):
@@ -249,8 +264,10 @@ class BuildIdempotentTest(unittest.TestCase):
         self.assertIn("hello", t1)
         self.assertIn("don't", t1)
         self.assertEqual(t1[-26:], list(spec.FALLBACK_LETTERS))
-        # 头部契约原样保留
-        self.assertEqual(t1[spec.DRAW_BEGIN], "<cx:0>")
+        # 头部契约原样保留（DRAW 区第一段是画布声明定界符）
+        self.assertEqual(t1[spec.DRAW_BEGIN], "<x>")
+        self.assertEqual(t1[spec.DRAW_BEGIN + spec.DRAW_CANVAS_BINS],
+                         "<x0>")
         self.assertEqual(t1[spec.HEAD_SIZE], "0")
 
     def test_user_added_replay(self):

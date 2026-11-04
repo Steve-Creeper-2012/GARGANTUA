@@ -1,0 +1,12 @@
+{
+  "title": "Python 运行时",
+  "kind": "runtime",
+  "order": 10,
+  "why": "standalone CPython 3.12（python-build-standalone），venv 以它为底座",
+  "install": "sh launcher/setup-environment.sh",
+  "probe": "python/bin/python3",
+  "version_arg": "-V",
+  "contents": {
+    "python/": "解包出来的解释器（bin / lib / share）"
+  }
+}

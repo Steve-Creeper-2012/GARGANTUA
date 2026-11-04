@@ -89,15 +89,18 @@ class Trainer:
     """
 
     def __init__(self, get_model, save_fn, lock,
-                 queue_dir="data/queue", done_dir="data/done",
-                 log_path="logs/auto_train.jsonl",
+                 queue_dir=None, done_dir=None,
+                 log_path=None,
                  block_size=32, steps_per_file=50, seed=0):
+        # 2026-11-04：默认值锚在项目根（由 paths.py 用 __file__ 推导），
+        # 不再依赖调用进程的 cwd——双击启动时 cwd 未必是项目目录。
+        from paths import project_dir
         self.get_model = get_model
         self.save_fn = save_fn
         self.lock = lock
-        self.queue_dir = queue_dir
-        self.done_dir = done_dir
-        self.log_path = log_path
+        self.queue_dir = queue_dir or project_dir("data", "queue")
+        self.done_dir = done_dir or project_dir("data", "done")
+        self.log_path = log_path or project_dir("logs", "auto_train.jsonl")
         self._block_size = validate_block_size(block_size)
         self._steps_per_file = validate_steps(steps_per_file)
         self._optimizer = spec.OPTIMIZER      # "muon"（Muon+AdamW 分工）或 "adamw"
@@ -403,6 +406,8 @@ def _serve_handle(req: dict, st: _ServeState) -> dict:
                 # 保留既有 config.json（block 数等），仅刷新 params
                 cfg = dict(read_config(model_dir))
                 cfg["params"] = sum(p.numel() for p in mod.parameters())
+                # 2026-11-04：共享模型的权重模式不能因 config 被手改而丢
+                cfg["share_enc_dec"] = bool(getattr(mod, "share_enc_dec", False))
                 save_checkpoint(model_dir, mod, cfg)
 
             trainer = Trainer(
@@ -534,8 +539,10 @@ def serve(idle_timeout: int = 300) -> int:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", help="模型目录（含 model.safetensors）")
-    ap.add_argument("--data", default="data", help="数据根目录（queue/done 在其下）")
-    ap.add_argument("--log", default="logs/auto_train.jsonl")
+    from paths import project_dir
+    ap.add_argument("--data", default=project_dir("data"),
+                    help="数据根目录（queue/done 在其下）")
+    ap.add_argument("--log", default=project_dir("logs", "auto_train.jsonl"))
     ap.add_argument("--block-size", type=int, default=32)
     ap.add_argument("--steps-per-file", type=int, default=50)
     ap.add_argument("--serve", action="store_true",
@@ -557,6 +564,8 @@ def main():
         # 保留既有 config.json（block 数等），仅刷新 params——不可写空配置
         cfg = dict(read_config(args.model))
         cfg["params"] = sum(p.numel() for p in mod.parameters())
+        # 2026-11-04：共享模型的权重模式不能因 config 被手改而丢
+        cfg["share_enc_dec"] = bool(getattr(mod, "share_enc_dec", False))
         save_checkpoint(args.model, mod, cfg)
 
     lock = threading.RLock()

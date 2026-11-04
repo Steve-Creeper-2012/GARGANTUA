@@ -49,8 +49,19 @@
   </nav>
 
   <main id="main">
+    <!-- 顶栏：一条覆盖在内容之上的磨砂玻璃条，自上而下由不透明渐隐到全透明。
+         标题与词表标签页同处这一行（同一水平线）。 -->
     <div id="topbar">
       <h1 class="page-title" id="page-title">主页</h1>
+      <!-- 词表标签页条：只有「词表」页显示，与标题同高；＋ 号拉出全部词表 -->
+      <div class="vtab-bar" id="vtab-bar" hidden>
+        <div class="vtab-strip" id="vtab-strip"></div>
+        <div class="vtab-add-wrap">
+          <button class="vtab-add" id="vtab-add" title="打开其它词表"
+                  aria-label="打开其它词表">＋</button>
+          <div class="vtab-menu" id="vtab-menu" hidden></div>
+        </div>
+      </div>
     </div>
 
     <div id="pages">
@@ -72,11 +83,16 @@
             <div class="dev-v">加载中…</div></div>
         </div>
 
-        <div class="dep-grid" id="dep-grid" style="margin-top:12px">
+        <!-- 依赖：环境包 / Python 依赖 / 系统依赖 合并成一个清单，与
+             requirements/{must,necessary}.txt 一一对应；wgpu 这类 Cargo 依赖
+             也列在这里。第一排固定 python + pywebview（启动核心，无法更新），
+             其后按顺序排列其余依赖，每排两个框。 -->
+        <div class="dep-grid" id="dep-grid">
           <div class="dep-card"><div class="dep-info">
             <div class="dep-title"><span class="dep-name">依赖</span></div>
             <div class="dep-desc">加载中…</div></div></div>
         </div>
+
         <div class="note" id="env-msg" style="margin-top:10px"></div>
 
         <div class="sec-head">
@@ -123,6 +139,14 @@
           <div class="form-grid">
             <label class="form-field"><span>模型名称</span>
               <input type="text" id="model-name" placeholder="目录名，如 beta"></label>
+            <label class="form-field"><span>权重模式</span>
+              <select id="model-share">
+                <option value="separate" selected>分离权重（默认）</option>
+                <option value="shared">共享权重（enc/dec 等深）</option>
+              </select></label>
+            <label class="form-field"><span>d_model（模型宽度）</span>
+              <input type="number" id="model-dmodel" value="1024"
+                     min="128" max="2048" step="128"></label>
             <label class="form-field"><span>enc blocks</span>
               <input type="number" id="model-enc" value="4" min="1" max="64"></label>
             <label class="form-field"><span>dec blocks</span>
@@ -160,6 +184,15 @@
             压缩段是同一段内容的两份压法——CSA 检索视图（默认 4:1）与 HCA 全局概括视图（默认 32:1），
             两者都读【压缩段 + 全部完整段】。压缩分组以时间步为原子，绝不跨步拆分。
           </div>
+          <div class="hint" style="margin-top:8px">
+            <b>权重模式</b>：默认「分离权重」，encoder / decoder 各有一套参数。
+            选「共享权重」时 enc_blocks[i] 与 dec_blocks[i] 逐层共用同一批参数，
+            <b>两侧 block 数强制相等</b>（dec 输入框会锁定并自动跟随 enc）；
+            参数量与权重文件约减半，但 encoder 仍双向、decoder 仍因果。
+            <b>d_model</b> 只改语义向量宽度（128 的倍数，128..2048，默认 1024）；
+            注意力头数/头维、MLA 低秩秩、FFN 隐藏宽度仍是冻结架构值。
+            宽度越大，embedding 与 lm_head 占用内存越多。
+          </div>
         </div>
 
         <div class="card flush">
@@ -176,17 +209,9 @@
 
       <!-- ==================== 词表 ====================
            一个标签页 = 一个「视图」，关掉只是关视图，不删词表文件。
-           分区表按接口返回渲染：不同词表的区块划分可以完全不同。 -->
+           分区表按接口返回渲染：不同词表的区块划分可以完全不同。
+           标签页条本体在顶栏里（#vtab-bar），与页面标题同一条水平线。 -->
       <section class="page scroll" id="p-vocab">
-        <!-- 标签页条：每个已打开的词表一个页签，最右 + 号拉出全部词表 -->
-        <div class="vtab-bar">
-          <div class="vtab-strip" id="vtab-strip"></div>
-          <div class="vtab-add-wrap">
-            <button class="vtab-add" id="vtab-add" title="打开其它词表"
-                    aria-label="打开其它词表">＋</button>
-            <div class="vtab-menu" id="vtab-menu" hidden></div>
-          </div>
-        </div>
         <div class="hint" id="vtab-note">加载中…</div>
 
         <!-- 第 1 块：分区展示 -->
@@ -321,8 +346,33 @@
         </div>
       </section>
 
-      <!-- ==================== 推理 ==================== -->
+      <!-- ==================== 推理 ====================
+           工具栏三个按钮贴在顶栏那一行（与页面标题同一水平线），不再自己
+           占一行；左侧的「模型：xxx」字样已删（模型名在「模型」页看）。 -->
       <section class="page" id="p-infer">
+        <div id="infer-toolbar">
+          <button class="act sec" id="infer-clear"
+                  title="清空对话 / 上下文 / 初始化 fast weight">清空</button>
+          <button class="act sec" id="infer-model-btn" title="选择对话模型">模型
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M6 9l6 6 6-6"/></svg></button>
+          <button class="act sec icon" id="infer-dev-btn" aria-label="开发者选项"
+                  title="开发者选项（temperature / top-p）">
+            <!-- 自绘「推子」图标：三条轨道 + 三个滑块，比齿轮更像参数面板 -->
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round">
+              <path d="M4 7h16M4 12h16M4 17h16"/>
+              <circle cx="9" cy="7" r="2.2" fill="var(--panel)"/>
+              <circle cx="15" cy="12" r="2.2" fill="var(--panel)"/>
+              <circle cx="8" cy="17" r="2.2" fill="var(--panel)"/>
+            </svg></button>
+          <div id="model-pop" class="pop" hidden>
+            <div class="pop-head"><span>选择模型</span>
+              <button class="act sec xs" id="model-pop-refresh">刷新</button></div>
+            <div class="pop-list" id="model-pop-list"><div class="hint">加载中…</div></div>
+          </div>
+        </div>
         <div id="infer-wrap">
           <div id="infer-main">
             <div id="chat-history">
@@ -343,20 +393,6 @@
               </div>
             </div>
           </div>
-          <aside id="debug-panel">
-            <div class="head">
-              <span class="card-title">调试参数</span>
-              <button class="toggle" title="折叠">
-                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
-                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M15 6l-6 6 6 6"/></svg>
-              </button>
-            </div>
-            <div class="field" title="采样温度：越低输出越确定"><label>temperature</label>
-              <input type="number" id="infer-temp" value="0.8" step="0.1" min="0.05"></div>
-            <div class="field" title="核采样累计概率阈值"><label>top_p</label>
-              <input type="number" id="infer-topp" value="0.95" step="0.01" min="0.01" max="1"></div>
-          </aside>
         </div>
       </section>
 
@@ -366,13 +402,22 @@
           <label>用哪个词表来转换</label>
           <select id="text-vocab" style="width:auto;min-width:160px"></select>
           <button class="act" id="text-encode">编码</button>
+          <button class="act sec" id="text-clear" title="清空本页输出（输入文本保留）">清空</button>
           <span class="hint">输出为 token 时间步格式：{}=一个时间步，{} 内 token 以 | 分隔</span>
         </div>
         <div class="codec-io">
-          <div class="card"><div class="card-head"><span class="card-title">输入文本</span></div>
-            <textarea id="text-in" style="flex:1;min-height:220px">Hello, 世界！</textarea></div>
-          <div class="card"><div class="card-head"><span class="card-title">输出 token</span></div>
-            <pre id="text-out">—</pre></div>
+          <div class="pane">
+            <div class="pane-head"><span>输入文本</span>
+              <span class="note" id="text-len"></span></div>
+            <div class="pane-body">
+              <textarea id="text-in" spellcheck="false">Hello, 世界！</textarea>
+            </div>
+          </div>
+          <div class="pane">
+            <div class="pane-head"><span>输出 token</span>
+              <span class="note">token-5 时间步格式</span></div>
+            <div class="pane-body"><pre id="text-out">—</pre></div>
+          </div>
         </div>
       </section>
 
@@ -388,9 +433,16 @@
             <span class="file-btn">选择文件</span>
             <span class="file-name" id="audio-file-name">未选择</span></label>
           <button class="act" id="audio-encode">编码</button>
+          <button class="act sec" id="audio-clear" title="清空本页输出与预览">清空</button>
         </div>
         <div id="audio-preview" class="row"></div>
-        <pre id="audio-out" style="flex:1;">—</pre>
+        <div class="codec-io" style="grid-template-columns:1fr;">
+          <div class="pane">
+            <div class="pane-head"><span>输出 token</span>
+              <span class="note">音频 token 是投影向量（无离散 ID）</span></div>
+            <div class="pane-body"><pre id="audio-out">—</pre></div>
+          </div>
+        </div>
       </section>
 
       <!-- ==================== 图片 ==================== -->
@@ -405,12 +457,20 @@
             <span class="file-btn">选择文件</span>
             <span class="file-name" id="image-file-name">未选择</span></label>
           <button class="act" id="image-encode">编码</button>
+          <button class="act sec" id="image-clear" title="清空本页输出与预览">清空</button>
         </div>
-        <div class="codec-io" style="margin-top:10px;">
-          <div class="card"><div class="card-head"><span class="card-title">原图</span></div>
-            <img id="image-preview" style="max-width:100%;max-height:320px;border-radius:var(--r);" alt=""></div>
-          <div class="card"><div class="card-head"><span class="card-title">输出 token</span></div>
-            <pre id="image-out">—</pre></div>
+        <div class="codec-io">
+          <div class="pane">
+            <div class="pane-head"><span>原图</span></div>
+            <div class="pane-body center">
+              <img id="image-preview" alt="">
+            </div>
+          </div>
+          <div class="pane">
+            <div class="pane-head"><span>输出 token</span>
+              <span class="note">视觉 token 是投影向量（无离散 ID）</span></div>
+            <div class="pane-body"><pre id="image-out">—</pre></div>
+          </div>
         </div>
       </section>
 
@@ -426,41 +486,169 @@
             <span class="file-btn">选择文件</span>
             <span class="file-name" id="video-file-name">未选择</span></label>
           <button class="act" id="video-encode">编码</button>
+          <button class="act sec" id="video-clear" title="清空本页输出与预览">清空</button>
         </div>
-        <div class="row"><video id="video-preview" controls style="max-height:180px;border-radius:var(--r);display:none;"></video></div>
+        <div class="row"><video id="video-preview" class="video-box" controls></video></div>
         <div id="video-stats" class="hint"></div>
-        <pre id="video-out" style="flex:1;">—</pre>
+        <div class="codec-io" style="grid-template-columns:1fr;">
+          <div class="pane">
+            <div class="pane-head"><span>输出 token</span>
+              <span class="note">每帧一个时间步</span></div>
+            <div class="pane-body"><pre id="video-out">—</pre></div>
+          </div>
+        </div>
       </section>
 
-      <!-- ==================== 图元绘画 ==================== -->
-      <section class="page" id="p-prims">
-        <div class="hint" style="margin-bottom:10px">
-          上传图片，转换为图元序列并渲染。优先调用 vendored 的 Rust/wgpu GPU 转换器（service/prims/fast_shape_render，
-          用 sh service/prims/setup.sh 构建）；未构建时回退 CPU 贪心拟合。每图元 9 token（cx,cy,theta,w,h,shape,r,g,b），画布 256×256。
+      <!-- ==================== 图元绘画 ====================
+           任务制：建任务 → 入队 → 后台跑 → 结果落盘可回看。
+           三个视图由右上角滑块切换：任务列队 / 渲染 / token 输出。 -->
+      <section class="page scroll" id="p-prims">
+        <div class="prims-bar">
+          <button class="side-btn" id="prims-about" title="关于图元绘画"
+                  aria-label="关于图元绘画">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round">
+              <circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg>
+          </button>
+          <div class="seg" id="prims-viewseg">
+            <button data-v="queue" class="on">任务列队</button>
+            <button data-v="render">渲染</button>
+            <button data-v="tokens">token 输出</button>
+          </div>
         </div>
-        <div class="row" style="margin-top:0">
-          <label class="file-pick" for="prims-file">
-            <input type="file" id="prims-file" accept="image/*">
-            <span class="file-btn">选择文件</span>
-            <span class="file-name" id="prims-file-name">未选择</span></label>
-          <label class="hint">步数上限</label>
-          <input type="number" id="prims-steps" value="100" min="1" max="1000" step="1"
-                 style="width:90px" title="默认 100，服务端上限 1000">
-          <label class="hint">模式</label>
-          <select id="prims-quality" style="width:auto" title="fast=快，20 候选/步；slow=慢，50 候选/步+短爬山">
-            <option value="fast">fast</option>
-            <option value="slow">slow</option>
-          </select>
-          <button class="act" id="prims-convert">转换</button>
-          <span class="hint" id="prims-msg"></span>
+
+        <!-- ---------- 任务列队 ---------- -->
+        <div class="prims-view" id="prims-view-queue">
+          <div class="q-col">
+            <div class="pane q-pane">
+              <div class="pane-head">
+                <span>列队</span>
+                <button class="act sec xs" id="prims-add"
+                        title="添加新任务">＋</button>
+              </div>
+              <div class="pane-body"><div class="q-list" id="prims-queue-list"></div></div>
+            </div>
+            <div class="pane q-pane">
+              <div class="pane-head">
+                <span>已完成</span>
+                <span class="note" id="prims-done-note"></span>
+              </div>
+              <div class="pane-body"><div class="q-list" id="prims-done-list"></div></div>
+            </div>
+          </div>
+          <div class="q-col">
+            <div class="pane q-pane">
+              <div class="pane-head">
+                <span id="prims-edit-title">新建任务</span>
+                <span class="note" id="prims-edit-msg"></span>
+              </div>
+              <div class="pane-body">
+                <div class="prims-form">
+                  <label class="file-pick" for="prims-file">
+                    <input type="file" id="prims-file" accept="image/*">
+                    <span class="file-btn">选择图片</span>
+                    <span class="file-name" id="prims-file-name">未选择</span></label>
+                  <label class="form-field"><span>任务名</span>
+                    <input type="text" id="prims-name" placeholder="默认用文件名"></label>
+                  <div class="form-grid">
+                    <label class="form-field"><span>引擎</span>
+                      <select id="prims-engine">
+                        <option value="auto" selected>auto（有 GPU 就用）</option>
+                        <option value="gpu">GPU</option>
+                        <option value="cpu">CPU</option>
+                      </select></label>
+                    <label class="form-field"><span>模式</span>
+                      <select id="prims-quality">
+                        <option value="fast" selected>fast</option>
+                        <option value="slow">slow</option>
+                      </select></label>
+                    <label class="form-field"><span>步数上限</span>
+                      <input type="number" id="prims-steps" value="275" min="1"
+                             max="20000" step="1"></label>
+                    <label class="form-field"><span>早停</span>
+                      <select id="prims-early">
+                        <option value="1" selected>开（没改善就收工）</option>
+                        <option value="0">关（跑满步数）</option>
+                      </select></label>
+                  </div>
+                  <div class="prims-canvas-row">
+                    <button class="act sec xs on" id="prims-canvas-mode"
+                            title="点一下切换：auto 跟随图片比例 / 手动指定宽高">auto</button>
+                    <span class="prims-wh">
+                      <input type="number" id="prims-cw" value="256" min="1" max="1920"
+                             disabled>
+                      <span>×</span>
+                      <input type="number" id="prims-ch" value="256" min="1" max="1080"
+                             disabled>
+                    </span>
+                  </div>
+                  <div class="row" style="margin-top:4px">
+                    <button class="act" id="prims-create">加入队列</button>
+                    <span class="hint" id="prims-form-msg"></span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="pane q-pane">
+              <div class="pane-head"><span>日志</span>
+                <div class="seg" id="prims-log-seg">
+                  <button data-v="job" class="on">当前任务</button>
+                  <button data-v="all">全部</button>
+                </div></div>
+              <div class="pane-body"><pre class="prims-log" id="prims-log"></pre></div>
+            </div>
+          </div>
         </div>
-        <div class="codec-io" style="margin-top:10px;">
-          <div class="card"><div class="card-head"><span class="card-title">原图</span></div>
-            <img id="prims-src" style="max-width:100%;max-height:320px;border-radius:var(--r);" alt=""></div>
-          <div class="card"><div class="card-head"><span class="card-title">图元渲染（SVG）</span></div>
-            <div id="prims-render" class="svg-out"></div></div>
+
+        <!-- ---------- 渲染 ---------- -->
+        <div class="prims-view" id="prims-view-render" hidden>
+          <div class="prims-tabs">
+            <div class="prims-tab-strip" id="prims-render-tabs"></div>
+            <button class="act sec xs" id="prims-render-add"
+                    title="打开一个已完成任务">＋</button>
+            <div class="seg" id="prims-mode-seg">
+              <button data-v="compare" class="on">对比</button>
+              <button data-v="timeline">时间线</button>
+            </div>
+          </div>
+          <div class="prims-stage" id="prims-stage-compare">
+            <div class="cmp-pane">
+              <div class="cmp-head"><span>原图</span></div>
+              <div class="cmp-body zoomable" id="cmp-src"><img id="cmp-src-img" alt=""></div>
+            </div>
+            <div class="cmp-pane">
+              <div class="cmp-head"><span>图元渲染</span>
+                <span class="note" id="cmp-note">—</span></div>
+              <div class="cmp-body zoomable" id="cmp-out">
+                <canvas id="cmp-canvas"></canvas>
+              </div>
+            </div>
+          </div>
+          <div class="cmp-progress" id="cmp-progress">
+            <div class="cmp-bar"><div class="cmp-fill" id="cmp-fill"></div></div>
+            <span class="note" id="cmp-pct">—</span>
+          </div>
+          <div class="prims-stage" id="prims-stage-timeline" hidden>
+            <div class="tl-top zoomable" id="tl-wrap">
+              <canvas id="tl-canvas"></canvas>
+            </div>
+            <div class="tl-bottom">
+              <button class="act sec xs" id="tl-play">▶ 播放</button>
+              <input type="range" class="slider" id="tl-range" min="0" max="0" value="0">
+              <span class="note" id="tl-label">0 / 0</span>
+            </div>
+          </div>
         </div>
-        <pre id="prims-out" style="flex-shrink:0;max-height:200px;margin-top:12px;">—</pre>
+
+        <!-- ---------- token 输出 ---------- -->
+        <div class="prims-view" id="prims-view-tokens" hidden>
+          <div class="prims-tabs">
+            <div class="prims-tab-strip" id="prims-token-tabs"></div>
+            <button class="act sec xs" id="prims-token-add"
+                    title="打开一个已完成任务">＋</button>
+          </div>
+          <pre class="prims-tokens" id="prims-tokens">—</pre>
+        </div>
       </section>
 
       <!-- ==================== Token 编辑器 ==================== -->
@@ -476,12 +664,391 @@
           <button class="act sec" id="json-minify">压缩</button>
           <button class="act sec" id="json-copy">复制</button>
           <button class="act" id="json-export">导出 .tokens</button>
+          <button class="act sec" id="json-clear" title="清空编辑器里的全部 token">清空</button>
           <select id="json-vocab" style="width:auto;min-width:160px"
                   title="导出时按哪个词表解析 token 名（&lt;stop&gt; 等）与校验 ID"></select>
           <span class="hint" id="json-msg"></span>
         </div>
         <div class="token-palette" id="json-palette"></div>
-        <div id="json-editor" contenteditable="true" spellcheck="false">&lt;1&gt;{text: C732}{text: 3083}{text: 5688}{text: 569F}&lt;2&gt;</div>
+        <div id="json-editor" contenteditable="true" spellcheck="false" data-placeholder="在此输入 token 序列（{text: HEX} …）"></div>
+      </section>
+
+      <!-- ==================== 图元编辑器 ====================
+           手动摆图元：左边实时 SVG，右边字段编辑，底部实时 token 流。
+           底图可开关、可调透明度，用来对比「画出来的」和「原图」差多少。
+           画布档位与字段 offset 全部来自 /api/status（唯一真源是 spec）。 -->
+      <section class="page scroll" id="p-pdraw">
+        <div class="row" style="margin-top:0">
+          <label class="hint">画布</label>
+          <select id="pdraw-canvas" style="width:auto"></select>
+          <label class="file-pick" for="pdraw-bg">
+            <input type="file" id="pdraw-bg" accept="image/*">
+            <span class="file-btn">底图</span>
+            <span class="file-name" id="pdraw-bg-name">未选择</span></label>
+          <div class="seg" id="pdraw-bgseg">
+            <button data-v="off">不显示底图</button>
+            <button data-v="on">显示底图</button>
+          </div>
+          <label class="hint">底图透明度</label>
+          <input type="range" class="slider" id="pdraw-bgalpha"
+                 min="0" max="100" step="1" value="60" style="width:110px">
+          <button class="act sec" id="pdraw-clear">清空</button>
+          <button class="act sec" id="pdraw-undo" title="删掉最后加的那个图元">撤销</button>
+          <span class="hint" id="pdraw-msg"></span>
+        </div>
+
+        <div class="pdraw-body">
+          <div class="card pdraw-canvas-card">
+            <div class="card-head">
+              <span class="card-title">画布</span>
+              <span class="row" style="margin:0;gap:8px">
+                <span class="note" id="pdraw-count">点空白处加一个矩形</span>
+                <span class="badge" id="pdraw-zoom">100%</span>
+                <button class="act sec xs" id="pdraw-view-reset">复位视图</button>
+              </span>
+            </div>
+            <div class="pdraw-stage" id="pdraw-stage">
+              <div class="pdraw-frame" id="pdraw-frame">
+                <img id="pdraw-bg-img" alt="">
+                <svg id="pdraw-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+              </div>
+            </div>
+            <div class="hint">
+              单击落一个图元 · 拖动平移 · 滚轮缩放 · 右侧列表可拖拽调图层（越靠后越在上）
+            </div>
+          </div>
+
+          <div class="card pdraw-side">
+          <div class="card-head">
+            <span class="card-title">图元</span>
+            <span class="pdraw-tools" id="pdraw-tools" style="margin:0">
+              <button class="shape-opt on" data-shape="0" title="矩形">▭</button>
+              <button class="shape-opt" data-shape="1" title="椭圆">◯</button>
+              <button class="shape-opt" data-shape="-1" title="背景">▦</button>
+              <button class="pdraw-add" id="pdraw-add" title="添加当前形状">＋</button>
+            </span>
+          </div>
+            <div class="pdraw-list" id="pdraw-list"></div>
+            <div class="pdraw-form" id="pdraw-form" hidden></div>
+          </div>
+        </div>
+
+        <div class="pane" style="flex-shrink:0;margin-top:10px;height:300px">
+          <div class="pane-head"><span>token 序列（可编辑）</span>
+            <span class="note">画布声明 + 每图元 9 个；改这里会自动重绘</span></div>
+          <div class="pane-body" style="padding:0;background:transparent;border:none">
+            <textarea id="pdraw-out" spellcheck="false"
+              placeholder="画布声明 + 图元 token…&#10;例如 {text: …} 画布，其后每个 {text: … ×9} 一个图元"></textarea>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== 终端 ====================
+           项目目录内的交互式 shell：装依赖、跑测试、看日志。
+           cwd 固定在项目根，cd 到外面会被后端拒绝（见 server_term.py）。 -->
+      <section class="page" id="p-term">
+        <div class="row" style="margin-top:0">
+          <span class="hint">工作目录</span>
+          <code class="term-cwd" id="term-cwd">—</code>
+          <button class="act sec" id="term-interrupt" title="发送 Ctrl-C">中断</button>
+          <button class="act sec" id="term-clear">清屏</button>
+          <button class="act sec" id="term-restart" title="关掉当前 shell 重开">重开</button>
+          <span class="hint" id="term-msg"></span>
+        </div>
+        <div class="term-wrap">
+          <pre class="term-out" id="term-out"></pre>
+          <div class="term-input">
+            <span class="term-prompt" id="term-prompt">$</span>
+            <input id="term-line" type="text" spellcheck="false" autocomplete="off"
+                   placeholder="输入命令，回车执行（↑↓ 翻历史）">
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== 关于 ==================== -->
+      <section class="page scroll" id="p-about">
+        <div class="card">
+          <div class="card-head"><span class="card-title">GARGANTUA 是什么</span></div>
+          <p class="about-p">
+            一个<b>单机跑得动</b>的通用 token 模型：默认配置约 10 亿参数
+            （4+6 blocks、每 block 5 个 FFN；可用 d_model / block 数 / 共享权重调规模），权重按需加载，
+            训练/推理/编解码全在本机完成，不依赖任何云服务。它不做「聊天框套壳」，
+            而是把文本、音频、图像、视频、图元（矢量绘图）统一压进同一条
+            <b>token 流</b>里，用同一个 Transformer 学。
+          </p>
+          <p class="about-p">
+            核心主张只有一句：<b>一切模态最终都是 token + 时间步</b>。
+            时间步 <code>{ … }</code> 是原子单位——压缩、丢弃、滑窗都不许把它切开。
+          </p>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><span class="card-title">1. 数据流：从任意模态到同一条 token 流</span></div>
+          <svg class="about-svg" viewBox="0 0 680 190" role="img"
+               aria-label="数据流：文本/音频/图像/视频/图元经编解码器变成时间步，进入模型，再解码回各模态">
+            <defs>
+              <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5"
+                      markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg3)"/>
+              </marker>
+            </defs>
+            <!-- 输入 -->
+            <g style="font-size:12px;fill:var(--fg2)">
+              <rect x="8" y="14" width="96" height="26" rx="8" style="fill:var(--panel-2)"/>
+              <text x="56" y="31" text-anchor="middle">文本</text>
+              <rect x="8" y="50" width="96" height="26" rx="8" style="fill:var(--panel-2)"/>
+              <text x="56" y="67" text-anchor="middle">音频 533 采样</text>
+              <rect x="8" y="86" width="96" height="26" rx="8" style="fill:var(--panel-2)"/>
+              <text x="56" y="103" text-anchor="middle">图像 32×32 patch</text>
+              <rect x="8" y="122" width="96" height="26" rx="8" style="fill:var(--panel-2)"/>
+              <text x="56" y="139" text-anchor="middle">视频 每帧一步</text>
+              <rect x="8" y="158" width="96" height="26" rx="8" style="fill:var(--panel-2)"/>
+              <text x="56" y="175" text-anchor="middle">图元 9 token</text>
+            </g>
+            <!-- 编码器 -->
+            <rect x="140" y="60" width="112" height="78" rx="10" style="fill:var(--accent-soft);stroke:var(--accent)"/>
+            <text x="196" y="88" text-anchor="middle" style="font-size:12.5px;font-weight:700;fill:var(--accent)">编码器</text>
+            <text x="196" y="106" text-anchor="middle" style="font-size:11px;fill:var(--fg2)">embedding / 线性投影</text>
+            <text x="196" y="122" text-anchor="middle" style="font-size:11px;fill:var(--fg2)">→ 时间步边界</text>
+            <!-- 模型 -->
+            <rect x="292" y="52" width="150" height="94" rx="10" style="fill:var(--panel-2);stroke:var(--border)"/>
+            <text x="367" y="76" text-anchor="middle" style="font-size:12.5px;font-weight:700;fill:var(--fg)">GARGANTUA</text>
+            <text x="367" y="94" text-anchor="middle" style="font-size:11px;fill:var(--fg2)">enc blocks ×4</text>
+            <text x="367" y="110" text-anchor="middle" style="font-size:11px;fill:var(--fg2)">dec blocks ×6</text>
+            <text x="367" y="126" text-anchor="middle" style="font-size:11px;fill:var(--fg2)">KDA · MLA · FFN</text>
+            <!-- 输出 -->
+            <rect x="482" y="60" width="112" height="78" rx="10" style="fill:var(--accent-soft);stroke:var(--accent)"/>
+            <text x="538" y="88" text-anchor="middle" style="font-size:12.5px;font-weight:700;fill:var(--accent)">解码器</text>
+            <text x="538" y="106" text-anchor="middle" style="font-size:11px;fill:var(--fg2)">token → 各模态</text>
+            <text x="538" y="122" text-anchor="middle" style="font-size:11px;fill:var(--fg2)">文本 / 图元 / 音频</text>
+            <!-- 箭头 -->
+            <g style="stroke:var(--fg3);stroke-width:1.4;fill:none" marker-end="url(#ah)">
+              <path d="M104,27 C122,27 122,80 138,88"/>
+              <path d="M104,63 C122,63 124,86 138,92"/>
+              <path d="M104,99 C120,99 126,96 138,96"/>
+              <path d="M104,135 C122,135 122,104 138,100"/>
+              <path d="M104,171 C126,171 126,112 138,104"/>
+              <path d="M252,99 L290,99"/>
+              <path d="M442,99 L480,99"/>
+            </g>
+            <text x="640" y="176" text-anchor="middle" style="font-size:11px;fill:var(--fg3)">输出仍是 token</text>
+          </svg>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><span class="card-title">2. 一个 block 里到底有什么</span></div>
+          <p class="about-p">
+            每个 block 的顺序是冻结的（2026-11-04 重排）：<b>KDA → FFN → KDA → FFN →
+            KDA → FFN → MLA-CSA → FFN → MLA-HCA → FFN → AttnRes</b>。
+            每个递推/注意力子层之后立刻接一个 FFN 做逐位置变换，<b>5 个 FFN 是独立实例</b>
+            （GLU，d_ff=4096）；两个 MLA 视图分别是 CSA（4:1 可学习压缩 + 检索）与
+            HCA（32:1 全局概括）。10 个计算子层各自先做一次 AttnRes 深度聚合与 RMSNorm，
+            再累加进残差流；块末还有零初始化标量门把块输入混回输出。
+          </p>
+          <p class="about-p">
+            建模时可选<b>权重模式</b>：默认「分离权重」，encoder / decoder 各持一套
+            block 参数（默认 4 / 6 层）；选「共享权重」则
+            <b>enc_blocks[i] 与 dec_blocks[i] 逐层共用同一批参数</b>，因此两侧层数
+            <b>必须相等</b>。共享只绑定参数、不合并实例——encoder 依旧双向，
+            decoder 依旧按时间步因果；权重文件只落一份，参数量与磁盘占用约减半。
+            模型宽度 <b>d_model</b> 建模时也可选（默认 1024，128 的倍数、128..2048）：
+            它只改语义向量宽度，注意力头数/头维、MLA 低秩秩与 FFN 隐藏宽度仍是冻结架构值。
+          </p>
+          <svg class="about-svg" viewBox="0 0 680 130" role="img"
+               aria-label="block 内部：KDA 与 FFN 交替三次，接 MLA-CSA、FFN、MLA-HCA、FFN，块末 AttnRes">
+            <text x="6" y="20" style="font-size:11px;fill:var(--fg3)">输入 → 残差流（每个子层前：AttnRes 深度聚合 → RMSNorm）</text>
+            <g style="font-size:9.5px;fill:var(--fg)">
+              <rect x="4" y="34" width="55" height="46" rx="7" style="fill:var(--accent-soft);stroke:var(--accent)"/>
+              <text x="31" y="53" text-anchor="middle" style="font-weight:700;fill:var(--accent)">KDA</text>
+              <text x="31" y="68" text-anchor="middle" style="fill:var(--fg2)">递推</text>
+              <rect x="65" y="34" width="55" height="46" rx="7" style="fill:var(--panel-2);stroke:var(--border)"/>
+              <text x="92" y="53" text-anchor="middle" style="font-weight:700">FFN</text>
+              <text x="92" y="68" text-anchor="middle" style="fill:var(--fg2)">GLU</text>
+              <rect x="126" y="34" width="55" height="46" rx="7" style="fill:var(--accent-soft);stroke:var(--accent)"/>
+              <text x="153" y="53" text-anchor="middle" style="font-weight:700;fill:var(--accent)">KDA</text>
+              <text x="153" y="68" text-anchor="middle" style="fill:var(--fg2)">递推</text>
+              <rect x="187" y="34" width="55" height="46" rx="7" style="fill:var(--panel-2);stroke:var(--border)"/>
+              <text x="214" y="53" text-anchor="middle" style="font-weight:700">FFN</text>
+              <text x="214" y="68" text-anchor="middle" style="fill:var(--fg2)">GLU</text>
+              <rect x="248" y="34" width="55" height="46" rx="7" style="fill:var(--accent-soft);stroke:var(--accent)"/>
+              <text x="275" y="53" text-anchor="middle" style="font-weight:700;fill:var(--accent)">KDA</text>
+              <text x="275" y="68" text-anchor="middle" style="fill:var(--fg2)">递推</text>
+              <rect x="309" y="34" width="55" height="46" rx="7" style="fill:var(--panel-2);stroke:var(--border)"/>
+              <text x="336" y="53" text-anchor="middle" style="font-weight:700">FFN</text>
+              <text x="336" y="68" text-anchor="middle" style="fill:var(--fg2)">GLU</text>
+              <rect x="370" y="34" width="55" height="46" rx="7" style="fill:var(--panel-2);stroke:var(--border)"/>
+              <text x="397" y="53" text-anchor="middle" style="font-weight:700">MLA·C</text>
+              <text x="397" y="68" text-anchor="middle" style="fill:var(--fg2)">4:1</text>
+              <rect x="431" y="34" width="55" height="46" rx="7" style="fill:var(--panel-2);stroke:var(--border)"/>
+              <text x="458" y="53" text-anchor="middle" style="font-weight:700">FFN</text>
+              <text x="458" y="68" text-anchor="middle" style="fill:var(--fg2)">GLU</text>
+              <rect x="492" y="34" width="55" height="46" rx="7" style="fill:var(--panel-2);stroke:var(--border)"/>
+              <text x="519" y="53" text-anchor="middle" style="font-weight:700">MLA·H</text>
+              <text x="519" y="68" text-anchor="middle" style="fill:var(--fg2)">32:1</text>
+              <rect x="553" y="34" width="55" height="46" rx="7" style="fill:var(--panel-2);stroke:var(--border)"/>
+              <text x="580" y="53" text-anchor="middle" style="font-weight:700">FFN</text>
+              <text x="580" y="68" text-anchor="middle" style="fill:var(--fg2)">GLU</text>
+              <rect x="614" y="34" width="55" height="46" rx="7" style="fill:var(--green)" opacity=".16"/>
+              <rect x="614" y="34" width="55" height="46" rx="7" style="fill:none;stroke:var(--green)"/>
+              <text x="641" y="53" text-anchor="middle" style="font-weight:700;fill:var(--green)">AttnRes</text>
+              <text x="641" y="68" text-anchor="middle" style="fill:var(--fg2)">块末门</text>
+            </g>
+            <g style="font-size:12px;fill:var(--fg3)">
+              <text x="62" y="62" text-anchor="middle">›</text>
+              <text x="123" y="62" text-anchor="middle">›</text>
+              <text x="184" y="62" text-anchor="middle">›</text>
+              <text x="245" y="62" text-anchor="middle">›</text>
+              <text x="306" y="62" text-anchor="middle">›</text>
+              <text x="367" y="62" text-anchor="middle">›</text>
+              <text x="428" y="62" text-anchor="middle">›</text>
+              <text x="489" y="62" text-anchor="middle">›</text>
+              <text x="550" y="62" text-anchor="middle">›</text>
+              <text x="611" y="62" text-anchor="middle">›</text>
+            </g>
+            <text x="6" y="106" style="font-size:11px;fill:var(--fg3)">5 个 FFN 各自独立；KDA 负责便宜的长程，MLA 负责精确检索，AttnRes 负责跨块信息回流</text>
+          </svg>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><span class="card-title">3. 上下文：完整段 + 压缩段</span></div>
+          <p class="about-p">
+            上下文 = <b>完整 1024 token + 压缩 3072 token</b>。完整段不压缩，原样保留；
+            压缩段是同一段内容的<b>两份压法</b>——CSA 检索视图（4:1）与 HCA 全局概括视图（32:1）。
+            两个视图都读【压缩段 + 全部完整段】。压缩以时间步为原子，绝不跨步拆分。
+          </p>
+          <svg class="about-svg" viewBox="0 0 680 150" role="img"
+               aria-label="KV 两段：完整段与压缩段，CSA 4:1 与 HCA 32:1 两个视图">
+            <text x="6" y="16" style="font-size:11px;fill:var(--fg3)">原始 token 流（按时间步分组）</text>
+            <g>
+              <rect x="6" y="24" width="300" height="26" rx="6" style="fill:var(--panel-2)"/>
+              <text x="156" y="41" text-anchor="middle" style="font-size:11px;fill:var(--fg2)">最近 1024 token（完整段，不压缩）</text>
+              <rect x="312" y="24" width="360" height="26" rx="6" style="fill:var(--track)"/>
+              <text x="492" y="41" text-anchor="middle" style="font-size:11px;fill:var(--fg2)">更早的内容（压缩段）</text>
+            </g>
+            <text x="6" y="78" style="font-size:11px;fill:var(--fg3)">CSA 视图（4:1）</text>
+            <g>
+              <rect x="6" y="86" width="300" height="20" rx="5" style="fill:var(--panel-2)"/>
+              <rect x="312" y="86" width="360" height="20" rx="5" style="fill:var(--accent-soft);stroke:var(--accent)"/>
+              <text x="492" y="100" text-anchor="middle" style="font-size:10.5px;fill:var(--accent)">每 4 个 token → 1 个压缩 token</text>
+            </g>
+            <text x="6" y="124" style="font-size:11px;fill:var(--fg3)">HCA 视图（32:1）</text>
+            <g>
+              <rect x="6" y="132" width="300" height="14" rx="5" style="fill:var(--panel-2)"/>
+              <rect x="312" y="132" width="360" height="14" rx="5" style="fill:var(--green)" opacity=".18"/>
+              <rect x="312" y="132" width="360" height="14" rx="5" style="fill:none;stroke:var(--green)"/>
+              <text x="492" y="143" text-anchor="middle" style="font-size:10.5px;fill:var(--green)">每 32 个 token → 1 个概括向量</text>
+            </g>
+          </svg>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><span class="card-title">4. 词表：冻结的契约头 + 可变的可见区</span></div>
+          <p class="about-p">
+            词表不是「一个 txt」，而是一个文件夹（<code>vocabs/&lt;name&gt;/{vocab.vfc, config.json}</code>）。
+            ID 必须严格连续 <code>0..N-1</code>，一个空位都不留——空位也要吃一行 embedding。
+            前 <b>9614</b> 个 ID 是<b>架构契约头</b>（special 6 + system 3 + draw 9605），
+            所有词表逐字一致、不可增删；可见区（数字 / 空白 / 符号 / emoji / 中日韩 / 英文 / 兜底字母）长度由各词表自己决定。
+          </p>
+          <svg class="about-svg" viewBox="0 0 680 120" role="img"
+               aria-label="词表布局：契约头与可见区">
+            <g style="font-size:10.5px">
+              <rect x="6" y="30" width="52" height="30" style="fill:var(--amber)" opacity=".55"/>
+              <text x="32" y="49" text-anchor="middle" style="fill:var(--fg)">special</text>
+              <rect x="58" y="30" width="30" height="30" style="fill:var(--green)" opacity=".55"/>
+              <text x="73" y="49" text-anchor="middle" style="fill:var(--fg)">sys</text>
+              <rect x="88" y="30" width="230" height="30" style="fill:var(--accent)" opacity=".55"/>
+              <text x="203" y="49" text-anchor="middle" style="fill:var(--fg)">draw（含画布声明 token）</text>
+              <rect x="318" y="30" width="70" height="30" style="fill:var(--fill-2)"/>
+              <text x="353" y="49" text-anchor="middle" style="fill:var(--fg2)">数字/空白</text>
+              <rect x="388" y="30" width="80" height="30" style="fill:var(--fill)"/>
+              <text x="428" y="49" text-anchor="middle" style="fill:var(--fg2)">符号/emoji</text>
+              <rect x="468" y="30" width="120" height="30" style="fill:var(--fill-2)"/>
+              <text x="528" y="49" text-anchor="middle" style="fill:var(--fg2)">中日韩 27584</text>
+              <rect x="588" y="30" width="66" height="30" style="fill:var(--fill)"/>
+              <text x="621" y="49" text-anchor="middle" style="fill:var(--fg2)">英文 3 万</text>
+            </g>
+            <path d="M6,70 L6,78 M294,70 L294,78" style="stroke:var(--fg3);stroke-width:1"/>
+            <text x="150" y="92" text-anchor="middle" style="font-size:11px;fill:var(--fg3)">架构契约头 0 … 9613（所有词表一致，冻结）</text>
+            <path d="M300,70 L300,78 M654,70 L654,78" style="stroke:var(--fg3);stroke-width:1"/>
+            <text x="477" y="92" text-anchor="middle" style="font-size:11px;fill:var(--fg3)">可见区 9614 … N-1（每个词表可以不同）</text>
+          </svg>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><span class="card-title">5. 图元输出：先声明画布，再画</span></div>
+          <p class="about-p">
+            一张图 = 1 段<b>画布声明</b>（<code>&lt;x&gt; 数字… &lt;x/&gt; &lt;y&gt; 数字… &lt;y/&gt;</code>，
+            1..1920×1080 任意尺寸）+ N×9 个图元 token。
+            每个图元 9 个字段，各自独立 bin 区间：<code>x</code>、<code>y</code>、<code>w</code>、<code>h</code>
+            全部 <b>1 token = 1 像素</b>（上限即画布上限 1920×1080）、
+            <code>theta</code>（3 bin/度，≥90° 交换宽高）、
+            <code>shape</code>（背景/矩形/椭圆）、<code>r</code>/<code>g</code>/<code>b</code>（10 bit，1024 档）。
+          </p>
+          <svg class="about-svg" viewBox="0 0 680 96" role="img"
+               aria-label="一条图元序列：画布 token 加每图元 9 个 token">
+            <g style="font-size:11px">
+              <rect x="6" y="26" width="58" height="32" rx="7" style="fill:var(--green)" opacity=".3"/>
+              <text x="35" y="46" text-anchor="middle" style="fill:var(--fg);font-weight:700">画布</text>
+              <g>
+                <rect x="70" y="26" width="52" height="32" rx="7" style="fill:var(--panel-2)"/><text x="96" y="46" text-anchor="middle" style="fill:var(--fg2)">cx</text>
+                <rect x="126" y="26" width="52" height="32" rx="7" style="fill:var(--panel-2)"/><text x="152" y="46" text-anchor="middle" style="fill:var(--fg2)">cy</text>
+                <rect x="182" y="26" width="52" height="32" rx="7" style="fill:var(--panel-2)"/><text x="208" y="46" text-anchor="middle" style="fill:var(--fg2)">theta</text>
+                <rect x="238" y="26" width="52" height="32" rx="7" style="fill:var(--panel-2)"/><text x="264" y="46" text-anchor="middle" style="fill:var(--fg2)">w</text>
+                <rect x="294" y="26" width="52" height="32" rx="7" style="fill:var(--panel-2)"/><text x="320" y="46" text-anchor="middle" style="fill:var(--fg2)">h</text>
+                <rect x="350" y="26" width="52" height="32" rx="7" style="fill:var(--panel-2)"/><text x="376" y="46" text-anchor="middle" style="fill:var(--fg2)">shape</text>
+                <rect x="406" y="26" width="40" height="32" rx="7" style="fill:var(--panel-2)"/><text x="426" y="46" text-anchor="middle" style="fill:var(--fg2)">r</text>
+                <rect x="450" y="26" width="40" height="32" rx="7" style="fill:var(--panel-2)"/><text x="470" y="46" text-anchor="middle" style="fill:var(--fg2)">g</text>
+                <rect x="494" y="26" width="40" height="32" rx="7" style="fill:var(--panel-2)"/><text x="514" y="46" text-anchor="middle" style="fill:var(--fg2)">b</text>
+              </g>
+              <text x="560" y="46" style="fill:var(--fg3)">… 重复 N 次</text>
+            </g>
+            <text x="6" y="80" style="font-size:11px;fill:var(--fg3)">一个时间步 = 一个图元；画布 token 单独占一步，永远在最前面</text>
+          </svg>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><span class="card-title">6. 进程结构：常驻 server + 按需子进程</span></div>
+          <p class="about-p">
+            <code>server/</code> 是一个常驻的轻量 HTTP 服务（纯标准库，不 import torch）；
+            训练、推理、编解码这些重活全部交给 <code>service/*</code> 的子进程，
+            用 JSON-lines over stdin/stdout 通信，空闲超时自动退出。
+            好处是：换模型/崩一个服务不会带走整个应用，内存也能真正还回去。
+          </p>
+          <svg class="about-svg" viewBox="0 0 680 132" role="img"
+               aria-label="进程结构：桌面窗口与 HTTP server 常驻，服务子进程按需拉起">
+            <defs>
+              <marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5"
+                      markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg3)"/>
+              </marker>
+            </defs>
+            <g style="font-size:11.5px">
+              <rect x="6" y="10" width="150" height="44" rx="9" style="fill:var(--panel-2);stroke:var(--border)"/>
+              <text x="81" y="29" text-anchor="middle" style="fill:var(--fg);font-weight:700">桌面窗口 / 浏览器</text>
+              <text x="81" y="44" text-anchor="middle" style="fill:var(--fg3)">service/web</text>
+
+              <rect x="196" y="10" width="170" height="44" rx="9" style="fill:var(--accent-soft);stroke:var(--accent)"/>
+              <text x="281" y="29" text-anchor="middle" style="fill:var(--accent);font-weight:700">server.py（常驻）</text>
+              <text x="281" y="44" text-anchor="middle" style="fill:var(--fg2)">HTTP + 路由 + 任务池</text>
+
+              <rect x="406" y="10" width="120" height="44" rx="9" style="fill:var(--panel-2);stroke:var(--border)"/>
+              <text x="466" y="29" text-anchor="middle" style="fill:var(--fg);font-weight:700">Supervisor</text>
+              <text x="466" y="44" text-anchor="middle" style="fill:var(--fg3)">按需拉起 / 空闲回收</text>
+
+              <rect x="406" y="76" width="120" height="40" rx="9" style="fill:var(--panel-2)"/>
+              <text x="466" y="100" text-anchor="middle" style="fill:var(--fg2)">train / infer</text>
+              <rect x="536" y="76" width="120" height="40" rx="9" style="fill:var(--panel-2)"/>
+              <text x="596" y="100" text-anchor="middle" style="fill:var(--fg2)">codec / tokens</text>
+            </g>
+            <g style="stroke:var(--fg3);stroke-width:1.3;fill:none" marker-end="url(#ah3)">
+              <path d="M156,32 L194,32"/>
+              <path d="M366,32 L404,32"/>
+              <path d="M466,54 L466,74"/>
+              <path d="M596,74 L596,58 L520,58 L520,40"/>
+            </g>
+          </svg>
+        </div>
+
       </section>
 
       <!-- ==================== 设置 ==================== -->
@@ -546,7 +1113,7 @@
           <div class="set-row">
             <div class="set-info">
               <div class="set-name">切换工具（上一个）</div>
-              <div class="set-desc">在 文本 / 音频 / 图片 / 视频 / 图元绘画 / Token 编辑器 间依次切换。</div>
+              <div class="set-desc">在 文本 / 音频 / 图片 / 视频 / 图元绘画 / Token 编辑器 / 图元编辑器 间依次切换。</div>
             </div>
             <div class="set-ctl">
               <span class="kbd" id="hk-label-prevTool">—</span>
@@ -575,6 +1142,25 @@
     </div>
   </main>
 </div>
+
+<!-- 开发者选项：右侧抽屉，与左侧边栏镜像（同宽、同圆角方向、同动画时长）。
+     放在 #app 之外：fixed 元素一旦进了带 overflow/transform 的祖先就容易被裁。 -->
+<aside id="dev-drawer" aria-hidden="true">
+  <div class="dev-inner">
+    <div class="dev-head">
+      <span class="dev-title">开发者选项</span>
+      <button class="side-btn" id="dev-close" title="关闭" aria-label="关闭">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div class="field" title="采样温度：越低输出越确定"><label>temperature</label>
+      <input type="number" id="infer-temp" value="0.8" step="0.1" min="0.05"></div>
+    <div class="field" title="核采样累计概率阈值"><label>top_p</label>
+      <input type="number" id="infer-topp" value="0.95" step="0.01" min="0.01" max="1"></div>
+  </div>
+</aside>
 
 <!-- 自绘模态框：替代系统 alert / confirm（禁令：不出现原生 UI） -->
 <div class="modal-mask" id="modal-mask" hidden>

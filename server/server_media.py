@@ -21,6 +21,7 @@ import numpy as np
 from PIL import Image
 
 import spec
+from paths import project_dir, project_tmp_dir
 from tokens import audio_codec
 
 # 编解码入口的尺寸/规模上限（防解压炸弹与 OOM：单个 patch = 4096 字节，
@@ -68,21 +69,17 @@ _FFMPEG_CACHE = []
 
 
 def find_ffmpeg():
-    """定位可用的 ffmpeg：缓存命中 → PATH → 常见安装路径 → imageio-ffmpeg。
-    对候选做 `-version` 冒烟测试，过滤架构/格式不对的二进制。"""
+    """定位可用的 ffmpeg：缓存命中 → 项目内 → PATH → imageio-ffmpeg。
+    对候选做 `-version` 冒烟测试，过滤架构/格式不对的二进制。
+
+    2026-11-04 可移植性：只认项目内自带 / PATH / Python 包自带的二进制。
+    绝不再硬编码某一台机器的绝对路径（Homebrew 前缀、某个 IDE 的用户
+    数据目录……），换了系统它们全是死引用，还把「依赖」指到了项目外。"""
     if _FFMPEG_CACHE:
         return _FFMPEG_CACHE[0]
-    import shutil
-    candidates = []
-    exe = shutil.which("ffmpeg")
-    if exe:
-        candidates.append(exe)
-    candidates += [
-        "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg",
-        os.path.expanduser(
-            "~/Library/Application Support/TRAE SOLO CN/ModularData/"
-            "ai-agent/vm/tools/bin/ffmpeg"),
-    ]
+    # 2026-11-04：只认项目内下载的二进制，**绝不查系统 PATH**。
+    from paths import bundled_tool
+    candidates = [bundled_tool("ffmpeg")]
     try:
         import imageio_ffmpeg
         candidates.append(imageio_ffmpeg.get_ffmpeg_exe())
@@ -153,7 +150,8 @@ def extract_video_frames(path, fps=30, max_frames=300):
     一致。现在统一过 size_guard_pil。 """
     exe = find_ffmpeg()
     if exe is not None:
-        outdir = tempfile.mkdtemp(prefix="garg_vframes_")
+        outdir = tempfile.mkdtemp(prefix="garg_vframes_",
+                                  dir=project_tmp_dir())
         try:
             try:
                 proc = subprocess.run(

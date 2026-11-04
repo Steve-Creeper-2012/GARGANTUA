@@ -74,19 +74,25 @@ def _script_bodies(text: str):
 
 
 def node_check(js: str) -> bool:
-    node = shutil.which("node")
+    # 2026-11-04 可移植性：项目内 node → PATH。不再硬编码任何一台机器的
+    # 绝对路径（/usr/local/bin、某个工具的用户目录），换系统即死引用。
+    node = None
+    exe_name = "node.exe" if os.name == "nt" else "node"
+    root = os.path.dirname(os.path.dirname(HERE))   # service/web → ROOT
+    for cand in (os.path.join(root, "environment", "bin", exe_name),
+                 os.path.join(root, "environment", "node", exe_name)):
+        if os.path.isfile(cand):
+            node = cand
+            break
+    # 2026-11-04：构建工具也只用项目内下载的 node，绝不查系统 PATH。
+    # 没有就跳过语法检查（全量回归的静态门另有 node --check 等价保障）。
     if not node:
-        for cand in ("/usr/local/bin/node", "/opt/homebrew/bin/node",
-                     os.path.expanduser("~/.workbuddy/binaries/node/"
-                                        "versions/22.22.2-6/bin/node")):
-            if os.path.isfile(cand):
-                node = cand
-                break
-    if not node:
-        print("[verify] node 不可用，跳过 JS 语法检查")
+        print("[verify] 项目内 node 不可用，跳过 JS 语法检查")
         return True
+    tmp_dir = os.path.join(root, "data", "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
-                                     encoding="utf-8") as f:
+                                     encoding="utf-8", dir=tmp_dir) as f:
         f.write(js)
         path = f.name
     try:

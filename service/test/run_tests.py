@@ -65,6 +65,15 @@ SUITES = [
     # 2026-10-30 词表契约重构：.vfc 格式 + 模型文件夹契约
     ("test_vfc", "service.test.test_vfc", 300, "unittest"),
     ("test_model_folder", "service.test.test_model_folder", 600, "unittest"),
+    # 2026-11-04 enc/dec 权重模式：绑定 / 等深约束 / 只落一份权重
+    ("test_shared_weights", "service.test.test_shared_weights", 600,
+     "unittest"),
+    # 2026-11-04 建模可选 d_model：严格校验 / 形状 / config roundtrip
+    ("test_dmodel", "service.test.test_dmodel", 600, "unittest"),
+    # 2026-11-04 可移植性静态门：外部绝对路径 / 未固定 dir 的 tempfile
+    ("test_portability", "service.test.test_portability", 120, "unittest"),
+    # 2026-10-31 图元编辑器：前端 JS 与 draw_codec 的编码对拍（需要 node）
+    ("test_pdraw_js", "service.test.test_pdraw_js", 120, "unittest"),
     ("verify_formats", "service/test/verify_formats.py", 600, "script"),
 ]
 

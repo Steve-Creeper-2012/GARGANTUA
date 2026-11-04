@@ -42,8 +42,10 @@ class ServiceError(RuntimeError):
 
 
 def _service_env(root: str) -> dict:
-    """服务子进程环境：PYTHONPATH 指向 boot 引导的代码根。"""
-    env = dict(os.environ)
+    """服务子进程环境：强制隔离（缓存/临时/工具链 HOME 全在项目内）。"""
+    # 2026-11-04：子进程不得继承会写系统目录的默认环境
+    from paths import isolated_env
+    env = isolated_env()
     start_dir = os.path.join(root, "start")
     if start_dir not in sys.path:
         sys.path.insert(0, start_dir)
@@ -200,6 +202,22 @@ class ServiceSupervisor:
         with self._lock:
             h = self._handles.get(name)
             return h is not None and h.alive()
+
+    def kill_service(self, name: str) -> bool:
+        """杀掉并注销某个常驻服务（不动其它服务）。
+
+        用于「初始化 fast weight / 清空上下文」：infer 服务的 fast_weight 与
+        KV 缓存都活在进程内，跨调用持久；杀掉进程即释放，下次推理会拉起一个
+        全新的干净服务。返回是否真有进程被终止。"""
+        with self._lock:
+            h = self._handles.get(name)
+            if h is None:
+                return False
+            try:
+                h.abort()
+            finally:
+                self._handles.pop(name, None)
+            return True
 
     # ------------------------------------------------------------------
     def call(self, name: str, op: str, timeout: float = 120.0, **args) -> dict:

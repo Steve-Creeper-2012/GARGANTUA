@@ -18,15 +18,19 @@ GARGANTUA is a next-generation AI framework built from the ground up for **multi
 Each block follows the order:
 
 ```
-KDA → KDA → KDA → MLA-CSA → MLA-HCA → FFN(GLU) → AttnRes
+KDA → FFN → KDA → FFN → KDA → FFN → MLA-CSA → FFN → MLA-HCA → FFN → AttnRes
 ```
 
-- **KDA** (Kimi-style Delta Attention): Gated linear recurrence with delta-state updates, inspired by Moonshot AI. Three consecutive KDA layers carry the recurrent/positional path.
+(2026-11-04 reorder: every recurrence/attention sub-layer is immediately
+followed by its own FFN; the five FFNs are independent instances, not one
+layer reused five times. `spec.BLOCK_ORDER` is the single source of truth.)
+
+- **KDA** (Kimi-style Delta Attention): Gated linear recurrence with delta-state updates, inspired by Moonshot AI. Three KDA layers carry the recurrent/positional path, interleaved with FFNs.
 - **MLA** (Multi-head Latent Attention): Low-rank joint KV compression, NoPE (no RoPE branch), inspired by DeepSeek-V2.
   - **MLA-CSA**: the retrieval view — 4:1 compressed segment + the whole full-KV segment.
   - **MLA-HCA**: the global-summary view — 32:1 compressed segment + the whole full-KV segment.
   - Both layers are plain MLA when the KV they read is uncompressed; the difference is which compressed segment they see.
-- **FFN**: GLU variant, `d_ff=4096`.
+- **FFN**: GLU variant, `d_ff=4096`, five independent instances per block. Default 4+6 blocks therefore reach ~1.03B params (~4.1 GB fp32); use `d_model`, block counts or shared weights to scale down. Checkpoints created before 2026-11-04 have a different state_dict layout (`ffn_up`/`ffn_down` vs `ffns.i.*`) and must be re-initialized.
 - **AttnRes** (Kimi/Moonshot, [Attention Residuals](https://github.com/MoonshotAI/Attention-Residuals), arXiv 2603.15031): before every sub-layer, the block aggregates the token embedding, all completed block representations and the current partial sum with a softmax pseudo-query (`h = softmax(norm(V)·w)ᵀV`); block-internal accumulation stays standard residual. A zero-initialized scalar gate at the block end mixes the block input back in (both residual forms are kept, complementarily).
 
 ### Fast Weight Memory
@@ -212,9 +216,10 @@ Within a single time-step (e.g., one video frame), all patches and audio tokens 
 ## Primitive Pipeline (image → primitive tokens)
 
 Adopted from [wonderfulearth/primitive-operation-painter](https://github.com/wonderfulearth/primitive-operation-painter)
-(vendored **verbatim** under `service/prims/` — the converter is copied
-byte-for-byte, never modified; the rest of the upstream repo is kept under
-`service/prims/upstream/` for reference).
+(the converter under `service/prims/fast_shape_render/` is copied byte-for-byte
+and never modified; the rest of the upstream repo — model / training code,
+~11MB — was **deleted** on 2026-10-31 since nothing here referenced it, and is
+recoverable from git history).
 **Languages**: the image→sequence converter (`fast_shape_render/`) is
 **Rust + wgpu** (GPU compute; Metal on macOS, DirectX 12 on Windows,
 Vulkan on Linux); the driver + CPU fallback is **Python + numpy**.
@@ -226,11 +231,13 @@ Vulkan on Linux); the driver + CPU fallback is **Python + numpy**.
   (`convert_with_renderer`, subprocess).
 - **CPU fallback**: the same greedy algorithm in pure numpy (no GPU
   required), outputting the identical primitive schema.
-- **Tokens (照搬第三方布局, `geometrize_256_v1`)**: 9 tokens per primitive
-  in field order `cx, cy, theta, w, h, shape, r, g, b`, each field an
+- **Tokens (`geometrize_256_v1` 布局，2026-11-01/02 起扩展)**: 9 tokens per
+  primitive in field order `x, y, theta, w, h, shape, r, g, b`, each field an
   independent bin range (token ID = `DRAW_BEGIN + field offset + bin`);
-  canvas 256×256; a step-first token in the special bin range ends the
-  sequence. See `server/spec.py` (DRAW_*) and
+  `x/y/w/h` are all 1 token = 1 px (upper bound = canvas max 1920×1080),
+  `theta` 3 bins/degree, `r/g/b` 10 bit (1024 levels). A canvas declaration
+  (`<x> digits <x/> <y> digits <y/>`) opens the sequence and may be any size
+  from 1×1 to 1920×1080. See `server/spec.py` (DRAW_*) and
   `service/tokens/draw_codec.py`.
 - **Quality modes** (CPU path): `fast` = 20 candidates/step, no
   hill-climbing (~2–5s/100 steps); `slow` = 50 candidates + short
@@ -370,23 +377,29 @@ stdout 追加到 `logs/server.log`，PID 写 `logs/server.pid`），等 `/api/st
 
 首次启动 `setup-environment.sh` / `setup.bat` 会：
 
-1. 从 python-build-standalone 发现并下载 **3.12 系列最新版**（atom feed
-   取最新 release tag + HEAD 探测补 patch 号），**镜像自动测速选取**
-   （对 gh-proxy / GitHub 直连 / SJTU 镜像并行发 Range 请求前 2MB 比速率，
-   选最快的下载；也可用 `GARGANTUA_PY_BASE_URL` 手动指定）；
-2. 解包到 `environment/python/`，用它建虚拟环境 `environment/venv/`
-   （**不碰系统 Python**；项目目录被移动后符号链接悬空会自动重建）；
-3. 按分类装依赖 `start/requirements/{core,window,dev}.txt`（core 必装，
-   window 桌面环境才装，dev 仅测试需要；pip 源同样测速选取：
-   TUNA vs PyPI 官方，默认快者）；
-4. 写依赖清单哈希 stamp——之后启动秒过，只有清单变了才重装。
+1. 检测 `environment/python/` 里的 standalone CPython 3.12；没有就**自动
+   测速选镜像**（GitHub 直连 / gh-proxy / SJTU）下载 python-build-standalone
+   到 `environment/_cache/downloads/` 并解包（缓存命中即完全离线）。
+   **绝不探测或复用系统 Python、绝不用系统包管理器**；
+2. 用项目内 Python 执行 `start/setup_env.py`：建 `environment/venv/`
+   （`pyvenv.cfg` 必须指向项目内，否则离线迁移旧轮子后重建）；下载、pip、
+   编译缓存全部写 `environment/_cache/`，临时文件写 `data/tmp/`，不落项目外；
+3. 装 `start/requirements/must.txt`（python + pywebview，启动只查这份）；
+   `necessary.txt`（torch / numpy / pillow / safetensors / pytest / ffmpeg /
+   rust）在主页「环境与依赖」里按需装，或设 `GARGANTUA_FULL_SETUP=1` 一次装齐；
+4. 把依赖清单哈希与 OS/CPU 架构指纹写进
+   `environment/venv/.gargantua_setup_stamp`——之后启动秒过；清单变了重装，
+   换平台自动重建 venv（不会复用旧架构的 `.so`/`.pyd`）。
 
 随后 `server/server.py` 启动：先做环境预检（解释器 ≥3.12 且 ≤3.12 系列、
 主依赖可导入——torch 2.2.2 没有 3.13 预编译轮子，版本不对会给可执行提示
 而不是 20 分钟源码编译），再起 HTTP 服务与独立桌面窗口。
 
-所有依赖与工具链（Python / venv / Rust）统一放在 `environment/`，与系统
-完全隔离——契约见 `environment/README.md`。
+所有依赖与工具链（Python / venv / Rust / ffmpeg / node）统一放在 `environment/`，
+**绝不复用系统 Python 或系统包管理器**（空目录也能自动下载安装；跨 OS/CPU 的
+硬限制见上面的 Portability and isolation）——契约见 `environment/README.md`。**一个依赖一个文件夹**，每个
+文件夹带一份 `pack.json` 清单；主页「环境包」区就是该目录的镜像（多一个
+文件夹就多一张卡），所以不会有「装了但主页看不见」的依赖。
 
 | Flag | Effect |
 | --- | --- |
@@ -399,8 +412,8 @@ stdout 追加到 `logs/server.log`，PID 写 `logs/server.pid`），等 `/api/st
 
 环境变量：`GARGANTUA_PY_RELEASE` / `GARGANTUA_PY_VERSION`（锁定
 python-build-standalone 版本）、`GARGANTUA_PY_BASE_URL`（指定 Python
-下载镜像）、`GARGANTUA_NO_WINDOW=1` / `GARGANTUA_INSTALL_DEV=1`（setup
-阶段）、`PIP_INDEX_URL`（自定义 pip 源）。
+下载镜像）、`GARGANTUA_FULL_SETUP=1`（setup 阶段连 necessary.txt 一起装，
+默认只装 must）、`PIP_INDEX_URL`（自定义 pip 源）。
 
 ### The window is not a browser
 
@@ -409,11 +422,11 @@ The UI opens in a **standalone desktop window** via
 `WebView2` / Linux `WebKitGTK`) — the OS web component, not a second browser
 engine. Chrome/Firefox spend 300–800 MB per tab on renderer processes,
 extensions and their own GPU pipeline; that budget belongs to training here
-(model + optimizer state + KV cache). The window dependency is deliberately
-**not** in the core requirements:
+(model + optimizer state + KV cache). The window dependency lives in
+`must.txt` (lightweight startup set):
 
 ```bash
-pip install -r start/requirements/window.txt   # ~18 MB, optional
+pip install -r start/requirements/must.txt   # ~18 MB, python + pywebview
 ```
 
 Without it the server still starts and prints the URL — you can open it in
@@ -482,14 +495,17 @@ Long-running work (inference, model init, image→primitives, **drawing render**
 │   ├── terminal/              # Windows-only entry points (.bat)
 │   │   ├── setup.bat          # Isolated Python 3.12.x + venv + deps (Windows)
 │   │   └── start.bat          # setup → exec server.py (Windows)
-│   └── requirements/          # Categorized dependencies
-│       ├── core.txt           # torch / numpy / pillow / safetensors (required)
-│       ├── window.txt         # pywebview — standalone window (~18 MB, optional)
-│       └── dev.txt            # pytest (tests only)
+│   └── requirements/          # Dependency manifests (single source: reqs.py)
+│       ├── must.txt           # python + pywebview — startup-required (light)
+│       └── necessary.txt      # torch / numpy / pillow / safetensors / pytest /
+│                             #   ffmpeg / rust — install on demand from the UI
 ├── environment/               # ALL dependencies & toolchains (system-isolated)
 │   ├── python/                # standalone CPython 3.12.x (downloaded by setup)
+│   │   └── pack.json          #   manifest (title / probe / install / contents)
 │   ├── venv/                  # virtual env on the above interpreter
+│   │   └── pack.json
 │   ├── rust/                  # Rust toolchain (installed by service/prims/setup.sh)
+│   │   └── pack.json
 │   └── README.md              # the contract (see it before touching this dir)
 ├── server/                    # All server files
 │   ├── spec.py                # Frozen architecture contract (single source of truth)
@@ -505,6 +521,8 @@ Long-running work (inference, model init, image→primitives, **drawing render**
 │   ├── server_codecs.py       # CodecApi mixin — all /api/codec/* endpoints
 │   ├── server_train.py        # TrainApi mixin — all /api/train/* endpoints
 │   ├── server_tokens.py       # TokensApi mixin — /api/tokens/* + /api/vocab/add
+│   ├── server_term.py         # Built-in terminal: PTY shell locked to project root
+│   ├── server_prims.py        # Primitive job queue (create/run/live/result, output/)
 │   └── server_util.py         # num_param / pip source / optional-install command
 ├── service/                   # One folder per service (started on demand)
 │   ├── infer/infer.py         # Autoregressive generation (CLI + --serve mode)
@@ -531,9 +549,9 @@ Long-running work (inference, model init, image→primitives, **drawing render**
 │   │   ├── image_to_primitives.py  # Driver: GPU subprocess + CPU fallback fitter
 │   │   ├── setup.sh           # Build GPU converter (Rust into environment/rust/)
 │   │   ├── fast_shape_render/ # ★ vendored Rust/wgpu converter, verbatim
-│   │   └── upstream/          # the rest of the upstream repo, verbatim (reference)
+│   │   └── README.md          # two paths (GPU 256²→any canvas / CPU any canvas)
 │   ├── web/                   # Frontend
-│   │   ├── index_source.html  # Single-page app source (11 pages)
+│   │   ├── index_source.html  # Single-page app source (13 pages, incl. terminal)
 │   │   ├── index.html         # Minified artifact (regenerate via web/minify.py)
 │   │   └── minify.py          # Safe minifier with --check self-test
 │   ├── window/window.py       # Standalone desktop window (pywebview, no browser)
@@ -569,6 +587,29 @@ points (`service/init/init.py`, `service/train/train.py`,
 models through `common.build_model()` so a model created with custom block
 counts loads identically everywhere.
 
+**Encoder/decoder weight sharing** (optional, 2026-11-04): when creating a
+model, pick `separate` (default) or `shared` weights. With shared weights,
+`enc_blocks[i]` and `dec_blocks[i]` are the *same* `nn.Parameter` objects (the
+two final norms are tied too), so `n_enc_blocks` must equal `n_dec_blocks`: the
+API rejects unequal counts, the UI locks the decoder field to the encoder
+value, and both defaults collapse to `spec.SHARED_DEFAULT_BLOCKS`. Only
+parameters are tied — encoder blocks stay bidirectional and decoder blocks
+stay causal, since they remain two distinct `Block` instances. Only one copy
+of the tied weights is written into `weights/` (safetensors forbids two keys
+sharing storage); `config.json` records `"share_enc_dec": true` and the loader
+mirrors the encoder keys back for a strict `load_state_dict`. Old model
+directories without the field load as separate-weight models unchanged.
+CLI: `python service/init/init.py --name alpha --share-enc-dec --enc-blocks 4`.
+
+**Configurable model width** (optional, 2026-11-04): `d_model` can be chosen at
+creation time (default 1024, any multiple of `HEAD_DIM=128` in
+`[128, 2048]`; `spec.check_d_model` is the single validation rule). It only
+changes the semantic vector width — embeddings, projections, shared KV and
+each block's input/output projections — while attention heads/head dim, MLA
+low ranks and FFN hidden width stay frozen. `config.json` records `d_model`
+and `common.build_model()` reads it back; old directories without a valid
+value fall back to 1024. CLI: `--d-model 512`.
+
 **Per-model vocabulary** (optional): drop a `vocab.txt` into the model
 directory and that model gets its own token↔ID mapping — one token per
 line, line *N* → ID `INVISIBLE_END + N` (the invisible region below
@@ -583,6 +624,51 @@ the infer/train service processes each call `set_model_vocab()`, so
 model's vocabulary. Export a starting point with
 `python service/tokens/build_vocab.py --export-txt models/NAME/vocab.txt`.
 
+## Portability and isolation
+
+Everything the app writes stays **inside the project folder**: `logs/`,
+`data/tmp/` (runtime temp files), `environment/_cache/` (downloads, pip
+wheels), `models/`, `vocabs/`, `service/*/output/`. `server/paths.py`
+derives the project root from `__file__` — never from the current working
+directory, `HOME`, or an absolute path baked into a script. Launchers
+(`启动.sh` / `启动.command` / `启动.bat`) resolve the root from their own
+location, so the folder can be moved or renamed freely. `setup-environment.sh`
+and `setup.bat` prefer the bundled `environment/python/` standalone
+interpreter, pin pip/download caches inside the project, and record an
+OS/architecture fingerprint in `environment/venv/.gargantua_setup_stamp` so
+a venv built on another machine is rebuilt instead of silently reused.
+`service/test/test_portability.py` is a static gate that fails if a
+machine-specific absolute path, an unpinned `tempfile.*` call, a
+`shutil.which()` fallback, a system package manager, or a venv bound to a
+system Python reappears.
+
+**Zero system dependency (hard rule).** Launchers check for the bundled
+standalone Python, an isolated venv and `pywebview`; if any is missing they
+call `setup-environment.sh` / `setup.bat`, which probe several mirrors with
+Range requests, pick the fastest, and download the standalone CPython into
+`environment/python/`. Everything after that runs under that bundled Python
+through `start/setup_env.py`: venv creation (`pyvenv.cfg` must point inside
+the project or it is rebuilt with its old wheels migrated offline), pip
+installs with mirror speed-probing, project-local caches, and the optional
+`ffmpeg` / `node` binaries. An empty `environment/` therefore boots from
+scratch, and dropping the archives into `environment/_cache/downloads/` makes
+it fully offline. Manual "install / update" clicks in the window go through
+`server/env_install.py` → the very same installer, never a second path using
+the system interpreter. The only system binaries ever *read* are `curl`/`tar`
+for that one-time bootstrap (plus the platform linker if you build the Rust
+renderer); nothing is installed, modified, or written outside the project.
+
+**Hard limit — one folder cannot run unchanged on every OS/CPU.** Native
+wheels (`torch 2.2.2` has macOS x86_64 wheels here), the vendored Rust
+renderer binary, and the system WebView (WKWebView / WebView2 / WebKitGTK)
+are platform-specific; `pty`/`sysctl`/`ioreg` based features are POSIX-only.
+Moving between different OSes or CPU architectures therefore requires one
+`environment/` built per target platform (or a container image) sharing the
+same project sources — the code paths, API and model formats are identical,
+but native binaries must be rebuilt/reinstalled for the target. A true
+Docker-level guarantee needs an actual container runtime; no Python script
+can emulate a different kernel or CPU architecture.
+
 ## Testing
 
 ```bash
@@ -595,7 +681,8 @@ python -m unittest service.test.test_model -v       # unittest directly
 `run_tests.py` first runs static gates (`py_compile` on every `.py`,
 `bash -n` on every `.sh`, `minify.py --check`), then each suite in its own
 subprocess. Suites run in **separate processes** on purpose: a full
-`Gargantua()` is ~527.9M params (~2.1 GB fp32), and PyTorch's CPU allocator
+`Gargantua()` is ~1.03B params (~4.1 GB fp32 since the 2026-11-04 block
+reorder; the shape tests use 1+1 blocks to stay light), and PyTorch's CPU allocator
 keeps freed blocks in its own pool, so RSS never drops within a process —
 running every suite under one `unittest discover` gets SIGKILLed (exit 137)
 partway through `test_model`.

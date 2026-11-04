@@ -2,9 +2,9 @@
   "name": "base",
   "format": "gargantua-vocab-folder-v1",
   "is_main": true,
-  "built_at": "2026-11-01T03:07:24Z",
-  "vocab_size": 69376,
-  "head_size": 2970,
+  "built_at": "2026-11-02T12:12:28Z",
+  "vocab_size": 76020,
+  "head_size": 9614,
   "regions": [
     {
       "region": "special",
@@ -19,7 +19,7 @@
     {
       "region": "draw",
       "category": "special",
-      "size": 2961
+      "size": 9605
     },
     {
       "region": "digit",

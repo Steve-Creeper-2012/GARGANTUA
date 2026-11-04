@@ -409,6 +409,65 @@ def _block_count(cfg: dict, key: str, default: int) -> int:
     return v
 
 
+# ---------------------------------------------------------------------------
+# enc/dec 权重模式（2026-11-04）——创建入口与加载入口共用的唯一规则
+# ---------------------------------------------------------------------------
+SHARE_CONFIG_KEY = "share_enc_dec"
+
+
+def read_share_enc_dec(cfg: dict) -> bool:
+    """config.json 的 share_enc_dec → bool；旧目录缺字段 = 分离权重。
+
+    只认真布尔、0/1 与 "true"/"false"：其余一律告警并回退分离。把 "yes"
+    或 2 这类手改值解释成共享，会让加载侧按错误的键集合 strict load，
+    报一堆看不懂的 missing keys，还不如明确拒绝。"""
+    v = cfg.get(SHARE_CONFIG_KEY, False)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str) and v.strip().lower() in ("true", "false"):
+        return v.strip().lower() == "true"
+    if v is not None:
+        _warn(f"config.json {SHARE_CONFIG_KEY}={v!r} 非法，按分离权重处理")
+    return False
+
+
+def read_d_model(cfg: dict) -> int:
+    """config.json 的 d_model → 合法宽度（2026-11-04）。
+
+    缺省 / 非法都回退 spec.D_MODEL，并告警——与 _block_count 的容错
+    口径一致：单个字段写错不该让整个模型目录报废。"""
+    v = cfg.get("d_model", spec.D_MODEL)
+    try:
+        return spec.check_d_model(v)
+    except ValueError as e:
+        _warn(f"config.json d_model={v!r} 非法，回退 {spec.D_MODEL}: {e}")
+        return spec.D_MODEL
+
+
+def normalize_shared_blocks(enc, dec, share: bool):
+    """建模入口共用的 block 数归一化（server.py 与 init.py 都走这里）。
+
+    - 分离权重：原样返回（None 让 Gargantua 取 spec 默认 4 / 6）。
+    - 共享权重：强制 enc == dec；只给一侧则另一侧跟随；两侧都没给则
+      一起取 spec.SHARED_DEFAULT_BLOCKS（不能各取各的 spec 默认，那两个
+      值不等，共享模型必须等深）。两侧都给但不等 → ValueError（HTTP 400）。
+    """
+    if not share:
+        return enc, dec
+    if enc is not None and dec is not None:
+        if int(enc) != int(dec):
+            raise ValueError(
+                f"共享权重要求 enc blocks == dec blocks（收到 {enc} / {dec}）；"
+                f"共享模式下两侧逐层一一绑定参数")
+        return int(enc), int(dec)
+    one = enc if enc is not None else dec
+    if one is not None:
+        return int(one), int(one)
+    return spec.SHARED_DEFAULT_BLOCKS, spec.SHARED_DEFAULT_BLOCKS
+
+
 def build_model(model_dir: str):
     """按模型目录的 config.json 构造 Gargantua 并加载权重。
 
@@ -421,11 +480,18 @@ def build_model(model_dir: str):
     之前调用，所以它不能依赖进程里已加载的词表，必须自己读目录。 """
     from model import Gargantua          # 延迟 import：避免 common → model 循环
     cfg = read_config(model_dir)
-    m = Gargantua(n_enc_blocks=_block_count(cfg, "n_enc_blocks",
-                                            spec.N_ENC_BLOCKS),
-                  n_dec_blocks=_block_count(cfg, "n_dec_blocks",
-                                            spec.N_DEC_BLOCKS),
+    share = read_share_enc_dec(cfg)
+    n_enc = _block_count(cfg, "n_enc_blocks", spec.N_ENC_BLOCKS)
+    n_dec = _block_count(cfg, "n_dec_blocks", spec.N_DEC_BLOCKS)
+    if share and n_enc != n_dec:
+        # 共享模型的 config 被手改成不等深：先给结论，别落到
+        # load_state_dict 的一堆 missing keys 里
+        raise ValueError(
+            f"共享权重模型的 config.json 要求 n_enc_blocks == n_dec_blocks"
+            f"（读到 {n_enc} / {n_dec}）：配置与权重不匹配")
+    m = Gargantua(n_enc_blocks=n_enc, n_dec_blocks=n_dec,
                   vocab_size=model_vocab_size(model_dir),
+                  share_enc_dec=share, d_model=read_d_model(cfg),
                   **_ctx_from_cfg(cfg))
     sd = load_model_state_dict(model_dir)
     if sd:
@@ -449,7 +515,58 @@ def build_model(model_dir: str):
         apply_precision(m, dtype_name)
     except Exception as e:
         _warn(f"config dtype={dtype_name!r} 施加失败，回退 fp32: {e}")
+    finally:
+        # 2026-11-04：model.to(dtype) 会替换 Parameter 对象，逐层共享的
+        # 绑定可能因此断掉（共享模型会退化成两份独立权重、且 dec 侧的
+        # 训练更新不再被保存）。转换前后数值相同，重建绑定无损。
+        # hasattr 是为了兼容测试里替换掉的替身模型。
+        if share and hasattr(m, "retie_shared_weights"):
+            m.retie_shared_weights()
     return m
+
+
+# ---------------------------------------------------------------------------
+# 共享权重的 state_dict 键镜像（2026-11-04）
+# ---------------------------------------------------------------------------
+# spec.TIED_KEY_PAIRS 是唯一真源。save 侧剥掉 dec 侧 key（只落 enc 一份：
+# safetensors 不允许两个 key 共享同一块 storage，且存两份会把省下的磁盘
+# 又吃回去），load 侧按 config 把 enc 侧张量镜像成 dec 侧 key，让严格
+# load_state_dict 拿到完整键集合。两边共用同一张前缀表。
+def _tied_dec_key(k: str):
+    """enc 侧 key → 对应的 dec 侧 key；不是绑定范围的返回 None。"""
+    for enc_p, dec_p in spec.TIED_KEY_PAIRS:
+        if k.startswith(enc_p):
+            return dec_p + k[len(enc_p):]
+    return None
+
+
+def _dec_prefixes() -> tuple:
+    return tuple(dec_p for _enc_p, dec_p in spec.TIED_KEY_PAIRS)
+
+
+def strip_tied_dec_keys(sd: dict) -> dict:
+    """共享模型落盘前：只保留 enc 侧那一份参数。"""
+    dec_p = _dec_prefixes()
+    return {k: v for k, v in sd.items() if not k.startswith(dec_p)}
+
+
+def expand_tied_dec_keys(sd: dict) -> dict:
+    """共享模型加载时：把 enc 侧张量**引用**镜像成 dec 侧 key。
+
+    不 clone：内存里两个 key 指向同一张量，load_state_dict 对同一个
+    Parameter copy_ 两次、值相同，无副作用；落盘仍只有一份。"""
+    dec_p = _dec_prefixes()
+    if any(k.startswith(dec_p) for k in sd):
+        raise ValueError(
+            "权重文件里已有 dec 侧参数，与 config.json 的 "
+            f"{SHARE_CONFIG_KEY}=true 冲突（目录被手改过，或混用了"
+            "分离/共享两套权重）")
+    out = dict(sd)
+    for k, v in sd.items():
+        twin = _tied_dec_key(k)
+        if twin is not None:
+            out[twin] = v
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +671,10 @@ def load_model_state_dict(model_dir: str) -> dict:
         p = _manifest_path(model_dir, cfg.get(key))
         if p and os.path.exists(p):
             sd.update(load_file(p))
+    # 2026-11-04：共享模型只落了 enc 侧一份，按 config 镜像出 dec 侧 key，
+    # 让 build_model 的 strict load_state_dict 拿到完整键集合。
+    if read_share_enc_dec(cfg):
+        sd = expand_tied_dec_keys(sd)
     return sd
 
 
@@ -636,8 +757,17 @@ def save_checkpoint(model_dir: str, model, config: dict) -> None:
     os.makedirs(model_dir, exist_ok=True)
     wdir = os.path.join(model_dir, WEIGHTS_DIRNAME)
     os.makedirs(wdir, exist_ok=True)
-    main_sd, disc_sd, cont_sd = split_state_dict(model.state_dict())
+    sd = model.state_dict()
+    # 2026-11-04：共享模型只落 enc 侧一份。两件事都不可省——safetensors
+    # 不允许两个 key 共享 storage（会直接报错），而且重复落一份等于把
+    # 共享省下来的磁盘又吃回去。config 是加载侧判断的唯一依据。
+    tied = bool(getattr(model, "share_enc_dec", False))
+    if tied:
+        sd = strip_tied_dec_keys(sd)
+    main_sd, disc_sd, cont_sd = split_state_dict(sd)
     cfg = dict(config)
+    if tied or SHARE_CONFIG_KEY in cfg:
+        cfg[SHARE_CONFIG_KEY] = tied
     plan = ((MAIN_WEIGHTS_PREFIX, main_sd, WEIGHTS_KEYS[0]),
             (DISCRETE_EMBED_PREFIX, disc_sd, WEIGHTS_KEYS[1]),
             (CONTINUOUS_EMBED_PREFIX, cont_sd, WEIGHTS_KEYS[2]))

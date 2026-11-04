@@ -25,7 +25,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUSTUP_HOME="$ROOT/environment/rust/rustup"
 CARGO_HOME="$ROOT/environment/rust/cargo"
+# 2026-11-04：连编译期的临时文件也不许落到系统临时目录
+TMP_ROOT="$ROOT/data/tmp"
+CACHE_ROOT="$ROOT/environment/_cache/prims"
+mkdir -p "$TMP_ROOT" "$CACHE_ROOT"
 export RUSTUP_HOME CARGO_HOME
+export TMPDIR="$TMP_ROOT" TMP="$TMP_ROOT" TEMP="$TMP_ROOT"
+export XDG_CACHE_HOME="$ROOT/environment/_cache"
 
 PROBE_TIMEOUT=8
 log() { echo "[prims] $*" >&2; }
@@ -78,7 +84,7 @@ if [ ! -x "$CARGO_HOME/bin/cargo" ]; then
     [ -n "$INIT_URL" ] || INIT_URL="https://static.rust-lang.org/rustup/dist/$RTRIPLE/rustup-init"
     log "选中 rustup-init 镜像：${INIT_URL}"
   fi
-  TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+  TMP="$(mktemp -d "$CACHE_ROOT/rustup.XXXXXX")"; trap 'rm -rf "$TMP"' EXIT
   log "下载 rustup-init……"
   curl -fSL --retry 3 --max-time 300 "$INIT_URL" -o "$TMP/rustup-init" \
     || die "rustup-init 下载失败：${INIT_URL}"

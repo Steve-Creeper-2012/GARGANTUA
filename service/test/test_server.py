@@ -37,6 +37,7 @@ ROOT = boot.project_root()   # 2026-10-24：项目根（旧布局曾是 service/
 
 # 新契约：spec 不再钉死词表长度；server API 会对真实文本走全局词表编码，
 # 替身模型必须按全局词表长度开 embedding
+import spec
 from tokens.vocab import Vocab
 _VS = len(Vocab.global_vocab())
 
@@ -271,7 +272,10 @@ class TestServer(unittest.TestCase):
         png = base64.b64decode(j["png_b64"])
         self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertIn("<svg", j["svg"])
-        self.assertEqual(len(j["tokens"]), 2 * 9)     # 9 token/图元
+        # 画布声明（256×256 → <x> 2 5 6 <x/> <y> 2 5 6 <y/> = 10）+ 每图元 9 个
+        self.assertEqual(len(j["tokens"]),
+                         10 + 2 * spec.DRAW_TOKENS_PER_PRIMITIVE)
+        self.assertEqual(j["canvas"], list(spec.DRAW_DEFAULT_CANVAS))
         # 反向：tokens → 渲染
         j2 = self._draw_and_wait({"tokens": j["tokens"]})
         self.assertEqual(j2["n_primitives"], 2)

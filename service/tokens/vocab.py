@@ -100,6 +100,18 @@ def _unbracket(text: str) -> str:
     return text
 
 
+# 头部对不上几乎只有两种原因，且都不是「词表写坏了」：
+#   1. 词表文件是旧 spec 建的（比如 spec 改了 DRAW 区布局）；
+#   2. server 进程比 spec.py 的改动更早启动——spec 是 import 期常量，
+#      进程里还是旧的那一份，而磁盘上的词表已经按新 spec 重建了。
+# 这两种都只需「重启 server / 重建词表」，把话写清楚，别让人去翻代码。
+_HEAD_DRIFT_HINT = (
+    "　【怎么修】spec.py 与词表版本不一致：① 先重启 server（spec 是 import "
+    "期常量，老进程里还是旧布局）；② 仍报错说明词表文件是旧 spec 建的，用 "
+    "python service/tokens/build_vocab.py 重建全局词表，再删掉 vocabs/base "
+    "让 ensure_base() 重新派生。")
+
+
 def validate_head(entries, source: str = "vocab.vfc") -> None:
     """校验架构契约头（不变量 I2）。
 
@@ -111,7 +123,8 @@ def validate_head(entries, source: str = "vocab.vfc") -> None:
         raise ValueError(
             f"{source}: 词表只有 {len(entries)} 条，短于架构契约头 "
             f"{len(head)} 条（special {spec.SPECIAL_SIZE} + "
-            f"system {spec.SYSTEM_SIZE} + draw {spec.MODAL_SIZE}）")
+            f"system {spec.SYSTEM_SIZE} + draw {spec.MODAL_SIZE}）。"
+            f"{_HEAD_DRIFT_HINT}")
     for k, (hid, htext, hvis) in enumerate(head):
         got = entries[k]
         # 两侧都用裸名比较：文件侧是裸名，内存侧可能是 '<name>' 形态
@@ -121,7 +134,7 @@ def validate_head(entries, source: str = "vocab.vfc") -> None:
                 f"{source}: 架构契约头第 {k} 项应为 "
                 f"id={hid} text={htext!r} visible={bool(hvis)}，"
                 f"实际为 id={got[0]} text={got[1]!r} "
-                f"visible={bool(got[2])}")
+                f"visible={bool(got[2])}。{_HEAD_DRIFT_HINT}")
 
 
 class Vocab:

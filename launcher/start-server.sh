@@ -217,26 +217,28 @@ if probe; then
 fi
 
 # ---------------------------------------------------------------------------
-# 核心组件 1：Python（隔离环境解释器）
+# 核心组件：隔离环境（项目内 standalone Python + venv + pywebview）
 # ---------------------------------------------------------------------------
-if [ ! -x "$VENV_PY" ]; then
-  echo "[launcher] 未找到隔离 Python → 一次性搭建（复用本机现成的 3.12，不下载）……"
-  "$SCRIPT_DIR/setup-environment.sh"
+# 2026-11-04（steve）：发现没有必需的 Python / pywebview 依赖、或 venv 不是
+# 由项目内 Python 构建时，自动找到 setup 脚本；setup 会测速选镜像下载
+# binaries，空 environment/ 也能从零跑起来。绝不复用系统 Python。
+BASE_PY="$ROOT/environment/python/python/bin/python3"
+SETUP="$SCRIPT_DIR/setup-environment.sh"
+NEED_SETUP=0
+[ -x "$VENV_PY" ] || NEED_SETUP=1
+[ -x "$BASE_PY" ] || NEED_SETUP=1
+if [ "$NEED_SETUP" = 0 ] && \
+   ! "$BASE_PY" "$ROOT/start/setup_env.py" --check >/dev/null 2>&1; then
+  echo "[launcher] 隔离校验未通过（venv 归属 / pywebview / 平台指纹）"
+  NEED_SETUP=1
+fi
+if [ "$NEED_SETUP" = 1 ]; then
+  echo "[launcher] 调用 setup：自动测速选镜像下载 binaries（全部落项目内）……"
+  "$SETUP" || { echo "[launcher] ✗ 隔离环境搭建失败（详见上方）"; exit 1; }
 fi
 [ -x "$VENV_PY" ] || { echo "[launcher] ✗ 隔离 Python 不可用：$VENV_PY"; exit 1; }
-echo "[launcher] Python ✓（$("$VENV_PY" -V 2>&1)）"
-
-# ---------------------------------------------------------------------------
-# 核心组件 2：pywebview（仅窗口模式需要；缺失不阻塞，HTTP server 仍可用）
-# ---------------------------------------------------------------------------
-if [ "$NEED_WIN" = 1 ]; then
-  if "$VENV_PY" -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('webview') is not None else 1)" 2>/dev/null; then
-    echo "[launcher] pywebview ✓"
-  else
-    echo "[launcher] ⚠ pywebview 未安装：桌面窗口可能起不来，HTTP server 仍可用。"
-    echo "[launcher]   补装：$VENV_PY -m pip install pywebview"
-  fi
-fi
+echo "[launcher] 隔离 Python ✓（$("$VENV_PY" -V 2>&1)）"
+echo "[launcher] pywebview ✓（由 setup 的 --check 保证）"
 
 # 告知 server：环境就绪，跳过 torch/rust 等重依赖阻塞检查
 export GARGANTUA_NO_DEPCHECK=1

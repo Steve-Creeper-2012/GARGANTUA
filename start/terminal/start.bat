@@ -21,8 +21,18 @@ setlocal
 set "SCRIPT_DIR=%~dp0"
 for %%I in ("%SCRIPT_DIR%..\..") do set "ROOT=%%~fI"
 
+REM 缺 standalone Python / venv / pywebview → setup 自动测速选镜像下载
+REM binaries，空 environment\ 也能从零跑起来（绝不复用系统 Python）。
+set "BASE_PY=%ROOT%\environment\python\python\python.exe"
+if not exist "%BASE_PY%" goto :need_setup
+call "%SCRIPT_DIR%setup.bat" --check >nul 2>&1
+if errorlevel 1 goto :need_setup
+goto :env_ready
+:need_setup
+echo [launcher] 调用 setup：自动测速选镜像下载 binaries（全部落项目内）...
 call "%SCRIPT_DIR%setup.bat"
 if errorlevel 1 exit /b 1
+:env_ready
 
 set "PY=%ROOT%\environment\venv\Scripts\python.exe"
 if not exist "%PY%" (
@@ -31,7 +41,10 @@ if not exist "%PY%" (
 )
 
 echo [launcher] 交接给 server ...
-start "GARGANTUA server" /MIN "%PY%" "%ROOT%\server\server.py" %*
+REM /D：子进程 cwd 固定为项目根，避免双击时 cwd 落在别处让相对路径跑偏。
+REM stdout 留在自己的最小化控制台窗口（不写任何项目外的日志文件）；
+REM 项目内的运行日志统一在 logs\ 下，由 server 自己写。
+start "GARGANTUA server" /MIN /D "%ROOT%" "%PY%" "%ROOT%\server\server.py" %*
 
 echo [launcher] OK  server 已在后台启动（最小化窗口），本窗口即将关闭。
 endlocal

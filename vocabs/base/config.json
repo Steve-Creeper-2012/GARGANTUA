@@ -1,7 +1,7 @@
 {
   "name": "base",
   "format": "gargantua-vocab-folder-v1",
-  "created": "2026-10-31 20:07:32",
+  "created": "2026-11-02 04:12:55",
   "source": null,
   "description": "基础词表（系统预设，不可直接编辑）",
   "is_main": true,
@@ -19,7 +19,7 @@
     {
       "region": "draw",
       "category": "special",
-      "size": 2961
+      "size": 9605
     },
     {
       "region": "digit",
@@ -62,5 +62,6 @@
       "size": 26
     }
   ],
-  "vocab_size": 69376
+  "vocab_size": 76020,
+  "head_size": 9614
 }

@@ -32,11 +32,21 @@ class TestShapes(unittest.TestCase):
     """ 形状与参数量。 """
 
     def test_total_params_in_budget(self):
-        m = model.Gargantua(vocab_size=_VS)
-        n = sum(p.numel() for p in m.parameters())
-        # 预算 ~500M，允许上浮（embedding 不绑定 + 527.9M 实测基线）
-        self.assertGreater(n, 450e6)
-        self.assertLess(n, 600e6)
+        # 2026-11-04：每个 block 的 FFN 从 1 个变 5 个，默认 4+6 blocks
+        # 从 ~527M 涨到 ~1.03B（fp32 ≈ 4.1GB）。真实例化全尺寸 + 反向
+        # 在老机器上会吃掉十几 GB，所以用 1+1 小模型量出「单 block」与
+        # 「全局部分」，再按默认 block 数算术推算预算——契约照测，不炸内存。
+        small = model.Gargantua(vocab_size=_VS, n_enc_blocks=1,
+                                n_dec_blocks=1)
+        n_small = sum(p.numel() for p in small.parameters())
+        per_block = sum(p.numel() for p in small.enc_blocks[0].parameters())
+        globals_ = n_small - 2 * per_block
+        n_default = (globals_ +
+                     (spec.N_ENC_BLOCKS + spec.N_DEC_BLOCKS) * per_block)
+        # 预算 ~1B（5 FFN/block 后的新基线），允许上下浮动
+        self.assertGreater(n_default, 900e6)
+        self.assertLess(n_default, 1200e6)
+        del small
 
     def test_kda_shapes(self):
         kda = model.KDAAttention()
@@ -51,7 +61,10 @@ class TestShapes(unittest.TestCase):
 
     def test_forward_train_and_backward(self):
         torch.manual_seed(0)
-        m = model.Gargantua(vocab_size=_VS)
+        # 2026-11-04：block 内 5 个 FFN，全尺寸 4+6 blocks ≈ 4.1GB fp32。
+        # 形状/前向/反向契约与 block 数无关，用 1+1 覆盖全部子层类型即可，
+        # 免得单个测试进程反复实例化 1B 参数模型把内存打爆。
+        m = model.Gargantua(vocab_size=_VS, n_enc_blocks=1, n_dec_blocks=1)
         ids_in = torch.randint(64, 70000, (1, 6))
         steps_in = torch.arange(6).unsqueeze(0)
         ids_t = torch.randint(64, 70000, (1, 4))
@@ -61,8 +74,14 @@ class TestShapes(unittest.TestCase):
         loss = F.cross_entropy(logits.view(-1, logits.shape[-1]),
                                torch.randint(64, 70000, (4,)))
         loss.backward()
-        # 随机初始化 loss 应接近 ln(V)
-        self.assertAlmostEqual(loss.item(), 11.27, delta=0.6)
+        # 随机初始化 loss 应接近 ln(V)。**期望值必须跟着词表长度走**：
+        # 2026-10-31 词表从 69376 涨到 74361（图元区扩到 1920×1080），
+        # ln(V) 从 11.15 变 11.22；写死 11.27 的旧断言在换词表后必然失败。
+        # 容差 1.5 nat 覆盖「同一 seed 下隐层规模不变、但 RNG 流因词表
+        # 变大而整体后移」带来的随机偏移（实测 0.82）。
+        import math
+        self.assertLess(abs(loss.item() - math.log(m.n_vocab)), 1.5,
+                        f"loss={loss.item():.3f} 偏离 ln(V)={math.log(m.n_vocab):.3f}")
         grads = [p.grad.norm().item() for p in m.parameters()
                  if p.grad is not None]
         self.assertTrue(all(g == g for g in grads))          # 无 NaN
@@ -172,13 +191,20 @@ class TestAttnResAndBlockOrder(unittest.TestCase):
     """ 2026-10-25：block 顺序 + Kimi Block AttnRes（子层级 + 块末标量门）。"""
 
     def test_block_order_contract(self):
+        # 2026-11-04：KDA / MLA 之后各紧跟一个独立 FFN
         self.assertEqual(spec.BLOCK_ORDER,
-                         ["kda", "kda", "kda", "mla_csa", "mla_hca",
-                          "ffn", "attnres"])
+                         ["kda", "ffn", "kda", "ffn", "kda", "ffn",
+                          "mla_csa", "ffn", "mla_hca", "ffn", "attnres"])
+        self.assertEqual(spec.N_FFN_PER_BLOCK, 5)
+        self.assertEqual(spec.N_SUBL_LAYERS, 10)
 
     def test_block_forward_returns_updated_blocks(self):
         torch.manual_seed(7)
         b = model.Block(is_decoder=True)
+        self.assertEqual(len(b.ffns), spec.N_FFN_PER_BLOCK)
+        self.assertEqual(len(b.norms), spec.N_SUBL_LAYERS)
+        self.assertEqual(len({id(f.ffn_up.weight) for f in b.ffns}),
+                         spec.N_FFN_PER_BLOCK, "5 个 FFN 必须是独立实例")
         x = torch.randn(1, 5, spec.D_MODEL)
         steps = torch.arange(5).unsqueeze(0)
         out, blocks = b(x, (None, None), (None, None), steps, [x])
@@ -209,7 +235,10 @@ class TestSharedKV(unittest.TestCase):
     """ 统一 KV 流：滑窗整步丢弃、双层视图、图元 9:1 就地压缩。"""
 
     def _mk(self):
-        m = model.Gargantua(vocab_size=_VS)
+        # 2026-11-04：block 内 5 个 FFN，全尺寸 4+6 blocks ≈ 4.1GB fp32。
+        # 形状/前向/反向契约与 block 数无关，用 1+1 覆盖全部子层类型即可，
+        # 免得单个测试进程反复实例化 1B 参数模型把内存打爆。
+        m = model.Gargantua(vocab_size=_VS, n_enc_blocks=1, n_dec_blocks=1)
         return model.SharedKV(m.csa_compressor, m.hca_compressor, m.draw_packer)
 
     def test_eviction_step_atomic(self):
@@ -271,7 +300,10 @@ class TestMultimodalAssemble(unittest.TestCase):
         from tokens.audio_codec import waveform_to_steps
         from tokens.text_codec import encode as text_encode
 
-        m = model.Gargantua(vocab_size=_VS)
+        # 2026-11-04：block 内 5 个 FFN，全尺寸 4+6 blocks ≈ 4.1GB fp32。
+        # 形状/前向/反向契约与 block 数无关，用 1+1 覆盖全部子层类型即可，
+        # 免得单个测试进程反复实例化 1B 参数模型把内存打爆。
+        m = model.Gargantua(vocab_size=_VS, n_enc_blocks=1, n_dec_blocks=1)
         steps = list(text_encode("你好"))
         steps.append(image_to_step(Image.new("RGBA", (64, 64), (200, 30, 30, 255))))
         steps.append(waveform_to_steps(np.zeros(600, dtype=np.int16))[0])
@@ -285,7 +317,10 @@ class TestMultimodalAssemble(unittest.TestCase):
         from PIL import Image
         from tokens.image_codec import image_to_step
         torch.manual_seed(0)
-        m = model.Gargantua(vocab_size=_VS)
+        # 2026-11-04：block 内 5 个 FFN，全尺寸 4+6 blocks ≈ 4.1GB fp32。
+        # 形状/前向/反向契约与 block 数无关，用 1+1 覆盖全部子层类型即可，
+        # 免得单个测试进程反复实例化 1B 参数模型把内存打爆。
+        m = model.Gargantua(vocab_size=_VS, n_enc_blocks=1, n_dec_blocks=1)
         steps = [image_to_step(Image.new("RGBA", (64, 64), (1, 2, 3, 255)))]
         emb, sids = m.assemble_embeddings(steps)
         logits = m.forward_train_embeddings(emb, sids, emb, sids + 1)

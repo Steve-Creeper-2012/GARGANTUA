@@ -56,7 +56,7 @@ class HeadContractTest(unittest.TestCase):
 
     def test_head_size_matches_spec(self):
         self.assertEqual(_H, spec.HEAD_SIZE)
-        self.assertEqual(_H, 6 + 3 + 2961)
+        self.assertEqual(_H, 6 + 3 + spec.DRAW_VOCAB_SIZE)
         self.assertEqual(len(_HEAD), _H)
 
     def test_head_ids_are_dense(self):
@@ -66,7 +66,14 @@ class HeadContractTest(unittest.TestCase):
         # 不可显示条目的 text 自带尖括号，与 spec / vocab.json 的拼写一致
         self.assertEqual([e[1] for e in _HEAD[:6]], list(spec.SPECIAL_TOKENS))
         self.assertEqual([e[1] for e in _HEAD[6:9]], spec.SYSTEM_CHARS)
-        self.assertEqual(_HEAD[9][1], "<cx:0>")
+        # DRAW 区第 0 段是画布声明定界符（2026-11-01：<x> <x/> <y> <y/>），
+        # 其后 x/y 字段是「名字 = 像素号」的 <x0>… / <y0>…
+        self.assertEqual(_HEAD[9][1], spec.DRAW_CANVAS_OPEN_X)
+        self.assertEqual(_HEAD[9 + 1][1], spec.DRAW_CANVAS_CLOSE_X)
+        self.assertEqual(_HEAD[9 + 2][1], spec.DRAW_CANVAS_OPEN_Y)
+        self.assertEqual(_HEAD[9 + spec.DRAW_CANVAS_BINS - 1][1],
+                         spec.DRAW_CANVAS_CLOSE_Y)
+        self.assertEqual(_HEAD[9 + spec.DRAW_CANVAS_BINS][1], "<x0>")
         self.assertEqual(_HEAD[_H - 1][1], "<draw:special:2>")
 
     def test_common_english_words_do_not_collide_with_head(self):
@@ -97,16 +104,22 @@ class HeadContractTest(unittest.TestCase):
         self.assertEqual(lines[0], vfc.MAGIC)
         self.assertEqual(lines[1], "<caps>:0")
         self.assertEqual(lines[7], '"{":6')
-        self.assertEqual(lines[10], "<cx:0>:9")
-        self.assertEqual(lines[1 + _H - 1], "<draw:special:2>:B99")
+        # ID 9-12：画布声明定界符；ID 13：x 字段第一个像素 token
+        self.assertEqual(lines[10], "<x>:9")
+        self.assertEqual(lines[13], "<y/>:C")
+        self.assertEqual(lines[14], f"<x0>:{13:X}")
+        last = _H - 1
+        self.assertEqual(lines[1 + last], f"<draw:special:2>:{last:X}")
 
 
 class RoundTripTest(unittest.TestCase):
     """dumps_vfc → parse_vfc 得到同样条目。"""
 
-    # 覆盖：中文、emoji（非 BMP）、单引号、双引号、换行、制表符、CR、反斜杠
+    # 覆盖：中文、emoji（非 BMP）、单引号、双引号、换行、制表符、CR、反斜杠。
+    # "<zz>"：长得像不可显示名但不在契约头里的可见 token（2026-11-01 起
+    # 契约头里有真的 <x>/<y>，可见区不能再收这四个文本，会撞「全表唯一」）。
     _TEXTS = ["hello", "中文", "\U0001f600", "it's", 'say "hi"',
-              "a" + NL + "b", "x\ty", "r\rn", "back\\slash", "<x>",
+              "a" + NL + "b", "x\ty", "r\rn", "back\\slash", "<zz>",
               " ", "\x00", "\x7f", " "]
 
     def test_roundtrip_keeps_entries(self):

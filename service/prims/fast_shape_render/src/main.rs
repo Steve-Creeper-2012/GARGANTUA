@@ -18,10 +18,51 @@ use wgpu::util::DeviceExt;
 // ==========================================
 const W: u32 = 256;
 const H: u32 = 256;
+
+/// 画布尺寸：默认 256×256，可用环境变量覆盖。
+///
+/// 2026-11-02（steve）：原来 W/H 是编译期常量，任何非 256×256 的画布都只能
+/// 「先拉成正方形拟合、再由调用方拉伸回去」——中间态是变形的，旋转过的矩形
+/// 拉回去会变成平行四边形。这里改成运行时参数，调用方按目标画布的**长宽比**
+/// 直接给一个小尺寸（如 16:9 → 256×144），拟合全程比例正确，输出等比放大即可。
+///
+///   SHAPE_RENDERER_CANVAS_WIDTH  / SHAPE_RENDERER_CANVAS_HEIGHT
+///   SHAPE_RENDERER_MAX_HALF_SIZE（默认 = max(宽,高) / 2）
+fn canvas_dims() -> (u32, u32) {
+    let w = positive_u32_env("SHAPE_RENDERER_CANVAS_WIDTH").unwrap_or(W);
+    let h = positive_u32_env("SHAPE_RENDERER_CANVAS_HEIGHT").unwrap_or(H);
+    (w, h)
+}
+
+fn positive_u32_env(name: &str) -> Option<u32> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|&value| value > 0)
+}
 const ALPHA: f32 = 0.5;
 const PENALTY_FACTOR: f32 = 1.8;
 
 const MAX_ITERATIONS: usize = 275;
+
+/// 搜索轮数上限：默认 275，可用 `SHAPE_RENDERER_MAX_ITERATIONS` 覆盖。
+///
+/// 2026-11-03（steve）：原来它同时是「shader 里的 history 步长」和
+/// 「SHAPE_RENDERER_MAX_OUTPUT_STEPS 的合法上界」，写死 275 → 前端把步数
+/// 调到 10000 直接被拒（`合法范围为 1..=276`）。现在整条链都读这个值，
+/// 步数上限真正跟着用户走。
+///
+/// 用 OnceLock 而不是到处传参：它只影响缓冲区尺寸/切片步长/循环上界，
+/// 进程内一次定值即可，改签名会牵连 6 个函数。
+static MAX_ITERATIONS_OVERRIDE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+fn max_iterations() -> usize {
+    *MAX_ITERATIONS_OVERRIDE.get_or_init(|| {
+        positive_usize_env("SHAPE_RENDERER_MAX_ITERATIONS")
+            .map(|v| v.clamp(1, 20_000))
+            .unwrap_or(MAX_ITERATIONS)
+    })
+}
 
 // ==========================================
 // 🧬 GPU 搜索与变异配置
@@ -43,7 +84,8 @@ const HEIGHT_MUTATION_RANGE: f32 = 28.0;
 /// 供人编辑时使用角度制；生成 WGSL 时转换成弧度。
 const ANGLE_MUTATION_RANGE_DEGREES: f32 = 16.0;
 const MIN_HALF_SIZE: f32 = 1.0;
-const MAX_HALF_SIZE: f32 = 128.0;
+// 半尺寸上限不再是常量：随画布走（max(宽,高)/2，256 画布 = 128），
+// 见 shader_constants()。可用 SHAPE_RENDERER_MAX_HALF_SIZE 覆盖。
 
 // 五类变异的相对权重。全部为 1 时与旧版 hash % 5 完全一致。
 const POSITION_MUTATION_WEIGHT: u32 = 1;
@@ -64,8 +106,23 @@ const NUM_VERSIONS: usize = 10;
 const MAX_CSV_SIZE_BYTES: usize = 1024 * 1024 * 1024;
 
 // 🛑 早停机制配置
+//
+// 2026-11-03（steve）：早停是「连续 HISTORY_WINDOW 步都没什么改善就收工」，
+// 不是 bug —— 但它会让「步数上限 20000」实际只跑出 3975 个图元。现在
+// 可以用 SHAPE_RENDERER_EARLY_STOP=0 关掉，跑满指定步数。
+// shader 里本来就是 `if (HISTORY_WINDOW > 0u) { … }`，传 0 即整段跳过。
 const HISTORY_WINDOW: usize = 1000;
 const EARLY_STOP_THRESHOLD: f32 = 0.0005;
+
+fn history_window() -> usize {
+    static OVERRIDE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        match std::env::var("SHAPE_RENDERER_EARLY_STOP").ok().as_deref() {
+            Some("0") | Some("false") | Some("off") => 0,
+            _ => HISTORY_WINDOW,
+        }
+    })
+}
 
 // ==========================================
 // 🧩 辅助结构体
@@ -104,14 +161,21 @@ struct CsvState {
     current_size: usize,
 }
 
-fn shader_constants() -> ShaderConstants {
+fn shader_constants(canvas_w: u32, canvas_h: u32) -> ShaderConstants {
+    // 半尺寸上限跟画布走：256×256 时是 128（与上游默认一致），
+    // 256×144 时是 128（取长边的一半，允许形状比画布高，与上游语义一致）。
+    let max_half_size = std::env::var("SHAPE_RENDERER_MAX_HALF_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or_else(|| canvas_w.max(canvas_h) as f32 / 2.0);
     ShaderConstants {
-        canvas_width: W,
-        canvas_height: H,
+        canvas_width: canvas_w,
+        canvas_height: canvas_h,
         shape_alpha: ALPHA,
         penalty_factor: PENALTY_FACTOR,
-        max_iterations: MAX_ITERATIONS,
-        history_window: HISTORY_WINDOW,
+        max_iterations: max_iterations(),
+        history_window: history_window(),
         early_stop_threshold: EARLY_STOP_THRESHOLD,
         initial_candidate_count: INITIAL_CANDIDATE_COUNT,
         survivor_count: SURVIVOR_COUNT,
@@ -122,7 +186,7 @@ fn shader_constants() -> ShaderConstants {
         height_mutation_range: HEIGHT_MUTATION_RANGE,
         angle_mutation_range_degrees: ANGLE_MUTATION_RANGE_DEGREES,
         min_half_size: MIN_HALF_SIZE,
-        max_half_size: MAX_HALF_SIZE,
+        max_half_size,
         mutation_weights: [
             POSITION_MUTATION_WEIGHT,
             WIDTH_MUTATION_WEIGHT,
@@ -162,7 +226,8 @@ fn validate_shader_constants(constants: &ShaderConstants) -> Result<u32, String>
             u32::MAX
         ));
     }
-    if constants.history_window == 0 || constants.history_window > u32::MAX as usize {
+    // 0 = 关闭早停（合法），只有超过 u32 才拒
+    if constants.history_window > u32::MAX as usize {
         return Err(format!(
             "❌ 参数 HISTORY_WINDOW={} 无效：合法范围为 1..={}",
             constants.history_window,
@@ -203,11 +268,13 @@ fn validate_shader_constants(constants: &ShaderConstants) -> Result<u32, String>
         || !constants.max_half_size.is_finite()
         || constants.min_half_size < 1.0
         || constants.min_half_size > constants.max_half_size
-        || constants.max_half_size > 128.0
+        || constants.max_half_size > constants.canvas_width.max(constants.canvas_height) as f32
     {
         return Err(format!(
-            "❌ 参数半尺寸范围 [{}, {}] 无效：必须满足 1.0 <= MIN_HALF_SIZE <= MAX_HALF_SIZE <= 128.0",
-            constants.min_half_size, constants.max_half_size
+            "❌ 参数半尺寸范围 [{}, {}] 无效：必须满足 1.0 <= MIN_HALF_SIZE <= MAX_HALF_SIZE <= max(画布宽,高)（当前 {}）",
+            constants.min_half_size,
+            constants.max_half_size,
+            constants.canvas_width.max(constants.canvas_height)
         ));
     }
 
@@ -455,11 +522,11 @@ fn output_step_limit() -> Result<Option<usize>, String> {
     let value = raw_value.to_string_lossy().parse::<usize>().map_err(|_| {
         "❌ SHAPE_RENDERER_MAX_OUTPUT_STEPS 必须是正整数（包含背景步骤）。".to_string()
     })?;
-    if value == 0 || value > MAX_ITERATIONS + 1 {
+    if value == 0 || value > max_iterations() + 1 {
         return Err(format!(
             "❌ SHAPE_RENDERER_MAX_OUTPUT_STEPS={} 无效；合法范围为 1..={}（包含背景步骤）。",
             value,
-            MAX_ITERATIONS + 1
+            max_iterations() + 1
         ));
     }
     Ok(Some(value))
@@ -487,12 +554,12 @@ fn output_dir() -> PathBuf {
         })
 }
 
-fn preprocess_image(path: &Path) -> HostImgData {
+fn preprocess_image(path: &Path, w: u32, h: u32) -> HostImgData {
     let img = image::open(path)
         .unwrap_or_else(|err| panic!("❌ 无法读取图片 {}: {err}", path.display()))
-        .resize_exact(W, H, FilterType::Lanczos3)
+        .resize_exact(w, h, FilterType::Lanczos3)
         .into_rgb8();
-    let mut target_pixels = vec![0u32; (W * H) as usize];
+    let mut target_pixels = vec![0u32; (w * h) as usize];
     let mut sum_r = 0u64;
     let mut sum_g = 0u64;
     let mut sum_b = 0u64;
@@ -507,7 +574,7 @@ fn preprocess_image(path: &Path) -> HostImgData {
         sum_b += b as u64;
     }
 
-    let count = (W * H) as u64;
+    let count = (w * h) as u64;
     let bg_r = (sum_r / count) as u8;
     let bg_g = (sum_g / count) as u8;
     let bg_b = (sum_b / count) as u8;
@@ -582,19 +649,24 @@ fn format_image_sequence(
     Ok(text)
 }
 
-fn create_gpu_shards(engines: &[GpuEngine], host_data: &[HostImgData]) -> Vec<GpuBatchShard> {
+fn create_gpu_shards(
+    engines: &[GpuEngine],
+    host_data: &[HostImgData],
+    w: u32,
+    h: u32,
+) -> Vec<GpuBatchShard> {
     balanced_ranges(host_data.len(), engines.len())
         .into_iter()
         .enumerate()
         .map(|(engine_index, range)| {
             let num_images = range.end - range.start;
-            let pixel_count = num_images * (W * H) as usize;
+            let pixel_count = num_images * (w * h) as usize;
             let mut flat_targets = Vec::with_capacity(pixel_count);
             let mut canvas_base = Vec::with_capacity(pixel_count);
 
             for data in &host_data[range.clone()] {
                 flat_targets.extend_from_slice(&data.target_pixels);
-                canvas_base.extend(std::iter::repeat_n(data.bg_packed, (W * H) as usize));
+                canvas_base.extend(std::iter::repeat_n(data.bg_packed, (w * h) as usize));
             }
 
             let target_buf = engines[engine_index].device.create_buffer_init(
@@ -632,10 +704,10 @@ async fn process_version_on_gpu(
     steps_to_run: usize,
     max_output_steps: Option<usize>,
 ) -> Result<Vec<String>, String> {
-    if steps_to_run == 0 || steps_to_run > MAX_ITERATIONS {
+    if steps_to_run == 0 || steps_to_run > max_iterations() {
         return Err(format!(
-            "GPU {} 的执行步数 {} 无效，合法范围为 1..={MAX_ITERATIONS}",
-            engine.gpu_index, steps_to_run
+            "GPU {} 的执行步数 {} 无效，合法范围为 1..={}",
+            engine.gpu_index, steps_to_run, max_iterations()
         ));
     }
 
@@ -693,7 +765,7 @@ async fn process_version_on_gpu(
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
 
-    let history_byte_size = (num_images * MAX_ITERATIONS * std::mem::size_of::<GpuShape>()) as u64;
+    let history_byte_size = (num_images * max_iterations() * std::mem::size_of::<GpuShape>()) as u64;
     let states_byte_size = (num_images * std::mem::size_of::<ImageState>()) as u64;
 
     let history_buf = engine.device.create_buffer(&wgpu::BufferDescriptor {
@@ -703,7 +775,8 @@ async fn process_version_on_gpu(
         mapped_at_creation: false,
     });
 
-    let error_history_byte_size = (num_images * HISTORY_WINDOW * std::mem::size_of::<f32>()) as u64;
+    let error_history_byte_size =
+        (num_images * history_window().max(1) * std::mem::size_of::<f32>()) as u64;
     let error_history_buf = engine.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Early Stop Error History"),
         size: error_history_byte_size,
@@ -742,6 +815,20 @@ async fn process_version_on_gpu(
         ],
     });
 
+    // 🎞️ 实时流：设置 SHAPE_RENDERER_STREAM_FILE 时，每 sync_interval 步就把
+    // 新采纳的图元追加写进该文件（一行一个，CSV schema）。前端据此边算边画。
+    // 只对「单图」开放——多图时 history 按 img_idx 分段，语义会乱。
+    let mut stream_writer: Option<fs::File> = std::env::var("SHAPE_RENDERER_STREAM_FILE")
+        .ok()
+        .filter(|_| num_images == 1)
+        .and_then(|path| fs::File::create(path).ok());
+    let mut streamed_steps: usize = 0;
+    let sync_interval = if stream_writer.is_some() {
+        5 // 流式：5 步一同步，肉眼够顺，又不至于每步都停一次 GPU
+    } else {
+        GPU_QUEUE_SYNC_INTERVAL
+    };
+
     for step in 0..steps_to_run {
         config_data.seed = rng.gen();
         config_data.step = step as u32;
@@ -750,13 +837,45 @@ async fn process_version_on_gpu(
             .write_buffer(&config_buf, 0, bytemuck::bytes_of(&config_data));
         engine.dispatch_step(&bind_group, num_images as u32);
 
-        if (step + 1) % GPU_QUEUE_SYNC_INTERVAL == 0 || step + 1 == steps_to_run {
+        if (step + 1) % sync_interval == 0 || step + 1 == steps_to_run {
             engine.wait_for_gpu(&format!(
                 "v{} 第 {}/{} 步队列同步",
                 version + 1,
                 step + 1,
                 steps_to_run
             ))?;
+
+            if let Some(writer) = stream_writer.as_mut() {
+                let from = (streamed_steps * std::mem::size_of::<GpuShape>()) as u64;
+                let count = step + 1 - streamed_steps;
+                let bytes = (count * std::mem::size_of::<GpuShape>()) as u64;
+                if count > 0 {
+                    let chunk = engine
+                        .read_buffer_range::<GpuShape>(&history_buf, from, bytes, "Stream")
+                        .await?;
+                    for shape in chunk {
+                        // 未被采纳的步写成 delta_err=9999 的 dummy；缓冲未写入时是 0
+                        if shape.delta_err < 0.0 {
+                            let _ = writeln!(
+                                writer,
+                                "stream,{},{},{},{},{},{},{},{},{}",
+                                shape.cx,
+                                shape.cy,
+                                shape.hw * 2.0,
+                                shape.hh * 2.0,
+                                shape.shape_type,
+                                shape.theta,
+                                shape.r,
+                                shape.g,
+                                shape.b
+                            );
+                        }
+                    }
+                    let _ = writer.flush();
+                    streamed_steps = step + 1;
+                }
+            }
+
             println!(
                 "  ⏳ GPU {} v{}: 已完成 {}/{} 步",
                 engine.gpu_index,
@@ -782,7 +901,7 @@ async fn process_version_on_gpu(
         num_images
     );
 
-    let history_items_per_image = MAX_ITERATIONS;
+    let history_items_per_image = max_iterations();
     let history_bytes_per_image =
         (history_items_per_image * std::mem::size_of::<GpuShape>()) as u64;
     let readback_images = history_readback_images().min(num_images).max(1);
@@ -828,7 +947,8 @@ async fn process_version_on_gpu(
                 .ok_or_else(|| format!("❌ 图片文件名无效：{}", path.display()))?;
             let bg = image_data[local_index].bg_color;
             let history_slice =
-                &all_history[local_index * MAX_ITERATIONS..(local_index + 1) * MAX_ITERATIONS];
+                &all_history[local_index * history_items_per_image
+                    ..(local_index + 1) * history_items_per_image];
             format_image_sequence(file_name, bg, history_slice, max_output_steps)
         })
         .collect();
@@ -883,7 +1003,8 @@ fn write_version_csv(
 // ==========================================
 async fn run() -> Result<(), String> {
     // 在访问数据集和创建 GPU 前完成参数校验与 WGSL 生成。
-    let shader_constants = shader_constants();
+    let (canvas_w, canvas_h) = canvas_dims();
+    let shader_constants = shader_constants(canvas_w, canvas_h);
     let shader_source = build_shader_source(&shader_constants)?;
     print_shader_constants(&shader_constants);
 
@@ -912,9 +1033,9 @@ async fn run() -> Result<(), String> {
     println!(
         "🧬 计划生成版本数: {} | 画布: {}x{} | GPU 最大步数: {} | 输出步骤上限: {} | 单个 CSV 上限: {} MB",
         num_versions,
-        W,
-        H,
-        MAX_ITERATIONS,
+        canvas_w,
+        canvas_h,
+        max_iterations(),
         max_output_steps
             .map(|value| value.to_string())
             .unwrap_or_else(|| "不限制".to_string()),
@@ -948,9 +1069,9 @@ async fn run() -> Result<(), String> {
 
         let host_data: Vec<HostImgData> = batch_paths
             .par_iter()
-            .map(|path| preprocess_image(path))
+            .map(|path| preprocess_image(path, canvas_w, canvas_h))
             .collect();
-        let gpu_shards = create_gpu_shards(&engines, &host_data);
+        let gpu_shards = create_gpu_shards(&engines, &host_data, canvas_w, canvas_h);
         let active_engines = &engines[..gpu_shards.len()];
 
         for version in 0..num_versions {
@@ -967,7 +1088,7 @@ async fn run() -> Result<(), String> {
                         batch_paths,
                         &host_data,
                         version,
-                        MAX_ITERATIONS,
+                        max_iterations(),
                         max_output_steps,
                     ))
                 })
@@ -1144,7 +1265,7 @@ mod tests {
 
     #[test]
     fn default_shader_constants_match_current_production_configuration() {
-        let constants = shader_constants();
+        let constants = shader_constants(W, H);
         assert_eq!(constants.canvas_width, 256);
         assert_eq!(constants.canvas_height, 256);
         assert_eq!(constants.shape_alpha, 0.5);
@@ -1167,7 +1288,7 @@ mod tests {
 
     #[test]
     fn generated_shader_contains_constants_and_no_template_markers() {
-        let source = build_shader_source(&shader_constants()).unwrap();
+        let source = build_shader_source(&shader_constants(W, H)).unwrap();
         assert!(source.contains("const CANVAS_WIDTH: u32 = 256u;"));
         assert!(source.contains("const INITIAL_CANDIDATE_COUNT: u32 = 50u;"));
         assert!(source.contains("const SURVIVOR_COUNT: u32 = 5u;"));
@@ -1181,43 +1302,44 @@ mod tests {
 
     #[test]
     fn rejects_invalid_shader_constants_before_gpu_initialization() {
-        let mut invalid = shader_constants();
+        let mut invalid = shader_constants(W, H);
         invalid.survivor_count = invalid.initial_candidate_count + 1;
         assert!(validate_shader_constants(&invalid)
             .unwrap_err()
             .contains("SURVIVOR_COUNT"));
 
-        invalid = shader_constants();
+        invalid = shader_constants(W, H);
         invalid.mutation_stagnation_limit = 0;
         assert!(validate_shader_constants(&invalid)
             .unwrap_err()
             .contains("MUTATION_STAGNATION_LIMIT"));
 
-        invalid = shader_constants();
+        invalid = shader_constants(W, H);
         invalid.mutation_stagnation_limit = invalid.max_mutations_per_survivor + 1;
         assert!(validate_shader_constants(&invalid)
             .unwrap_err()
             .contains("MAX_MUTATIONS_PER_SURVIVOR"));
 
-        invalid = shader_constants();
-        invalid.max_half_size = 129.0;
+        invalid = shader_constants(W, H);
+        // 2026-11-02：上限不再是 128，而是 max(画布宽,高)；256 画布 → 256
+        invalid.max_half_size = 257.0;
         assert!(validate_shader_constants(&invalid)
             .unwrap_err()
             .contains("MAX_HALF_SIZE"));
 
-        invalid = shader_constants();
+        invalid = shader_constants(W, H);
         invalid.position_mutation_range = -1.0;
         assert!(validate_shader_constants(&invalid)
             .unwrap_err()
             .contains("POSITION_MUTATION_RANGE"));
 
-        invalid = shader_constants();
+        invalid = shader_constants(W, H);
         invalid.mutation_weights = [0; 5];
         assert!(validate_shader_constants(&invalid)
             .unwrap_err()
             .contains("至少一个权重"));
 
-        invalid = shader_constants();
+        invalid = shader_constants(W, H);
         invalid.mutation_weights = [u32::MAX, 1, 0, 0, 0];
         assert!(validate_shader_constants(&invalid)
             .unwrap_err()
@@ -1405,7 +1527,7 @@ mod tests {
     #[ignore = "requires local hardware GPU and runs one optimized compute step"]
     fn optimized_shader_computes_one_step_on_all_gpus() {
         configure_utf8_console();
-        let shader_source = build_shader_source(&shader_constants()).unwrap();
+        let shader_source = build_shader_source(&shader_constants(W, H)).unwrap();
         let engines = pollster::block_on(GpuEngine::discover_all(&shader_source)).unwrap();
         let pixel_count = (W * H) as usize;
         let paths: Vec<PathBuf> = (0..engines.len())
@@ -1426,7 +1548,7 @@ mod tests {
                 }
             })
             .collect();
-        let shards = create_gpu_shards(&engines, &host_data);
+        let shards = create_gpu_shards(&engines, &host_data, W, H);
 
         let groups: Vec<Vec<String>> = engines
             .par_iter()

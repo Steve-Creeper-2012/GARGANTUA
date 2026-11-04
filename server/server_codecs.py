@@ -15,6 +15,7 @@ import os
 import tempfile
 
 import spec
+from paths import project_tmp_dir
 from tokens import audio_codec, draw_codec, image_codec, tok5
 from prims.image_to_primitives import image_to_primitives
 from server_media import (MAX_AUDIO_TOKENS, MAX_PATCHES_TOTAL, b64_to_pil,
@@ -57,6 +58,38 @@ def codec_vocab(body):
         return get_vocab()
     from vocab_presets import load_vocab
     return load_vocab(name)
+
+
+def parse_draw_canvas(value):
+    """请求体里的画布参数 → (宽, 高) 或 "auto"；缺省 = 默认画布（256×256）。
+
+    接受三种写法：'auto'（按图片长宽比自动挑一档）、[宽, 高]、
+    "宽x高"（'×' 也认）。尺寸只要在契约范围内就行（1..1920 × 1..1080）——
+    画布不再是固定档位，token 侧用 `<x>数字<x/>` 表达任意整数。
+    """
+    if value is None:
+        return spec.DRAW_DEFAULT_CANVAS
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    if isinstance(value, str):
+        parts = value.lower().replace("×", "x").split("x")
+        if len(parts) != 2:
+            raise ValueError(f"画布格式应为 auto / 宽x高: {value!r}")
+        try:
+            value = [int(parts[0]), int(parts[1])]
+        except ValueError:
+            raise ValueError(f"画布格式应为 auto / 宽x高: {value!r}") from None
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"画布必须是 auto 或 [宽, 高]: {value!r}")
+    try:
+        w, h = int(value[0]), int(value[1])
+    except (TypeError, ValueError):
+        raise ValueError(f"画布宽高必须是整数: {value!r}") from None
+    if not spec.draw_canvas_valid(w, h):
+        raise ValueError(
+            f"画布 {w}×{h} 超出契约范围（1..{spec.DRAW_CANVAS_MAX_W} × "
+            f"1..{spec.DRAW_CANVAS_MAX_H}）")
+    return (w, h)
 
 
 class CodecApi:
@@ -130,7 +163,8 @@ class CodecApi:
         # 旧实现写在 write() 之后，磁盘满/写入异常时临时文件永久泄漏
         apath = None
         try:
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False,
+                                             dir=project_tmp_dir()) as f:
                 f.write(data)
                 apath = f.name
             samples = decode_audio_any(apath, filename, spec.AUDIO_SR)
@@ -157,6 +191,9 @@ class CodecApi:
         }
 
     def api_codec_draw(self, body):
+        # 画布：tokens 路径由序列开头的画布 token 决定（没有就用默认）；
+        # primitives 路径看 body["canvas"]，缺省 256×256。
+        canvas = spec.DRAW_DEFAULT_CANVAS
         if "primitives" in body:
             raw = body["primitives"]
             if not isinstance(raw, list):
@@ -175,6 +212,10 @@ class CodecApi:
                 theta=p.get("theta", 0), r=p.get("r", 0),
                 g=p.get("g", 0), b=p.get("b", 0))
                 for p in raw]
+            canvas = parse_draw_canvas(body.get("canvas"))
+            if canvas == "auto":
+                # 这条路径没有图片可参考，auto 落回默认画布
+                canvas = spec.DRAW_DEFAULT_CANVAS
         elif "tokens" in body:
             toks = body["tokens"]
             if not isinstance(toks, list) or not all(
@@ -182,25 +223,28 @@ class CodecApi:
                     for t in toks):
                 raise ValueError("tokens 必须是整数数组")
             # 2026-10-27 审计修复：tokens 路径此前绕过 MAX_PRIMITIVES 上限，
-            # 一个巨大数组即可拖死渲染任务
-            if len(toks) > spec.DRAW_TOKENS_PER_PRIMITIVE * MAX_PRIMITIVES:
+            # 一个巨大数组即可拖死渲染任务。+1 是序列开头那个画布 token。
+            if len(toks) > (spec.DRAW_TOKENS_PER_PRIMITIVE * MAX_PRIMITIVES
+                            + 1):
                 raise ValueError(
                     f"绘图 token 数超限: {len(toks)} > "
-                    f"{spec.DRAW_TOKENS_PER_PRIMITIVE * MAX_PRIMITIVES}"
-                    f"（{MAX_PRIMITIVES} 个图元）")
-            prims = draw_codec.tokens_to_primitives(toks)
+                    f"{spec.DRAW_TOKENS_PER_PRIMITIVE * MAX_PRIMITIVES + 1}"
+                    f"（{MAX_PRIMITIVES} 个图元 + 画布）")
+            canvas, prims = draw_codec.decode_draw(toks)
         else:
             raise ValueError("缺少 primitives 或 tokens")
 
         def work():
-            tokens = draw_codec.primitives_to_tokens(prims)
-            buf = draw_codec.render_rgba(prims)
-            png = draw_codec.encode_png(bytes(buf), spec.CANVAS_W,
-                                        spec.CANVAS_H)
+            from tokens.vocab import get_vocab
+            vocab = get_vocab()
+            tokens = draw_codec.primitives_to_tokens(prims, canvas, vocab)
+            buf = draw_codec.render_rgba(prims, *canvas)
+            png = draw_codec.encode_png(bytes(buf), *canvas)
             return {
                 "png_b64": base64.b64encode(png).decode(),
-                "svg": draw_codec.primitives_to_svg(prims),
+                "svg": draw_codec.primitives_to_svg(prims, *canvas),
                 "tokens": tokens,
+                "canvas": list(canvas),
                 "n_primitives": len(prims),
             }
 
@@ -235,7 +279,8 @@ class CodecApi:
         # 保护（旧实现 finally 只包住解码，写入失败即泄漏）
         vpath = None
         try:
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False,
+                                             dir=project_tmp_dir()) as f:
                 f.write(data)
                 vpath = f.name
             frames = extract_video_frames(vpath)
@@ -305,23 +350,39 @@ class CodecApi:
         # 此前非法 quality 被静默改成 fast，用户以为自己选了 slow
         if quality not in ("fast", "slow"):
             raise ValueError(f"quality 必须是 fast/slow: {quality!r}")
-        if not (1 <= max_steps <= 1000):
-            raise ValueError(f"max_steps 必须在 [1, 1000]: {max_steps}")
+        # 2026-10-31：步数上限取消（steve 定案）。只守「至少 1 步」——
+        # 0 步会连背景之外的任何图元都不产生，属于误用而不是合法输入。
+        if max_steps < 1:
+            raise ValueError(f"max_steps 必须 ≥ 1: {max_steps}")
+        canvas = parse_draw_canvas(body.get("canvas"))
+        # 引擎：auto（默认，有 GPU 转换器就用）/ gpu（强制）/ cpu（强制）
+        engine = body.get("engine") or "auto"
+        if engine not in ("auto", "gpu", "cpu"):
+            raise ValueError(f"engine 必须是 auto/gpu/cpu: {engine!r}")
         tid = self.pool.submit(
-            lambda: self._image2prims(b64, max_steps, quality))
+            lambda: self._image2prims(b64, max_steps, quality, canvas, engine))
         return 202, {"task_id": tid}
 
-    def _image2prims(self, b64, max_steps, quality):
+    def _image2prims(self, b64, max_steps, quality, canvas, engine="auto"):
+        img = b64_to_pil(b64)
+        # "auto"：按图片长宽比挑画布——大图不会再被压进 256×256
+        if canvas == "auto":
+            canvas = spec.draw_canvas_auto(*img.size)
         prims, note = image_to_primitives(
-            b64_to_pil(b64), max_steps=max_steps, quality=quality)
-        tokens = draw_codec.primitives_to_tokens(prims)
+            img, max_steps=max_steps, quality=quality, canvas=canvas,
+            backend=engine)
+        # 画布声明里的数字是可见区的文本数字 token —— 要按当前词表解析
+        from tokens.vocab import get_vocab
+        vocab = get_vocab()
+        tokens = draw_codec.primitives_to_tokens(prims, canvas, vocab)
         return {
             "primitives": [{"cx": p.cx, "cy": p.cy, "w": p.w, "h": p.h,
                             "shape_type": p.shape_type, "theta": p.theta,
                             "r": p.r, "g": p.g, "b": p.b}
                            for p in prims],
             "n_primitives": len(prims),
+            "canvas": list(canvas),
             "tokens": tokens,
-            "svg": draw_codec.primitives_to_svg(prims),
+            "svg": draw_codec.primitives_to_svg(prims, *canvas),
             "note": note,
         }

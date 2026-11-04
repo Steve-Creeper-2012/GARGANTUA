@@ -9,9 +9,10 @@
 #     （macOS 读数走 sysctl / vm_stat / top / ps / system_profiler）。
 #   * 读不到的项一律返回 None，前端渲染为「—」——宁可少报，不可误报。
 #   * 更新检查走清华 PyPI 镜像（实测官方源 ~5KB/s，镜像 ~18MB/s），
-#     并尊重 start/requirements/core.txt 的版本约束：torch==2.2.2 是
-#     最后一个带 macOS x86_64 轮子的版本，钉住的包不报「可更新」，
-#     否则一个更新按钮就把主依赖契约（torch 2.2.2 / numpy<2）破坏掉。
+#     并尊重 start/requirements/{must,necessary}.txt 的版本约束：
+#     torch 2.2.2 是最后一个带 macOS x86_64 轮子的版本，硬上限（numpy<2）
+#     之外的更高版本不报违规（向后兼容，见 _core_constraints）；
+#     钉住的包不报「可更新」，否则一个更新按钮就把主依赖契约破坏掉。
 # ===========================================================================
 from __future__ import annotations
 
@@ -698,7 +699,7 @@ def _gargantua_processes(include_other=True):
 
 
 # ---------------------------------------------------------------------------
-# 依赖更新检查（清华镜像 + core.txt 版本约束）
+# 依赖更新检查（镜像版本查询 + 清单约束）
 # ---------------------------------------------------------------------------
 _DIST_NAME = {"PIL": "pillow", "cv2": "opencv-python"}
 
@@ -719,23 +720,20 @@ def _ver_tuple(v: str):
 
 
 def _core_constraints() -> dict:
-    """core.txt → {规范包名: [(op, version), ...]}。torch==2.2.2 / numpy<2。"""
-    path = os.path.join(ROOT, "start", "requirements", "core.txt")
+    """must.txt + necessary.txt → {规范包名: [(op, version), ...]}。
+
+    2026-11-01：清单从 core.txt 换成 must/necessary 两份，语义变了——
+    下限（>=）是「默认装哪版」不是「不许装更高」，所以这里只取**上限**
+    与 ==（numpy<2 这类硬约束），>= 不进约束表（否则会把用户故意装的
+    更新版本判成违规）。
+    """
+    from reqs import all_requirements
     spec = {}
-    try:
-        for line in open(path, encoding="utf-8"):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            m = re.match(r"^([A-Za-z0-9_.-]+)\s*([<>=!~].*)?$", line)
-            if not m:
-                continue
-            conds = []
-            for tok in re.findall(r"(==|!=|<=|>=|<|>)\s*([\d.]+)", m.group(2) or ""):
-                conds.append((tok[0], _ver_tuple(tok[1])))
-            spec[_norm(m.group(1))] = conds
-    except Exception:
-        pass
+    for d in all_requirements():
+        hard = [(op, _ver_tuple(v)) for op, v in (d.get("constraints") or [])
+                if op in ("<", "<=", "==", "!=")]
+        if hard:
+            spec[_norm(d.get("dist") or d["name"])] = hard
     return spec
 
 
@@ -871,7 +869,7 @@ class MonitorApi:
         for i, g in enumerate(gpus):
             note = None
             if torch_ok is False:
-                note = f"{g['model']} 不支持 torch"
+                note = "不支持 torch"
             elif torch_ok is None:
                 note = "torch 未安装，GPU 不可用"
             r = rt[i] if i < len(rt) else {}
@@ -954,46 +952,88 @@ class MonitorApi:
         return 200, data
 
     def api_system_install(self, body):
-        """安装 / 更新依赖（异步任务）。body: {names: [...], upgrade?: bool}
+        """安装 / 更新依赖（异步任务）。
 
-        装进当前跑 server 的解释器；必须带 core.txt 约束（-c），否则装
-        opencv/soundfile 时 pip 会顺手把 numpy 顶到 2.x，破坏 torch 2.2.2
-        的主依赖契约；升级 torch 也会被 ==2.2.2 的钉住挡回来。"""
+        body: {names: [...], version?: "2.2.2"}
+          · names   —— 依赖名（must.txt / necessary.txt 里写的名字）
+          · version —— 指定版本；不给就装清单里的**下限版本**
+            （「默认装最低要求」；用户也可以选更新的版本，编译器向后兼容，
+              往往能拿到更好的 wheel 与优化）
+
+        装进当前跑 server 的解释器；已 import 的模块不会热更新，所以返回
+        里明确要求重启。清单里 numpy<2 这类**上限**仍然生效（写成临时
+        constraints 文件给 pip 的 -c）。
+        """
         names = body.get("names") or []
         if isinstance(names, str):
             names = [names]
         if not names:
             raise ValueError("缺少 names")
-        optional = getattr(self, "_OPTIONAL_DEPS", {})
-        dist = dict(_DIST_NAME)
-        dist.update({k: v["pkg"] for k, v in optional.items()})
+        version = (body.get("version") or "").strip()
+        from reqs import all_requirements
+        table = {d["name"]: d for d in all_requirements()}
         pkgs = []
         for n in names:
-            if n not in {d["name"] for d in self.api_system()[1]["dependencies"]}:
-                raise ValueError(f"未知依赖: {n!r}")
-            pkgs.append(dist.get(n, n))
-        upgrade = bool(body.get("upgrade"))
-        req = os.path.join(boot_project_root(), "start", "requirements",
-                           "core.txt")
+            d = table.get(n)
+            if d is None:
+                raise ValueError(
+                    f"未知依赖: {n!r}（清单里有: {sorted(table)}）")
+            if d.get("kind") != "pip":
+                raise ValueError(
+                    f"{n} 不是 pip 包（{d.get('kind')}），请按提示执行："
+                    f"{d.get('install', '')}")
+            dist = d.get("dist") or n
+            pkgs.append(f"{dist}=={version}" if version
+                        else (f"{dist}>={d['min']}" if d.get("min") else dist))
+        if not pkgs:
+            return 200, {"installed": [], "note": "无需安装"}
 
         def work():
-            cmd = [sys.executable, "-m", "pip", "install"]
-            if os.path.exists(req):
-                cmd += ["-c", req]
-            if upgrade:
-                cmd += ["-U"]
-            cmd += pip_index_args() + pkgs
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=1800)
+            # 2026-11-04：与启动引导共用 start/setup_env.py——项目内 Python、
+            # 镜像测速、项目内缓存/临时目录、隔离环境变量，全部同一条路径。
+            from env_install import install_packages
+            from reqs import all_requirements as _all
+            r = install_packages(
+                pkgs, upgrade=bool(body.get("upgrade")),
+                py_deps=[d for d in _all() if d.get("kind") == "pip"])
             if r.returncode != 0:
                 raise RuntimeError("pip 安装失败: "
                                    + (r.stderr or r.stdout)[-400:])
-            return {"installed": pkgs, "upgrade": upgrade,
-                    "note": "已安装；Python 不会热更新已 import 的模块，"
-                            "重启 server 后生效"}
+            return {"installed": pkgs,
+                    "note": "已安装（下载/缓存均在项目内）；Python 不会热更新"
+                            "已 import 的模块，重启 server 后生效"}
 
         tid = self.pool.submit(work)
         return 202, {"task_id": tid}
+
+    def api_system_versions(self, query=None):
+        """某个 pip 依赖在镜像上**所有可安装的版本**（供用户挑）。
+
+        语义（2026-11-01）：清单里的下限（>=）不限制用户选更新的版本——
+        编译器/运行时向后兼容，装新的往往有更好的 wheel 与优化；但硬上限
+        （numpy<2）仍然过滤掉违规版本。默认推荐的是清单里的下限版本。
+        """
+        name = (query.get("name", [""])[0] or "").strip().lower()
+        if not name:
+            raise ValueError("缺少 name")
+        from reqs import all_requirements, version_ok
+        table = {d["name"]: d for d in all_requirements()}
+        d = table.get(name)
+        if d is None:
+            raise ValueError(f"未知依赖: {name!r}")
+        if d.get("kind") != "pip":
+            return 200, {"name": name, "versions": [], "default": d.get("min"),
+                         "note": "非 pip 包，请按提示手动安装"}
+        raw = _pypi_versions(d.get("dist") or name) or []
+        # 预发布版（0.9.0rc0）不算「可选版本」
+        raw = [v for v in raw if not re.search(r"[A-Za-z]", v)]
+        ok = [v for v in raw if version_ok(v, d.get("constraints") or [])]
+        ok.sort(key=_ver_tuple, reverse=True)
+        return 200, {"name": name, "pkg": d.get("dist") or name,
+                     "versions": ok, "default": d.get("min") or (ok[-1] if ok else ""),
+                     "min": d.get("min") or "",
+                     "constraints": d.get("constraints") or []}
+
 
 
 def boot_project_root() -> str:

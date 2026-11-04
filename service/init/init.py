@@ -1,7 +1,8 @@
 # ===========================================================================
 # GARGANTUA v1 — init.py：创建并初始化模型
 # 用法：python init.py --name alpha [--out models/] [--force]
-#       [--enc-blocks N] [--dec-blocks N]
+#       [--enc-blocks N] [--dec-blocks N] [--share-enc-dec]
+#       [--d-model N]
 #       [--ctx-full N] [--ctx-compress N]
 #       [--csa-ratio N] [--hca-ratio N]
 #       [--json]                    # 末行输出 JSON 结果（server 用）
@@ -20,6 +21,10 @@
 #   （ctx_compress 容量，对外有 CSA/HCA 两个同源视图，压缩比分别可配）。
 #   缺省即 spec 默认（1024/3072/4/32）。
 # 2026-10-25：删除 CSA 局部窗选项——CSA 的保留区就是完整 KV 区。
+# 2026-11-04：新增 --share-enc-dec（enc/dec 逐层共享权重）。共享模式下
+#   两侧 block 数强制相等：只给一侧另一侧跟随、都不给取
+#   spec.SHARED_DEFAULT_BLOCKS、给全但不等直接拒绝。归一化规则在
+#   common.normalize_shared_blocks（server 的 Web 入口用同一份）。
 # ===========================================================================
 import argparse
 import json
@@ -42,7 +47,8 @@ import boot
 boot.bootstrap()
 import spec
 from common import (MAX_BLOCKS, model_exists, model_init_lock,
-                    save_checkpoint, valid_model_name, validate_ctx_config)
+                    normalize_shared_blocks, save_checkpoint,
+                    valid_model_name, validate_ctx_config)
 from model import Gargantua
 
 
@@ -52,8 +58,14 @@ def _run(args) -> dict:
     bad = valid_model_name(args.name)
     if bad:
         raise SystemExit(f"[init] 非法模型名 {args.name!r}: {bad}")
-    for label, v in (("enc-blocks", args.enc_blocks),
-                     ("dec-blocks", args.dec_blocks)):
+    # 2026-11-04：共享权重要求两侧等深（唯一规则在 common）
+    try:
+        enc_blocks, dec_blocks = normalize_shared_blocks(
+            args.enc_blocks, args.dec_blocks, args.share_enc_dec)
+    except ValueError as e:
+        raise SystemExit(f"[init] {e}")
+    for label, v in (("enc-blocks", enc_blocks),
+                     ("dec-blocks", dec_blocks)):
         if v is not None and not (1 <= int(v) <= MAX_BLOCKS):
             # 0/负数会造出 0-block 实例，config 写默认值 → 目录再也无法
             # 被加载（state_dict 缺 key），属不可逆的坏目录
@@ -63,6 +75,12 @@ def _run(args) -> dict:
                                   ctx_compress=args.ctx_compress,
                                   csa_ratio=args.csa_ratio,
                                   hca_ratio=args.hca_ratio)
+    except ValueError as e:
+        raise SystemExit(f"[init] {e}")
+    # 2026-11-04：模型宽度建模可选，规则唯一真源在 spec.check_d_model
+    try:
+        dm = (spec.D_MODEL if args.d_model is None
+              else spec.check_d_model(args.d_model))
     except ValueError as e:
         raise SystemExit(f"[init] {e}")
 
@@ -104,20 +122,25 @@ def _run(args) -> dict:
 
         torch.manual_seed(args.seed)
         t0 = time.time()
-        m = Gargantua(n_enc_blocks=args.enc_blocks,
-                      n_dec_blocks=args.dec_blocks,
+        m = Gargantua(n_enc_blocks=enc_blocks,
+                      n_dec_blocks=dec_blocks,
+                      share_enc_dec=args.share_enc_dec,
+                      d_model=dm,
                       vocab_size=vocab_size, **ctx)
+        # parameters() 由 PyTorch 去重——共享模型的 n 只算一份参数
         n = sum(p.numel() for p in m.parameters())
         config = {
             "name": args.name,
             "created": time.strftime("%Y-%m-%d %H:%M:%S"),
             "params": n,
-            "d_model": spec.D_MODEL, "head_dim": spec.HEAD_DIM,
-            # is not None：0/None 都要如实记录（0 已被上面拒绝，防御性保留）
-            "n_enc_blocks": (args.enc_blocks if args.enc_blocks is not None
-                             else spec.N_ENC_BLOCKS),
-            "n_dec_blocks": (args.dec_blocks if args.dec_blocks is not None
-                             else spec.N_DEC_BLOCKS),
+            # 2026-11-04：以实例为准（旧目录 config 里本就有这个键）
+            "d_model": m.d_model, "head_dim": spec.HEAD_DIM,
+            # 以实例为准：共享模式下 common 会把两侧归一化成同一个数，
+            # train.py 的 _config_dict 也是这么记的。
+            "n_enc_blocks": len(m.enc_blocks),
+            "n_dec_blocks": len(m.dec_blocks),
+            # 2026-11-04：加载侧的开关（共享模型只落 enc 侧一份权重）
+            "share_enc_dec": bool(args.share_enc_dec),
             # 2026-10-30：词表长度（每个模型可以不同；common.model_vocab_size
             # 据此构造 wte / lm_head 的形状）。旧的 "vocab_size_padded" 键随之
             # 退役——长度不再「pad」到一个全局固定值，就是词表的真实长度。
@@ -135,7 +158,11 @@ def _run(args) -> dict:
         save_checkpoint(d, m, config)
         # 词表已在建模之前复制进 models/NAME/vocab/（见上方 install_model_vocab）
         # ——这里不再重复 seed：重复复制会覆盖用户在建模期间可能做的改动。
-    _say(f"[init] 词表预设: {preset_name}  dtype: {dtype_name}")
+    _say(f"[init] 词表预设: {preset_name}  dtype: {dtype_name}"
+         f"  d_model: {m.d_model}")
+    _say(f"[init] 权重模式: " + (
+        f"共享（enc/dec 各 {len(m.enc_blocks)} 层逐层绑定，只落一份参数）"
+        if args.share_enc_dec else "分离"))
     total_ctx = ctx["ctx_full"] + ctx["ctx_compress"]
     _say(f"[init] {d}  params={n/1e6:.1f}M  ({time.time()-t0:.1f}s)")
     _say(f"[init] 上下文: full={ctx['ctx_full']} + compress="
@@ -143,6 +170,10 @@ def _run(args) -> dict:
          f"CSA {ctx['csa_ratio']}:1 · HCA {ctx['hca_ratio']}:1"
          f"（两视图都读完整区）")
     return {"name": args.name, "dir": d, "params": n,
+            "d_model": m.d_model,
+            "share_enc_dec": bool(args.share_enc_dec),
+            "n_enc_blocks": len(m.enc_blocks),
+            "n_dec_blocks": len(m.dec_blocks),
             "total_ctx": total_ctx, **ctx}
 
 
@@ -155,6 +186,15 @@ def main():
                     help=f"encoder block 数（默认 {spec.N_ENC_BLOCKS}）")
     ap.add_argument("--dec-blocks", type=int, default=None,
                     help=f"decoder block 数（默认 {spec.N_DEC_BLOCKS}）")
+    ap.add_argument("--share-enc-dec", action="store_true",
+                    help="enc/dec 逐层共享权重（默认分离；共享时两侧 block "
+                         "数强制相等，都不给时一起取 "
+                         f"{spec.SHARED_DEFAULT_BLOCKS}）")
+    ap.add_argument("--d-model", type=int, default=None,
+                    help=f"模型宽度（默认 {spec.D_MODEL}；"
+                         f"{spec.D_MODEL_MIN}..{spec.D_MODEL_MAX}，"
+                         f"须为 {spec.HEAD_DIM} 的倍数；"
+                         f"预设档位 {list(spec.D_MODEL_CHOICES)}）")
     ap.add_argument("--force", action="store_true",
                     help="允许覆盖已存在的同名模型")
     # ---- 上下文长度（2026-10-23 新功能）----

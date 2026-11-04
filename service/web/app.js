@@ -91,6 +91,19 @@ function modalBodySet(body) {
   if (body && body.nodeType) el.appendChild(body);
   else el.textContent = body == null ? "" : String(body);
 }
+/* 需要富文本的对话框（关于页、任务选择器）走这个：body 是 HTML 字符串。
+   内容全部由本文件自己拼，不含用户输入。 */
+function modalOpenHTML(title, html, okText, withCancel) {
+  return new Promise(res => {
+    MODAL_RESOLVE = res;
+    $("modal-title").textContent = title;
+    $("modal-body").innerHTML = html;
+    $("modal-ok").textContent = okText || "确定";
+    $("modal-cancel").style.display = withCancel ? "" : "none";
+    $("modal-mask").hidden = false;
+    $("modal-ok").focus();
+  });
+}
 function modalOpen(title, body, okText, withCancel) {
   return new Promise(res => {
     MODAL_RESOLVE = res;
@@ -282,17 +295,23 @@ const NAV_GROUPS = [
     {id:"image", label:"图片", icon:"M4 16l4.586-5.657a2 2 0 013 0L15 14m-2-2l2.586-3.657a2 2 0 013 0L20 12M4 6h16M4 12h16M4 18h16"},
     {id:"video", label:"视频", icon:"M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"},
     {id:"prims", label:"图元绘画", icon:"M12 3l1.9 5.8H20l-4.9 3.6 1.9 5.8-5-3.6-5 3.6 1.9-5.8L4 8.8h6.1z"},
+  ]},
+  {label: "编辑器", items: [
     {id:"json", label:"Token 编辑器", icon:"M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"},
+    {id:"pdraw", label:"图元编辑器", icon:"M15.232 5.232l3.536 3.536M9 13l6.5-6.5a2.5 2.5 0 113.536 3.536L12.5 16.5 8 18l1.5-4.5zM3 21h18"},
   ]},
 ];
 const NAV_BOTTOM = [
+  {id:"term", label:"终端", icon:"M4 17l6-5-6-5M12 19h8"},
   {id:"settings", label:"设置", icon:"M12 15a3 3 0 100-6 3 3 0 000 6zm7.5-3a7.4 7.4 0 00-.1-1.2l2-1.6-2-3.4-2.4 1a7.6 7.6 0 00-2-1.2L14.6 3H9.4l-.4 2.6a7.6 7.6 0 00-2 1.2l-2.4-1-2 3.4 2 1.6a7.4 7.4 0 000 2.4l-2 1.6 2 3.4 2.4-1a7.6 7.6 0 002 1.2l.4 2.6h5.2l.4-2.6a7.6 7.6 0 002-1.2l2.4 1 2-3.4-2-1.6c.06-.4.1-.8.1-1.2z"},
+  {id:"about", label:"关于", icon:"M12 22a10 10 0 100-20 10 10 0 000 20zM12 16v-4M12 8h.01"},
 ];
 // 页面标题只此一处：顶行那个 h1。切页时改文字，不再每页各写一个 h1。
 const PAGE_TITLES = {
   home: "主页", models: "模型", vocab: "词表", train: "训练", infer: "推理",
   text: "文本", audio: "音频", image: "图片", video: "视频",
-  prims: "图元绘画", json: "Token 编辑器", settings: "设置",
+  prims: "图元绘画", json: "Token 编辑器", pdraw: "图元编辑器",
+  about: "关于", settings: "设置", term: "终端",
 };
 function navItemHTML(n) {
   return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="${n.icon}"/></svg><span class="label">${esc(n.label)}</span>`;
@@ -405,6 +424,8 @@ positionIndicator(false);   // 首帧无动画就位
 function switchPage(id) {
   $$(".nav-item").forEach(x => x.classList.toggle("active", x.dataset.p === id));
   $$(".page").forEach(x => x.classList.toggle("active", x.id === "p-" + id));
+  // 词表标签页住在顶栏里，只在「词表」页出现（其余页面顶栏只有标题）
+  $("vtab-bar").hidden = (id !== "vocab");
   positionIndicator(true);
   const t = PAGE_TITLES[id];
   if (t) {
@@ -425,6 +446,10 @@ function switchPage(id) {
   if (id === "models") refreshModels();
   if (id === "train") refreshQueue();
   if (id === "vocab") refreshVocab();
+  if (id === "pdraw") pdrawInit();
+  if (id === "prims") primsInit();
+  if (id === "term") termInit();
+  if (id !== "infer") setDevOpen(false);   // 离开推理页就收起开发者抽屉
   if (id === "home") refreshMonitors();
 }
 
@@ -452,22 +477,56 @@ async function refreshStatus() {
   try {
     const s = await api("/api/status");
     ACTIVE_MODEL = s.model || "";
+    if (s.draw_layout) PDRAW.layout = s.draw_layout;
+    fillCanvasOptions(s.draw_canvas);
   } catch (e) {}
+}
+/* 图元画布的档位表来自 /api/status（唯一真源是 server/spec.py，
+   前端不复制一份常量，spec 改档位这里自动跟随）。
+   「图元绘画」页要 auto 选项，「图元编辑器」页只认具体尺寸。 */
+function fillCanvasOptions(dc) {
+  if (!dc || !Array.isArray(dc.sizes) || !dc.sizes.length) return;
+  PDRAW.canvasList = dc.sizes.map(s => [s[0], s[1]]);
+  const opts = dc.sizes.map(s => {
+    const [w, h] = s;
+    return `<option value="${w}x${h}">${w}×${h}</option>`;
+  }).join("");
+  const ed = $("pdraw-canvas");
+  if (ed) {
+    const prev = ed.value;
+    ed.innerHTML = opts;
+    if (prev) ed.value = prev;
+    if (!ed.value) ed.value = `${dc.default[0]}x${dc.default[1]}`;
+    if (!PDRAW.prims.length) pdrawSetCanvas(ed.value);
+  }
 }
 
 /* =========================================================================
    主页：环境与依赖
    -------------------------------------------------------------------------
-   一张卡 = 一行两列（等宽）。左侧两行字：标题（加粗）+ 版本标注 / 小字解释
-   （未安装写「未发现」）；右侧一个按钮（安装 / 更新）或一句状态文字。
+   三段，各自一张网格，卡片样式统一：
+     · 环境包   —— environment/ 下每个文件夹一张卡（后端扫目录给出，
+                   两边永远对得上：多一个文件夹就多一张卡）
+     · Python 依赖 —— 全部 pip 包，一项不漏（含可选/窗口/测试依赖）
+     · 系统依赖 —— 装不进 environment/ 的外部命令（ffmpeg / 编译器）
    ========================================================================= */
 const DEP_META = {
-  torch:       {display: "PyTorch",     desc: "深度学习框架（训练与推理）"},
-  numpy:       {display: "NumPy",       desc: "数值计算库"},
-  PIL:         {display: "Pillow",      desc: "图像处理库"},
-  safetensors: {display: "Safetensors", desc: "模型权重存储格式"},
-  cv2:         {display: "OpenCV",      desc: "图像/视频解码加速（可选，缺失时用 Pillow + ffmpeg）"},
-  soundfile:   {display: "SoundFile",   desc: "音频解码加速（可选，缺失时用 ffmpeg）"},
+  python:      {display: "Python 运行时",   desc: "跑 server 与训练 / 推理的解释器"},
+  pywebview:   {display: "pywebview",       desc: "开独立桌面窗口（无 GUI 环境可跳过）"},
+  torch:       {display: "PyTorch",        desc: "深度学习框架（训练与推理）"},
+  numpy:       {display: "NumPy",          desc: "数值计算库"},
+  pillow:      {display: "Pillow",         desc: "图像处理库"},
+  safetensors: {display: "Safetensors",    desc: "模型权重存储格式"},
+  pytest:      {display: "pytest",         desc: "测试套件"},
+  ffmpeg:      {display: "FFmpeg",         desc: "音视频解码与抽帧"},
+  rust:        {display: "Rust 工具链",    desc: "构建 GPU 图元转换器"},
+  wgpu:        {display: "wgpu",           desc: "GPU 图元渲染后端（随 Rust 转换器构建）"},
+  cv2:         {display: "OpenCV",         desc: "图像/视频解码加速（可选，缺失时用 Pillow + ffmpeg）"},
+  soundfile:   {display: "SoundFile",      desc: "音频解码加速（可选，缺失时用 ffmpeg）"},
+};
+/* 依赖分组的中文名（后端给 group 字符串，前端只负责翻译） */
+const DEP_GROUP = {
+  core: "核心", window: "窗口", dev: "测试", optional: "可选",
 };
 let SYSTEM_CACHE = null, UPDATES_CACHE = null, DEVICE_CACHE = null;
 
@@ -539,7 +598,7 @@ function renderDevices(d) {
       // 有 GPU 但 torch 用不了：小字点明是这张卡的型号不支持，而不是含糊报错
       const sub = g.torch_ok
         ? "支持 PyTorch"
-        : `<span class="dev-s warn">${esc(g.note || (g.model + " 不支持 torch"))}</span>`;
+        : `<span class="dev-s warn">${esc(g.note || "不支持 torch")}</span>`;
       items.push(`<div class="dev-item"><div class="dev-k">GPU</div>
         <div class="dev-v" title="${esc(g.model)}">${esc(g.model)}</div>
         <div class="dev-s">${sub}</div></div>`);
@@ -573,10 +632,18 @@ function renderDeps() {
   const um = {};
   (UPDATES_CACHE || []).forEach(u => { um[u.name] = u; });
   grid.innerHTML = (s.dependencies || []).map(d => {
-    const meta = DEP_META[d.name] || {display: d.name, desc: d.why || ""};
-    const line2 = d.ok ? meta.desc : "未发现";
+    const meta = DEP_META[d.name] ||
+      {display: d.title || d.name, desc: d.why || d.install || ""};
+    const line2 = d.ok
+      ? (meta.desc || d.why || "")
+      : (d.group === "must"
+           ? "启动核心（在此不更新）"
+           : (d.install ? "未安装 · " + d.install : "未安装"));
     let right;
-    if (!d.ok) {
+    // 第一排 python + pywebview 是启动核心，不在界面里更新
+    if (d.group === "must") {
+      right = `<span class="dep-state">无法更新</span>`;
+    } else if (!d.ok) {
       right = `<button class="act" data-install="${esc(d.name)}" data-upgrade="0">安装</button>`;
     } else {
       const u = um[d.name];
@@ -587,9 +654,10 @@ function renderDeps() {
       else if (!u.checked) right = `<span class="dep-state">未能检查更新</span>`;
       else right = `<span class="dep-state ok">当前已是最新版本</span>`;
     }
+    const ver = (d.ok && d.version)
+      ? `<span class="dep-ver">${esc(d.version)}</span>` : "";
     return `<div class="dep-card"><div class="dep-info">
-      <div class="dep-title"><span class="dep-name" title="${esc(meta.display)}">${esc(meta.display)}</span>${
-        d.ok && d.version ? `<span class="dep-ver">${esc(d.version)}</span>` : ""}</div>
+      <div class="dep-title"><span class="dep-name" title="${esc(meta.display)}">${esc(meta.display)}</span>${ver}</div>
       <div class="dep-desc" title="${esc(line2)}">${esc(line2)}</div>
     </div>${right}</div>`;
   }).join("");
@@ -768,12 +836,7 @@ function toggleProcCol(col) {
 $("proc-mem-th").onclick = () => toggleProcCol("mem");
 $("proc-vram-th").onclick = () => toggleProcCol("vram");
 
-/* 滚动区顶部磨砂条：只在滚动后出现（静止在顶部时不能模糊首屏内容） */
-$$(".page.scroll").forEach(pg => {
-  pg.addEventListener("scroll", () => {
-    pg.classList.toggle("scrolled", pg.scrollTop > 6);
-  }, {passive: true});
-});
+/* 顶部磨砂条常驻在 #topbar（跨所有页面），页内不再需要滚动状态类 */
 
 async function killProc(pid, isSelf) {
   if (isSelf && !await uiConfirm(
@@ -855,8 +918,13 @@ function stepsToToken5(steps, bound) {
     const ids = st.token_ids || [];
     if (!ids.length) continue;                 // 模态步：由后端 token5 给出
     if (st.modality === "draw") {
-      // 绘图：一个图元 = 9 个 token = 一个时间步
-      for (let j = 0; j + 9 <= ids.length; j += 9)
+      // 绘图：序列最前面是画布 token（单独一步），其后一个图元 = 9 token = 一步
+      let j = 0;
+      if (ids.length % 9 === 1) {
+        parts.push("{" + "text: " + _IDHEX(ids[0]) + "}");
+        j = 1;
+      }
+      for (; j + 9 <= ids.length; j += 9)
         parts.push("{" + ids.slice(j, j + 9).map(t => "text: " + _IDHEX(t)).join(" | ") + "}");
       continue;
     }
@@ -871,11 +939,17 @@ async function refreshModels() {
   try {
     const r = await api("/api/models");
     $("model-tbody").innerHTML = r.models.map(m =>
-      `<tr><td>${esc(m.name)} ${m.name === r.active ? '<span class="badge on">当前</span>' : ""}</td>
+      `<tr><td>${esc(m.name)} ${m.name === r.active ? '<span class="badge on">当前</span>' : ""}${m.share_enc_dec ? '<span class="badge">共享权重</span>' : ""}</td>
        <td>${m.params ? (m.params/1e6).toFixed(1)+"M" : "—"}</td>
-       <td class="right"><button class="act sec xs" data-load="${esc(m.name)}">加载</button></td></tr>`).join("");
+       <td class="right">
+         <button class="act sec xs" data-load="${esc(m.name)}">加载</button>
+         <button class="act sec xs del" data-del="${esc(m.name)}">删除</button>
+       </td></tr>`).join("");
     $("model-tbody").querySelectorAll("[data-load]").forEach(b => {
       b.onclick = () => loadModel(b.dataset.load);
+    });
+    $("model-tbody").querySelectorAll("[data-del]").forEach(b => {
+      b.onclick = () => deleteModel(b.dataset.del);
     });
     const target = $("train-target");
     const cur = target.value;
@@ -890,6 +964,38 @@ async function loadModel(name) {
         refreshModels(); refreshStatus(); }
   catch (e) { $("model-create-msg").textContent = "错误: " + e.message; }
 }
+async function deleteModel(name) {
+  if (!confirm(`确定删除模型「${name}」？此操作不可恢复。`)) return;
+  try {
+    await api("/api/model/delete", {name});
+    $("model-create-msg").textContent = "已删除 " + name;
+    refreshModels(); refreshStatus();
+  } catch (e) { $("model-create-msg").textContent = "错误: " + e.message; }
+}
+/* 权重模式联动（2026-11-04）：共享权重要求 enc/dec 等深。
+   共享时 dec 输入框锁定并镜像 enc，提交也不读它的值——「强制一样」
+   不能只靠 UI 提示，后端另有同一份归一化规则兜底。 */
+function modelShareMode() { return $("model-share").value === "shared"; }
+let savedDecBlocks = null;   // 切回「分离」时还原用户原来填的 dec 值
+function syncModelShareMode() {
+  const shared = modelShareMode();
+  const enc = $("model-enc"), dec = $("model-dec");
+  if (shared) {
+    if (savedDecBlocks === null) savedDecBlocks = dec.value;
+    dec.value = enc.value;
+  } else if (savedDecBlocks !== null) {
+    dec.value = savedDecBlocks;
+    savedDecBlocks = null;
+  }
+  dec.disabled = shared;
+  dec.title = shared ? "共享权重下 dec blocks 强制等于 enc blocks" : "";
+}
+$("model-share").addEventListener("change", syncModelShareMode);
+$("model-enc").addEventListener("input", () => {
+  if (modelShareMode()) $("model-dec").value = $("model-enc").value;
+});
+syncModelShareMode();
+
 $("model-create").onclick = async () => {
   const name = $("model-name").value.trim();
   if (!name) return;
@@ -919,10 +1025,15 @@ async function createModel(name, overwrite) {
     const n = parseInt(v, 10);
     return Number.isFinite(n) ? n : undefined;
   };
+  const shared = modelShareMode();
+  const encBlocks = intOrUndef($("model-enc").value);
   const {task_id} = await api("/api/model/init", {
     name, overwrite,
-    n_enc_blocks: intOrUndef($("model-enc").value),
-    n_dec_blocks: intOrUndef($("model-dec").value),
+    share_enc_dec: shared,
+    d_model: intOrUndef($("model-dmodel").value),
+    n_enc_blocks: encBlocks,
+    // 共享时强制相等：直接复用 enc 的值，不依赖被锁定的 dec 输入框
+    n_dec_blocks: shared ? encBlocks : intOrUndef($("model-dec").value),
     ctx_full: intOrUndef($("model-ctx-full").value),
     ctx_compress: intOrUndef($("model-ctx-compress").value),
     csa_ratio: intOrUndef($("model-csa-ratio").value),
@@ -1056,9 +1167,7 @@ setInterval(refreshTrain, 2000);
 /* ---------- 推理（类 Kimi 聊天） ---------- */
 const chatHistory = $("chat-history");
 let lastMedia = null, mediaObjUrl = null;
-function hideEmpty() { const e = $("chat-empty"); if (e) e.style.display = "none"; }
 function addMsg(role, html) {
-  hideEmpty();
   const row = document.createElement("div"); row.className = "msg-row";
   const d = document.createElement("div"); d.className = "msg " + role;
   d.innerHTML = html; row.appendChild(d);
@@ -1127,81 +1236,193 @@ $("send-btn").onclick = async () => {
 $("infer-prompt").addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("send-btn").click(); }
 });
-$("debug-panel").querySelector(".toggle").onclick =
-  () => $("debug-panel").classList.toggle("collapsed");
+/* 开发者选项：右侧抽屉，与左侧边栏镜像（状态挂在 <html data-dev> 上，
+   这样 #main 的让位、工具栏左移、抽屉滑入都吃同一套 CSS 过渡）。 */
+function setDevOpen(on) {
+  const el = document.documentElement;
+  if (on) el.setAttribute("data-dev", "open");
+  else el.removeAttribute("data-dev");
+  const d = $("dev-drawer");
+  if (d) d.setAttribute("aria-hidden", on ? "false" : "true");
+}
+function devOpen() {
+  return document.documentElement.getAttribute("data-dev") === "open";
+}
+$("dev-close").onclick = () => setDevOpen(false);
+/* 推理工具栏：清空 / 选模型 / 开发者选项（右侧抽屉） */
+$("infer-dev-btn").onclick = () => setDevOpen(!devOpen());
+$("infer-clear").onclick = async () => {
+  const ch = $("chat-history");
+  if (ch) ch.innerHTML = "";                 // 清空对话（前端）
+  const st = $("infer-status");
+  try {
+    // 后端：杀掉 infer 服务进程 → 释放持久 fast weight + KV 上下文，下次推理全新起
+    await api("/api/infer/reset");
+    if (st) st.textContent = "已清空对话 / 上下文 / 初始化 fast weight";
+  } catch (e) {
+    if (st) st.textContent = "前端已清空；后端重置失败: " + e.message;
+  }
+};
+$("infer-model-btn").onclick = async () => {
+  const pop = $("model-pop");
+  pop.hidden = !pop.hidden;
+  if (!pop.hidden) await refreshModelPop();
+};
+$("model-pop-refresh").onclick = refreshModelPop;
+async function refreshModelPop() {
+  const list = $("model-pop-list");
+  if (!list) return;
+  try {
+    const r = await api("/api/models");
+    list.innerHTML = r.models.map(m =>
+      `<div class="model-pop-row${m.name === r.active ? " on" : ""}" data-load="${esc(m.name)}">
+         <span class="nm">${esc(m.name)}<span class="sub">${m.name === r.active ? "当前活动" : "点此加载"} · `
+      + `${m.params ? (m.params / 1e6).toFixed(1) + "M" : "—"}</span></span>
+         <button class="act sec xs del" data-del="${esc(m.name)}" title="删除模型">删除</button>
+       </div>`).join("")
+      || `<div class="hint">还没有模型，去「模型」页创建一个</div>`;
+    list.querySelectorAll("[data-load]").forEach(row => {
+      row.onclick = async e => {
+        if (e.target.closest("[data-del]")) return;   // 点删除不触发加载
+        await loadModel(row.dataset.load);
+        $("model-pop").hidden = true;
+        await refreshModelPop();
+      };
+    });
+    list.querySelectorAll("[data-del]").forEach(b => {
+      b.onclick = e => {
+        e.stopPropagation();
+        deleteModel(b.dataset.del).then(() => refreshModelPop());
+      };
+    });
+  } catch (e) {
+    list.innerHTML = `<div class="hint">获取模型失败: ${esc(e.message)}</div>`;
+  }
+}
+/* 点击工具栏之外关闭模型弹窗 */
+document.addEventListener("click", e => {
+  const pop = $("model-pop"), btn = $("infer-model-btn");
+  if (pop && !pop.hidden && btn && !pop.contains(e.target) && !btn.contains(e.target))
+    pop.hidden = true;
+});
 
 /* ---------- 编解码器 ---------- */
+/* 清空与输出保护
+   ---------------------------------------------------------------------
+   转换器的输出量随输入线性膨胀（4K 图 = 两千多个 patch × 10240 个 hex
+   字符；视频按帧再乘；图元可以跑上万步），一个 <pre> 堆到几十 MB 时
+   浏览器排版会直接卡死。两道闸：
+     · setOut 只在 DOM 里放前 OUT_MAX_CHARS 个字符，超出部分明说被截断；
+     · 每页一个「清空」把该页 token 文本、预览、文件选择一起复位，
+       并释放 blob URL（否则每转一张图就漏一份原图在内存里）。 */
+const OUT_MAX_CHARS = 200000;
+
+function setOut(el, text) {
+  if (!el) return;
+  const s = text == null ? "" : String(text);
+  if (!s) { el.textContent = "—"; return; }
+  if (s.length > OUT_MAX_CHARS) {
+    el.textContent = s.slice(0, OUT_MAX_CHARS) +
+      `\n\n… 已截断：全文 ${s.length} 字符，此处只显示前 ${OUT_MAX_CHARS}。` +
+      `\n点「清空」可释放这一页占用的内存。`;
+    return;
+  }
+  el.textContent = s;
+}
+/* 复位一个自绘文件选择器（触发 change 让 wireFileInput 的 sync 生效） */
+function resetFileInput(id) {
+  const inp = $(id);
+  if (!inp) return;
+  inp.value = "";
+  inp.dispatchEvent(new Event("change"));
+}
+/* 卸掉 <img>/<video>/<audio> 的 blob URL 并解引用 */
+function releaseBlob(el) {
+  if (!el) return;
+  const src = el.getAttribute("src") || "";
+  if (src.startsWith("blob:")) URL.revokeObjectURL(src);
+  el.removeAttribute("src");
+}
+
+$("text-clear").onclick = () => { setOut($("text-out"), ""); };
+$("audio-clear").onclick = () => {
+  setOut($("audio-out"), "");
+  const box = $("audio-preview");
+  box.querySelectorAll("audio").forEach(releaseBlob);
+  box.innerHTML = "";
+  resetFileInput("audio-file");
+};
+$("image-clear").onclick = () => {
+  setOut($("image-out"), "");
+  releaseBlob($("image-preview"));
+  resetFileInput("image-file");
+};
+$("video-clear").onclick = () => {
+  setOut($("video-out"), "");
+  $("video-stats").textContent = "";
+  const vp = $("video-preview");
+  try { vp.pause(); } catch (e) {}
+  releaseBlob(vp);
+  vp.classList.remove("on");
+  resetFileInput("video-file");
+};
+$("json-clear").onclick = () => {
+  $("json-editor").textContent = "";
+  $("json-msg").textContent = "";
+};
+
 $("text-encode").onclick = async () => {
   try {
     // vocab：用哪个词表来转换（后端尚未认这个字段时忽略即可，不影响编码）
     const r = await api("/api/codec/text",
                         {text: $("text-in").value, vocab: $("text-vocab").value});
-    $("text-out").textContent = r.token5;
-  } catch (e) { $("text-out").textContent = "错误: " + e.message; }
+    setOut($("text-out"), r.token5);
+  } catch (e) { setOut($("text-out"), "错误: " + e.message); }
 };
 $("audio-encode").onclick = async () => {
   const f = $("audio-file").files[0]; if (!f) return;
-  $("audio-preview").innerHTML = `<audio src="${fileToUrl(f)}" controls></audio>`;
-  $("audio-out").textContent = "编码中…";
+  const box = $("audio-preview");
+  box.querySelectorAll("audio").forEach(releaseBlob);
+  box.innerHTML = `<audio src="${fileToUrl(f)}" controls></audio>`;
+  setOut($("audio-out"), "编码中…");
   try {
     const r = await api("/api/codec/audio", {audio_b64: await fileToB64(f),
                              filename: f.name},
                         {timeout: API_UPLOAD_TIMEOUT_MS});
-    $("audio-out").textContent =
-      `# 音元数 ${r.n_tokens}，时长 ${r.duration_s}s\n` + r.token5;
-  } catch (e) { $("audio-out").textContent = "错误: " + e.message; }
+    setOut($("audio-out"),
+           `# 音元数 ${r.n_tokens}，时长 ${r.duration_s}s\n` + r.token5);
+  } catch (e) { setOut($("audio-out"), "错误: " + e.message); }
 };
 $("image-encode").onclick = async () => {
   const f = $("image-file").files[0]; if (!f) return;
+  releaseBlob($("image-preview"));
   $("image-preview").src = fileToUrl(f);
-  $("image-out").textContent = "编码中…";
+  setOut($("image-out"), "编码中…");
   try {
     const r = await api("/api/codec/image",
                         {image_b64: await fileToB64(f)},
                           {timeout: API_UPLOAD_TIMEOUT_MS});
     const st = r.steps[0];
-    $("image-out").textContent =
-      `# grid ${st.meta.grid[0]}×${st.meta.grid[1]}，patch 数 ${st.meta.n_patches}\n` +
-      r.token5;
-  } catch (e) { $("image-out").textContent = "错误: " + e.message; }
+    setOut($("image-out"),
+           `# grid ${st.meta.grid[0]}×${st.meta.grid[1]}，patch 数 ${st.meta.n_patches}\n` +
+           r.token5);
+  } catch (e) { setOut($("image-out"), "错误: " + e.message); }
 };
 $("video-encode").onclick = async () => {
   const f = $("video-file").files[0]; if (!f) return;
-  const vp = $("video-preview"); vp.src = fileToUrl(f); vp.style.display = "block";
-  $("video-out").textContent = "编码中（ffmpeg 抽帧 + 提取音轨）…";
+  const vp = $("video-preview"); releaseBlob(vp);
+  vp.src = fileToUrl(f); vp.classList.add("on");
+  setOut($("video-out"), "编码中（ffmpeg 抽帧 + 提取音轨）…");
   try {
     const r = await api("/api/codec/video", {video_b64: await fileToB64(f),
                              filename: f.name},
                         {timeout: API_UPLOAD_TIMEOUT_MS});
     $("video-stats").textContent =
       `帧数: ${r.n_frames}　总 patches: ${r.total_patches}　音元: ${r.n_audio_tokens}`;
-    $("video-out").textContent = r.token5;
-  } catch (e) { $("video-out").textContent = "错误: " + e.message;
+    setOut($("video-out"), r.token5);
+  } catch (e) { setOut($("video-out"), "错误: " + e.message);
                 $("video-stats").textContent = ""; }
 };
-$("prims-convert").onclick = async () => {
-  const f = $("prims-file").files[0]; if (!f) return;
-  $("prims-src").src = fileToUrl(f);
-  $("prims-msg").textContent = "转换中（贪心图元拟合，后台任务）…";
-  $("prims-render").innerHTML = ""; $("prims-out").textContent = "—";
-  try {
-    const {task_id} = await api("/api/codec/image2prims",
-                                {image_b64: await fileToB64(f),
-                                 max_steps: clampNum($("prims-steps").value, 1, 1000, 100),
-                                 quality: $("prims-quality").value || "fast"},
-                                {timeout: API_UPLOAD_TIMEOUT_MS});
-    const t = await pollTask(task_id, {
-      interval: 1200, timeout: 120000,
-      onTick: x => { $("prims-msg").textContent = "转换中… " + x.status; }});
-    const r = t.result;
-    $("prims-render").innerHTML = r.svg;
-    $("prims-out").textContent =
-      `# ${r.note}\n# 图元 ${r.n_primitives} 个，token ${r.tokens.length} 个（9/图元）\n` +
-      stepsToToken5([{modality: "draw", token_ids: r.tokens, meta: {}}], "model");
-    $("prims-msg").textContent = r.n_primitives + " 个图元";
-  } catch (e) { $("prims-msg").textContent = "错误: " + e.message; }
-};
-
 /* ---------- Token 编辑器 ----------
    调色板：扩展系统 token（<0>..<5>，也可直接写名字）+ 结构字符。 */
 const TOKEN_PALETTE = [
@@ -1268,6 +1489,585 @@ $("json-export").onclick = async () => {
     msg.textContent = `已导出 ${r.n_tokens} tokens / ${r.n_steps} 时间步`;
   } catch (e) { msg.textContent = "错误: " + e.message; }
 };
+
+/* =========================================================================
+   图元编辑器：手动摆图元 → 实时 SVG + 实时 token 流
+   -------------------------------------------------------------------------
+   · 画布档位与字段 offset 全部来自 /api/status.draw_layout（spec 是唯一
+     真源），前端只做「值 → bin」这一步算术，公式与 draw_codec 逐行对应：
+       x/y  = trunc(px)          （1 token = 1 像素）
+       theta = trunc(deg × 3)     （≥90° 交换宽高）
+       w/h  = trunc(px × 4)      shape = shape_type + 1
+       r/g/b = 值本身             （10 bit，0..1023）
+   · 画布声明 = `<x>` 数字… `<x/>` `<y>` 数字… `<y/>`（数字用可见区的文本
+     数字 token，ID 也在 draw_layout.digits 里）。
+   · 画布可缩放（滚轮）与平移（拖动）；单击落一个图元。
+   · 右侧列表可拖拽排序 = 调图层顺序（越靠后越在上面）。
+   · 底图可开关、可调透明度，用来对比「画出来的」和「原图」差多少；
+     取色笔从合成结果（底图 + 图元）上取色。
+   ========================================================================= */
+const PDRAW = {
+  w: 256, h: 256,
+  prims: [],          // {cx, cy, w, h, shape_type, theta(rad), r, g, b}
+  sel: -1,
+  layout: null,       // /api/status.draw_layout
+  canvasList: [],     // [[w,h], …]（/api/status.draw_canvas.sizes）
+  brush: {r: 256, g: 512, b: 1023},
+  brushShape: 0,      // 画布点击 / ＋ 按钮默认落下的形状（0 矩形 / 1 椭圆 / -1 背景）
+  view: {zoom: 1, ox: 0, oy: 0},   // 视图缩放 / 平移
+  picking: false,     // 取色笔待命
+};
+
+const _PD_SHAPE = { "-1": "背景", "0": "矩形", "1": "椭圆" };
+const _r2 = v => Math.round(Number(v) * 100) / 100;
+/* 值 → bin：与 draw_codec._bin 同为截断（不是四舍五入） */
+function _pdBin(v, fd) {
+  const n = Math.trunc(Number(v) * (fd.per || 1));
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(fd.bins - 1, n));
+}
+/* 10 bit ↔ 8 bit（显示用） */
+function _pdTo8(v) { return Math.round(Number(v) * 255 / 1023); }
+function _pdTo10(v) { return Math.round(Number(v) * 1023 / 255); }
+/* 10 bit 色的十六进制：每通道 3 位（0..3FF），如 #3FF000200 */
+function _pdHex(r, g, b) {
+  const h3 = v => Math.max(0, Math.min(1023, Math.round(v)))
+    .toString(16).toUpperCase().padStart(3, "0");
+  return "#" + h3(r) + h3(g) + h3(b);
+}
+
+/* 一条绘图序列 → token-5 文本：
+   画布声明独占一步（`<x> 1 9 2 0 <x/> <y> 1 0 8 0 <y/>`），
+   其后每个图元一步（9 个 token）。 */
+function pdrawTokenText() {
+  const L = PDRAW.layout;
+  if (!L) return "（正在读取 spec 常量…）";
+  const F = {};
+  L.fields.forEach(f => { F[f.name] = f; });
+  const B = L.begin;
+  const steps = [];
+  // —— 画布声明 ——
+  const mk = L.canvas.markers || ["<x>", "<x/>", "<y>", "<y/>"];
+  const dig = L.digits || [];
+  const digitsOf = n => String(n).split("").map(ch => dig[Number(ch)]);
+  const cw = B + L.canvas.offset;
+  steps.push("{" + [cw + 0].concat(digitsOf(PDRAW.w), [cw + 1],
+                                 [cw + 2], digitsOf(PDRAW.h), [cw + 3])
+    .map(t => "text: " + _IDHEX(t)).join(" | ") + "}");
+  // —— 每个图元 9 个 token ——
+  for (const p of PDRAW.prims) {
+    let deg = (p.theta * 180 / Math.PI) % 180;
+    if (deg < 0) deg += 180;
+    let pw = p.w, ph = p.h;
+    if (deg >= 90) { deg -= 90; const t = pw; pw = ph; ph = t; }
+    const shapeBin = Math.max(0, Math.min(F.shape.bins - 1, p.shape_type + 1));
+    const ids = [
+      B + F.x.offset + _pdBin(p.cx, F.x),
+      B + F.y.offset + _pdBin(p.cy, F.y),
+      B + F.theta.offset + _pdBin(deg, F.theta),
+      B + F.w.offset + _pdBin(pw, F.w),
+      B + F.h.offset + _pdBin(ph, F.h),
+      B + F.shape.offset + shapeBin,
+      B + F.r.offset + _pdBin(p.r, F.r),
+      B + F.g.offset + _pdBin(p.g, F.g),
+      B + F.b.offset + _pdBin(p.b, F.b),
+    ];
+    steps.push("{" + ids.map(t => "text: " + _IDHEX(t)).join(" | ") + "}");
+  }
+  return steps.join("");
+}
+
+/* 图元 → SVG（与 draw_codec.primitives_to_svg 同语义） */
+function pdrawRenderSVG() {
+  const svg = $("pdraw-svg");
+  const { w, h } = PDRAW;
+  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+  svg.setAttribute("width", w);
+  svg.setAttribute("height", h);
+  const out = [];
+  PDRAW.prims.forEach((p, i) => {
+    const fill = `rgb(${_pdTo8(p.r)},${_pdTo8(p.g)},${_pdTo8(p.b)})`;
+    const deg = p.theta * 180 / Math.PI;
+    const rot = Math.abs(deg) > 1e-9
+      ? ` transform="rotate(${deg} ${p.cx} ${p.cy})"` : "";
+    const hl = i === PDRAW.sel
+      ? ' style="stroke:var(--accent);stroke-width:1.5"' : "";
+    if (p.shape_type === -1) {
+      out.push(`<rect x="0" y="0" width="${w}" height="${h}" fill="${fill}"${hl}/>`);
+    } else if (p.shape_type === 1) {
+      out.push(`<ellipse cx="${p.cx}" cy="${p.cy}" rx="${p.w / 2}" `
+        + `ry="${p.h / 2}" fill="${fill}"${rot}${hl}/>`);
+    } else {
+      out.push(`<rect x="${p.cx - p.w / 2}" y="${p.cy - p.h / 2}" `
+        + `width="${p.w}" height="${p.h}" fill="${fill}"${rot}${hl}/>`);
+    }
+  });
+  svg.innerHTML = out.join("");
+  $("pdraw-count").textContent = PDRAW.prims.length
+    ? `${PDRAW.prims.length} 个图元 · ${PDRAW.w}×${PDRAW.h}`
+    : "点空白处加一个矩形";
+  pdrawFit();
+  pdrawApplyView();
+}
+
+/* 完整重绘（画布/表单变更用）：SVG + 把当前序列写回 token 文本框 */
+function pdrawRender() {
+  pdrawRenderSVG();
+  setOut($("pdraw-out"), pdrawTokenText());
+}
+
+/* 文本框 → 图元序列：与 pdrawTokenText 互逆。
+   用布局（L）里的 offset / bins / per 把每个 token ID 还原成字段值。
+   画布声明块结构固定为 [cw, w位, cw+1, cw+2, h位, cw+3]（cw = begin + canvas.offset），
+   据此抽出宽高；其后每个 9-token 块还原成一个图元。解析失败（半截输入、
+   非法字符）返回 false，调用方静默忽略——绝不拿脏数据清掉画布。 */
+function pdrawParse(text) {
+  if (!PDRAW.layout) return false;
+  const L = PDRAW.layout;
+  const B = L.begin;
+  const cw = B + L.canvas.offset;
+  const dig = L.digits || [];
+  const blocks = (text.match(/\{[^}]*\}/g) || []).map(s => s.slice(1, -1));
+  if (!blocks.length) return false;
+  const parseBlock = raw => raw.split("|").map(s => s.trim()).filter(Boolean)
+    .map(tok => {
+      const m = /text:\s*([0-9A-Fa-f]+)/.exec(tok) || /([0-9A-Fa-f]+)/.exec(tok);
+      return m ? parseInt(m[1], 16) : NaN;
+    });
+  const cb = parseBlock(blocks[0]);
+  const iCW = cb.indexOf(cw), iCW1 = cb.indexOf(cw + 1),
+        iCW2 = cb.indexOf(cw + 2), iCW3 = cb.indexOf(cw + 3);
+  if (iCW >= 0 && iCW1 > iCW && iCW2 > iCW1 && iCW3 > iCW2) {
+    const digVal = t => { const i = dig.indexOf(t); return i >= 0 ? i : NaN; };
+    const wd = cb.slice(iCW + 1, iCW1).map(digVal);
+    const hd = cb.slice(iCW2 + 1, iCW3).map(digVal);
+    if (wd.length && hd.length && wd.every(Number.isFinite) && hd.every(Number.isFinite)) {
+      const w = parseInt(wd.map(String).join(""), 10);
+      const h = parseInt(hd.map(String).join(""), 10);
+      if (Number.isFinite(w) && Number.isFinite(h) && w >= 1 && h >= 1) {
+        PDRAW.w = w; PDRAW.h = h;
+      }
+    }
+  }
+  const F = {};
+  L.fields.forEach(f => { F[f.name] = f; });
+  const unbin = (id, name) => {
+    const f = F[name]; const bin = id - (B + f.offset);
+    return bin / (f.per || 1);
+  };
+  const prims = [];
+  for (let bi = 1; bi < blocks.length; bi++) {
+    const ids = parseBlock(blocks[bi]);
+    if (ids.length < 9) continue;
+    if (ids.some(n => !Number.isFinite(n))) continue;
+    let deg = unbin(ids[2], "theta");
+    let pw = unbin(ids[3], "w"), ph = unbin(ids[4], "h");
+    if (deg >= 90) { deg -= 90; const t = pw; pw = ph; ph = t; }   // 与编码器一致
+    prims.push({
+      cx: unbin(ids[0], "x"), cy: unbin(ids[1], "y"),
+      w: pw, h: ph,
+      shape_type: (ids[5] - (B + F.shape.offset)) - 1,
+      theta: Math.max(0, deg * Math.PI / 180),
+      r: Math.round(unbin(ids[6], "r")),
+      g: Math.round(unbin(ids[7], "g")),
+      b: Math.round(unbin(ids[8], "b")),
+    });
+  }
+  PDRAW.prims = prims;
+  PDRAW.sel = prims.length ? prims.length - 1 : -1;
+  return true;
+}
+
+/* 文本框变更 → 重绘（不回写文本框，保留用户光标与输入）。
+   空文本 = 清空全部图元；解析失败则保持原样。 */
+function pdrawFromText() {
+  const ta = $("pdraw-out");
+  if (!ta) return;
+  if (!ta.value.replace(/\s+/g, "")) {
+    PDRAW.prims = []; PDRAW.sel = -1; pdrawEnsureCanvasOption(PDRAW.w, PDRAW.h); pdrawSync(false);
+    return;
+  }
+  if (!pdrawParse(ta.value)) return;
+  pdrawEnsureCanvasOption(PDRAW.w, PDRAW.h);
+  pdrawSync(false);
+}
+
+/* 当前画布尺寸若不在下拉框里，动态补一个选项并选中（解析出非预设尺寸时） */
+function pdrawEnsureCanvasOption(w, h) {
+  const sel = $("pdraw-canvas");
+  if (!sel) return;
+  const val = `${w}x${h}`;
+  const exists = Array.from(sel.options).some(o => o.value === val);
+  if (!exists) {
+    const opt = document.createElement("option");
+    opt.value = val; opt.textContent = `${w}×${h}`;
+    sel.appendChild(opt);
+    if (!PDRAW.canvasList.some(s => s[0] === w && s[1] === h))
+      PDRAW.canvasList.push([w, h]);
+  }
+  sel.value = val;
+}
+
+/* 视图：缩放 + 平移（作用在 frame 上，SVG 内部坐标不变） */
+function pdrawApplyView() {
+  const f = $("pdraw-frame");
+  if (!f) return;
+  const v = PDRAW.view;
+  f.style.transform = `translate(${v.ox}px, ${v.oy}px) scale(${v.zoom})`;
+  const z = $("pdraw-zoom");
+  if (z) z.textContent = Math.round(v.zoom * 100) + "%";
+}
+
+/* 画布铺满可用空间：frame 的**布局**尺寸 = 画布等比缩放到 stage 内。
+   缩放/平移仍由 pdrawApplyView 的 transform 叠加在上面，两者互不干扰。
+   以前 frame 由 SVG 的 width/height 属性撑成 256px，画布永远只有一小块。 */
+function pdrawFit() {
+  const stage = $("pdraw-stage"), frame = $("pdraw-frame");
+  if (!stage || !frame) return;
+  const aw = stage.clientWidth, ah = stage.clientHeight;
+  if (!aw || !ah) return;
+  const s = Math.min(aw / PDRAW.w, ah / PDRAW.h);
+  frame.style.width = Math.max(1, Math.floor(PDRAW.w * s)) + "px";
+  frame.style.height = Math.max(1, Math.floor(PDRAW.h * s)) + "px";
+}
+
+/* 列表 + 选中项表单 + SVG 一起刷新。
+   writeText=false 时不回写 token 文本框（用户在文本框里输入、由 pdrawFromText
+   触发重绘时用，避免光标跳动与输入被覆盖）。 */
+function pdrawSync(writeText) {
+  if (writeText === undefined) writeText = true;
+  const list = $("pdraw-list");
+  list.innerHTML = PDRAW.prims.map((p, i) => `
+    <div class="pdraw-item${i === PDRAW.sel ? " on" : ""}" data-i="${i}"
+         draggable="true" title="拖动可调整图层顺序（越靠后越靠上）">
+      <span class="pdraw-grip" aria-hidden="true">⋮⋮</span>
+      <span class="sw" style="background:rgb(${_pdTo8(p.r)},${_pdTo8(p.g)},${_pdTo8(p.b)})"></span>
+      <span class="nm">#${i} ${_PD_SHAPE[p.shape_type]} `
+    + `${_r2(p.cx)},${_r2(p.cy)} · ${_r2(p.w)}×${_r2(p.h)}</span>`
+    + `<button class="pdraw-del" data-del="${i}" title="删除该图元" aria-label="删除">✕</button>`
+    + `</div>`).join("")
+    || `<div class="hint">还没有图元。点画布空白处，或右上角的 ＋ 按钮。</div>`;
+  list.querySelectorAll("[data-i]").forEach(el => {
+    el.onclick = e => {
+      if (e.target.closest(".pdraw-del")) return;   // 点删除按钮不触发选中
+      PDRAW.sel = Number(el.dataset.i); pdrawSync();
+    };
+    el.ondragstart = e => {
+      e.dataTransfer.setData("text/plain", el.dataset.i);
+      e.dataTransfer.effectAllowed = "move";
+      el.classList.add("dragging");
+    };
+    el.ondragend = () => el.classList.remove("dragging");
+    el.ondragover = e => { e.preventDefault(); el.classList.add("over"); };
+    el.ondragleave = () => el.classList.remove("over");
+    el.ondrop = e => {
+      e.preventDefault();
+      el.classList.remove("over");
+      const from = Number(e.dataTransfer.getData("text/plain"));
+      const to = Number(el.dataset.i);
+      if (Number.isNaN(from) || from === to) return;
+      const [it] = PDRAW.prims.splice(from, 1);
+      PDRAW.prims.splice(to, 0, it);
+      PDRAW.sel = to;
+      pdrawSync();
+    };
+  });
+  list.querySelectorAll("[data-del]").forEach(b => {
+    b.onclick = e => {
+      e.stopPropagation(); e.preventDefault();
+      const i = Number(b.dataset.del);
+      PDRAW.prims.splice(i, 1);
+      if (PDRAW.sel === i) PDRAW.sel = Math.max(-1, i - 1);
+      else if (PDRAW.sel > i) PDRAW.sel -= 1;
+      pdrawSync();
+    };
+  });
+  pdrawForm();
+  pdrawRenderSVG();
+  if (writeText) setOut($("pdraw-out"), pdrawTokenText());
+}
+
+function pdrawForm() {
+  const box = $("pdraw-form");
+  const p = PDRAW.prims[PDRAW.sel];
+  if (!p) { box.hidden = true; box.innerHTML = ""; return; }
+  box.hidden = false;
+  const { w, h } = PDRAW;
+  const cmax = (PDRAW.layout && PDRAW.layout.color_max) || 1023;
+  const deg = _r2(p.theta * 180 / Math.PI);
+  box.innerHTML = `
+    <div class="pdraw-grid">
+      <label class="form-field"><span>x（0–${w - 1}）</span>
+        <input type="number" data-f="cx" value="${_r2(p.cx)}" min="0" max="${w - 1}" step="1"></label>
+      <label class="form-field"><span>y（0–${h - 1}）</span>
+        <input type="number" data-f="cy" value="${_r2(p.cy)}" min="0" max="${h - 1}" step="1"></label>
+      <label class="form-field"><span>宽 w（≤${w}）</span>
+        <input type="number" data-f="w" value="${_r2(p.w)}" min="0" max="${w}" step="0.5"></label>
+      <label class="form-field"><span>高 h（≤${h}）</span>
+        <input type="number" data-f="h" value="${_r2(p.h)}" min="0" max="${h}" step="0.5"></label>
+      <label class="form-field"><span>角度 theta（度）</span>
+        <input type="number" data-f="theta" value="${deg}" min="0" max="179" step="1"></label>
+      <label class="form-field"><span>形状</span>
+        <select data-f="shape">
+          <option value="-1"${p.shape_type === -1 ? " selected" : ""}>背景</option>
+          <option value="0"${p.shape_type === 0 ? " selected" : ""}>矩形</option>
+          <option value="1"${p.shape_type === 1 ? " selected" : ""}>椭圆</option>
+        </select></label>
+    </div>
+    <div class="pdraw-color">
+      <button class="pdraw-sw" data-f="sw" title="当前颜色（10 bit，每通道 0–1023）"
+        style="background:rgb(${_pdTo8(p.r)},${_pdTo8(p.g)},${_pdTo8(p.b)})"></button>
+      <div class="pdraw-cs">
+        <label>R<input type="range" class="slider" data-f="r" min="0" max="${cmax}" value="${p.r}"></label>
+        <label>G<input type="range" class="slider" data-f="g" min="0" max="${cmax}" value="${p.g}"></label>
+        <label>B<input type="range" class="slider" data-f="b" min="0" max="${cmax}" value="${p.b}"></label>
+      </div>
+    </div>
+    <div class="pdraw-color-row">
+      <button class="act sec xs" data-f="pick" title="取色笔：到画布上点一下取那里的颜色">取色笔</button>
+      <code class="pdraw-hex" data-f="hex">${_pdHex(p.r, p.g, p.b)}</code>
+      <span class="hint">10 bit（每通道 0–3FF）</span>
+    </div>`;
+  const pick = f => box.querySelector(`[data-f="${f}"]`);
+  const bind = (f, key, cast) => {
+    const el = pick(f);
+    if (!el) return;
+    el.oninput = () => {
+      const q = PDRAW.prims[PDRAW.sel];
+      if (!q) return;
+      q[key] = cast(el.value);
+      PDRAW.brush = { r: q.r, g: q.g, b: q.b };
+      // 只重画不重建表单：否则正在拖的滑杆会被 innerHTML 换掉，手感断掉
+      pdrawRender();
+      if (f === "r" || f === "g" || f === "b") {
+        const sw = pick("sw");
+        if (sw) sw.style.background = `rgb(${_pdTo8(q.r)},${_pdTo8(q.g)},${_pdTo8(q.b)})`;
+        const hx = pick("hex");
+        if (hx) hx.textContent = _pdHex(q.r, q.g, q.b);
+      }
+      const item = $("pdraw-list").querySelector(`[data-i="${PDRAW.sel}"] .nm`);
+      if (item) item.textContent = `#${PDRAW.sel} ${_PD_SHAPE[q.shape_type]} `
+        + `${_r2(q.cx)},${_r2(q.cy)} · ${_r2(q.w)}×${_r2(q.h)}`;
+    };
+  };
+  bind("cx", "cx", Number);
+  bind("cy", "cy", Number);
+  bind("w", "w", Number);
+  bind("h", "h", Number);
+  bind("theta", "theta", v => Number(v) * Math.PI / 180);
+  bind("r", "r", v => Math.round(Number(v)));
+  bind("g", "g", v => Math.round(Number(v)));
+  bind("b", "b", v => Math.round(Number(v)));
+  pick("shape").onchange = e => {
+    const q = PDRAW.prims[PDRAW.sel];
+    if (!q) return;
+    q.shape_type = Number(e.target.value);
+    pdrawSync();
+  };
+  pick("pick").onclick = () => {
+    PDRAW.picking = !PDRAW.picking;
+    pick("pick").classList.toggle("on", PDRAW.picking);
+    $("pdraw-msg").textContent = PDRAW.picking
+      ? "取色笔已就绪：在画布上点一下取那里的颜色" : "";
+  };
+}
+
+function pdrawAdd(shapeType, cx, cy) {
+  const { w, h } = PDRAW;
+  const size = Math.max(8, Math.round(Math.min(w, h) * 0.22));
+  const b = PDRAW.brush;
+  PDRAW.prims.push({
+    cx: cx == null ? w / 2 : Math.max(0, Math.min(w - 1, cx)),
+    cy: cy == null ? h / 2 : Math.max(0, Math.min(h - 1, cy)),
+    w: shapeType === -1 ? 0 : size,
+    h: shapeType === -1 ? 0 : size,
+    shape_type: shapeType,
+    theta: 0,
+    r: b.r, g: b.g, b: b.b,
+  });
+  PDRAW.sel = PDRAW.prims.length - 1;
+  pdrawSync();
+}
+
+/* 画布档位：两处下拉（图元绘画页 + 本页）共用同一份 spec 列表 */
+function pdrawSetCanvas(value) {
+  const m = /^(\d+)x(\d+)$/.exec(value || "");
+  if (!m) return;
+  PDRAW.w = Number(m[1]);
+  PDRAW.h = Number(m[2]);
+  PDRAW.prims.forEach(p => {
+    p.cx = Math.min(p.cx, PDRAW.w - 1);
+    p.cy = Math.min(p.cy, PDRAW.h - 1);
+  });
+  pdrawSync();
+}
+
+/* 取色：把「底图 + 图元」合成到离屏 canvas 上再读像素，
+   与屏幕上的呈现一致（SVG 层是透明的，底图在下层）。 */
+function pdrawSample(x, y) {
+  const cv = document.createElement("canvas");
+  cv.width = PDRAW.w; cv.height = PDRAW.h;
+  const ctx = cv.getContext("2d", { willReadFrequently: true });
+  const img = $("pdraw-bg-img");
+  if (img.classList.contains("on") && img.getAttribute("src")) {
+    try { ctx.drawImage(img, 0, 0, PDRAW.w, PDRAW.h); } catch (e) {}
+  } else {
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, PDRAW.w, PDRAW.h);
+  }
+  PDRAW.prims.forEach(p => {
+    ctx.save();
+    ctx.translate(p.cx, p.cy);
+    ctx.rotate(p.theta);
+    ctx.fillStyle = `rgb(${_pdTo8(p.r)},${_pdTo8(p.g)},${_pdTo8(p.b)})`;
+    if (p.shape_type === 1) {
+      ctx.beginPath();
+      ctx.ellipse(0, 0, p.w / 2, p.h / 2, 0, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+    }
+    ctx.restore();
+  });
+  const px = Math.max(0, Math.min(PDRAW.w - 1, Math.floor(x)));
+  const py = Math.max(0, Math.min(PDRAW.h - 1, Math.floor(y)));
+  const d = ctx.getImageData(px, py, 1, 1).data;
+  return { r: _pdTo10(d[0]), g: _pdTo10(d[1]), b: _pdTo10(d[2]) };
+}
+
+/* 画布交互：单击落图元 / 拖动平移 / 滚轮缩放（以光标为锚点） */
+function pdrawCanvasPoint(e) {
+  const svg = $("pdraw-svg");
+  const r = svg.getBoundingClientRect();
+  if (!r.width || !r.height) return null;
+  return { x: (e.clientX - r.left) / r.width * PDRAW.w,
+           y: (e.clientY - r.top) / r.height * PDRAW.h };
+}
+(function wireCanvas() {
+  const stage = $("pdraw-stage");
+  if (!stage) return;
+  let drag = null;
+  stage.addEventListener("pointerdown", e => {
+    if (e.button !== 0) return;
+    drag = { x: e.clientX, y: e.clientY, ox: PDRAW.view.ox, oy: PDRAW.view.oy,
+             moved: false };
+    stage.setPointerCapture(e.pointerId);
+  });
+  stage.addEventListener("pointermove", e => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (Math.abs(dx) + Math.abs(dy) > 4) drag.moved = true;
+    if (!drag.moved) return;
+    PDRAW.view.ox = drag.ox + dx;
+    PDRAW.view.oy = drag.oy + dy;
+    pdrawApplyView();
+  });
+  stage.addEventListener("pointerup", e => {
+    const d = drag;
+    drag = null;
+    if (!d || d.moved) return;              // 拖过 = 平移，不加图元
+    const pt = pdrawCanvasPoint(e);
+    if (!pt) return;
+    if (PDRAW.picking) {
+      const c = pdrawSample(pt.x, pt.y);
+      PDRAW.picking = false;
+      PDRAW.brush = c;
+      const q = PDRAW.prims[PDRAW.sel];
+      if (q) { q.r = c.r; q.g = c.g; q.b = c.b; }
+      $("pdraw-msg").textContent =
+        `已取色 ${_pdHex(c.r, c.g, c.b)}`;
+      pdrawSync();
+      return;
+    }
+    pdrawAdd(PDRAW.brushShape, pt.x, pt.y);
+  });
+  stage.addEventListener("wheel", e => {
+    e.preventDefault();
+    const v = PDRAW.view;
+    const before = pdrawCanvasPoint(e);
+    const k = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+    v.zoom = Math.max(0.15, Math.min(8, v.zoom * k));
+    pdrawApplyView();
+    // 以光标为锚点缩放：先量出缩放后光标下的画布坐标偏了多少
+    // （after - before，单位 = 画布 px），再换算回屏幕 px 补进平移——
+    // 1 画布 px = zoom 屏幕 px，所以必须乘当前 zoom。
+    const after = pdrawCanvasPoint(e);
+    if (before && after) {
+      v.ox += (after.x - before.x) * v.zoom;
+      v.oy += (after.y - before.y) * v.zoom;
+      pdrawApplyView();
+    }
+  }, { passive: false });
+})();
+
+$("pdraw-canvas").onchange = e => pdrawSetCanvas(e.target.value);
+/* 形状选择器：三个图形选项挑「当前画笔形状」，＋ 号按当前形状落一个。
+   画布单击也按当前形状落子（不再永远矩形）。 */
+(function wirePdrawTools() {
+  const tools = $("pdraw-tools");
+  if (!tools) return;
+  tools.querySelectorAll(".shape-opt").forEach(b => {
+    b.onclick = () => {
+      PDRAW.brushShape = Number(b.dataset.shape);
+      tools.querySelectorAll(".shape-opt").forEach(x => x.classList.remove("on"));
+      b.classList.add("on");
+    };
+  });
+  const addBtn = $("pdraw-add");
+  if (addBtn) addBtn.onclick = () => pdrawAdd(PDRAW.brushShape);
+})();
+$("pdraw-clear").onclick = () => { PDRAW.prims = []; PDRAW.sel = -1; pdrawSync(); };
+$("pdraw-undo").onclick = () => {
+  if (!PDRAW.prims.length) return;
+  PDRAW.prims.pop();
+  PDRAW.sel = Math.min(PDRAW.sel, PDRAW.prims.length - 1);
+  pdrawSync();
+};
+$("pdraw-view-reset").onclick = () => {
+  PDRAW.view = { zoom: 1, ox: 0, oy: 0 };
+  pdrawApplyView();
+};
+$("pdraw-bg").onchange = () => {
+  const f = $("pdraw-bg").files[0];
+  const img = $("pdraw-bg-img");
+  if (!f) { releaseBlob(img); img.classList.remove("on"); return; }
+  releaseBlob(img);
+  img.src = fileToUrl(f);
+  img.classList.add("on");
+  vocabSegSync("pdraw-bgseg", "on");
+  $("pdraw-msg").textContent = "底图已载入，调透明度对比";
+};
+vocabSegWire("pdraw-bgseg", v => {
+  const img = $("pdraw-bg-img");
+  img.classList.toggle("on", v === "on" && !!img.getAttribute("src"));
+  $("pdraw-msg").textContent = v === "on" ? "" : "已隐藏底图";
+});
+vocabSegSync("pdraw-bgseg", "off");
+$("pdraw-bgalpha").oninput = e => {
+  $("pdraw-bg-img").style.opacity = (Number(e.target.value) / 100).toFixed(2);
+};
+$("pdraw-bg-img").style.opacity = "0.6";
+/* 文本框直接编辑 token 序列 → 自动重绘 SVG / 列表（不回写文本框本身） */
+const _pdrawOut = $("pdraw-out");
+if (_pdrawOut) _pdrawOut.addEventListener("input", pdrawFromText);
+
+/* 进页面时按当前档位铺一次画布（尺寸来自 spec 列表，取默认那档） */
+function pdrawInit() {
+  if (!PDRAW.prims.length) {
+    const sel = $("pdraw-canvas");
+    if (sel && sel.value) pdrawSetCanvas(sel.value);
+    else pdrawSync();
+  } else {
+    pdrawSync();
+  }
+  // 窗口/侧栏变化时重新贴合（ResizeObserver 只建一次）
+  const stage = $("pdraw-stage");
+  if (stage && !PDRAW._ro && typeof ResizeObserver === "function") {
+    PDRAW._ro = new ResizeObserver(() => pdrawFit());
+    PDRAW._ro.observe(stage);
+  }
+  requestAnimationFrame(pdrawFit);
+}
 
 /* =========================================================================
    词表页：标签页 + 分区 + 增删 token + 词表级操作
@@ -1765,7 +2565,8 @@ const HK_DEFAULTS = {
   prevTool: "Alt+[",
   nextTool: "Alt+]",
 };
-const TOOL_PAGES = ["text", "audio", "image", "video", "prims", "json"];
+const TOOL_PAGES = ["text", "audio", "image", "video", "prims",
+                    "json", "pdraw"];
 function cycleTool(dir) {
   const cur = document.querySelector(".page.active");
   const id = cur ? cur.id.slice(2) : "";
@@ -1905,3 +2706,800 @@ document.addEventListener("keydown", e => {
     return;
   }
 }, true);
+
+/* =========================================================================
+   终端：项目目录内的交互式 shell（后端 server_term.py）
+   -------------------------------------------------------------------------
+   行模式：回车把整行发给后端，PTY 的输出由后端渲染成纯文本，这里每
+   250ms 轮询一次整体替换 <pre>。不做增量拼接——少一个包就永久错位，
+   而本地 localhost 全量传 100KB 的代价可以忽略。
+   ========================================================================= */
+const TERM = {
+  opened: false,
+  timer: null,
+  hist: [],          // 命令历史（↑↓ 翻）
+  hi: -1,
+  stick: true,       // 是否吸附在底部（用户往上翻就不抢滚动位置）
+};
+
+function termScroll() {
+  const out = $("term-out");
+  if (!out) return;
+  if (TERM.stick) out.scrollTop = out.scrollHeight;
+}
+
+async function termOpen() {
+  const r = await api("/api/term/open", {});
+  TERM.opened = true;
+  $("term-cwd").textContent = r.cwd;
+  $("term-msg").textContent = "";
+  TERM.stick = true;
+  await termPoll();
+}
+
+async function termPoll() {
+  try {
+    const r = await api("/api/term/poll");
+    const out = $("term-out");
+    if (!out) return;
+    if (out.textContent !== r.text) {
+      out.textContent = r.text;
+      termScroll();
+    }
+    $("term-cwd").textContent = r.cwd || "—";
+    if (!r.alive) $("term-msg").textContent = "会话已结束，点「重开」";
+  } catch (e) {
+    $("term-msg").textContent = "轮询失败: " + e.message;
+  }
+}
+
+async function termInit() {
+  if (!TERM.timer) {
+    TERM.timer = setInterval(() => {
+      // 只在终端页可见时轮询，切走就停，别白耗
+      if ($("p-term") && $("p-term").classList.contains("active")) termPoll();
+    }, 250);
+  }
+  try {
+    if (!TERM.opened) await termOpen();
+    else await termPoll();
+    $("term-line").focus();
+  } catch (e) {
+    $("term-msg").textContent = "打开终端失败: " + e.message;
+  }
+}
+
+async function termSubmit() {
+  const inp = $("term-line");
+  const line = inp.value;
+  inp.value = "";
+  if (!line.trim()) return;
+  TERM.hist.push(line);
+  TERM.hi = TERM.hist.length;
+  TERM.stick = true;
+  try {
+    await api("/api/term/input", {line});
+  } catch (e) {
+    $("term-msg").textContent = e.message;
+  }
+  await termPoll();
+}
+
+(function wireTerm() {
+  const inp = $("term-line");
+  if (!inp) return;
+  inp.addEventListener("keydown", e => {
+    if (e.key === "Enter") { e.preventDefault(); termSubmit(); return; }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!TERM.hist.length) return;
+      TERM.hi = Math.max(0, (TERM.hi < 0 ? TERM.hist.length : TERM.hi) - 1);
+      inp.value = TERM.hist[TERM.hi] || "";
+      return;
+    }
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      if (!TERM.hist.length) return;
+      TERM.hi = Math.min(TERM.hist.length, TERM.hi + 1);
+      inp.value = TERM.hi >= TERM.hist.length ? "" : TERM.hist[TERM.hi];
+    }
+  });
+  const out = $("term-out");
+  if (out) out.addEventListener("scroll", () => {
+    TERM.stick = out.scrollTop + out.clientHeight >= out.scrollHeight - 24;
+  });
+  $("term-clear").onclick = async () => {
+    try { await api("/api/term/clear", {}); } catch (e) {}
+    await termPoll();
+  };
+  $("term-interrupt").onclick = async () => {
+    try { await api("/api/term/interrupt", {}); } catch (e) {
+      $("term-msg").textContent = e.message;
+    }
+  };
+  $("term-restart").onclick = async () => {
+    try { await api("/api/term/close", {}); } catch (e) {}
+    TERM.opened = false;
+    await termInit();
+  };
+})();
+
+/* =========================================================================
+   图元绘画：任务列队 / 渲染 / token 输出
+   -------------------------------------------------------------------------
+   任务制：建任务 → 入队 → 后端顺序跑 → 结果落盘（service/prims/output/jobs）。
+   前端只做三件事：轮询任务表、按 `since` 增量拉实时图元、把图元画到 canvas。
+
+   为什么用 canvas 而不是 SVG：一次转换能出几千个图元，SVG 每加一个节点都要
+   重新布局；canvas 是「画上去就不管了」，实时渲染和 4000 步的时间线都扛得住。
+   ========================================================================= */
+const PRIMS = {
+  view: "queue",        // queue | render | tokens
+  jobs: [],             // 全部任务 meta（新→旧）
+  selected: null,       // 队列里选中的任务 id
+  editing: null,        // 正在编辑的排队任务 id（null = 新建）
+  listTimer: null,
+  logMode: "job",       // job | all
+  canvasAuto: true,     // 画布跟随图片比例
+  // 渲染页
+  tabs: [],             // [{id, name}]
+  active: null,
+  mode: "compare",      // compare | timeline
+  prims: [],            // 当前标签页已拿到的图元
+  canvas: null,         // [w,h]
+  status: "idle",
+  drawn: 0,             // 已经画到第几个（增量绘制）
+  tlStep: 0,
+  playing: false,
+  playTimer: null,
+  // token 页
+  tokTabs: [],
+  tokActive: null,
+};
+
+const _PRIM_DOT = { queued: "", running: "running", done: "done", error: "error" };
+
+/* ---------------- 通用：图元 → canvas ---------------- */
+function primFill(p) {
+  return `rgb(${_pdTo8(p.r)},${_pdTo8(p.g)},${_pdTo8(p.b)})`;
+}
+function drawOne(ctx, p, w, h) {
+  if (p.shape_type === -1) {
+    ctx.fillStyle = primFill(p);
+    ctx.fillRect(0, 0, w, h);
+    return;
+  }
+  ctx.save();
+  ctx.translate(p.cx, p.cy);
+  if (p.theta) ctx.rotate(p.theta);
+  ctx.fillStyle = primFill(p);
+  if (p.shape_type === 1) {
+    ctx.beginPath();
+    ctx.ellipse(0, 0, p.w / 2, p.h / 2, 0, 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+  }
+  ctx.restore();
+}
+/* 把 canvas 等比塞进 box（不改内部分辨率，只改 CSS 尺寸） */
+function fitCanvas(box, cv, cw, ch) {
+  if (!box || !cv || !cw || !ch) return;
+  // box 自己有 12px 内边距（框内留一圈），这里再扣掉一点呼吸量
+  const bw = Math.max(40, box.clientWidth - 24);
+  const bh = Math.max(40, box.clientHeight - 24);
+  const s = Math.min(bw / cw, bh / ch);
+  cv.style.width = Math.round(cw * s) + "px";
+  cv.style.height = Math.round(ch * s) + "px";
+}
+/* 缩放 + 平移：作用在元素 transform 上 */
+function wireZoomPan(box, target) {
+  const st = { z: 1, x: 0, y: 0 };
+  const apply = () => {
+    target.style.transform =
+      `translate(${st.x}px, ${st.y}px) scale(${st.z})`;
+  };
+  box.addEventListener("wheel", e => {
+    e.preventDefault();
+    st.z = Math.max(0.15, Math.min(16, st.z * Math.exp(-e.deltaY * 0.0015)));
+    apply();
+  }, { passive: false });
+  let drag = null;
+  box.addEventListener("pointerdown", e => {
+    if (e.button !== 0) return;
+    drag = { x: e.clientX, y: e.clientY, ox: st.x, oy: st.y };
+    box.setPointerCapture(e.pointerId);
+    box.classList.add("dragging");
+  });
+  box.addEventListener("pointermove", e => {
+    if (!drag) return;
+    st.x = drag.ox + (e.clientX - drag.x);
+    st.y = drag.oy + (e.clientY - drag.y);
+    apply();
+  });
+  const end = () => { drag = null; box.classList.remove("dragging"); };
+  box.addEventListener("pointerup", end);
+  box.addEventListener("pointercancel", end);
+  return { st, apply, reset() { st.z = 1; st.x = 0; st.y = 0; apply(); } };
+}
+
+/* ---------------- 视图切换 ---------------- */
+function primsSetView(v) {
+  PRIMS.view = v;
+  ["queue", "render", "tokens"].forEach(k => {
+    const el = $("prims-view-" + k);
+    if (el) el.hidden = k !== v;
+    const b = document.querySelector(`#prims-viewseg [data-v="${k}"]`);
+    if (b) b.classList.toggle("on", k === v);
+  });
+  if (v === "render") primsRenderRefresh();
+  if (v === "tokens") primsTokensRefresh();
+}
+
+/* ---------------- 任务表 ---------------- */
+async function primsRefreshJobs() {
+  try {
+    const r = await api("/api/prims/jobs");
+    PRIMS.jobs = r.jobs || [];
+    primsRenderQueue();
+    primsRenderDone();
+  } catch (e) { /* 服务还没起来时静默 */ }
+}
+
+function jobSub(j) {
+  const p = j.params || {};
+  const bits = [];
+  bits.push(String(p.engine || "auto").toUpperCase());
+  bits.push(`${p.steps || 0} 步`);
+  if (j.canvas) bits.push(`${j.canvas[0]}×${j.canvas[1]}`);
+  if (j.status === "running") {
+    const pr = j.progress || {};
+    bits.push(`${pr.step || 0}/${pr.total || 0}`);
+  }
+  if (j.status === "error" && j.error) bits.push(j.error.slice(0, 40));
+  return bits.join(" · ");
+}
+
+function jobItemHTML(j) {
+  const dot = _PRIM_DOT[j.status] || "";
+  const t = j.finished
+    ? new Date(j.finished * 1000).toLocaleString("zh-CN", { hour12: false })
+    : "";
+  const sub = j.status === "done"
+    ? `${j.n_primitives || 0} 图元 · ${(j.elapsed || 0).toFixed(1)}s · ${t}`
+    : jobSub(j);
+  return `<div class="q-item${PRIMS.selected === j.id ? " on" : ""}" data-id="${j.id}">
+    <span class="q-dot ${dot}"></span>
+    <span class="q-main"><span class="q-name">${esc(j.name)}</span>
+      <span class="q-sub">${esc(sub)}</span></span>
+    <button class="q-del" data-del="${j.id}" title="删除">✕</button>
+  </div>`;
+}
+
+function primsRenderQueue() {
+  const el = $("prims-queue-list");
+  if (!el) return;
+  const act = PRIMS.jobs.filter(j => j.status === "queued" || j.status === "running");
+  el.innerHTML = act.length ? act.map(jobItemHTML).join("")
+    : `<div class="hint" style="padding:8px">队列是空的。点右上角 ＋ 建一个任务。</div>`;
+  wireJobItems(el);
+}
+function primsRenderDone() {
+  const el = $("prims-done-list");
+  if (!el) return;
+  const done = PRIMS.jobs.filter(j => j.status === "done" || j.status === "error");
+  el.innerHTML = done.length ? done.map(jobItemHTML).join("")
+    : `<div class="hint" style="padding:8px">还没有完成的任务。</div>`;
+  wireJobItems(el);
+  const n = $("prims-done-note");
+  if (n) n.textContent = done.length ? `${done.length} 个` : "";
+}
+
+function wireJobItems(root) {
+  root.querySelectorAll(".q-item").forEach(el => {
+    el.onclick = e => {
+      if (e.target.closest(".q-del")) return;
+      primsSelect(el.dataset.id);
+    };
+  });
+  root.querySelectorAll(".q-del").forEach(b => {
+    b.onclick = async e => {
+      e.stopPropagation();
+      try {
+        await api("/api/prims/job/delete", { id: b.dataset.del });
+        if (PRIMS.selected === b.dataset.del) primsSelect(null);
+        await primsRefreshJobs();
+      } catch (err) { toast("删除失败: " + err.message, true); }
+    };
+  });
+}
+
+async function primsSelect(id) {
+  PRIMS.selected = id;
+  primsRenderQueue(); primsRenderDone();
+  const job = PRIMS.jobs.find(j => j.id === id);
+  const title = $("prims-edit-title");
+  if (!job) {
+    PRIMS.editing = null;
+    if (title) title.textContent = "新建任务";
+    const log = $("prims-log");
+    if (log) log.textContent = "";
+    return;
+  }
+  if (title) title.textContent = job.status === "queued" ? "编辑任务" : "任务详情";
+  // 表单回填（只有排队中的任务可改）
+  PRIMS.editing = job.status === "queued" ? job.id : null;
+  const p = job.params || {};
+  if ($("prims-engine")) $("prims-engine").value = p.engine || "auto";
+  if ($("prims-quality")) $("prims-quality").value = p.quality || "fast";
+  if ($("prims-steps")) $("prims-steps").value = p.steps || 100;
+  if ($("prims-early")) $("prims-early").value = p.early_stop === false ? "0" : "1";
+  const cv = p.canvas;
+  primsSetCanvasAuto(cv === "auto" || !cv);
+  if (Array.isArray(cv)) {
+    if ($("prims-cw")) $("prims-cw").value = cv[0];
+    if ($("prims-ch")) $("prims-ch").value = cv[1];
+  }
+  if ($("prims-name")) $("prims-name").value = job.name || "";
+  await primsLoadLog(id);
+}
+
+async function primsLoadLog(id) {
+  const log = $("prims-log");
+  if (!log) return;
+  try {
+    let lines;
+    if (PRIMS.logMode === "all") {
+      const r = await api("/api/prims/log?limit=400");
+      lines = r.lines || [];
+    } else {
+      if (!id) { log.textContent = "（没选任务）"; return; }
+      const r = await api(`/api/prims/job/live?id=${encodeURIComponent(id)}&since=999999`);
+      lines = r.log || [];
+    }
+    log.textContent = lines.join("\n");
+    log.scrollTop = log.scrollHeight;
+  } catch (e) { /* ignore */ }
+}
+
+/* ---------------- 新建 / 保存 ---------------- */
+async function primsCreate() {
+  const f = $("prims-file") && $("prims-file").files[0];
+  const msg = $("prims-form-msg");
+  const steps = Math.floor(Number($("prims-steps").value) || 0);
+  const body = {
+    engine: $("prims-engine").value,
+    quality: $("prims-quality").value,
+    steps: steps >= 1 ? steps : 100,
+    early_stop: $("prims-early").value === "1",
+    name: ($("prims-name").value || "").trim() ||
+          (f ? f.name.replace(/\.[^.]+$/, "") : "未命名"),
+  };
+  if (PRIMS.canvasAuto) {
+    body.canvas = "auto";
+  } else {
+    body.canvas = [Number($("prims-cw").value), Number($("prims-ch").value)];
+  }
+  try {
+    if (PRIMS.editing) {
+      await api("/api/prims/job/update", { id: PRIMS.editing, ...body });
+      if (msg) msg.textContent = "已保存";
+    } else {
+      if (!f) { if (msg) msg.textContent = "先选一张图片"; return; }
+      body.image_b64 = await fileToB64(f);
+      const r = await api("/api/prims/job/create", body);
+      if (msg) msg.textContent = "已加入队列";
+      PRIMS.selected = r.id;
+      if ($("prims-name")) $("prims-name").value = "";
+      resetFileInput("prims-file");
+      if ($("prims-file-name")) $("prims-file-name").textContent = "未选择";
+    }
+    await primsRefreshJobs();
+    primsSelect(PRIMS.selected);
+  } catch (e) {
+    if (msg) msg.textContent = "失败: " + e.message;
+  }
+}
+
+/* 画布 auto / 手动：一个小按钮，点一下换一次（steve 2026-11-03 指定） */
+function primsSetCanvasAuto(on) {
+  PRIMS.canvasAuto = !!on;
+  const b = $("prims-canvas-mode");
+  if (b) {
+    b.textContent = PRIMS.canvasAuto ? "auto" : "手动";
+    b.classList.toggle("on", PRIMS.canvasAuto);
+  }
+  if ($("prims-cw")) $("prims-cw").disabled = PRIMS.canvasAuto;
+  if ($("prims-ch")) $("prims-ch").disabled = PRIMS.canvasAuto;
+}
+
+function primsResetForm() {
+  PRIMS.editing = null;
+  PRIMS.selected = null;
+  ["prims-name"].forEach(id => { if ($(id)) $(id).value = ""; });
+  if ($("prims-engine")) $("prims-engine").value = "auto";
+  if ($("prims-quality")) $("prims-quality").value = "fast";
+  if ($("prims-steps")) $("prims-steps").value = 275;
+  if ($("prims-early")) $("prims-early").value = "1";
+  primsSetCanvasAuto(true);
+  const t = $("prims-edit-title"); if (t) t.textContent = "新建任务";
+  const l = $("prims-log"); if (l) l.textContent = "";
+  primsRenderQueue(); primsRenderDone();
+}
+
+/* ---------------- 渲染页：标签页 ---------------- */
+function primsTabHTML(j, active, kind) {
+  return `<button class="prims-tab${active ? " on" : ""}" data-tab="${j.id}" data-kind="${kind}">
+    ${esc(j.name)}<span class="x" data-close="${j.id}" data-kind="${kind}">✕</span></button>`;
+}
+function primsRenderTabs() {
+  const strip = $("prims-render-tabs");
+  if (!strip) return;
+  strip.innerHTML = PRIMS.tabs.map(id => {
+    const j = PRIMS.jobs.find(x => x.id === id) || { id, name: id };
+    return primsTabHTML(j, PRIMS.active === id, "render");
+  }).join("") || `<span class="hint">点 ＋ 打开一个任务</span>`;
+  strip.querySelectorAll("[data-tab]").forEach(b => {
+    b.onclick = e => {
+      if (e.target.closest("[data-close]")) return;
+      primsOpenTab(b.dataset.tab, false);
+    };
+  });
+  strip.querySelectorAll("[data-close]").forEach(b => {
+    b.onclick = e => {
+      e.stopPropagation();
+      const id = b.dataset.close;
+      PRIMS.tabs = PRIMS.tabs.filter(x => x !== id);
+      if (PRIMS.active === id) {
+        PRIMS.active = PRIMS.tabs[0] || null;
+        primsRenderRefresh();
+      }
+      primsRenderTabs();
+    };
+  });
+}
+
+async function primsOpenTab(id, add = true) {
+  if (add && !PRIMS.tabs.includes(id)) PRIMS.tabs.push(id);
+  PRIMS.active = id;
+  PRIMS.drawn = 0; PRIMS.prims = []; PRIMS.canvas = null;
+  primsRenderTabs();
+  await primsRenderRefresh();
+}
+
+/* 打开任务选择器（＋） */
+function primsPickJob(kind) {
+  // 运行中的也能开：渲染页对「还没跑完」的任务走实时增量，边跑边看。
+  const cands = PRIMS.jobs.filter(j => j.status !== "error");
+  if (!cands.length) { toast("还没有任务", true); return; }
+  const body = `<div class="pop-list">${cands.map(j => {
+    const st = j.status === "done" ? `${j.n_primitives || 0} 图元 · ${(j.elapsed || 0).toFixed(1)}s`
+      : (j.status === "running" ? "运行中…" : "排队中");
+    return `<button data-pick="${j.id}">${esc(j.name)}
+      <span class="sub">${st}</span></button>`;
+  }).join("")}</div>`;
+  modalOpenHTML("打开任务", body, "关闭", false);
+  $("modal-body").querySelectorAll("[data-pick]").forEach(b => {
+    b.onclick = () => {
+      const id = b.dataset.pick;
+      modalClose(true);
+      if (kind === "tokens") primsOpenTokenTab(id);
+      else primsOpenTab(id);
+    };
+  });
+}
+
+/* ---------------- 渲染页：取数据 + 画 ---------------- */
+async function primsRenderRefresh() {
+  const id = PRIMS.active;
+  const note = $("cmp-note");
+  if (!id) {
+    if (note) note.textContent = "没有打开的任务";
+    primsPaintAll();
+    return;
+  }
+  const job = PRIMS.jobs.find(j => j.id === id);
+  if (!job) return;
+  const img = $("cmp-src-img");
+  if (img) img.src = `/api/prims/job/source?id=${encodeURIComponent(id)}&t=${job.created}`;
+  if (job.status === "done") {
+    try {
+      const r = await api(`/api/prims/job/result?id=${encodeURIComponent(id)}`);
+      PRIMS.canvas = r.canvas;
+      PRIMS.prims = r.prims || [];
+      PRIMS.status = "done";
+      PRIMS.drawn = 0;
+      primsPaintAll();
+      if (note) note.textContent = `${r.prims.length} 个图元 · 画布 ${r.canvas[0]}×${r.canvas[1]}`;
+      const pct = $("cmp-pct"); if (pct) pct.textContent = "完成";
+      const fill = $("cmp-fill"); if (fill) fill.style.width = "100%";
+      const prog = $("cmp-progress"); if (prog) prog.hidden = false;
+      primsSyncTimeline();
+    } catch (e) {
+      if (note) note.textContent = "读取失败: " + e.message;
+    }
+    return;
+  }
+  // 排队/运行中：拉实时增量
+  const prog = $("cmp-progress"); if (prog) prog.hidden = false;
+  try {
+    const r = await api(`/api/prims/job/live?id=${encodeURIComponent(id)}&since=${PRIMS.prims.length}`);
+    if (r.canvas) PRIMS.canvas = r.canvas;
+    PRIMS.status = r.status;
+    if (r.prims && r.prims.length) {
+      PRIMS.prims.push(...r.prims);
+      primsPaintIncremental();
+    }
+    const pr = r.progress || {};
+    const total = pr.total || 1;
+    const pct = Math.min(100, Math.round((pr.step || 0) / total * 100));
+    const fill = $("cmp-fill"); if (fill) fill.style.width = pct + "%";
+    const pctEl = $("cmp-pct");
+    if (pctEl) pctEl.textContent = `${pr.step || 0} / ${total} 步 · ${PRIMS.prims.length} 图元`;
+    if (note) note.textContent = r.status === "running"
+      ? `运行中 · ${PRIMS.prims.length} 个图元` : (r.note || r.status);
+    if (r.status === "done" || r.status === "error") {
+      if (r.status === "done") { PRIMS.status = "done"; await primsRenderRefresh(); }
+    }
+  } catch (e) {
+    if (note) note.textContent = "读取失败: " + e.message;
+  }
+}
+
+function primsEnsureCanvas() {
+  const cv = $("cmp-canvas");
+  const box = $("cmp-out");
+  if (!cv || !box || !PRIMS.canvas) return null;
+  const [w, h] = PRIMS.canvas;
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  fitCanvas(box, cv, w, h);
+  return cv;
+}
+
+function primsPaintAll() {
+  const cv = primsEnsureCanvas();
+  if (!cv) return;
+  const ctx = cv.getContext("2d");
+  const [w, h] = PRIMS.canvas;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, w, h);
+  PRIMS.prims.forEach(p => drawOne(ctx, p, w, h));
+  PRIMS.drawn = PRIMS.prims.length;
+  primsLayout();
+}
+
+function primsPaintIncremental() {
+  const cv = primsEnsureCanvas();
+  if (!cv) return;
+  const ctx = cv.getContext("2d");
+  const [w, h] = PRIMS.canvas;
+  if (PRIMS.drawn === 0) { ctx.clearRect(0, 0, w, h); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h); }
+  for (let i = PRIMS.drawn; i < PRIMS.prims.length; i++) drawOne(ctx, PRIMS.prims[i], w, h);
+  PRIMS.drawn = PRIMS.prims.length;
+  primsLayout();
+}
+
+/* 左右 / 上下自动布局：哪个方向能给出更大的显示面积就用哪个 */
+function primsLayout() {
+  const stage = $("prims-stage-compare");
+  const box = $("cmp-out");
+  if (!stage || !box || !PRIMS.canvas) return;
+  const [cw, ch] = PRIMS.canvas;
+  const W = stage.clientWidth, H = stage.clientHeight;
+  if (!W || !H) return;
+  const A = cw / ch;
+  // 并排时每格 W/2 × H；上下时每格 W × H/2。取面积大者。
+  const sideArea = Math.min(W / 2, H * A) * Math.min(H, (W / 2) / A);
+  const stackArea = Math.min(W, (H / 2) * A) * Math.min(H / 2, W / A);
+  const vert = stackArea > sideArea;
+  stage.classList.toggle("vert", vert);
+  const cv = $("cmp-canvas");
+  if (cv) fitCanvas(box, cv, cw, ch);
+  const tl = $("tl-canvas");
+  if (tl) fitCanvas($("tl-wrap"), tl, cw, ch);
+}
+
+/* ---------------- 时间线 ---------------- */
+function primsSyncTimeline() {
+  const range = $("tl-range");
+  if (!range) return;
+  range.max = Math.max(0, PRIMS.prims.length - 1);
+  PRIMS.tlStep = Math.min(PRIMS.tlStep, Number(range.max));
+  range.value = PRIMS.tlStep;
+  primsPaintTimeline();
+}
+function primsPaintTimeline() {
+  const cv = $("tl-canvas");
+  const box = $("tl-wrap");
+  if (!cv || !box || !PRIMS.canvas) return;
+  const [w, h] = PRIMS.canvas;
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  fitCanvas(box, cv, w, h);
+  const ctx = cv.getContext("2d");
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h);
+  const n = Math.min(PRIMS.prims.length, PRIMS.tlStep + 1);
+  for (let i = 0; i < n; i++) drawOne(ctx, PRIMS.prims[i], w, h);
+  const lab = $("tl-label");
+  if (lab) lab.textContent = `${n} / ${PRIMS.prims.length}`;
+}
+function primsPlay() {
+  PRIMS.playing = !PRIMS.playing;
+  const b = $("tl-play");
+  if (b) b.textContent = PRIMS.playing ? "⏸ 暂停" : "▶ 播放";
+  if (PRIMS.playTimer) { clearInterval(PRIMS.playTimer); PRIMS.playTimer = null; }
+  if (!PRIMS.playing) return;
+  PRIMS.playTimer = setInterval(() => {
+    const range = $("tl-range");
+    if (!range) return;
+    let v = Number(range.value) + Math.max(1, Math.round(PRIMS.prims.length / 300));
+    if (v >= Number(range.max)) { v = Number(range.max); primsPlay(); }
+    range.value = v;
+    PRIMS.tlStep = v;
+    primsPaintTimeline();
+  }, 40);
+}
+
+/* ---------------- token 页 ---------------- */
+function primsRenderTokenTabs() {
+  const strip = $("prims-token-tabs");
+  if (!strip) return;
+  strip.innerHTML = PRIMS.tokTabs.map(id => {
+    const j = PRIMS.jobs.find(x => x.id === id) || { id, name: id };
+    return primsTabHTML(j, PRIMS.tokActive === id, "tok");
+  }).join("") || `<span class="hint">点 ＋ 打开一个已完成任务</span>`;
+  strip.querySelectorAll("[data-tab]").forEach(b => {
+    b.onclick = e => {
+      if (e.target.closest("[data-close]")) return;
+      primsOpenTokenTab(b.dataset.tab, false);
+    };
+  });
+  strip.querySelectorAll("[data-close]").forEach(b => {
+    b.onclick = e => {
+      e.stopPropagation();
+      const id = b.dataset.close;
+      PRIMS.tokTabs = PRIMS.tokTabs.filter(x => x !== id);
+      if (PRIMS.tokActive === id) PRIMS.tokActive = PRIMS.tokTabs[0] || null;
+      primsRenderTokenTabs(); primsTokensRefresh();
+    };
+  });
+}
+async function primsOpenTokenTab(id, add = true) {
+  if (add && !PRIMS.tokTabs.includes(id)) PRIMS.tokTabs.push(id);
+  PRIMS.tokActive = id;
+  primsRenderTokenTabs();
+  await primsTokensRefresh();
+}
+async function primsTokensRefresh() {
+  const pre = $("prims-tokens");
+  if (!pre) return;
+  primsRenderTokenTabs();
+  const id = PRIMS.tokActive;
+  if (!id) { pre.textContent = "—"; return; }
+  try {
+    const r = await api(`/api/prims/job/result?id=${encodeURIComponent(id)}`);
+    const lines = [];
+    lines.push(`# 画布 ${r.canvas[0]}×${r.canvas[1]} · ${r.prims.length} 个图元 · ${r.tokens.length} 个 token`);
+    lines.push("# " + (r.note || ""));
+    lines.push(stepsToToken5([{ modality: "draw", token_ids: r.tokens, meta: {} }], "model"));
+    pre.textContent = lines.join("\n");
+  } catch (e) {
+    pre.textContent = "读取失败: " + e.message;
+  }
+}
+
+/* ---------------- 关于 ---------------- */
+function primsShowAbout() {
+  modalOpenHTML("关于图元绘画", `
+    <div class="about-p" style="text-align:left;line-height:1.75">
+      <p><b>图元绘画</b>把一张位图「重画」成一串矢量图元（矩形 / 椭圆），
+      每画一个都记录 9 个参数：位置 <code>x,y</code>、旋转 <code>theta</code>、
+      尺寸 <code>w,h</code>、形状 <code>shape</code>、颜色 <code>r,g,b</code>。
+      序列最前面还有一段<b>画布声明</b>，说明这张画有多大。</p>
+      <p><b>两条引擎</b>：<br>
+      · <b>GPU</b>：vendored 的 Rust/wgpu 转换器（<code>service/prims/fast_shape_render</code>）。
+      按目标画布的长宽比挑一个小画布拟合（长边 256），结果等比放大。
+      耗时与步数成正比，275 步约 20 秒。<br>
+      · <b>CPU</b>：本地 numpy 贪心拟合，单线程，几秒出结果，适合快速试。</p>
+      <p><b>步数</b>：GPU 下是「搜索轮数」，每轮最多采纳 1 个图元；CPU 下是迭代次数。<br>
+      <b>早停</b>：连续 1000 步没有明显改善就收工——这就是「填了 20000 只出
+      3975 个图元」的原因。关掉早停才会真的跑满。</p>
+      <p><b>画布</b>：1..1920 × 1..1080 任意尺寸。左边那个小按钮在
+      <code>auto</code> / <code>手动</code> 之间切换——<b>auto</b> 按原图长宽比
+      算出「塞得进上限的最大同比例画布」（竖图就是 810×1080 这种），
+      <b>手动</b> 才用你填的宽高。</p>
+      <p><b>任务列队</b>：一次只能跑一个（GPU 独占），其余排队；结果落在
+      <code>service/prims/output/jobs/&lt;id&gt;/</code>，随时可以回看、对比、取 token。</p>
+      <p><b>渲染</b>：左边原图、右边图元，都能滚轮缩放 / 拖动平移；跑的时候
+      边算边画，底部有进度条。<b>时间线</b>按步回放，可以拖、可以自动播放。</p>
+    </div>`, "知道了", false);
+}
+
+/* ---------------- 初始化 ---------------- */
+function primsInit() {
+  if (!PRIMS.listTimer) {
+    PRIMS.listTimer = setInterval(() => {
+      const page = $("p-prims");
+      if (!page || !page.classList.contains("active")) return;
+      primsRefreshJobs();
+      if (PRIMS.view === "render" && PRIMS.active) primsRenderRefresh();
+      if (PRIMS.selected) primsLoadLog(PRIMS.selected);
+    }, 1200);
+  }
+  primsRefreshJobs().then(() => {
+    if (PRIMS.view === "render") primsRenderRefresh();
+    if (PRIMS.view === "tokens") primsTokensRefresh();
+  });
+}
+
+(function wirePrims() {
+  const seg = $("prims-viewseg");
+  if (seg) {
+    seg.querySelectorAll("[data-v]").forEach(b => {
+      b.onclick = () => primsSetView(b.dataset.v);
+    });
+  }
+  const mode = $("prims-mode-seg");
+  if (mode) {
+    mode.querySelectorAll("[data-v]").forEach(b => {
+      b.onclick = () => {
+        PRIMS.mode = b.dataset.v;
+        mode.querySelectorAll("[data-v]").forEach(x => x.classList.toggle("on", x === b));
+        const cmp = $("prims-stage-compare");
+        const tl = $("prims-stage-timeline");
+        if (cmp) cmp.hidden = PRIMS.mode !== "compare";
+        if (tl) tl.hidden = PRIMS.mode !== "timeline";
+        if (PRIMS.mode === "timeline") { primsSyncTimeline(); primsPaintTimeline(); }
+        else primsLayout();
+      };
+    });
+  }
+  const logSeg = $("prims-log-seg");
+  if (logSeg) {
+    logSeg.querySelectorAll("[data-v]").forEach(b => {
+      b.onclick = () => {
+        PRIMS.logMode = b.dataset.v;
+        logSeg.querySelectorAll("[data-v]").forEach(x => x.classList.toggle("on", x === b));
+        primsLoadLog(PRIMS.selected);
+      };
+    });
+  }
+  if ($("prims-about")) $("prims-about").onclick = primsShowAbout;
+  if ($("prims-add")) $("prims-add").onclick = primsResetForm;
+  if ($("prims-create")) $("prims-create").onclick = primsCreate;
+  if ($("prims-canvas-mode")) {
+    $("prims-canvas-mode").onclick = () => primsSetCanvasAuto(!PRIMS.canvasAuto);
+  }
+  if ($("prims-render-add")) $("prims-render-add").onclick = () => primsPickJob("render");
+  if ($("prims-token-add")) $("prims-token-add").onclick = () => primsPickJob("tokens");
+  if ($("tl-range")) {
+    $("tl-range").oninput = e => {
+      PRIMS.tlStep = Number(e.target.value);
+      primsPaintTimeline();
+    };
+  }
+  if ($("tl-play")) $("tl-play").onclick = primsPlay;
+
+  // 缩放 / 平移（三个画布各自一套）
+  const srcImg = $("cmp-src-img");
+  if ($("cmp-src") && srcImg) wireZoomPan($("cmp-src"), srcImg);
+  if ($("cmp-out") && $("cmp-canvas")) wireZoomPan($("cmp-out"), $("cmp-canvas"));
+  if ($("tl-wrap") && $("tl-canvas")) wireZoomPan($("tl-wrap"), $("tl-canvas"));
+
+  // 尺寸变化时重新贴合
+  if (typeof ResizeObserver === "function") {
+    const ro = new ResizeObserver(() => {
+      if (PRIMS.view === "render") {
+        primsLayout();
+        const cv = $("cmp-canvas");
+        if (cv && PRIMS.canvas) fitCanvas($("cmp-out"), cv, PRIMS.canvas[0], PRIMS.canvas[1]);
+        const tl = $("tl-canvas");
+        if (tl && PRIMS.canvas) fitCanvas($("tl-wrap"), tl, PRIMS.canvas[0], PRIMS.canvas[1]);
+      }
+    });
+    ["prims-stage-compare", "prims-stage-timeline"].forEach(id => {
+      const el = $(id); if (el) ro.observe(el);
+    });
+  }
+})();

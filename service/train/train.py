@@ -136,9 +136,14 @@ def _config_dict(args, m) -> dict:
     cfg.update({
         "name": os.path.basename(os.path.normpath(args.model)),
         "params": sum(p.numel() for p in m.parameters()),
-        "d_model": spec.D_MODEL, "head_dim": spec.HEAD_DIM,
+        # 2026-11-04：以模型实例为准写回宽度（旧默认目录同样是 1024）
+        "d_model": getattr(m, "d_model", spec.D_MODEL),
+        "head_dim": spec.HEAD_DIM,
         "n_enc_blocks": len(m.enc_blocks),
         "n_dec_blocks": len(m.dec_blocks),
+        # 2026-11-04：以模型实例为准写回权重模式。共享模型若丢了这个
+        # 字段，下次 build_model 会按「分离」构造，strict load 直接失败。
+        "share_enc_dec": bool(getattr(m, "share_enc_dec", False)),
         # 2026-10-30：词表长度是每个模型自己的属性（不再有全局 pad 值）。
         # 以模型实例为准——训练中途换过词表时，这里记录的是实际在训的形状。
         "vocab_size": int(getattr(m, "n_vocab", 0) or 0),

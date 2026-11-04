@@ -239,39 +239,70 @@ class TestAudioCodec(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestDrawCodec(unittest.TestCase):
     """图元 codec：token 布局照搬 primitive-operation-painter
-    geometrize_256_v1（cx,cy,theta,w,h,shape,r,g,b + special 3 bins）。"""
+    geometrize_256_v1（x,y,theta,w,h,shape,r,g,b + special 3 bins），
+    2026-11-01 起序列开头是画布声明（<x> 数字 <x/> <y> 数字 <y/>），
+    x/y 1 token=1 像素、颜色 10 bit（1 bin=1 值）。"""
 
     B = spec.DRAW_BEGIN
 
+    @staticmethod
+    def _decl_len(w: int, h: int) -> int:
+        """画布声明的 token 数 = 4 定界符 + 两段十进制数字。"""
+        return 4 + len(str(w)) + len(str(h))
+
     def test_primitive_token_roundtrip(self):
-        # bin 精确值（cx 偶数、w/h 为 0.25 倍数、角度为 1/3 度倍数、
-        # 颜色偶数）→ roundtrip 严格相等
+        # bin 精确值（cx/cy 整数像素、w/h 为 0.25 倍数、角度为 1/3 度倍数、
+        # 颜色为 10 bit 整值）→ roundtrip 严格相等
         prims = [
-            draw_codec.Primitive(0, 0, 0, 0, -1, 0.0, 100, 200, 250),
+            draw_codec.Primitive(0, 0, 0, 0, -1, 0.0, 400, 800, 1000),
             draw_codec.Primitive(128, 96, 40, 20, 0, math.radians(20),
-                                 254, 0, 128),
+                                 1016, 0, 512),
             draw_codec.Primitive(60, 180, 30, 50, 1, math.radians(12),
-                                 10, 20, 30),
+                                 40, 80, 120),
         ]
         ids = draw_codec.primitives_to_tokens(prims)
-        self.assertEqual(len(ids), 3 * 9)
+        # 画布声明（<x> 2 5 6 <x/> <y> 2 5 6 <y/> = 10）+ 3 图元 × 9
+        self.assertEqual(len(ids), self._decl_len(256, 256) + 3 * 9)
+        self.assertEqual(draw_codec.canvas_of_tokens(ids),
+                         spec.DRAW_DEFAULT_CANVAS)
         back = draw_codec.tokens_to_primitives(ids)
         self.assertEqual(back, prims)
+
+    def test_canvas_token_leads_and_sets_range(self):
+        # 大画布：cx/cy 可以到 1919 / 1079，roundtrip 仍然严格相等
+        prims = [draw_codec.Primitive(1500, 900, 40, 20, 0,
+                                      math.radians(20), 1016, 0, 512)]
+        ids = draw_codec.primitives_to_tokens(prims, canvas=(1920, 1080))
+        self.assertEqual(draw_codec.canvas_of_tokens(ids), (1920, 1080))
+        # 声明打头：`<x> 1 9 2 0 <x/> <y> 1 0 8 0 <y/>`（12 个 token），
+        # 定界符都落在 DRAW 区最前 4 个 bin
+        self.assertEqual(ids[0] - self.B, spec.DRAW_CANVAS_OFFSET + 0)
+        self.assertEqual(ids[5] - self.B, spec.DRAW_CANVAS_OFFSET + 1)
+        self.assertEqual(ids[6] - self.B, spec.DRAW_CANVAS_OFFSET + 2)
+        self.assertEqual(ids[11] - self.B, spec.DRAW_CANVAS_OFFSET + 3)
+        canvas, back = draw_codec.decode_draw(ids)
+        self.assertEqual(canvas, (1920, 1080))
+        self.assertEqual(back, prims)
+        # 没有画布声明的裸流（旧数据）按默认画布解码
+        body = ids[self._decl_len(1920, 1080):]
+        self.assertIsNone(draw_codec.canvas_of_tokens(body))
+        self.assertEqual(draw_codec.tokens_to_primitives(body), prims)
 
     def test_token_ranges_and_order(self):
         p = draw_codec.Primitive(cx=10, cy=20, w=8, h=12, shape_type=0,
                                  theta=math.radians(20), r=60, g=70, b=80)
-        ids = draw_codec.primitives_to_tokens([p])
+        # 单图元编码：只返回该图元的 9 个 token（画布声明不参与）
+        ids = draw_codec.primitive_to_tokens(p)
         b = self.B
-        self.assertEqual(ids[0], b + spec.DRAW_X_OFFSET + 20)      # 10*2
-        self.assertEqual(ids[1], b + spec.DRAW_Y_OFFSET + 40)      # 20*2
+        self.assertEqual(ids[0], b + spec.DRAW_X_OFFSET + 10)      # 1bin=1px
+        self.assertEqual(ids[1], b + spec.DRAW_Y_OFFSET + 20)
         self.assertEqual(ids[2], b + spec.DRAW_ANGLE_OFFSET + 60)  # 20*3
-        self.assertEqual(ids[3], b + spec.DRAW_W_OFFSET + 32)      # 8*4
-        self.assertEqual(ids[4], b + spec.DRAW_H_OFFSET + 48)      # 12*4
+        self.assertEqual(ids[3], b + spec.DRAW_W_OFFSET + 8)       # 1bin=1px
+        self.assertEqual(ids[4], b + spec.DRAW_H_OFFSET + 12)      # 1bin=1px
         self.assertEqual(ids[5], b + spec.DRAW_SHAPE_OFFSET + 1)   # 0+1
-        self.assertEqual(ids[6], b + spec.DRAW_R_OFFSET + 30)      # 60//2
-        self.assertEqual(ids[7], b + spec.DRAW_G_OFFSET + 35)      # 70//2
-        self.assertEqual(ids[8], b + spec.DRAW_B_OFFSET + 40)      # 80//2
+        self.assertEqual(ids[6], b + spec.DRAW_R_OFFSET + 60)      # 10bit 原值
+        self.assertEqual(ids[7], b + spec.DRAW_G_OFFSET + 70)
+        self.assertEqual(ids[8], b + spec.DRAW_B_OFFSET + 80)
         for t in ids:
             # 图元 token 落在架构契约头的 DRAW 区（新契约：词表长度不再
             # 全局钉死，但 DRAW 区的位置与大小仍是 spec 冻结契约）
@@ -282,11 +313,11 @@ class TestDrawCodec(unittest.TestCase):
         # theta ≥ 90°：归一到 [0,90) 并交换宽高（与仓库 encode 一致）
         p = draw_codec.Primitive(cx=100, cy=100, w=8, h=40, shape_type=0,
                                  theta=math.radians(100), r=0, g=0, b=0)
-        ids = draw_codec.primitives_to_tokens([p])
+        ids = draw_codec.primitive_to_tokens(p)
         b = self.B
         self.assertEqual(ids[2] - b - spec.DRAW_ANGLE_OFFSET, 30)   # 100-90=10° ×3
-        self.assertEqual(ids[3] - b - spec.DRAW_W_OFFSET, 160)      # 40*4（交换后）
-        self.assertEqual(ids[4] - b - spec.DRAW_H_OFFSET, 32)       # 8*4
+        self.assertEqual(ids[3] - b - spec.DRAW_W_OFFSET, 40)       # 40（交换后）
+        self.assertEqual(ids[4] - b - spec.DRAW_H_OFFSET, 8)        # 8
 
     def test_special_bin_stops_decode(self):
         # 步首 token 落入 special bin 区 → 序列结束（仓库 decode 语义）
@@ -298,28 +329,29 @@ class TestDrawCodec(unittest.TestCase):
         self.assertEqual(back, [p])
 
     def test_clamp_out_of_range(self):
-        p = draw_codec.Primitive(5000, -3, 9999, 2000, 7, 99.0,
+        # theta=0 避开「≥90° 交换宽高」：这里只验证各字段钳到词表区间
+        p = draw_codec.Primitive(5000, -3, 9999, 2000, 7, 0.0,
                                  2000, -1, 300)
         with self.assertLogs("tokens.draw_codec", level="WARNING"):
             ids = draw_codec.primitives_to_tokens([p])
         back = draw_codec.tokens_to_primitives(ids)[0]
         b = self.B
-        self.assertEqual(back.cx, 255.0)                    # clamp 后 bin 510
+        self.assertEqual(back.cx, 255.0)                    # clamp 到画布边 255
         self.assertEqual(back.cy, 0.0)
         self.assertEqual(back.w, (spec.DRAW_W_BINS - 1)
-                         / spec.SIZE_BINS_PER_PIXEL)        # 127.75
+                         / spec.SIZE_BINS_PER_PIXEL)        # 1919
         self.assertEqual(back.h, (spec.DRAW_H_BINS - 1)
-                         / spec.SIZE_BINS_PER_PIXEL)
+                         / spec.SIZE_BINS_PER_PIXEL)        # 1079
         self.assertEqual(back.shape_type, 0)                 # 非法 → 矩形
-        self.assertEqual(back.r, 254)                       # 255//2=127 → 254
+        self.assertEqual(back.r, spec.DRAW_COLOR_MAX)        # 10bit 上限 1023
         self.assertEqual(back.g, 0)
-        self.assertEqual(back.b, 254)
+        self.assertEqual(back.b, 300)                        # ≤1023 不动
 
     def test_csv_roundtrip(self):
         prims = [
-            draw_codec.Primitive(0, 0, 0, 0, -1, 0.0, 12, 34, 56),
-            draw_codec.Primitive(33.5, 64.0, 40, 20, 0, math.radians(20),
-                                 200, 100, 50),
+            draw_codec.Primitive(0, 0, 0, 0, -1, 0.0, 48, 136, 224),
+            draw_codec.Primitive(33, 64, 40, 20, 0, math.radians(20),
+                                 800, 400, 200),
         ]
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "seq.csv")
@@ -331,9 +363,16 @@ class TestDrawCodec(unittest.TestCase):
             back = draw_codec.csv_to_primitives(path)
         self.assertEqual(len(back), 2)
         self.assertEqual(back[0].shape_type, -1)
-        self.assertAlmostEqual(back[1].cx, 33.5, places=6)
+        # CSV 落盘 8 bit、读入升 10 bit：48 → color_to8=12 → color_to10=48
+        # 无损；800 → 199 → 798 有 ±1 量化（8bit 边界的固有精度）
+        self.assertEqual(back[0].r, 48)
+        self.assertEqual(back[1].r, draw_codec.color_to10(
+            draw_codec.color_to8(800)))
+        self.assertAlmostEqual(back[1].cx, 33, places=6)
         self.assertAlmostEqual(back[1].theta, math.radians(20), places=6)
-        # CSV → token → 解码 → 再编码：ID 流幂等（bin 量化吸收精度）
+        # CSV → token → 解码 → 再编码：ID 流幂等（bin 量化吸收精度）。
+        # x/y 是 1 bin=1 px，所以图元坐标必须取整数像素；分数坐标在
+        # token 化时截断（这是新布局的固有量化，不是 bug）。
         ids = draw_codec.primitives_to_tokens(back)
         back2 = draw_codec.tokens_to_primitives(ids)
         self.assertEqual(back2, back)
@@ -342,9 +381,10 @@ class TestDrawCodec(unittest.TestCase):
     def test_png_render_header_and_size(self):
         prims = [
             draw_codec.Primitive(0, 0, 0, 0, -1, 0.0, 0, 0, 0),
-            draw_codec.Primitive(32, 24, 20, 10, 0, 0.0, 255, 0, 0),
+            # 内部色值是 10 bit：1023 = 满红（渲染边界 color_to8 → 255）
+            draw_codec.Primitive(32, 24, 20, 10, 0, 0.0, 1023, 0, 0),
             draw_codec.Primitive(32, 24, 16, 16, 1, math.radians(30),
-                                 0, 0, 255),
+                                 0, 0, 1023),
         ]
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "out.png")
@@ -359,9 +399,9 @@ class TestDrawCodec(unittest.TestCase):
         self.assertEqual(img.getpixel((23, 20))[:3], (255, 0, 0))
 
     def test_ellipse_rotation_hit(self):
-        # 旋转椭圆：渲染缓冲内应有椭圆颜色的像素
+        # 旋转椭圆：渲染缓冲内应有椭圆颜色的像素（g=1023 → 满绿）
         prims = [draw_codec.Primitive(32, 24, 20, 20, 1, math.radians(45),
-                                      0, 255, 0)]
+                                      0, 1023, 0)]
         buf = draw_codec.render_rgba(prims, w=64, h=48)
         arr = np.frombuffer(bytes(buf), dtype=np.uint8).reshape(48, 64, 4)
         green = (arr[:, :, 1] == 255) & (arr[:, :, 0] == 0)

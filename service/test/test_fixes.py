@@ -924,37 +924,41 @@ class TestStartupChain(unittest.TestCase):
         # 回归：api_system 曾用裸 `_DIST_NAME` 访问类属性（NameError），
         # 又被 `except Exception: pass` 吞掉 → 前端永远拿不到版本号，
         # 「环境与依赖」卡片退化成只有名字。
+        # 2026-11-01：清单改由 start/requirements/{must,necessary}.txt
+        # 声明（server/reqs.py 解析）——所有依赖（装了/没装）都必须出现在
+        # dependencies 里，装的必须有版本号。
         import server
         code, obj = server.App("models", "data",
                                "logs/auto_train.jsonl").api_system()
         self.assertEqual(code, 200)
         names = {d["name"]: d for d in obj["dependencies"]}
-        for mod in ("torch", "numpy", "PIL", "safetensors"):
+        for mod in ("python", "pywebview", "torch", "numpy", "pillow",
+                    "safetensors", "pytest", "ffmpeg", "rust"):
+            self.assertIn(mod, names, f"{mod} 必须出现在依赖清单里")
+        # 已装的 Python 依赖必须有版本号（静默 except 会让版本变空）
+        for mod in ("torch", "numpy", "pillow", "safetensors"):
             self.assertTrue(names[mod]["ok"], f"{mod} 应已安装")
             self.assertTrue(names[mod].get("version"),
-                           f"{mod} 缺少版本号（类属性访问/静默 except？）")
-        # PIL 的发行包名是 pillow，不是 PIL
-        self.assertIn(".", names["PIL"]["version"])
-        # 可选依赖缺失时必须给「用途 + pip 包名」，而不是 str(e) 原文
-        for mod in ("cv2", "soundfile"):
-            if names[mod]["ok"]:
-                continue                        # 环境里装过就跳过
-            self.assertTrue(names[mod].get("optional"), f"{mod} 应标记为可选")
-            self.assertTrue(names[mod].get("why"), f"{mod} 缺用途说明")
-            self.assertTrue(names[mod].get("pkg"), f"{mod} 缺 pip 包名")
-            self.assertNotIn("No module named", names[mod].get("note", ""),
-                             "不许把 traceback 文案倒给前端")
+                            f"{mod} 缺少版本号（类属性访问/静默 except？）")
+        # 发行包名是 pillow（不是模块名 PIL）
+        self.assertIn(".", names["pillow"]["version"])
+        # must / necessary 分组必须如实标出
+        self.assertEqual(names["pywebview"]["group"], "must")
+        self.assertEqual(names["torch"]["group"], "necessary")
+        # optional_missing = necessary 里没装的（测试机通常都装了）
         self.assertEqual(sorted(obj["optional_missing"]),
-                         sorted(n for n, d in names.items()
-                                if d.get("optional") and not d["ok"]))
+                         sorted(d["name"] for d in obj["dependencies"]
+                                if d["group"] == "necessary" and not d["ok"]))
 
     def test_optional_install_carries_constraints(self):
-        # 回归：装 cv2/soundfile 时若不带 `-c start/requirements/core.txt`，
-        # pip 会把 numpy 升到 2.x，而 torch==2.2.2 只支持 numpy<2——主依赖
+        # 回归：装 cv2/soundfile 时若不带 `-c start/requirements/necessary.txt`，
+        # pip 会把 numpy 升到 2.x，而 torch 2.2.2 只支持 numpy<2——主依赖
         # 契约被一个「可选」安装悄悄破坏（实测发生过：numpy 1.26.4 → 2.5.4）。
+        # 2026-11-01：约束文件从 core.txt 换成 necessary.txt（numpy 的
+        # <2 硬上限住那里，见 server_util.optional_install_cmd）。
         from server_util import optional_install_cmd
         req = os.path.join(boot.project_root(), "start",
-                           "requirements", "core.txt")
+                           "requirements", "necessary.txt")
         cmd = optional_install_cmd("/py", ["opencv-python"], req)
         self.assertIn("-c", cmd)
         self.assertIn(req, cmd)

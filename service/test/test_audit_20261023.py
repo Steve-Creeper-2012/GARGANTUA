@@ -361,10 +361,15 @@ class TestCodecContracts(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.host.api_codec_image2prims(
                 {"image_b64": _make_png_b64(32, 32), "quality": "medium"})
-        for bad in (0, 1001, -1):
+        # 2026-10-31：步数上限取消（steve 定案），只守「至少 1 步」
+        for bad in (0, -1):
             with self.assertRaises(ValueError, msg=str(bad)):
                 self.host.api_codec_image2prims(
                     {"image_b64": _make_png_b64(32, 32), "max_steps": bad})
+        # 超过旧上限 1000 现在必须被接受（不再有上限）
+        code, obj = self.host.api_codec_image2prims(
+            {"image_b64": _make_png_b64(32, 32), "max_steps": 1001})
+        self.assertEqual(code, 202)
         code, obj = self.host.api_codec_image2prims(
             {"image_b64": _make_png_b64(32, 32), "max_steps": 3,
              "quality": "fast"})

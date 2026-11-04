@@ -50,8 +50,8 @@ def open_window(port: int, host: str, width: int, height: int):
         import webview
     except ImportError:
         print("[window] 缺少 pywebview，无法创建独立窗口。")
-        print("[window] 安装窗口依赖（仅 ~18MB，用系统 WebView，不带浏览器内核）：")
-        print("  pip install -r start/requirements/window.txt")
+        print("[window] 安装启动必备依赖（仅 ~18MB，用系统 WebView，不带浏览器内核）：")
+        print("  pip install -r start/requirements/must.txt")
         print("[window] 或者继续用浏览器访问，不影响 server：")
         print(f"  http://{host}:{port}")
         return 2

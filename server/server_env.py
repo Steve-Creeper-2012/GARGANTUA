@@ -8,13 +8,19 @@
 # 本模块（纯标准库，server 启动早期就能跑，缺依赖时也能给出可读提示）：
 #   check_deps            探针：解释器能否 import 主依赖
 #   check_environment     解释器版本 + 主依赖预检（server main 第一步）
+#   list_env_packs        environment/ 下每个依赖包（一个文件夹一个包）
+#   detect_tools          系统级外部命令（ffmpeg 等）
 #   wait_port / wait_status / kill_proc   子进程管理小工具（测试复用）
 #
-# 注：window.py 的 sha256 完整性校验曾在这里，2026-10-24 steve 判定
-# 「过于复杂」已整体移除（基准文件 + 弹窗 + 测试面一并删除）。
+# 2026-10-31：environment/ 的目录契约改成「一个依赖一个文件夹，各带
+# pack.json 清单」。主页的「环境包」区就是扫这个目录出来的——凡是显示在
+# 主页上的环境，必定在 environment/ 下有自己的文件夹；反过来 environment/
+# 下多出一个文件夹，主页立刻多一张卡。两边永远对得上，不会有「装了但
+# 没人知道」的依赖（之前 rust 就是这种状态）。
 # ===========================================================================
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
@@ -40,6 +46,165 @@ def project_root() -> str:
 
 
 ROOT = project_root()
+ENV_ROOT = os.path.join(ROOT, "environment")
+
+# ---------------------------------------------------------------------------
+# environment/ 依赖包：一个文件夹 = 一个包
+# ---------------------------------------------------------------------------
+# 每个包目录里放一个 pack.json（清单），字段：
+#   title       人话名字（主页卡片标题）
+#   kind        runtime / venv / toolchain / binary
+#   why         一句话说明它管什么
+#   install     装它的命令（未安装时主页提示用）
+#   probe       可执行文件相对本包的路径（用于判断装没装 + 取版本）
+#   version_arg 取版本号的参数（默认 --version）
+#   env         这个包要求的环境变量（键 → 相对路径，或 {abs} 占位）
+#   contents    目录内各个子文件夹的用途说明（用于「分干净」自检）
+# pack.json 缺失时也能显示（推断：有 probe 就算装好），但描述会是空的。
+PACK_MANIFEST = "pack.json"
+_SIZE_TTL = 60.0            # 目录体积缓存（du 走一次几百毫秒，别每次请求都跑）
+_SIZE_CACHE: dict = {}
+
+
+def _du_bytes(path: str) -> int:
+    """目录占用（字节）；用 du -sk，比 os.walk 数万个文件快一个量级。"""
+    now = time.time()
+    hit = _SIZE_CACHE.get(path)
+    if hit and now - hit[0] < _SIZE_TTL:
+        return hit[1]
+    size = 0
+    try:
+        r = subprocess.run(["du", "-sk", path], capture_output=True,
+                           text=True, timeout=20)
+        if r.returncode == 0 and r.stdout.strip():
+            size = int(r.stdout.split()[0]) * 1024
+    except Exception:
+        size = 0
+    _SIZE_CACHE[path] = (now, size)
+    return size
+
+
+def _probe_exe(path: str, version_arg: str = "--version"):
+    """跑一下可执行文件取版本号；跑不起来返回 None。"""
+    if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+        return None
+    try:
+        r = subprocess.run([path, version_arg], capture_output=True,
+                           text=True, timeout=15)
+        out = (r.stdout or r.stderr or "").strip().splitlines()
+        if out:
+            # 只取第一行里像版本号的那一段，别把整段 banner 塞进卡片
+            line = out[0].strip()
+            for tok in line.replace("(", " ").replace(")", " ").split():
+                if tok[:1].isdigit() and any(c.isdigit() for c in tok):
+                    return tok.rstrip(",;")
+            return line[:40]
+    except Exception:
+        return None
+    return None
+
+
+def read_pack_manifest(dir_path: str) -> dict:
+    """读某个包目录的 pack.json；缺失/损坏返回 {}。"""
+    p = os.path.join(dir_path, PACK_MANIFEST)
+    if not os.path.isfile(p):
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            m = json.load(f)
+        return m if isinstance(m, dict) else {}
+    except Exception:
+        return {}
+
+
+def list_env_packs() -> list:
+    """environment/ 下每个子目录 = 一个依赖包。
+
+    返回 [{name, title, kind, why, install, present, version, size, path,
+           env, contents, extras}]，按 pack.json 的 order 再按名字排序。
+    没有 pack.json 的目录也会列出来（present 按目录非空判断），这样
+    「多装了一个东西」不会在主页上隐身。
+    """
+    out = []
+    if not os.path.isdir(ENV_ROOT):
+        return out
+    for name in sorted(os.listdir(ENV_ROOT)):
+        d = os.path.join(ENV_ROOT, name)
+        if not os.path.isdir(d) or name.startswith("."):
+            continue
+        m = read_pack_manifest(d)
+        probe_rel = m.get("probe") or ""
+        version = None
+        present = bool(m.get("present_when_missing"))
+        if probe_rel:
+            version = _probe_exe(os.path.join(d, probe_rel),
+                                 m.get("version_arg") or "--version")
+            present = version is not None
+        else:
+            # 没有可执行探针的包（venv 这类）：看几个标志文件在不在。
+            # 直接「目录非空就算装好」会把只剩 pack.json 的空壳当成已安装。
+            marks = m.get("probe_files") or []
+            if marks:
+                present = any(os.path.exists(os.path.join(d, x))
+                              for x in marks)
+            else:
+                try:
+                    present = any(not x.startswith((".", PACK_MANIFEST))
+                                  for x in os.listdir(d))
+                except OSError:
+                    present = False
+        out.append({
+            "name": name,
+            "title": m.get("title") or name,
+            "kind": m.get("kind") or "pack",
+            "why": m.get("why") or "",
+            "install": m.get("install") or "",
+            "present": bool(present),
+            "version": version or m.get("version") or "",
+            "size": _du_bytes(d),
+            "path": os.path.relpath(d, ROOT),
+            "env": m.get("env") or {},
+            "contents": m.get("contents") or {},
+            "order": int(m.get("order", 100)),
+        })
+    out.sort(key=lambda x: (x["order"], x["name"]))
+    return out
+
+
+# 2026-11-04（steve）：所有外部二进制必须是下载到 environment/ 内的本地
+# 副本。不再列系统命令、不再提示 brew/apt/xcode-select，也绝不查系统 PATH。
+BUNDLED_TOOLS = (
+    {"name": "ffmpeg", "title": "FFmpeg（项目内）", "version_arg": "-version",
+     "why": "音频/视频解码与抽帧（缺了只能处理 wav 与帧序列）",
+     "install": "python start/setup_env.py --stage tools"},
+    {"name": "node", "title": "Node.js（项目内）", "version_arg": "--version",
+     "why": "构建期 app.js 语法检查",
+     "install": "python start/setup_env.py --stage tools"},
+    {"name": "cargo", "title": "Rust 工具链（项目内）",
+     "version_arg": "--version",
+     "why": "构建 GPU 图元转换器（environment/rust/ 下）",
+     "install": "sh service/prims/setup.sh"},
+)
+
+
+def detect_tools() -> list:
+    """只探测 environment/ 里的本地二进制；缺了给项目内安装命令。"""
+    from paths import bundled_tool
+    out = []
+    for t in BUNDLED_TOOLS:
+        exe = bundled_tool(t["name"])
+        out.append({
+            "name": t["name"],
+            "title": t["title"],
+            "why": t["why"],
+            "install": t["install"],
+            "present": bool(exe),
+            "path": exe or "",
+            "isolated": True,
+            "version": _probe_exe(exe, t.get("version_arg") or "--version")
+                       if exe else "",
+        })
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -81,11 +246,15 @@ def python_version(python_exe: str):
 
 
 def check_environment(python_exe: str = None) -> bool:
-    """server 启动第一步：解释器版本 + 主依赖预检。
+    """server 启动第一步：**只检查 must 清单**（轻量必备）。
 
-    返回 True 才继续启动。失败时打印可执行的修复命令——用户最常见的
-    情况是「用系统 Python 直接跑了 server/server.py」（那边没有 torch），
-    提示必须指向 launcher/start-server.sh（由根目录 启动.sh 调用）这条正规链路。
+    2026-11-01（steve 定案）：启动只认 start/requirements/must.txt ——
+    Python 运行时（跑 server）+ pywebview（开独立窗口）。torch、ffmpeg、
+    rust 这些**不影响启动**，缺了只是训练/推理/图元转换用不了，用户可以
+    之后在主页「环境与依赖」里装。所以这里绝不能再因为缺 torch 而拒绝
+    启动——那会让「轻装进页面 → 逐个装依赖」这条路走不通。
+
+    返回 True 才继续启动。失败时打印可执行的修复命令。
     """
     py = python_exe or sys.executable
     ver = python_version(py)
@@ -103,14 +272,37 @@ def check_environment(python_exe: str = None) -> bool:
         return False
     print(f"[server] Python {ver[0]}.{ver[1]} ✓（{py}）")
 
-    if not check_deps(py):
-        print("[server] ✗ 主依赖缺失（torch/numpy/PIL/safetensors）。")
+    # 2026-11-01：启动只查 must 清单（python + pywebview）。
+    # torch / numpy / ffmpeg / rust 这些在 necessary.txt —— 缺了不影响
+    # 启动，只是对应功能用不了，用户在主页里按需安装。
+    try:
+        from reqs import all_requirements, dep_state
+        must = [d for d in all_requirements() if d["group"] == "must"]
+    except Exception:
+        must = []
+    missing = []
+    soft = []
+    for d in must:
+        st = dep_state(d)
+        if st["ok"]:
+            continue
+        (soft if d.get("soft") else missing).append(d)
+    if soft:
+        # soft = 缺了只影响某项功能（比如 pywebview 只影响独立窗口），
+        # 不该拦住 server 起来（--no-window / SSH 场景照常用）。
+        print("[server] ⚠ 缺少可选的启动依赖："
+              + "、".join(d["name"] for d in soft)
+              + "（对应功能不可用，不影响启动）")
+    if missing:
+        print("[server] ✗ 启动必备依赖缺失："
+              + "、".join(d["name"] for d in missing))
+        for d in missing:
+            print(f"[server]   {d['name']}：{d.get('install', '')}")
         print("[server]   正规启动方式（自动装好隔离环境后拉起 server）：")
         print("[server]     ./启动.sh（或 ./启动.command）")
-        print("[server]   或手动安装到当前解释器：")
-        print(f"[server]     {py} -m pip install -r start/requirements/core.txt")
         return False
-    print("[server] 主依赖（torch/numpy/PIL/safetensors）✓")
+    print("[server] 启动必备依赖 ✓（"
+          + "、".join(d["name"] for d in must) + "）")
     return True
 
 

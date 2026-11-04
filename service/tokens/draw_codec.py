@@ -3,21 +3,29 @@
 # ---------------------------------------------------------------------------
 # 契约来源：ROOT/spec.py（冻结）+ service/prims/fast_shape_render
 # （逐字照搬第三方布局，geometrize_256_v1）
-# （wonderfulearth，geometrize_256_v1 布局照搬）。
-#   - 每个图元 9 个 token，字段序 cx, cy, theta, w, h, shape, r, g, b；
+#   - **一条绘图序列 = 一段画布声明 + N × 9 个图元 token**：
+#       <x> 数字… <x/> <y> 数字… <y/>   [x y theta w h shape r g b] …
+#     画布声明必须在最前面，决定后面对 x/y 的解释范围。数字用的是可见区
+#     的文本数字 token（"0".."9"），所以 1920×1080 以内的**任意**尺寸都
+#     写得出来，词表只多付 4 个定界符。旧数据没有画布声明时按
+#     spec.DRAW_DEFAULT_CANVAS（256×256）解码。
+#   - 每个图元 9 个 token，字段序 x, y, theta, w, h, shape, r, g, b；
 #     各字段独立 bin 区间（token ID = spec.DRAW_BEGIN + offset + bin）。
 #   - bin 数学与仓库 visualize.py 的 encode_image_group /
-#     decode_tokens_to_render_data 逐行一致：
-#       cx/cy = px * 2（512 bins，[0,256) px）
-#       theta = deg * 3（270 bins，[0,90) 度；CSV 存弧度，≥90° 交换宽高）
-#       w/h   = px * 4（512 bins，[0,128) px）
+#     decode_tokens_to_render_data 一致，只有 x/y 与颜色按 2026-11-01 的
+#     定案改过（仓库是 256 画布 / 8 bit 色）：
+#       x     = px       （1920 bins，[0,1920) px，1 token = 1 像素）
+#       y     = px       （1080 bins，[0,1080) px）
+#       theta = deg * 3  （270 bins，[0,90) 度；CSV 存弧度，≥90° 交换宽高）
+#       w/h   = px * 4   （512 bins，[0,128) px）
 #       shape = shape_type + 1（256 bins；-1 背景 / 0 矩形 / 1 椭圆）
-#       r/g/b = value // 2（各 128 bins）
+#       r/g/b = 0..1023  （10 bit，1 bin 一个值；出图/CSV 时降到 8 bit）
 #   - CSV schema 照搬：image_name,cx,cy,w,h,shape_type,theta,r,g,b
 #     （首行背景：cx=cy=w=h=0，shape_type=-1，theta=0，rgb=背景色）。
-#   - 渲染：256×256 画布，背景整幅填充，矩形/椭圆绕中心旋转，逐图元覆盖
-#     绘制（仓库 visualize 用 alpha 0.5 叠加，此处保持 GARGANTUA 既有
-#     不透明覆盖语义，供 PNG/SVG 预览）。
+#     画布尺寸不进 CSV——CSV 是仓库格式，画布只活在 token 流里。
+#   - 渲染：画布尺寸由调用方给（默认 256×256），背景整幅填充，矩形/椭圆
+#     绕中心旋转，逐图元覆盖绘制（仓库 visualize 用 alpha 0.5 叠加，此处
+#     保持 GARGANTUA 既有不透明覆盖语义，供 PNG/SVG 预览）。
 #   - PNG 写出：zlib + struct 手写 encoder（filter 0），不依赖 Pillow 画图。
 # ===========================================================================
 """draw_codec: 图元序列 ↔ 绘图 token；CSV 归档；PNG/SVG 渲染。"""
@@ -47,10 +55,12 @@ _ALPHA = 0.5                                    # 仓库渲染语义（预览不
 class Primitive:
     """一个图元操作（字段与仓库 CSV 一致）。
 
-    cx/cy/w/h 单位 px（画布 256×256，w/h ∈ [0,128)）；
+    cx/cy/w/h 单位 px；坐标范围由**画布**决定（最大 1920×1080），
+    w/h 恒在 [0,128)（token 侧 512 bins × 4/px，与画布无关）；
     shape_type：-1 背景 / 0 矩形 / 1 椭圆；
     theta 单位弧度（[0,π)，token 化时归一到 [0,90) 度）；
-    r/g/b 为 8bit。
+    r/g/b 为 **10 bit**（0..1023，与词表 1 bin=1 值一致；CSV / PNG / SVG
+    这三个 8 bit 边界上由 color_to10 / color_to8 换算，见下）。
     """
 
     cx: float
@@ -92,8 +102,15 @@ def _clamp(v: float, lo: float, hi: float, name: str) -> float:
     return v
 
 
-def clamp_primitive(p: Primitive) -> Primitive:
-    """各字段 clamp 到 spec 词表区间；越界记录 warning。"""
+def clamp_primitive(p: Primitive, w=None, h=None) -> Primitive:
+    """各字段 clamp 到 spec 词表区间；越界记录 warning。
+
+    w/h 是**画布尺寸**：cx/cy 的合法上界 = 画布边长 − 1。不传就按
+    最大画布（1920×1080）钳位——渲染时超出画布的部分本来就会被裁掉，
+    编码时则必须传真实画布，否则会把画布外的坐标编成合法 token。
+    """
+    cw = spec.DRAW_CANVAS_MAX_W if w is None else int(w)
+    ch = spec.DRAW_CANVAS_MAX_H if h is None else int(h)
     st = p.shape_type
     if st not in (-1, 0, 1):
         log.warning("draw_codec: 未知 shape_type=%r，按矩形处理", st)
@@ -102,18 +119,30 @@ def clamp_primitive(p: Primitive) -> Primitive:
     if theta < 0:
         theta += math.pi
     return Primitive(
-        cx=_clamp(p.cx, 0.0, spec.CANVAS_W - 1.0, "cx"),
-        cy=_clamp(p.cy, 0.0, spec.CANVAS_H - 1.0, "cy"),
+        cx=_clamp(p.cx, 0.0, cw - 1.0, "cx"),
+        cy=_clamp(p.cy, 0.0, ch - 1.0, "cy"),
         w=_clamp(p.w, 0.0, (spec.DRAW_W_BINS - 1) / spec.SIZE_BINS_PER_PIXEL,
                  "w"),
         h=_clamp(p.h, 0.0, (spec.DRAW_H_BINS - 1) / spec.SIZE_BINS_PER_PIXEL,
                  "h"),
         shape_type=st,
         theta=theta,
-        r=int(_clamp(p.r, 0, 255, "r")),
-        g=int(_clamp(p.g, 0, 255, "g")),
-        b=int(_clamp(p.b, 0, 255, "b")),
+        r=int(_clamp(p.r, 0, spec.DRAW_COLOR_MAX, "r")),
+        g=int(_clamp(p.g, 0, spec.DRAW_COLOR_MAX, "g")),
+        b=int(_clamp(p.b, 0, spec.DRAW_COLOR_MAX, "b")),
     )
+
+
+# 10 bit ↔ 8 bit：词表里颜色是 0..1023（见 spec 第 1a 节），而 PNG/SVG 与
+# 仓库 CSV 都是 8 bit。只在**出图**与**读 CSV** 两个边界上换算。
+def color_to8(v) -> int:
+    """10 bit 色值 → 8 bit（四舍五入，0..1023 → 0..255）。"""
+    return int(round(float(v) * 255.0 / spec.DRAW_COLOR_MAX))
+
+
+def color_to10(v) -> int:
+    """8 bit 色值 → 10 bit（四舍五入，0..255 → 0..1023）。"""
+    return int(round(float(v) * spec.DRAW_COLOR_MAX / 255.0))
 
 
 # ---------------------------------------------------------------------------
@@ -130,19 +159,134 @@ def _theta_w_h(p: Primitive) -> Tuple[float, float, float]:
 
 
 def _bin(value: float, per: float, bins: int, name: str) -> int:
-    return int(_clamp(value * per, 0, bins - 1, name))
+    """值 → bin 下标：**先截断，再判越界**（与仓库 astype(int) 一致）。
+
+    theta 的合法域是 [0,90) 度 ×3 = [0,270)，所以 89.9° → 269.7 截断成
+    269，本来就落在区间里。旧实现拿 269.7 去和上限 269 比，于是每个角度
+    接近 90° 的图元都报一次「越界」——假警报，一次转换能刷出几百行
+    （steve 2026-11-02 的日志）。只有 bin 下标真的 <0 / >bins-1 才告警。
+    """
+    scaled = float(value) * float(per)
+    if not math.isfinite(scaled):
+        return 0
+    n = int(scaled)                      # 截断（向零取整），不是四舍五入
+    if n < 0 or n > bins - 1:
+        n = int(_clamp(scaled, 0, bins - 1, name))
+    return n
 
 
-def primitive_to_tokens(p: Primitive) -> List[int]:
-    """单个图元 → 9 个 token ID（照搬仓库 encode_image_group 的 bin 数学）。"""
-    p = clamp_primitive(p)
+def canvas_digit_ids(vocab=None) -> List[int]:
+    """文本数字 token（"0".."9"）的 ID 表，按 0→9 顺序。
+
+    画布声明里的数字用的是**可见区的文本数字 token**（不是 DRAW 区新增
+    的 token），所以解析需要知道它们在哪：
+      · 给了 vocab → 直接查 token_to_id（唯一正确的做法）；
+      · 没给 → 按 spec 的可见区布局兜底：可见区第一段就是 digit
+        （VISIBLE_REGION_ORDER 的第一项），ID 恰好是 HEAD_SIZE..HEAD_SIZE+9。
+        base 词表永远是这种布局；自定义词表请传 vocab。
+    """
+    if vocab is not None:
+        out = []
+        for ch in spec.DRAW_CANVAS_DIGITS:
+            tid = vocab.token_to_id.get(ch)
+            if tid is None:
+                raise ValueError(
+                    f"词表 {getattr(vocab, 'name', '?')} 里没有数字 token "
+                    f"{ch!r}，无法表达画布尺寸")
+            out.append(int(tid))
+        return out
+    base = spec.HEAD_SIZE
+    return [base + i for i in range(len(spec.DRAW_CANVAS_DIGITS))]
+
+
+def canvas_tokens(canvas, vocab=None) -> List[int]:
+    """(宽, 高) → 画布声明 token 序列：`<x> 数字… <x/> <y> 数字… <y/>`。
+
+    画布声明是绘图序列的**最前面一段**：模型先说画多大，再画。尺寸可以是
+    1..1920 × 1..1080 里的任意整数（不再是固定档位）。
+    """
+    try:
+        w, h = int(canvas[0]), int(canvas[1])
+    except (TypeError, ValueError, IndexError):
+        raise ValueError(f"画布必须是 (宽, 高): {canvas!r}") from None
+    if not spec.draw_canvas_valid(w, h):
+        raise ValueError(
+            f"画布 {w}×{h} 超出契约范围（1..{spec.DRAW_CANVAS_MAX_W} × "
+            f"1..{spec.DRAW_CANVAS_MAX_H}）")
+    b = spec.DRAW_BEGIN
+    dig = canvas_digit_ids(vocab)
+    out = [b + spec.DRAW_CANVAS_OFFSET + 0]          # <x>
+    out += [dig[int(ch)] for ch in str(w)]
+    out.append(b + spec.DRAW_CANVAS_OFFSET + 1)      # <x/>
+    out.append(b + spec.DRAW_CANVAS_OFFSET + 2)      # <y>
+    out += [dig[int(ch)] for ch in str(h)]
+    out.append(b + spec.DRAW_CANVAS_OFFSET + 3)      # <y/>
+    return out
+
+
+def _parse_canvas(ids: Sequence[int], vocab=None):
+    """解析开头的画布声明 → ((宽, 高), 剩余 token 列表)。"""
+    b = spec.DRAW_BEGIN
+    dig = canvas_digit_ids(vocab)
+    rev = {tid: i for i, tid in enumerate(dig)}
+    n = len(ids)
+    i = 0
+
+    def expect(marker_bin: int, what: str) -> None:
+        nonlocal i
+        if i >= n or int(ids[i]) != b + marker_bin:
+            raise ValueError(f"画布声明缺少 {what}（第 {i} 个 token 不符）")
+        i += 1
+
+    def digits(what: str) -> int:
+        nonlocal i
+        got = []
+        while i < n and int(ids[i]) in rev:
+            got.append(str(rev[int(ids[i])]))
+            i += 1
+        if not got:
+            raise ValueError(f"画布声明的 {what} 为空（缺数字）")
+        return int("".join(got))
+
+    expect(spec.DRAW_CANVAS_OFFSET + 0, "<x>")
+    w = digits("宽")
+    expect(spec.DRAW_CANVAS_OFFSET + 1, "<x/>")
+    expect(spec.DRAW_CANVAS_OFFSET + 2, "<y>")
+    h = digits("高")
+    expect(spec.DRAW_CANVAS_OFFSET + 3, "<y/>")
+    if not spec.draw_canvas_valid(w, h):
+        raise ValueError(
+            f"画布 {w}×{h} 超出契约范围（1..{spec.DRAW_CANVAS_MAX_W} × "
+            f"1..{spec.DRAW_CANVAS_MAX_H}）")
+    return (w, h), list(ids[i:])
+
+
+def canvas_of_tokens(ids: Sequence[int], vocab=None):
+    """token 流开头的画布声明 → (宽, 高)；没有画布声明返回 None。
+
+    旧数据（没有画布声明的裸图元流）返回 None，解码时按默认画布处理。
+    """
+    if not ids:
+        return None
+    if int(ids[0]) != spec.DRAW_BEGIN + spec.DRAW_CANVAS_OFFSET:
+        return None
+    return _parse_canvas(ids, vocab)[0]
+
+
+def primitive_to_tokens(p: Primitive, canvas=None) -> List[int]:
+    """单个图元 → 9 个 token ID（照搬仓库 encode_image_group 的 bin 数学）。
+
+    canvas 决定 cx/cy 的钳位上界（不传按默认 256×256）。
+    """
+    cw, ch = (spec.DRAW_DEFAULT_CANVAS if canvas is None else canvas)
+    p = clamp_primitive(p, cw, ch)
     deg, w, h = _theta_w_h(p)
     b = spec.DRAW_BEGIN
     return [
         b + spec.DRAW_X_OFFSET + _bin(p.cx, spec.XY_BINS_PER_PIXEL,
-                                      spec.DRAW_X_BINS, "cx"),
+                                      spec.DRAW_X_BINS, "x"),
         b + spec.DRAW_Y_OFFSET + _bin(p.cy, spec.XY_BINS_PER_PIXEL,
-                                      spec.DRAW_Y_BINS, "cy"),
+                                      spec.DRAW_Y_BINS, "y"),
         b + spec.DRAW_ANGLE_OFFSET + _bin(deg, spec.ANGLE_BINS_PER_DEGREE,
                                           spec.DRAW_ANGLE_BINS, "theta"),
         b + spec.DRAW_W_OFFSET + _bin(w, spec.SIZE_BINS_PER_PIXEL,
@@ -152,36 +296,45 @@ def primitive_to_tokens(p: Primitive) -> List[int]:
         b + spec.DRAW_SHAPE_OFFSET + int(_clamp(p.shape_type + 1, 0,
                                                 spec.DRAW_SHAPE_BINS - 1,
                                                 "shape")),
-        b + spec.DRAW_R_OFFSET + int(_clamp(p.r // 2, 0,
-                                            spec.DRAW_COLOR_BINS - 1, "r")),
-        b + spec.DRAW_G_OFFSET + int(_clamp(p.g // 2, 0,
-                                            spec.DRAW_COLOR_BINS - 1, "g")),
-        b + spec.DRAW_B_OFFSET + int(_clamp(p.b // 2, 0,
-                                            spec.DRAW_COLOR_BINS - 1, "b")),
+        # 10 bit 颜色：1 bin 一个值，不再 //2
+        b + spec.DRAW_R_OFFSET + int(_clamp(p.r, 0,
+                                            spec.DRAW_COLOR_MAX, "r")),
+        b + spec.DRAW_G_OFFSET + int(_clamp(p.g, 0,
+                                            spec.DRAW_COLOR_MAX, "g")),
+        b + spec.DRAW_B_OFFSET + int(_clamp(p.b, 0,
+                                            spec.DRAW_COLOR_MAX, "b")),
     ]
 
 
-def primitives_to_tokens(prims: Sequence[Primitive]) -> List[int]:
-    ids: List[int] = []
+def primitives_to_tokens(prims: Sequence[Primitive],
+                         canvas=spec.DRAW_DEFAULT_CANVAS,
+                         vocab=None) -> List[int]:
+    """图元序列 → token 流：**画布声明打头**，其后每图元 9 个。
+
+    画布声明是序列的一部分（模型要先说画多大），所以哪怕 0 个图元
+    也至少有 6 个 token（4 个定界符 + 至少各 1 位数字）。
+    """
+    ids: List[int] = canvas_tokens(canvas, vocab)
     for prim in prims:
-        ids.extend(primitive_to_tokens(prim))
+        ids.extend(primitive_to_tokens(prim, canvas))
     return ids
 
 
-def tokens_to_primitives(ids: Sequence[int]) -> List[Primitive]:
-    """token ID 流 → 图元序列（照搬仓库 decode_tokens_to_render_data）。
+def decode_draw(ids: Sequence[int], vocab=None):
+    """token 流 → (画布 (w,h), 图元列表)。
 
-    步首 token 落在 special bin 区（含仓库自带 pad）即停止——
-    模型输出特殊 bin 表示序列结束。总数非 9 倍数时截断尾部并 warning。
-
-    2026-10-27 审计修复：逐字段校验 bin 区间——旧实现不检查九个字段的
-    取值范围，9 个 0 也能「解出」cx=-48、负宽高、负颜色等荒谬图元；
-    畸形 token 现在一律 ValueError（HTTP 400），而不是静默产出坏图。
+    序列开头若是画布声明（`<x>…<x/>`）就先吃掉它；没有则用默认画布。
+    图元 token 的步首落在 special bin 区即停止——模型输出特殊 bin
+    表示序列结束。
     """
-    if len(ids) % _TOKENS_PER != 0:
-        log.warning("draw_codec: token 数 %d 不是 %d 的倍数，截断尾部",
-                    len(ids), _TOKENS_PER)
     b = spec.DRAW_BEGIN
+    head_canvas = canvas_of_tokens(ids, vocab)
+    canvas = head_canvas or spec.DRAW_DEFAULT_CANVAS
+    body = _parse_canvas(ids, vocab)[1] if head_canvas is not None else list(ids)
+
+    if len(body) % _TOKENS_PER != 0:
+        log.warning("draw_codec: token 数 %d 不是 %d 的倍数，截断尾部",
+                    len(body), _TOKENS_PER)
     # 九个字段的 (offset, bins) 表——与 primitive_to_tokens 的编码表同源
     _FIELDS = (
         (spec.DRAW_X_OFFSET, spec.DRAW_X_BINS),
@@ -205,8 +358,8 @@ def tokens_to_primitives(ids: Sequence[int]) -> List[Primitive]:
         return v - off
 
     prims: List[Primitive] = []
-    for i in range(0, len(ids) - _TOKENS_PER + 1, _TOKENS_PER):
-        t = ids[i:i + _TOKENS_PER]
+    for i in range(0, len(body) - _TOKENS_PER + 1, _TOKENS_PER):
+        t = body[i:i + _TOKENS_PER]
         if not all(isinstance(x, int) for x in t):
             raise ValueError(f"draw token 必须是整数: {t!r}")
         if t[0] - b >= spec.DRAW_SPECIAL_OFFSET:
@@ -219,11 +372,22 @@ def tokens_to_primitives(ids: Sequence[int]) -> List[Primitive]:
             shape_type=_bin_of(t[5], 5) - 1,
             theta=math.radians(_bin_of(t[2], 2)
                                / spec.ANGLE_BINS_PER_DEGREE),
-            r=_bin_of(t[6], 6) * 2,
-            g=_bin_of(t[7], 7) * 2,
-            b=_bin_of(t[8], 8) * 2,
+            r=_bin_of(t[6], 6),          # 10 bit，1 bin 一个值
+            g=_bin_of(t[7], 7),
+            b=_bin_of(t[8], 8),
         ))
-    return prims
+    return canvas, prims
+
+
+def tokens_to_primitives(ids: Sequence[int], vocab=None) -> List[Primitive]:
+    """token ID 流 → 图元序列（照搬仓库 decode_tokens_to_render_data）。
+
+    画布声明若有则跳过（要知道画布尺寸用 decode_draw）。
+    2026-10-27 审计修复：逐字段校验 bin 区间——旧实现不检查九个字段的
+    取值范围，9 个 0 也能「解出」cx=-48、负宽高、负颜色等荒谬图元；
+    畸形 token 现在一律 ValueError（HTTP 400），而不是静默产出坏图。
+    """
+    return decode_draw(ids, vocab)[1]
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +399,7 @@ def primitives_to_csv(prims: Sequence[Primitive], path: str,
 
     浮点用最短精确回环表示（repr），保证 CSV → token 的 bin 量化不被
     写入精度污染（%.8f 会让 radians(20°) 少一位尾数，角度 bin 差 1）。
+    **CSV 是上游仓库的格式，颜色是 8 bit**——内部 10 bit 色值在这里降位。
     """
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -243,12 +408,15 @@ def primitives_to_csv(prims: Sequence[Primitive], path: str,
             w.writerow([image_name, repr(float(p.cx)), repr(float(p.cy)),
                         repr(float(p.w)), repr(float(p.h)),
                         int(p.shape_type), repr(float(p.theta)),
-                        int(p.r), int(p.g), int(p.b)])
+                        color_to8(p.r), color_to8(p.g), color_to8(p.b)])
 
 
 def csv_to_primitives(path: str) -> List[Primitive]:
     """CSV 文件 → 图元序列（按 image_name 分组只取第一组，行为与仓库
-    iter_complete_image_groups 一致：每组首行背景）。"""
+    iter_complete_image_groups 一致：每组首行背景）。
+
+    CSV 里的颜色是 8 bit，读进来立刻升到内部的 10 bit。
+    """
     with open(path, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     if not rows:
@@ -263,7 +431,8 @@ def csv_to_primitives(path: str) -> List[Primitive]:
             w=float(row["w"]), h=float(row["h"]),
             shape_type=int(row["shape_type"]),
             theta=float(row["theta"]),
-            r=int(row["r"]), g=int(row["g"]), b=int(row["b"]),
+            r=color_to10(row["r"]), g=color_to10(row["g"]),
+            b=color_to10(row["b"]),
         ))
     return prims
 
@@ -272,7 +441,7 @@ def csv_to_primitives(path: str) -> List[Primitive]:
 # 纯 Python RGBA 渲染（逐图元覆盖绘制，不依赖 Pillow 画图）
 # ---------------------------------------------------------------------------
 def _rgba8(p: Primitive) -> bytes:
-    return bytes((p.r, p.g, p.b, 255))
+    return bytes((color_to8(p.r), color_to8(p.g), color_to8(p.b), 255))
 
 
 def _fill_span(buf: bytearray, w: int, h: int,
@@ -299,10 +468,11 @@ def render_rgba(prims: Sequence[Primitive],
     2026-10-20：逐像素 Python 双重循环改为 numpy 掩码赋值（逐图元一次
     向量化计算，输出逐字节一致）。100 图元从 ~35s 降到 <1s。
     2026-10-24：字段迁移到仓库 schema（theta 弧度、w/h 全尺寸、无 triangle）。
+    2026-10-31：画布尺寸由调用方给（默认 256×256），钳位也按该画布。
     """
     buf = bytearray(w * h * 4)
     for prim in prims:
-        p = clamp_primitive(prim)
+        p = clamp_primitive(prim, w, h)
         px = _rgba8(p)
         if p.shape_type == -1:
             buf[:] = px * (w * h)
@@ -376,7 +546,7 @@ def primitives_to_png(prims: Sequence[Primitive], path: str,
 # SVG 导出（前端可视化用）
 # ---------------------------------------------------------------------------
 def _rgb8(p: Primitive) -> str:
-    return f"rgb({p.r},{p.g},{p.b})"
+    return f"rgb({color_to8(p.r)},{color_to8(p.g)},{color_to8(p.b)})"
 
 
 def primitives_to_svg(prims: Sequence[Primitive],
@@ -387,7 +557,7 @@ def primitives_to_svg(prims: Sequence[Primitive],
         f'width="{w}" height="{h}" viewBox="0 0 {w} {h}">'
     ]
     for prim in prims:
-        p = clamp_primitive(prim)
+        p = clamp_primitive(prim, w, h)
         fill = _rgb8(p)
         if p.shape_type == -1:
             parts.append(f'<rect width="{w}" height="{h}" fill="{fill}"/>')

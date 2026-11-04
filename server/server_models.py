@@ -71,12 +71,16 @@ class ModelManager:
             # 改用 model_exists（config.json 或 model*.safetensors 任一）
             if not model_exists(d):
                 continue
-            info = {"name": os.path.basename(d), "params": None}
+            info = {"name": os.path.basename(d), "params": None,
+                    # 2026-11-04：前端在模型列表里标注共享权重模型
+                    "share_enc_dec": False}
             cfg = os.path.join(d, "config.json")
             if os.path.exists(cfg):
                 try:
                     with open(cfg, encoding="utf-8") as f:
-                        info["params"] = json.load(f).get("params")
+                        meta = json.load(f)
+                    info["params"] = meta.get("params")
+                    info["share_enc_dec"] = meta.get("share_enc_dec") is True
                 except Exception:
                     pass
             out.append(info)
