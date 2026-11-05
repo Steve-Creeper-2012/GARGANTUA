@@ -397,10 +397,10 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
             "version": _read_version(),
             # 共享契约：前端推理页 max_new_tokens 输入框上限
             "max_new_tokens": MAX_NEW_TOKENS,
-            # d_model 的合法档位：唯一真源在 spec.check_d_model，前端建模
-            # 表单据此生成「128 的倍数」下拉，不再维护第二套硬编码范围。
+            # d_model 无上限（steve 2026-11-05 拍板）：只约束 ≥ D_MODEL_MIN 且为
+            # 128 倍数；前端用 <input type="number" min=128 step=128> 直接输入。
             "d_model_range": {
-                "min": spec.D_MODEL_MIN, "max": spec.D_MODEL_MAX,
+                "min": spec.D_MODEL_MIN,
                 "step": spec.HEAD_DIM, "default": spec.D_MODEL,
             },
             # 图元画布档位：唯一真源在 spec，前端据此填下拉框

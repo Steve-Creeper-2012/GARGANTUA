@@ -200,10 +200,10 @@
                 <option value="shared">共享权重（enc/dec 等深）</option>
               </select></label>
             <label class="form-field"><span>d_model（模型宽度）</span>
-              <!-- 只列 128 的倍数，档位由 /api/status 的 d_model_range 下发
-                   （spec.D_MODEL_MIN/MAX/HEAD_DIM 是唯一真源），不让用户手输
-                   非法值再等后端 400。下拉由 enhanceSelect 自绘。 -->
-              <select id="model-dmodel"></select></label>
+              <!-- 只约束 128 的倍数、≥128，完全无上限；直接输入任意倍数，
+                   非法值由后端 check_d_model 校验（≥128 且 128 倍数）。 -->
+              <input type="number" id="model-dmodel" value="1024"
+                     min="128" step="128"></label>
             <label class="form-field"><span>enc blocks</span>
               <input type="number" id="model-enc" value="4" min="1" max="64"></label>
             <label class="form-field"><span>dec blocks</span>
@@ -269,7 +269,7 @@
             选「共享权重」时 enc_blocks[i] 与 dec_blocks[i] 逐层共用同一批参数，
             <b>两侧 block 数强制相等</b>（dec 输入框会锁定并自动跟随 enc）；
             参数量与权重文件约减半，但 encoder 仍双向、decoder 仍因果。
-            <b>d_model</b> 只改语义向量宽度（128 的倍数，128..2048，默认 1024）；
+            <b>d_model</b> 只改语义向量宽度（128 的倍数，无上限，默认 1024）；
             注意力头数/头维、MLA 低秩秩、FFN 隐藏宽度仍是冻结架构值。
             宽度越大，embedding 与 lm_head 占用内存越多。
           </div>
@@ -861,7 +861,7 @@
             <b>enc_blocks[i] 与 dec_blocks[i] 逐层共用同一批参数</b>，因此两侧层数
             <b>必须相等</b>。共享只绑定参数、不合并实例——encoder 依旧双向，
             decoder 依旧按时间步因果；权重文件只落一份，参数量与磁盘占用约减半。
-            模型宽度 <b>d_model</b> 建模时也可选（默认 1024，128 的倍数、128..2048）：
+            模型宽度 <b>d_model</b> 建模时也可选（默认 1024，128 的倍数、无上限）：
             它只改语义向量宽度，注意力头数/头维、MLA 低秩秩与 FFN 隐藏宽度仍是冻结架构值。
           </p>
           <svg class="about-svg" viewBox="0 0 680 130" role="img"

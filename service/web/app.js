@@ -1088,30 +1088,8 @@ async function runModelEstimate() {
   }
 }
 
-/* d_model 的「选项」只需要是 128 的倍数：档位由 /api/status 的
-   d_model_range 下发（唯一真源是 spec.D_MODEL_MIN/MAX/HEAD_DIM），
-   前端不再手输数字、也不再维护第二套硬编码范围。 */
-function fillDModelChoices(range) {
-  const sel = $("model-dmodel");
-  if (!sel || sel.tagName !== "SELECT") return;
-  const step = Number(range && range.step) || 128;
-  const min = Number(range && range.min) || 128;
-  const max = Number(range && range.max) || 2048;
-  const dflt = Number(range && range.default) || 1024;
-  let html = "";
-  for (let n = min; n <= max; n += step) {
-    html += `<option value="${n}"${n === dflt ? " selected" : ""}>${n}</option>`;
-  }
-  sel.innerHTML = html;
-  sel.value = String(dflt);
-}
-fillDModelChoices();                       // 后端还没回时先给可用的默认档
-(async () => {
-  try {
-    const s = await api("/api/status");
-    if (s.d_model_range) fillDModelChoices(s.d_model_range);
-  } catch (e) {}
-})();
+// d_model 完全无上限（steve 2026-11-05 拍板）：只约束 ≥128 且为 128 的倍数，
+// 用 <input type="number" min="128" step="128"> 直接输入，不再下拉枚举。
 
 ["model-dmodel", "model-enc", "model-dec", "model-ctx-full",
  "model-ctx-compress", "model-csa-ratio", "model-hca-ratio",

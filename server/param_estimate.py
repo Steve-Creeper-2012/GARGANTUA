@@ -97,7 +97,7 @@ def estimate(d_model: int = spec.D_MODEL,
     """返回三类参数量 / 理论存储 / fp32 落盘大小。
 
     参数：
-      d_model       语义向量宽度（128 的倍数，128..2048）
+      d_model       语义向量宽度（128 的倍数，无上限，默认 1024）
       n_enc_blocks  encoder block 数
       n_dec_blocks  decoder block 数（共享权重时必须等于 enc）
       share_enc_dec enc/dec 是否逐层共享同一批参数

@@ -192,9 +192,8 @@ def main():
                          f"{spec.SHARED_DEFAULT_BLOCKS}）")
     ap.add_argument("--d-model", type=int, default=None,
                     help=f"模型宽度（默认 {spec.D_MODEL}；"
-                         f"{spec.D_MODEL_MIN}..{spec.D_MODEL_MAX}，"
-                         f"须为 {spec.HEAD_DIM} 的倍数；"
-                         f"预设档位 {list(spec.D_MODEL_CHOICES)}）")
+                         f"须 ≥ {spec.D_MODEL_MIN} 且为 {spec.HEAD_DIM} 的倍数，"
+                         f"无上限；示例档位 {list(spec.D_MODEL_CHOICES)}）")
     ap.add_argument("--force", action="store_true",
                     help="允许覆盖已存在的同名模型")
     # ---- 上下文长度（2026-10-23 新功能）----

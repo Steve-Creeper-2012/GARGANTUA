@@ -132,8 +132,9 @@
 #     wte/lm_head/type_emb/模态投影、共享 KV 流、各 block 的输入输出投影、
 #     RMSNorm 全部跟随；注意力头数/头维、MLA 低秩秩、FFN 隐藏宽度仍按
 #     本文件冻结值不变（换宽度不换架构，权重形状可控、旧目录全兼容）。
-#   - 必须是 HEAD_DIM=128 的整数倍，且落在 [D_MODEL_MIN, D_MODEL_MAX]；
-#     上界是防 RAM 炸弹（wte 与 lm_head 各 V×D 行 fp32）。
+#   - 必须是 HEAD_DIM=128 的整数倍，且 ≥ D_MODEL_MIN（完全无上限，
+#     steve 2026-11-05 拍板；宽度只影响 embedding/lm_head 的 V×D 行内存，
+#     由用户自行权衡规模）。
 #   - config.json 的 d_model 是加载侧的唯一依据；缺省 → 1024。
 #
 # 定案记录（2026-11-04，steve 拍板，block 子层重排）：
@@ -418,10 +419,10 @@ NUM_TYPES = 3
 D_MODEL = 1024
 HEAD_DIM = 128
 N_HEADS = D_MODEL // HEAD_DIM                      # 8
-# 建模可选宽度（2026-11-04）：默认档位 + 合法范围，唯一真源在 check_d_model
+# 建模可选宽度（2026-11-04）：默认档位 + 合法范围，唯一真源在 check_d_model。
+# 无上限（steve 2026-11-05 拍板：完全无上限，只约束 ≥ D_MODEL_MIN 且为 128 倍数）。
 D_MODEL_MIN = 128
-D_MODEL_MAX = 2048          # 2× 默认；再大 embedding 会把内存吃穿
-D_MODEL_CHOICES = (256, 512, 768, 1024, 1536, 2048)
+D_MODEL_CHOICES = (256, 512, 768, 1024, 1536, 2048)   # 仅示例档位，无上限
 
 # 精度名 → 每参数比特数（唯一真源；precision.py 与建模参数量预估共用）。
 # 低比特档在 CPU 上按「权重量化 → 反量化回 fp32」模拟，落盘仍是 fp32；
@@ -437,8 +438,8 @@ def check_d_model(v) -> int:
     """建模时指定的 d_model 严格校验（唯一规则，所有入口共用）。
 
     合法返回 int；非法抛 ValueError（HTTP 层映射 400）。拒绝 bool、
-    非整数 float、非数字字符串、越界值与非 HEAD_DIM 倍数值——任何一项
-    松了都会造出 config 与权重形状对不上的模型目录。"""
+    非整数 float、非数字字符串、过小值（< D_MODEL_MIN）与非 HEAD_DIM 倍数值
+    ——任何一项松了都会造出 config 与权重形状对不上的模型目录。"""
     if isinstance(v, bool):
         raise ValueError(f"d_model 必须是整数，不能是布尔值: {v!r}")
     if isinstance(v, int):
@@ -454,9 +455,8 @@ def check_d_model(v) -> int:
         n = int(s)
     else:
         raise ValueError(f"d_model 必须是整数: {v!r}")
-    if not (D_MODEL_MIN <= n <= D_MODEL_MAX):
-        raise ValueError(
-            f"d_model 必须在 [{D_MODEL_MIN}, {D_MODEL_MAX}]: {n}")
+    if n < D_MODEL_MIN:
+        raise ValueError(f"d_model 必须 ≥ {D_MODEL_MIN}: {n}")
     if n % HEAD_DIM:
         raise ValueError(f"d_model 必须是 {HEAD_DIM} 的整数倍: {n}")
     return n
