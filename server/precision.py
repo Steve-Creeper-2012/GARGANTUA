@@ -176,14 +176,12 @@ def apply_precision(model, name: str):
 
 def dtype_summary(name: str) -> dict:
     """给前端展示一个精度的元数据（类别/比特/是否原生/说明）。"""
+    import spec
     info = parse_precision(name)
+    bits = spec.DTYPE_BITS[name]
     if info["kind"] == "native":
-        return {"name": name, "kind": "native",
-                "bits": {torch.float64: 64, torch.float32: 32,
-                         torch.float16: 16, torch.bfloat16: 16}[
-                             info["torch_dtype"]],
+        return {"name": name, "kind": "native", "bits": bits,
                 "note": "torch 原生 dtype，GPU/CPU 均可原生计算"}
-    bits = 8 if name == "fp8" else (4 if name == "fp4" else info["spec"])
     return {"name": name, "kind": "sim", "bits": bits,
             "note": "低比特：CPU 以 fp32 容器承载、权重量化到该精度"
                     "（权重-only 模拟，有损耗）"}

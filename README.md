@@ -321,7 +321,7 @@ one text token is required as the decode seed.
 Every inference call persists its token ids before/while generating:
 
 ```
-logs/infer_archive/<YYYYmmdd_HHMMSS>_<id>.tokens   # tok-32, one { id } step per token
+logs/infer_archive/<YYYYmmdd_HHMMSS>_<id>.tokens   # token-5，每个 { id } 一步
 logs/infer_archive/<...>.json                      # model / counts / ctx_total / n_evicted
 ```
 
@@ -339,13 +339,20 @@ the inference result. Archiving failure is logged to stderr and degrades to
 A built-in web UI provides:
 - **Model Management**: Create models with configurable encoder/decoder block counts **and context length** (full / compressed capacity + CSA/HCA compression ratios — see "Context Length" above).
 - **Training Queue**: Upload `.tokens` streams, queue training tasks with automatic execution.
-- **Inference Chat**: Standard AI chat interface with collapsible debug panel (temperature, top-p, max_new_tokens).
+- **Inference Chat**: 推理页中间整块（左右边栏之间、磨砂顶栏之下，**含输入框**）
+  由**可插拔显示插件**渲染，因为不同词表的 token 显示方式不同。插件只负责
+  「把用户输入转成 infer 请求（含 max_new_tokens / temperature / top_p）→
+  读流式输出 → 自己画 HTML」。选择器与导入入口在「开发者选项 → 显示插件」，
+  默认插件是「纯 token 显示」（逐 token 追加原 ID + TTFT/tok/s）；base 词表
+  插件开发中、不显示。完整协议与开发文档见 `service/web/plugins/README.md`。
+- **开发者选项**（右侧边栏）：上下文占用、KV cache、**fast weight 状态热力图
+  与逐步写入幅度折线**、显示插件选择/导入、采样参数。
 - **Codec Visualizers**:
   - Text → Token conversion
   - Audio → Wave token conversion
   - Image/Video → Patch token conversion
   - Image → Primitive sequence conversion
-  - Token editor with a spec-aligned palette and **Export .tokens** (writes the same tok-32 stream training consumes)
+  - Token editor with a spec-aligned palette and **Export .tokens** (writes the same token-5 stream training consumes)
   - **Vocabulary page**: ID-region occupancy, presets, plus global search / add-token (the editor itself no longer carries vocabulary operations)
 
 ### Launch
@@ -386,7 +393,9 @@ stdout 追加到 `logs/server.log`，PID 写 `logs/server.pid`），等 `/api/st
    编译缓存全部写 `environment/_cache/`，临时文件写 `data/tmp/`，不落项目外；
 3. 装 `start/requirements/must.txt`（python + pywebview，启动只查这份）；
    `necessary.txt`（torch / numpy / pillow / safetensors / pytest / ffmpeg /
-   rust）在主页「环境与依赖」里按需装，或设 `GARGANTUA_FULL_SETUP=1` 一次装齐；
+   rust）由终端脚本按需装：`python3 start/setup_env.py install`（装齐）或
+   `python3 start/setup_env.py update`（升到允许的最新版），也可设
+   `GARGANTUA_FULL_SETUP=1` 让启动引导一次装齐；**GUI 不再提供安装/更新入口**；
 4. 把依赖清单哈希与 OS/CPU 架构指纹写进
    `environment/venv/.gargantua_setup_stamp`——之后启动秒过；清单变了重装，
    换平台自动重建 venv（不会复用旧架构的 `.so`/`.pyd`）。
@@ -398,8 +407,8 @@ stdout 追加到 `logs/server.log`，PID 写 `logs/server.pid`），等 `/api/st
 所有依赖与工具链（Python / venv / Rust / ffmpeg / node）统一放在 `environment/`，
 **绝不复用系统 Python 或系统包管理器**（空目录也能自动下载安装；跨 OS/CPU 的
 硬限制见上面的 Portability and isolation）——契约见 `environment/README.md`。**一个依赖一个文件夹**，每个
-文件夹带一份 `pack.json` 清单；主页「环境包」区就是该目录的镜像（多一个
-文件夹就多一张卡），所以不会有「装了但主页看不见」的依赖。
+文件夹带一份 `pack.json` 清单；主页「环境包」区就是该目录的**只读镜像**
+（多一个文件夹就多一张卡），所以不会有「装了但主页看不见」的依赖。
 
 | Flag | Effect |
 | --- | --- |

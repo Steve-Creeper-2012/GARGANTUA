@@ -5,7 +5,8 @@
 #   · pywebview  —— 开独立桌面窗口（无 GUI 环境可跳过，server 仍可用）
 #
 # 启动时**只检查这一份**（server_env.check_environment）。其余依赖在
-# necessary.txt —— 启动不检查，用到时在主页「环境与依赖」里按需安装。
+# necessary.txt —— 启动不检查，用终端脚本安装：
+#   python3 start/setup_env.py install
 #
 # 版本写法：名字 + 下限（>=）。编译器/运行时向后兼容，用户可以装更新的
 # 版本（主页里能选具体版本），默认装这里写的下限版本。

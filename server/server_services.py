@@ -166,6 +166,47 @@ class _Handle:
             raise ServiceError(str(resp.get("error") or "未知服务错误"))
         return resp.get("result") or {}
 
+    def send_stream(self, req: dict, timeout: float):
+        """发一个流式请求：逐个 yield 服务发回的帧，直到 final 帧。
+
+        与 send 的区别：pending 条目要保留到流结束（同一个 id 会连续来多
+        帧），partial 帧原样交给调用方。超时与 send 一样判定服务失控——
+        杀掉子进程，避免「接口报错、后台还在算」。
+
+        2026-11-04 新增（推理流式显示）：协议本身没变，只是允许服务在
+        final 结果之前先发若干 `{"partial": {...}}` 帧。
+        """
+        rid = uuid.uuid4().hex
+        req = dict(req)
+        req["id"] = rid
+        q = queue.Queue()
+        self.pending[rid] = q
+        try:
+            self.proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
+            self.proc.stdin.flush()
+        except Exception as e:
+            self.pending.pop(rid, None)
+            raise ServiceError(f"服务 {self.name} 写入失败: {e}")
+        try:
+            while True:
+                try:
+                    obj = q.get(timeout=timeout)
+                except queue.Empty:
+                    try:
+                        self.proc.kill()
+                    except Exception:
+                        pass
+                    raise ServiceError(
+                        f"服务 {self.name} 流式超时（{timeout:.0f}s）："
+                        f"{req.get('op')}（服务已被终止）")
+                if not obj.get("ok"):
+                    raise ServiceError(str(obj.get("error") or "未知服务错误"))
+                yield obj
+                if obj.get("final"):
+                    return
+        finally:
+            self.pending.pop(rid, None)
+
     def abort(self) -> None:
         """终止子进程（超时隔离用）。调用方持 h.lock。"""
         if self.proc is not None:
@@ -206,9 +247,10 @@ class ServiceSupervisor:
     def kill_service(self, name: str) -> bool:
         """杀掉并注销某个常驻服务（不动其它服务）。
 
-        用于「初始化 fast weight / 清空上下文」：infer 服务的 fast_weight 与
-        KV 缓存都活在进程内，跨调用持久；杀掉进程即释放，下次推理会拉起一个
-        全新的干净服务。返回是否真有进程被终止。"""
+        用于「重置 infer 服务」：杀掉服务进程 → 下次推理重新加载模型。
+        当前实现每次 generate 从零开始（state/kv 都是本次局部量），跨轮
+        持久状态尚未接线，所以杀进程并不等于「清空记忆 / 重置 fast weight」。
+        返回是否真有进程被终止。"""
         with self._lock:
             h = self._handles.get(name)
             if h is None:
@@ -232,6 +274,13 @@ class ServiceSupervisor:
         with h.lock:
             for attempt in (1, 2):
                 if not h.alive():
+                    # kill_service 可能已把该句柄从注册表摘掉：此时绝不能在旧
+                    # 局部 h 上重新 spawn，否则造出 shutdown_all 收不到的孤儿进程
+                    if attempt == 2:
+                        with self._lock:
+                            if self._handles.get(name) is not h:
+                                raise ServiceError(
+                                    f"服务 {name} 已被注销，取消重启")
                     h.spawn()
                 try:
                     return h.send({"op": op, **args}, timeout)
@@ -242,21 +291,45 @@ class ServiceSupervisor:
                     raise
             raise ServiceError(f"服务 {name} 重试后仍失败")
 
+    def stream(self, name: str, op: str, timeout: float = 600.0, **args):
+        """流式调用：yield 服务的每一帧（partial… final）。
+
+        句柄锁在整个迭代期间持有——推理本来就是按服务串行的，不能两条
+        流同时进同一个模型。调用方必须把生成器耗尽或显式 close()，
+        否则锁要等 GC 才释放（server 侧用 try/finally 包住）。
+        """
+        with self._lock:
+            h = self._handle(name)
+        h.lock.acquire()
+        try:
+            if not h.alive():
+                h.spawn()
+            yield from h.send_stream({"op": op, **args}, timeout)
+        finally:
+            h.lock.release()
+
     def query(self, name: str, op: str, timeout: float = 15.0, **args):
         """状态查询：服务没在跑就返回 None（不为查询而起进程）。
 
-        与 call 相同：句柄锁而非全局锁，长推理不再阻塞状态查询。"""
+        句柄锁用带超时的 acquire：整个生成期 stream()/call() 持有 h.lock，
+        拿不到锁就立刻返回 None（状态查询永远不阻塞 HTTP 线程），锁等待
+        上限取 min(timeout, 2)。"""
         with self._lock:
             h = self._handles.get(name)
         if h is None or not h.alive():
             return None
-        with h.lock:
+        # 拿不到锁直接放弃，不阻塞：生成期锁被推理流持有，stats 走本地缓冲
+        if not h.lock.acquire(timeout=min(timeout, 2)):
+            return None
+        try:
             if not h.alive():
                 return None
             try:
                 return h.send({"op": op, **args}, timeout)
             except ServiceError:
                 return None
+        finally:
+            h.lock.release()
 
     # ------------------------------------------------------------------
     def run_oneshot(self, script: str, argv: list, timeout: float = 600.0) -> dict:

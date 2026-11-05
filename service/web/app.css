@@ -22,6 +22,12 @@
     /* 侧栏宽度（展开态）。顶栏要横跨整窗，靠它算负偏移与左内边距；
        开发者抽屉镜像时也用同一个值。 */
     --side-w: 244px;
+    /* 开发者选项（右侧边栏）展开宽度 = 左栏 1.5 倍 = 366px。展开态内容多
+       （上下文 / fast weight 两张图 / 采样参数），244px 会把数值挤掉；
+       折叠态仍是 50px 按钮栏，与左栏严格对称。
+       写成 px 而不是 calc(var(--side-w) * 1.5)：calc 的乘法在旧版
+       WebKit/WKWebView 上支持不一致，宽度一失效整套 clip-path 会错位。 */
+    --dev-w: 366px;
     /* 内容区左右内边距：顶栏与每个页面共用同一个值，保证左右严格对称 */
     --pad: 18px;
     /* 自绘滚动条宽度：页面右侧 padding 要减掉它，视觉边距才和左边相等 */
@@ -197,7 +203,8 @@
     display: flex; align-items: center;
     min-height: 38px; padding: 0 2px 0 48px;
   }
-  #sidebar .brand {
+  #sidebar .brand,
+  #right-sidebar .brand {
     font-size: var(--title); font-weight: 800; letter-spacing: .02em;
     color: var(--fg); white-space: nowrap; line-height: 1.1;
     overflow: hidden; text-overflow: ellipsis;
@@ -306,6 +313,13 @@
      它不属于边栏/顶栏任何会被裁切的层，收起全程原地可见，彻底取代旧的
      「边栏内按钮 + 浮层按钮」双按钮交接。 */
   #side-toggle { position: fixed; left: 12px; top: 13px; z-index: 40; }
+  /* 右侧边栏的折叠按钮：左侧按钮的镜像，同样 fixed 常驻、永不被裁切、
+     永不随右侧边栏开合移动。只在推理页显示。 */
+  #right-toggle {
+    position: fixed; right: 12px; top: 13px; z-index: 40;
+    display: none;
+  }
+  html[data-page="infer"] #right-toggle { display: flex; }
   /* 标题盒高度与边栏那个 38px 的折叠按钮对齐：两边的文字垂直中心都在 y=32，
      这样 GARGANTUA 与页面标题永远在同一条水平线上（含边栏收起/展开两种状态）。 */
   .page-title {
@@ -699,52 +713,100 @@
   }
   #train-queue { max-height: 240px; overflow-y: auto; }
 
-  /* ---------- 推理 ---------- */
-  #infer-wrap { flex: 1; display: flex; min-height: 0; }
-  #infer-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-  #chat-history {
-    flex: 1; overflow-y: auto; padding: 6px 2px;
-    display: flex; flex-direction: column; gap: 14px;
+  /* ---------- 推理（宿主容器） ----------
+     整个推理界面归显示插件：宿主只保证这块容器吃满「顶栏之下、左右边栏
+     之间」的区域，里面长什么样全由插件决定（见 plugins/README.md）。
+     宿主不提供任何聊天/输入样式，避免和插件自己的视觉打架。 */
+  #plugin-host {
+    flex: 1; min-height: 0; min-width: 0;
+    display: flex; flex-direction: column;
   }
-  .msg-row { display: flex; width: 100%; }
-  .msg {
-    max-width: 74%; padding: 11px 16px; border-radius: var(--r);
-    line-height: 1.65; word-break: break-word;
+  /* 插件加载中 / 加载失败：宿主唯一自己画的两种状态 */
+  .plugin-boot {
+    margin: auto; color: var(--fg3); font-size: 12.5px; line-height: 1.7;
   }
-  .msg.user { margin-left: auto; background: var(--accent); color: var(--on-accent); }
-  .msg.model { margin-right: auto; background: var(--panel-2); color: var(--fg); }
-  .msg .media img, .msg .media video {
-    max-width: 100%; border-radius: var(--r); display: block; margin-top: 6px;
-  }
-  #input-dock { flex-shrink: 0; padding: 8px 0 4px; }
-  #input-box { background: var(--panel); border: 1px solid var(--border);
-               border-radius: var(--r); padding: 12px 14px; }
-  #infer-prompt { border: none; background: none; resize: none; padding: 2px; font-size: 14px; }
-  #infer-prompt:focus { border: none; box-shadow: none; }
-  #input-tools { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
-  #input-tools label { color: var(--fg2); font-size: 12px; }
-  #input-tools input[type=number] { width: 72px; }
-  #send-btn {
-    margin-left: auto; width: 34px; height: 34px; border-radius: var(--r);
-    background: var(--accent); color: var(--on-accent); font-size: 16px; font-weight: 700;
-    display: flex; align-items: center; justify-content: center;
-  }
-  #send-btn:hover { background: var(--accent-2); }
-  #send-btn:disabled { opacity: .4; cursor: default; }
-  #attach-preview { display: none; margin-bottom: 8px; }
-  #attach-preview img, #attach-preview video { max-height: 100px; border-radius: var(--r); }
-  /* 推理页：工具栏 + 右侧滑出式开发者面板（动画同左侧边栏）。
+  .plugin-boot.err { color: #d9534f; max-width: 560px; }
+  /* 推理页：工具栏在顶栏里（#topbar-actions），右侧边栏是左栏的镜像。
      注意：display:flex 已由 .page.active 提供，这里只补 position:relative——
      否则 id 选择器会盖过 .page{display:none}，导致该页永远可见、切页失效。 */
   #p-infer { position: relative; }
-  /* 推理工具栏：三个按钮贴在顶栏那一行（与标题同一水平线，y=13..51），
-     不再自己占一行。位置 fixed 在窗口右上，抽屉打开时整体左移一个侧栏宽。 */
-  #infer-toolbar {
-    position: fixed; top: 13px; right: var(--pad); z-index: 35;
-    display: flex; align-items: center; gap: 8px; height: 38px;
-    transition: right var(--dur-side) var(--move-ease);
+  /* 标题行右半段：所有与标题同高的按钮都住这里。它是 #topbar 的直接
+     子元素（z-index 2，压在两块磨砂伪元素之上），切页只切 hidden，
+     不参与 .page 的淡入/位移动画——不会再被磨砂条盖一下。 */
+  #topbar-actions {
+    margin-left: auto; display: flex; align-items: center; gap: 8px;
+    height: 38px; flex-shrink: 0;
   }
-  html[data-dev="open"] #infer-toolbar { right: calc(var(--side-w) + var(--pad)); }
+  /* 右上角按钮间距统一：#topbar-actions 内部与 #infer-toolbar 内部都是
+     8px，固定的 #right-toggle 也必须留下同样的 8px。收起态 #main 右缘
+     在 W-50，顶栏右内边距改成 8px 后，最后一颗按钮右缘 = W-58，
+     而按钮左缘 = W-50 → 恰好 8px，与行内 gap 一致。展开态中间隔着
+     整块面板，不受这条规则影响（恢复 18px 的常规右内边距）。 */
+  html[data-page="infer"][data-dev="closed"] #topbar { padding-right: 8px; }
+  /* 「关于」：与同排按钮同高（34px）的方形按钮，带外框（.act.sec 自带）。
+     每页一份内容，切页只换目标，不换位置——所以在任何页面上它都落在
+     同一个像素点上，和标题、其它按钮严格对齐。 */
+  .about-btn {
+    width: 38px; height: 34px; padding: 0; flex-shrink: 0;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .about-btn svg { width: 18px; height: 18px; }
+  .about-btn[hidden] { display: none; }
+
+  /* ---------- 自绘下拉（所有 <select> 统一换皮） ----------
+     原生 <select> 的弹层由系统画，配色/圆角/字号都跟不了主题。这里保留
+     select 本体当「值容器」（JS 的 .value 读写与 change 事件全部不变），
+     只把外观换成一个按钮 + 自绘菜单：没有系统控件，风格与 .pop / .vtab-menu
+     完全一致。 */
+  .csel { position: relative; display: inline-block; vertical-align: middle; }
+  /* 原 select 没写宽度 → 它本来吃全局 select{width:100%}，包装层照做 */
+  .csel.csel-fill { display: block; width: 100%; }
+  .csel > select { display: none; }
+  .csel-btn {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    /* 与全局 input 完全同高（8+8 内边距 + 13px×1.4 行高 + 1px 边框） */
+    padding: 8px 12px; min-height: 36px;
+    background: var(--sunken); color: var(--fg);
+    border: 1px solid var(--border); border-radius: var(--r);
+    font-size: 13px; line-height: 1.4; text-align: left; cursor: pointer;
+    transition: border-color .15s var(--ease), box-shadow .15s var(--ease);
+  }
+  .csel-btn:hover { border-color: var(--fg3); }
+  .csel-btn:focus {
+    outline: none; border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  .csel-label {
+    flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .csel-btn svg {
+    width: 14px; height: 14px; flex-shrink: 0; color: var(--fg3);
+    transition: transform .18s var(--ease);
+  }
+  .csel.open .csel-btn svg { transform: rotate(180deg); }
+  /* 菜单挂在 body 上、fixed 定位（见 enhanceSelect 注释）：侧栏/弹窗里的
+     滚动容器都有 overflow，留在原地会被裁。位置由 JS 按按钮矩形算。 */
+  .csel-menu {
+    position: fixed; z-index: 300;
+    max-height: 260px; overflow-y: auto; padding: 5px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--r); box-shadow: var(--shadow);
+  }
+  .csel-menu[hidden] { display: none; }
+  .csel-opt {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    padding: 7px 9px; border-radius: calc(var(--r) - 4px);
+    font-size: 13px; color: var(--fg2); text-align: left; cursor: pointer;
+  }
+  .csel-opt:hover { background: var(--fill); color: var(--fg); }
+  .csel-opt.on { background: var(--accent-soft); color: var(--fg); font-weight: 600; }
+  .csel-opt .tick { margin-left: auto; width: 14px; height: 14px; opacity: 0; }
+  .csel-opt.on .tick { opacity: 1; color: var(--accent); }
+  #infer-toolbar {
+    position: relative;
+    display: flex; align-items: center; gap: 8px; height: 38px;
+  }
+  #infer-toolbar[hidden] { display: none; }
   #infer-toolbar .act { height: 34px; display: inline-flex; align-items: center; gap: 5px; }
   #infer-toolbar .act svg { width: 15px; height: 15px; flex-shrink: 0; }
   #infer-toolbar .act.icon { width: 38px; padding: 0; justify-content: center; }
@@ -775,33 +837,184 @@
   .pop-list .model-pop-row .nm { display: flex; flex-direction: column; min-width: 0; }
   .pop-list .model-pop-row .sub { display: block; font-size: 11px; color: var(--fg3); margin-top: 2px; }
   .pop-list .model-pop-row .del { flex-shrink: 0; cursor: pointer; }
-  /* 开发者选项：左侧边栏的**镜像**——不是「滑进来一块板」，而是和左栏
-     一样的**宽度收放**：面板内宽固定 --side-w，父容器宽度 0 → --side-w，
-     多出来的部分被 overflow 裁掉，看起来就是从右沿长出来 / 缩回去。
-     圆角方向也镜像（左侧两角圆），时长曲线与左栏同一套。
-     打开时 #main 一起让位（margin-right），和左栏推内容一致。 */
-  #dev-drawer {
-    position: fixed; top: 0; right: 0; bottom: 0;
-    width: 0; overflow: hidden; z-index: 26;
+  /* ---------- 右侧边栏：左侧边栏的逐像素镜像 ----------
+     和 #sidebar 一样是 #app 的 flex 子项（不是 fixed 抽屉）：
+       · 收起态 = 50px（与左栏收起态同宽），展开态 = --side-w；
+       · 内层固定 244px、绝对定位贴右沿，宽度动画时多出来的部分被父级
+         overflow 裁掉——与左栏「从按钮矩形长出来」完全同构；
+       · 圆角、边框、裁切方向左右对调；时长/曲线/反向折返复用同一套
+         --dur-side / --dur-tail / --move-ease。
+     只在推理页出现（其余页 width:0），固定的 #right-toggle 正好落在
+     收起态裁切终点矩形里，开合全程原地不动。 */
+  #right-sidebar {
+    position: relative; z-index: 24;
+    width: 0; flex-shrink: 0; margin: 0;
+    overflow: hidden;
     transition: width var(--dur-side) var(--move-ease);
   }
-  html[data-dev="open"] #dev-drawer { width: var(--side-w); }
-  .dev-inner {
-    width: var(--side-w); height: 100%; display: flex; flex-direction: column;
-    padding: 12px 10px 10px;
+  html[data-page="infer"][data-dev="closed"] #right-sidebar {
+    width: 50px; pointer-events: none;
+  }
+  html[data-page="infer"][data-dev="open"] #right-sidebar { width: var(--dev-w); }
+  /* 与左栏同一套 delay：展开时先让内容把最后 50px 退出来，面板再动 */
+  html[data-page="infer"][data-dev="open"] #right-sidebar {
+    transition-delay: var(--dur-tail);
+  }
+  .right-inner {
+    /* 绝对定位贴右沿：父级只有 50px 时，244px 的内层必须向左溢出，
+       收起的裁切终点才落在右上角按钮的矩形上（普通块级 + auto margin
+       在「子宽 > 父宽」时只会算成 0，贴不到右边）。 */
+    position: absolute; top: 0; right: 0;
+    width: var(--dev-w); height: 100%; display: flex; flex-direction: column;
+    /* 右内边距必须是 0：滚动容器一直贴到面板右缘，滚动条才不会被
+       10px 的 padding 顶到内容区里（steve 2026-11-04 截图反馈「滚动条
+       太靠左」）。内容自己的右边距由 .right-nav 的 padding-right 给。 */
+    padding: 12px 0 10px 10px;
     background: var(--panel); border: 1px solid var(--border);
     border-right: none; border-radius: var(--r) 0 0 var(--r);
+    clip-path: inset(0 0 0 0 round var(--r) 0 0 var(--r));
   }
-  .dev-head {
-    display: flex; align-items: center; justify-content: space-between;
-    min-height: 38px; padding: 0 0 0 2px; margin-bottom: 8px;
+  /* 收起态：四边内缩到右上角按钮矩形（内层坐标 x = dev_w-50..dev_w-12，
+     y = 13..51），与左栏的 inset(13 194 calc(100%-51) 12) 左右镜像。
+     写成 calc(var(--dev-w) - 50px) —— 宽度调成 1.5 倍后不用再手算常数。 */
+  html[data-page="infer"][data-dev="closed"] .right-inner {
+    clip-path: inset(13px 12px calc(100% - 51px)
+                     calc(var(--dev-w) - 50px) round var(--r));
   }
-  .dev-title { font-size: 15px; font-weight: 800; color: var(--fg); }
-  /* 抽屉开合时内容区跟着收放（与左栏 width 过渡同一时长） */
-  #main { transition: margin-right var(--dur-side) var(--move-ease); }
-  html[data-dev="open"] #main { margin-right: var(--side-w); }
+  /* 与左栏同一套「仅在用户点击时挂过渡」策略；右侧单独一个 right-anim，
+     避免和左栏 side-anim 的计时器互相摘除。 */
+  html.right-anim .right-inner {
+    transition: clip-path var(--dur-side) var(--move-ease);
+  }
+  html.right-anim[data-dev="open"] .right-inner {
+    transition-delay: var(--dur-tail);
+  }
+  /* 标题靠左：与左栏 GARGANTUA 同一落点规则（左侧留 2px，靠 padding 对齐）。
+     旧实现 justify-content:flex-end + padding-right:48 是「给折叠按钮让位」
+     的镜像写法，但右侧按钮是 fixed 的、不在流内，标题被推到了右边。 */
+  .right-head {
+    display: flex; align-items: center; justify-content: flex-start;
+    min-height: 38px; padding: 0 2px; flex-shrink: 0;
+  }
+  .right-nav {
+    flex: 1; overflow-y: auto; overflow-x: hidden;
+    /* 滚动条贴面板右缘，内容自己往左让 12px —— 两者分离，不再靠
+       padding 把滚动条一起推到左边。 */
+    padding-right: 12px;
+  }
+  /* 开发者面板专用细滚动条：全站 9px 在 366px 宽的面板里太粗，
+     而且浅色 thumb 压在内容上像一块灰色竖条。这里自绘更细的一条。 */
+  .right-nav::-webkit-scrollbar { width: 6px; }
+  .right-nav::-webkit-scrollbar-track { background: transparent; }
+  .right-nav::-webkit-scrollbar-thumb {
+    background: var(--fg3); border-radius: var(--r-pill);
+  }
+  .right-nav::-webkit-scrollbar-thumb:hover { background: var(--fg2); }
+  .right-nav .field { margin: 10px 2px 0; }
+  .right-nav .nav-group { padding-left: 2px; }
+  .right-nav .nav-group.first { margin-top: 2px; }
+
+  /* 上下文占用：两条 bar + 数值（完整 / 压缩），KV cache 单行 */
+  .meter { margin: 8px 2px 0; }
+  .meter-top {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 8px; font-size: 12px; color: var(--fg2); margin-bottom: 5px;
+  }
+  .meter-val {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px; font-weight: 600; color: var(--fg);
+    font-variant-numeric: tabular-nums;
+  }
+  .meter-bar {
+    height: 6px; border-radius: 999px; background: var(--track);
+    overflow: hidden;
+  }
+  .meter-bar i {
+    display: block; height: 100%; width: 0;
+    border-radius: 999px; background: var(--accent);
+    transition: width .32s var(--ease), background .2s var(--ease);
+  }
+  .meter-bar i.warn { background: #e0a33a; }
+  .meter-bar i.full { background: #d9534f; }
+  .meter-kv {
+    display: flex; align-items: baseline; justify-content: space-between;
+    margin: 8px 2px 2px; padding-top: 7px;
+    border-top: 1px dashed var(--border);
+    font-size: 12px; color: var(--fg2);
+  }
+  .meter-kv b {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px; color: var(--fg); font-weight: 600;
+  }
+
+  /* fast weight：热力图 + 写入折线，都是自绘 canvas（没有系统控件） */
+  .fw-card {
+    margin: 8px 2px 0; padding: 8px;
+    background: var(--fill); border-radius: var(--r);
+  }
+  .fw-canvas {
+    display: block; width: 100%; aspect-ratio: 1 / 1;
+    border-radius: calc(var(--r) - 4px); background: var(--panel-2);
+    image-rendering: pixelated;
+  }
+  .fw-write {
+    display: block; width: 100%; height: 52px; margin-top: 8px;
+    border-radius: calc(var(--r) - 4px); background: var(--panel-2);
+  }
+  .fw-cap {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 8px; margin-top: 5px; font-size: 11px; color: var(--fg3);
+  }
+  .fw-cap b {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px; color: var(--fg2); font-weight: 600;
+  }
   .field { margin-bottom: 12px; }
   .field label { display: block; color: var(--fg3); font-size: 12px; margin-bottom: 5px; }
+
+  /* ---------- 显示插件：导入 / 已导入列表（全部自绘，无原生控件） ---------- */
+  .plugin-import-bar {
+    display: flex; align-items: center; gap: 8px;
+    margin: 9px 2px 0; flex-wrap: wrap;
+  }
+  .plugin-import-bar .hint { flex: 1; min-width: 130px; line-height: 1.55; }
+  .plugin-imported { margin: 8px 2px 0; display: flex; flex-direction: column; gap: 4px; }
+  .plugin-imported:empty { display: none; }
+  .plugin-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 9px; background: var(--fill); border-radius: var(--r-sm);
+    font-size: 12px; color: var(--fg2);
+  }
+  .plugin-row .nm {
+    flex: 1; min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; color: var(--fg);
+  }
+  .plugin-row .tag {
+    font-size: 10.5px; color: var(--fg3); flex-shrink: 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .plugin-row .del {
+    width: 20px; height: 20px; flex-shrink: 0; padding: 0;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: transparent; color: var(--fg3);
+    border-radius: calc(var(--r-sm) / 2); font-size: 13px; line-height: 1;
+  }
+  .plugin-row .del:hover { background: var(--fill-2); color: var(--red); }
+
+  /* 自绘下拉：禁用的选项要明确画成禁用态（不能靠浏览器默认灰化） */
+  .csel-opt[disabled] { opacity: .42; cursor: not-allowed; }
+  .csel-opt[disabled]:hover { background: transparent; color: var(--fg2); }
+  .csel-opt[disabled] .tick { display: none; }
+
+  /* 文档里的列表也不用系统默认圆点：自绘一个小方块，颜色跟主题走 */
+  .about-ul, .doc-body ul { list-style: none; padding-left: 2px; }
+  .about-ul > li, .doc-body ul > li { position: relative; padding-left: 16px; }
+  .about-ul > li::before, .doc-body ul > li::before {
+    content: ""; position: absolute; left: 2px; top: .72em;
+    width: 5px; height: 5px; border-radius: 1px; background: var(--accent);
+  }
+  /* 行号错误列表本身有 .ln 定位，去掉系统项目符号即可 */
+  .verr ul { list-style: none; padding-left: 2px; }
 
   /* ---------- 编解码器 ----------
      一层皮：`.pane` 就是一块面板（头 + 体），体里直接放 textarea / pre，
@@ -1120,6 +1333,68 @@
   }
   .about-ul b { color: var(--fg); font-weight: 700; }
 
+  /* ---------- 工具说明（右上角「关于」） ----------
+     一个宽模态：左侧工具目录 + 右侧详细说明。所有工具的「一句话介绍」
+     都搬到这里，工具页只留操作控件。 */
+  .modal.wide { width: min(880px, calc(100vw - 64px)); }
+  .modal.wide .modal-body { max-height: 66vh; }
+  .doc-layout {
+    display: grid; grid-template-columns: 168px minmax(0, 1fr);
+    gap: 16px; text-align: left;
+  }
+  .doc-nav { display: flex; flex-direction: column; gap: 2px; }
+  .doc-nav button {
+    text-align: left; padding: 7px 10px; border-radius: var(--r-sm);
+    color: var(--fg2); font-size: 13px; font-weight: 600;
+    transition: background .15s var(--ease), color .15s var(--ease);
+  }
+  .doc-nav button:hover { background: var(--fill); color: var(--fg); }
+  .doc-nav button.on { background: var(--accent-soft); color: var(--accent); }
+  .doc-body { min-width: 0; }
+  .doc-body h4 {
+    margin: 0 0 8px; font-size: 15.5px; font-weight: 800; color: var(--fg);
+  }
+  .doc-body p {
+    margin: 0 0 9px; color: var(--fg2); font-size: 13px; line-height: 1.8;
+  }
+  .doc-body ul {
+    margin: 0 0 9px; padding-left: 18px;
+    color: var(--fg2); font-size: 13px; line-height: 1.8;
+  }
+  .doc-body li { margin: 2px 0; }
+  .doc-body b { color: var(--fg); font-weight: 700; }
+  .doc-body .doc-tip {
+    margin-top: 10px; padding: 8px 10px; border-radius: var(--r-sm);
+    background: var(--sunken); color: var(--fg2); font-size: 12.5px;
+  }
+  @media (max-width: 640px) {
+    .doc-layout { grid-template-columns: 1fr; }
+    .doc-nav { flex-direction: row; overflow-x: auto; padding-bottom: 4px; }
+  }
+
+  /* ---------- 建模参数量预测 ---------- */
+  .est-card {
+    margin-top: 16px; padding: 12px 14px;
+    background: var(--sunken); border: 1px solid var(--border);
+    border-radius: var(--r);
+  }
+  .est-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 8px;
+  }
+  .est-title { font-size: 13.5px; font-weight: 800; color: var(--fg); }
+  .est-card .table-wrap { background: transparent; border: none; }
+  .est-card table { font-size: 12.5px; }
+  .est-card thead th { padding: 5px 8px; }
+  .est-card tbody td { padding: 6px 8px; }
+  .est-card tbody tr:nth-child(odd) td { background: transparent; }
+  .est-card tbody tr:hover td { background: transparent; }
+  .est-card tbody tr.total td {
+    border-top: 1px solid var(--border); font-weight: 800; color: var(--fg);
+  }
+  .est-num { font-variant-numeric: tabular-nums; }
+  .est-card .hint { margin-top: 8px; }
+
   /* ---------- Token 编辑器 ---------- */
   .token-palette { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
   .token-palette button {
@@ -1200,12 +1475,13 @@
      三个视图由右上角滑块切换；页面本身可滚（列队要「很长」）。
      注意：**不要**给 #p-prims 写 display —— 会盖掉 .page{display:none}。
      ========================================================================= */
-  /* 关于图标 + 三视图滑块贴在顶栏那一行（与页面标题同一水平线），
-     标签页条留在下面 —— 和推理页工具栏同一套做法。 */
+  /* 三视图滑块在顶栏里（#topbar-actions），与页面标题同一水平线。
+     与推理页工具栏同一套做法：不是 fixed、不参与 .page 的切页动画。 */
   .prims-bar {
-    position: fixed; top: 13px; right: var(--pad); z-index: 35;
+    position: relative;
     display: flex; align-items: center; gap: 8px; height: 38px;
   }
+  .prims-bar[hidden] { display: none; }
   .prims-bar .side-btn { width: 34px; height: 34px; }
   .prims-bar .side-btn svg { width: 19px; height: 19px; }
   .prims-view { display: flex; flex-direction: column; min-height: 0; }

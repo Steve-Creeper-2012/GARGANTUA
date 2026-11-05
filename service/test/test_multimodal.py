@@ -211,11 +211,14 @@ class TestMultimodalGenerate(unittest.TestCase):
         try:
             img = image_codec.image_to_step(
                 Image.new("RGBA", (64, 64), (10, 20, 30, 255)))
-            steps, archive = generate(self.m, "hello", max_new=2,
-                                      temperature=0.9, archive_dir=tmp,
-                                      media_steps=[img])
+            steps, archive, meta = generate(self.m, "hello", max_new=2,
+                                            temperature=0.9, archive_dir=tmp,
+                                            media_steps=[img])
             self.assertGreaterEqual(len(steps), 0)
             self.assertIsNotNone(archive)
+            # 2026-11-04：generate 第三个返回值是本次统计（流式/开发者选项用）
+            self.assertEqual(meta["n_generated"], len(steps))
+            self.assertGreater(meta["kv_steps"], 0)
             items = tok5.read_file(archive)
             kinds = [e["kind"] for it in items if it["kind"] == "step"
                      for e in it["elements"]]

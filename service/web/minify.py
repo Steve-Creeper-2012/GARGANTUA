@@ -84,11 +84,16 @@ def node_check(js: str) -> bool:
         if os.path.isfile(cand):
             node = cand
             break
-    # 2026-11-04：构建工具也只用项目内下载的 node，绝不查系统 PATH。
-    # 没有就跳过语法检查（全量回归的静态门另有 node --check 等价保障）。
+    # 2026-11-04：优先项目内下载的 node；找不到再退回 PATH 上的 node
+    #（WorkBuddy 托管的 node 就装在 PATH 上，不在本项目 environment/ 里）。
+    # 绝不硬编码某台机器的绝对路径（/usr/local/bin 等换系统即死）。
+    # 真没有 node 才返回 None = 「跳过」（不能伪装成 True，否则 verify 会
+    # 把坏 JS 当通过）。
     if not node:
-        print("[verify] 项目内 node 不可用，跳过 JS 语法检查")
-        return True
+        node = shutil.which(exe_name)
+    if not node:
+        print("[verify] 项目内与 PATH 都找不到 node，跳过 JS 语法检查（SKIP）")
+        return None
     tmp_dir = os.path.join(root, "data", "tmp")
     os.makedirs(tmp_dir, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
@@ -135,10 +140,12 @@ def verify(src_text: str, dst_text: str, css_text: str, js_text: str) -> bool:
     # 3. app.js 非空 + node --check
     has_js = bool(js_text.strip())
     js_ok = node_check(js_text) if has_js else False
+    state = ("通过" if js_ok is True else
+             "跳过（SKIP）" if js_ok is None else "失败")
     print(f"[verify] app.js {'存在' if has_js else '缺失'} "
-          f"+ node --check {'通过' if js_ok else '失败'} "
-          f"{'✓' if (has_js and js_ok) else '✗'}")
-    ok &= (has_js and js_ok)
+          f"+ node --check {state} "
+          f"{'✓' if (has_js and js_ok is not False) else '✗'}")
+    ok &= bool(has_js and js_ok is not False)
 
     # 4. 标签序列一致（结构没被压坏）
     ta, tb = _tag_sequence(src_text), _tag_sequence(dst_text)

@@ -423,6 +423,15 @@ D_MODEL_MIN = 128
 D_MODEL_MAX = 2048          # 2× 默认；再大 embedding 会把内存吃穿
 D_MODEL_CHOICES = (256, 512, 768, 1024, 1536, 2048)
 
+# 精度名 → 每参数比特数（唯一真源；precision.py 与建模参数量预估共用）。
+# 低比特档在 CPU 上按「权重量化 → 反量化回 fp32」模拟，落盘仍是 fp32；
+# 这里的 bits 只用于「理论占用」展示，不等于 safetensors 文件大小。
+DTYPE_BITS = {
+    "fp64": 64, "fp32": 32, "fp16": 16, "bf16": 16,
+    "fp8": 8, "fp4": 4,
+    "int16": 16, "int8": 8, "int4": 4, "int2": 2,
+}
+
 
 def check_d_model(v) -> int:
     """建模时指定的 d_model 严格校验（唯一规则，所有入口共用）。
@@ -540,6 +549,12 @@ FW_CHUNK = KDA_CHUNK_SIZE
 # 先用当前状态读出（当作权重层用），用后按 KDA 门控 delta 规则更新，
 # 状态跨调用推进。enc 与 dec 共享同一个 bank 实例。当前为无差别写入
 # （序列里所有 token 都写进状态，不做选择性筛选）。
+#
+# 可视化（2026-11-04，/api/infer/stats）：状态 S 是 [H, dk, dv] 的实矩阵，
+# 前端不可能画 8×128×128 个点——降采样成 FW_VIZ_BINS² 的平均幅值热力图，
+# 写入幅度按步保留最近 FW_WRITE_HISTORY 个点。纯展示，不参与任何计算。
+FW_VIZ_BINS = 24
+FW_WRITE_HISTORY = 96
 
 # ---------------------------------------------------------------------------
 # 5. 模态参数
@@ -556,6 +571,7 @@ VIDEO_FPS = 30
 # (x, y) patch 坐标不 embed，以加性 2D 位置嵌入注入该 patch 的向量。
 VISUAL_R_QUANT = 1024        # R/G/B 各 1024 档（仅 token 存档/输出词表用）
 VISUAL_A_QUANT = 1000        # A 透明度 1000 档（0.1% 步进）
+VISUAL_COORD_BINS = 256      # patch 坐标嵌入表大小（x / y 各一张）
 
 # 音频输入（仅输入）
 AUDIO_SR = 16000             # 16kHz 单声道

@@ -19,6 +19,17 @@ async function api(path, body, opts) {
   const ms = o.timeout || API_TIMEOUT_MS;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ms);
+  // 外部取消令牌（切插件 / 卸载时中止流式轮询）：宿主的请求超时和插件
+  // 生命周期取消要能同时生效，否则卸掉的插件后台还在一直 GET /stream。
+  const ext = o.signal;
+  let onAbort = null;
+  if (ext) {
+    if (ext.aborted) ctrl.abort();
+    else {
+      onAbort = () => ctrl.abort();
+      ext.addEventListener("abort", onAbort, {once: true});
+    }
+  }
   const opt = body === undefined
     ? {signal: ctrl.signal}
     : {method: "POST", headers: {"Content-Type": "application/json"},
@@ -46,6 +57,7 @@ async function api(path, body, opts) {
     throw e;
   } finally {
     clearTimeout(timer);
+    if (ext && onAbort) ext.removeEventListener("abort", onAbort);
   }
 }
 // 统一任务轮询：每轮【先】检查 deadline，超时抛错，并复用 api() 的单请求超时。
@@ -93,13 +105,15 @@ function modalBodySet(body) {
 }
 /* 需要富文本的对话框（关于页、任务选择器）走这个：body 是 HTML 字符串。
    内容全部由本文件自己拼，不含用户输入。 */
-function modalOpenHTML(title, html, okText, withCancel) {
+function modalOpenHTML(title, html, okText, withCancel, wide) {
   return new Promise(res => {
     MODAL_RESOLVE = res;
     $("modal-title").textContent = title;
     $("modal-body").innerHTML = html;
     $("modal-ok").textContent = okText || "确定";
     $("modal-cancel").style.display = withCancel ? "" : "none";
+    const box = document.querySelector(".modal");
+    if (box) box.classList.toggle("wide", !!wide);
     $("modal-mask").hidden = false;
     $("modal-ok").focus();
   });
@@ -111,6 +125,8 @@ function modalOpen(title, body, okText, withCancel) {
     modalBodySet(body);
     $("modal-ok").textContent = okText || "确定";
     $("modal-cancel").style.display = withCancel ? "" : "none";
+    const box = document.querySelector(".modal");
+    if (box) box.classList.remove("wide");
     $("modal-mask").hidden = false;
     $("modal-ok").focus();
   });
@@ -274,6 +290,10 @@ function toggleSidebar() {
 }
 $("side-toggle").onclick = toggleSidebar;
 applySidebar(document.documentElement.getAttribute("data-side") === "collapsed");
+/* 首帧状态：主页 + 右侧边栏收起。写在 HTML 属性上，CSS 直接按收起态
+   落位，不会先展开再收（与 data-side 同一套做法）。 */
+document.documentElement.setAttribute("data-page", "home");
+document.documentElement.setAttribute("data-dev", "closed");
 
 /* ---------- 导航（2026-10-29 重构：按类型分组，灰色加粗组名分隔，
    底部固定「设置」；所有文本 user-select 已由全局 CSS 禁止） ---------- */
@@ -424,8 +444,19 @@ positionIndicator(false);   // 首帧无动画就位
 function switchPage(id) {
   $$(".nav-item").forEach(x => x.classList.toggle("active", x.dataset.p === id));
   $$(".page").forEach(x => x.classList.toggle("active", x.id === "p-" + id));
-  // 词表标签页住在顶栏里，只在「词表」页出现（其余页面顶栏只有标题）
+  // 顶栏右侧的工具条跟着页面切换：它们是 #topbar 的直接子元素，
+  // 只切 hidden，不参与 .page 的淡入/位移动画（旧实现会先被磨砂条盖住）。
+  document.documentElement.setAttribute("data-page", id);
   $("vtab-bar").hidden = (id !== "vocab");
+  $("infer-toolbar").hidden = (id !== "infer");
+  $("prims-bar").hidden = (id !== "prims");
+  // 「关于」是**每页独立**的：同一颗按钮，切页换目标；没有文档的页就不出现。
+  const doc = TOOL_DOCS.find(x => x.id === id);
+  const aboutBtn = $("about-btn");
+  if (aboutBtn) {
+    aboutBtn.hidden = !doc;
+    aboutBtn.title = doc ? `关于「${doc.name}」` : "";
+  }
   positionIndicator(true);
   const t = PAGE_TITLES[id];
   if (t) {
@@ -443,13 +474,24 @@ function switchPage(id) {
        {opacity: 1, transform: "none"}],
       {duration: 320, easing: "cubic-bezier(.22, .61, .36, 1)"});
   }
-  if (id === "models") refreshModels();
+  if (id === "models") { refreshModels(); refreshModelEstimate(); }
   if (id === "train") refreshQueue();
   if (id === "vocab") refreshVocab();
   if (id === "pdraw") pdrawInit();
   if (id === "prims") primsInit();
   if (id === "term") termInit();
-  if (id !== "infer") setDevOpen(false);   // 离开推理页就收起开发者抽屉
+  if (id !== "infer") {
+    setDevOpen(false);                     // 离开推理页就收起右侧边栏
+    $("model-pop").hidden = true;
+  }
+  if (id === "infer") {
+    // 插件按需挂载：第一次进推理页才加载它的 JS/CSS；离开不卸载，
+    // 保留会话（回来还在），只有换插件时才重建。
+    if (!PLUGIN_CUR) mountInferPlugin();
+    startInferStats();
+  } else {
+    stopInferStats();
+  }
   if (id === "home") refreshMonitors();
 }
 
@@ -528,7 +570,7 @@ const DEP_META = {
 const DEP_GROUP = {
   core: "核心", window: "窗口", dev: "测试", optional: "可选",
 };
-let SYSTEM_CACHE = null, UPDATES_CACHE = null, DEVICE_CACHE = null;
+let SYSTEM_CACHE = null, DEVICE_CACHE = null;
 
 /* 字节 → 人话：<1GB 用 MB、<1MB 用 KB，一律两位小数（如 2.57GB） */
 function fmtBytes(b) {
@@ -544,7 +586,7 @@ const fmtPct = p => (p === null || p === undefined || isNaN(p))
 async function refreshEnv(force) {
   const q = force ? "?force=1" : "";
   const msg = $("env-msg");
-  if (force) msg.textContent = "检查中…";
+  if (force) msg.textContent = "读取中…";
   try {
     const [s, d] = await Promise.all([
       api("/api/system"),
@@ -557,10 +599,8 @@ async function refreshEnv(force) {
     renderDeps();
     renderMonitors(d);
     if (force) msg.textContent = "";
-    // 更新检查是网络活（镜像源），异步补上后再重渲染按钮
-    api("/api/system/updates" + q, undefined, {timeout: 60000})
-      .then(u => { UPDATES_CACHE = u.updates || []; renderDeps(); })
-      .catch(() => { UPDATES_CACHE = null; renderDeps(); });
+    // 2026-11-04：GUI 不再自动检查依赖更新（也不提供安装按钮）。
+    // 安装 / 更新统一走终端脚本 start/setup_env.py（install / update）。
   } catch (e) {
     msg.textContent = "环境检查失败: " + e.message;
     $("device-card").innerHTML =
@@ -629,31 +669,21 @@ function renderDeps() {
   const s = SYSTEM_CACHE;
   if (!s) return;
   const grid = $("dep-grid");
-  const um = {};
-  (UPDATES_CACHE || []).forEach(u => { um[u.name] = u; });
+  // 只读展示：已装 / 未装 / 启动核心，三种状态都没有可点的安装按钮。
+  // 安装与更新统一在终端跑 start/setup_env.py（install / update）。
   grid.innerHTML = (s.dependencies || []).map(d => {
     const meta = DEP_META[d.name] ||
       {display: d.title || d.name, desc: d.why || d.install || ""};
     const line2 = d.ok
       ? (meta.desc || d.why || "")
       : (d.group === "must"
-           ? "启动核心（在此不更新）"
-           : (d.install ? "未安装 · " + d.install : "未安装"));
-    let right;
-    // 第一排 python + pywebview 是启动核心，不在界面里更新
-    if (d.group === "must") {
-      right = `<span class="dep-state">无法更新</span>`;
-    } else if (!d.ok) {
-      right = `<button class="act" data-install="${esc(d.name)}" data-upgrade="0">安装</button>`;
-    } else {
-      const u = um[d.name];
-      if (!u) right = `<span class="dep-state">检查更新中…</span>`;
-      else if (u.update_available)
-        right = `<button class="act" data-install="${esc(d.name)}" data-upgrade="1"
-                         title="更新到 ${esc(u.latest || "")}">更新</button>`;
-      else if (!u.checked) right = `<span class="dep-state">未能检查更新</span>`;
-      else right = `<span class="dep-state ok">当前已是最新版本</span>`;
-    }
+           ? "启动核心（用终端脚本重装）"
+           : (d.install ? "未安装 · 终端脚本可装" : "未安装"));
+    const right = d.group === "must"
+      ? `<span class="dep-state">启动核心</span>`
+      : d.ok
+        ? `<span class="dep-state ok">已安装</span>`
+        : `<span class="dep-state">未安装</span>`;
     const ver = (d.ok && d.version)
       ? `<span class="dep-ver">${esc(d.version)}</span>` : "";
     return `<div class="dep-card"><div class="dep-info">
@@ -661,26 +691,6 @@ function renderDeps() {
       <div class="dep-desc" title="${esc(line2)}">${esc(line2)}</div>
     </div>${right}</div>`;
   }).join("");
-  // 事件委托：依赖名可能带引号，不拼进 onclick 字符串
-  grid.querySelectorAll("button[data-install]").forEach(b => {
-    b.onclick = () => installDep(b.dataset.install, b.dataset.upgrade === "1");
-  });
-}
-
-async function installDep(name, upgrade) {
-  const msg = $("env-msg");
-  msg.textContent = (upgrade ? "正在更新 " : "正在安装 ") + name + " …";
-  try {
-    const {task_id} = await api("/api/system/install",
-                                {names: [name], upgrade: !!upgrade});
-    const t = await pollTask(task_id, {interval: 2000, timeout: 1800000});
-    msg.textContent = (t.result && t.result.note) || "完成";
-    toast((upgrade ? "已更新 " : "已安装 ") + name);
-    await refreshEnv(true);
-  } catch (e) {
-    msg.textContent = "错误: " + e.message;
-    toast("安装失败: " + e.message, true);
-  }
 }
 /* 刷新按钮：点击后图标持续旋转，请求完成（或至少转满 650ms）后停下，
    期间禁用按钮防重复点击。三个刷新按钮共用这一套。 */
@@ -701,8 +711,8 @@ function wireRefreshSpin(id, fn) {
   });
 }
 wireRefreshSpin("env-refresh", () => {
+  // 只重读设备 / 依赖状态；不联网、不检查更新、不安装
   $("env-msg").textContent = "";
-  UPDATES_CACHE = null;
   return Promise.all([refreshEnv(true), refreshMonitors()]);
 });
 
@@ -990,11 +1000,127 @@ function syncModelShareMode() {
   dec.disabled = shared;
   dec.title = shared ? "共享权重下 dec blocks 强制等于 enc blocks" : "";
 }
-$("model-share").addEventListener("change", syncModelShareMode);
+$("model-share").addEventListener("change", () => {
+  syncModelShareMode();
+  refreshModelEstimate();
+});
 $("model-enc").addEventListener("input", () => {
   if (modelShareMode()) $("model-dec").value = $("model-enc").value;
+  refreshModelEstimate();
 });
 syncModelShareMode();
+
+/* ---------- 建模参数量预测 ----------
+   与 /api/model/init 用同一套入参（modelFormValues），后端按 spec 解析式
+   估算、不建模型。表单任一字段变化 → 180ms 防抖 → 重算。 */
+function modelFormValues() {
+  // 空值/非数字不下发（服务端取 spec 默认）。0 对压缩上下文是合法值，
+  // 不能用 `parseInt(v) || undefined` 把 0 吞掉。
+  const intOrUndef = (v) => {
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  const shared = modelShareMode();
+  const encBlocks = intOrUndef($("model-enc").value);
+  return {
+    share_enc_dec: shared,
+    d_model: intOrUndef($("model-dmodel").value),
+    n_enc_blocks: encBlocks,
+    // 共享时强制相等：直接复用 enc 的值，不依赖被锁定的 dec 输入框
+    n_dec_blocks: shared ? encBlocks : intOrUndef($("model-dec").value),
+    ctx_full: intOrUndef($("model-ctx-full").value),
+    ctx_compress: intOrUndef($("model-ctx-compress").value),
+    csa_ratio: intOrUndef($("model-csa-ratio").value),
+    hca_ratio: intOrUndef($("model-hca-ratio").value),
+    vocab: $("model-vocab").value || "base",
+    dtype: $("model-dtype").value || "fp32",
+  };
+}
+
+function fmtParams(n) {
+  if (!Number.isFinite(n)) return "—";
+  if (n >= 1e9) return (n / 1e9).toFixed(3) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  return String(n);
+}
+
+let EST_TIMER = null, EST_SEQ = 0;
+function refreshModelEstimate() {
+  if (!$("model-est-body")) return;
+  clearTimeout(EST_TIMER);
+  EST_TIMER = setTimeout(runModelEstimate, 180);
+}
+async function runModelEstimate() {
+  const body = $("model-est-body");
+  if (!body) return;
+  const seq = ++EST_SEQ;
+  try {
+    const r = await api("/api/model/estimate", modelFormValues());
+    if (seq !== EST_SEQ) return;             // 只认最后一次请求
+    const rows = (r.parts || []).map(p => `<tr>
+      <td>${esc(p.label)}</td>
+      <td class="right est-num">${fmtParams(p.params)}</td>
+      <td class="right est-num">${fmtBytes(p.bytes)}</td>
+      <td class="right est-num">${fmtBytes(p.file_bytes)}</td>
+    </tr>`).join("");
+    const t = r.total || {};
+    body.innerHTML = rows + `<tr class="total">
+      <td>合计</td>
+      <td class="right est-num">${fmtParams(t.params)}</td>
+      <td class="right est-num">${fmtBytes(t.bytes)}</td>
+      <td class="right est-num">${fmtBytes(t.file_bytes)}</td>
+    </tr>`;
+    const c = r.config || {};
+    $("model-est-note").textContent =
+      `${c.dtype} · ${c.bits} bit/参数 · 词表 ${Number(c.vocab_size).toLocaleString()}`;
+    $("model-est-foot").textContent =
+      `d_model=${c.d_model} · enc ${c.n_enc_blocks} / dec ${c.n_dec_blocks}` +
+      `${c.share_enc_dec ? "（共享权重）" : ""} · ` +
+      `理论存储按所选精度折算；init 一律写 fp32 权重文件，` +
+      `低比特在加载后量化，不改变磁盘占用。`;
+  } catch (e) {
+    if (seq !== EST_SEQ) return;
+    body.innerHTML =
+      `<tr><td colspan="4" class="hint">估算失败: ${esc(e.message)}</td></tr>`;
+    $("model-est-note").textContent = "参数不合法";
+    $("model-est-foot").textContent = "";
+  }
+}
+
+/* d_model 的「选项」只需要是 128 的倍数：档位由 /api/status 的
+   d_model_range 下发（唯一真源是 spec.D_MODEL_MIN/MAX/HEAD_DIM），
+   前端不再手输数字、也不再维护第二套硬编码范围。 */
+function fillDModelChoices(range) {
+  const sel = $("model-dmodel");
+  if (!sel || sel.tagName !== "SELECT") return;
+  const step = Number(range && range.step) || 128;
+  const min = Number(range && range.min) || 128;
+  const max = Number(range && range.max) || 2048;
+  const dflt = Number(range && range.default) || 1024;
+  let html = "";
+  for (let n = min; n <= max; n += step) {
+    html += `<option value="${n}"${n === dflt ? " selected" : ""}>${n}</option>`;
+  }
+  sel.innerHTML = html;
+  sel.value = String(dflt);
+}
+fillDModelChoices();                       // 后端还没回时先给可用的默认档
+(async () => {
+  try {
+    const s = await api("/api/status");
+    if (s.d_model_range) fillDModelChoices(s.d_model_range);
+  } catch (e) {}
+})();
+
+["model-dmodel", "model-enc", "model-dec", "model-ctx-full",
+ "model-ctx-compress", "model-csa-ratio", "model-hca-ratio",
+ "model-vocab", "model-dtype"].forEach(id => {
+  const el = $(id);
+  if (!el) return;
+  el.addEventListener("input", refreshModelEstimate);
+  el.addEventListener("change", refreshModelEstimate);
+});
 
 $("model-create").onclick = async () => {
   const name = $("model-name").value.trim();
@@ -1018,29 +1144,8 @@ $("model-create").onclick = async () => {
   }
 };
 async function createModel(name, overwrite) {
-  // 空值/非数字不下发（服务端取 spec 默认）。
-  // 注意不能用 `parseInt(v) || undefined`——0 对压缩上下文是合法值
-  // （表示不压缩），会被静默吞成默认 3072
-  const intOrUndef = (v) => {
-    const n = parseInt(v, 10);
-    return Number.isFinite(n) ? n : undefined;
-  };
-  const shared = modelShareMode();
-  const encBlocks = intOrUndef($("model-enc").value);
-  const {task_id} = await api("/api/model/init", {
-    name, overwrite,
-    share_enc_dec: shared,
-    d_model: intOrUndef($("model-dmodel").value),
-    n_enc_blocks: encBlocks,
-    // 共享时强制相等：直接复用 enc 的值，不依赖被锁定的 dec 输入框
-    n_dec_blocks: shared ? encBlocks : intOrUndef($("model-dec").value),
-    ctx_full: intOrUndef($("model-ctx-full").value),
-    ctx_compress: intOrUndef($("model-ctx-compress").value),
-    csa_ratio: intOrUndef($("model-csa-ratio").value),
-    hca_ratio: intOrUndef($("model-hca-ratio").value),
-    vocab: $("model-vocab").value || "base",
-    dtype: $("model-dtype").value || "fp32",
-  });
+  const {task_id} = await api("/api/model/init",
+                              {name, overwrite, ...modelFormValues()});
   await pollTask(task_id, {interval: 1500, timeout: 120000});
   $("model-create-msg").textContent = "创建成功";
   refreshModels(); await refreshStatus();
@@ -1164,104 +1269,561 @@ async function refreshTrain() {
 }
 setInterval(refreshTrain, 2000);
 
-/* ---------- 推理（类 Kimi 聊天） ---------- */
-const chatHistory = $("chat-history");
-let lastMedia = null, mediaObjUrl = null;
-function addMsg(role, html) {
-  const row = document.createElement("div"); row.className = "msg-row";
-  const d = document.createElement("div"); d.className = "msg " + role;
-  d.innerHTML = html; row.appendChild(d);
-  chatHistory.appendChild(row); chatHistory.scrollTop = chatHistory.scrollHeight;
+/* ===========================================================================
+   推理：显示插件宿主（2026-11-04）
+   ---------------------------------------------------------------------------
+   推理界面（左右边栏之间、顶栏之下，**含输入框**）整块归插件。宿主只做四件
+   事，不碰任何聊天/输入的视觉：
+     1. 给一块满高容器（#plugin-host）；
+     2. 提供受控 API：流式推理 / 重置 / 实时统计 / 模型列表 / toast；
+     3. 管生命周期：挂载、卸载、切插件（含插件自己的 CSS）；
+     4. 在开发者选项里提供选择器。
+   插件协议见 service/web/plugins/README.md——它只连 /api/infer 与
+   /api/infer/stream 两个端点，其余（DOM、输入解析、展示方式）完全自理。
+   =========================================================================== */
+/* 内置插件只注册「纯 token 显示」一个。base 词表插件仍在开发中，按需求
+   「不显示」——不注册、不出现在选择器里；开发计划写在 plugins/README.md。
+   其它显示器由开发者用「开发者选项 → 显示插件 → 导入插件…」从本地 .js
+   导入，服务端落到 service/web/plugins/ 并在 /api/plugin/list 登记。 */
+const BUILTIN_PLUGINS = [
+  {id: "tokens", name: "纯 token 显示", entry: "plugins/tokens.js",
+   css: "plugins/tokens.css",
+   desc: "逐 token 流式显示原 ID，带 TTFT 与 tok/s；输入只接受 token 格式。"},
+];
+const PLUGINS = BUILTIN_PLUGINS.slice();   // 运行期 append 导入的插件
+const PLUGIN_KEY = "gargantua.infer.plugin";
+let PLUGIN_CUR = null;          // {id, instance, cleanup, cssEl, ctx, controller}
+let PLUGIN_GEN = 0;            // 挂载世代：并发切插件时丢弃过期 import 结果
+
+function pluginById(id) {
+  return PLUGINS.find(p => p.id === id && !p.status) ||
+         PLUGINS.find(p => !p.status) || PLUGINS[0];
 }
-$("infer-media").onchange = () => {
-  const f = $("infer-media").files[0]; if (!f) return;
-  lastMedia = f;
-  if (mediaObjUrl) URL.revokeObjectURL(mediaObjUrl);
-  mediaObjUrl = fileToUrl(f);
-  let tag = "";
-  if (f.type.startsWith("image/")) tag = `<img src="${mediaObjUrl}">`;
-  else if (f.type.startsWith("video/")) tag = `<video src="${mediaObjUrl}" controls></video>`;
-  else tag = `<div class="hint">已选择音频/文件：${esc(f.name)}</div><audio src="${mediaObjUrl}" controls></audio>`;
-  const ap = $("attach-preview"); ap.innerHTML = tag; ap.style.display = "block";
-};
-$("send-btn").onclick = async () => {
-  const st = $("infer-status");
-  const prompt = $("infer-prompt").value;
-  if (!prompt.trim() && !lastMedia) return;
-  let userHtml = esc(prompt);
-  if (lastMedia) {
-    let tag = "";
-    if (lastMedia.type.startsWith("image/")) tag = `<img src="${mediaObjUrl}">`;
-    else if (lastMedia.type.startsWith("video/")) tag = `<video src="${mediaObjUrl}" controls></video>`;
-    else tag = `<audio src="${mediaObjUrl}" controls></audio>`;
-    userHtml += `<div class="media">${tag}</div>`;
+function selectedPluginId() {
+  let id = null;
+  try { id = localStorage.getItem(PLUGIN_KEY); } catch (e) {}
+  return pluginById(id).id;
+}
+function setSelectedPluginId(id) {
+  try { localStorage.setItem(PLUGIN_KEY, id); } catch (e) {}
+}
+
+/* 流式推理客户端：POST 起任务 → 按 from 游标增量拉 token。
+   为什么不用长连接：server 是纯标准库 http.server，一条连接一个线程，
+   长连接会把「停止/切页」都变成连接生命周期问题；轮询 90ms 一帧在这个
+   数据量下完全够（一个 token 几秒才出来）。 */
+/* 后端上限 common.MAX_NEW_TOKENS = 2048；前端不再写死 512，
+   否则 513..2048 这一档永远用不上（/api/status 也会下发同一个值）。 */
+const INFER_MAX_NEW = 2048;
+const INFER_WALL_MS = 10 * 60 * 1000;   // 整轮流式的墙钟上限
+
+/* 流式推理客户端：POST 起任务 → 按 from 游标增量拉 token。
+   为什么不用长连接：server 是纯标准库 http.server，一条连接一个线程，
+   长连接会把「停止/切页」都变成连接生命周期问题；轮询 90ms 一帧在这个
+   数据量下完全够（一个 token 几秒才出来）。
+
+   2026-11-04 审查修复：
+     · signal —— 切插件/卸载时中止轮询，不让死实例继续占用后端串行队列；
+     · 墙钟上限 —— 服务端若一直回 running，不能永远卡在「生成中…」；
+     · 单次 GET 失败重试 3 次 —— 本地服务偶发断连不该整轮报废。 */
+async function inferStream(req, h, signal) {
+  h = h || {};
+  const aborted = () => !!(signal && signal.aborted);
+  const body = {
+    stream: true,
+    max_new_tokens: clampNum(req.maxNew, 1, INFER_MAX_NEW, 32),
+    temperature: clampNum(req.temperature, 0.05, 5, 0.8),
+    top_p: clampNum(req.topP, 0.01, 1, 0.95),
+  };
+  if (Array.isArray(req.tokenIds) && req.tokenIds.length) {
+    body.token_ids = req.tokenIds;
+  } else if (req.prompt) {
+    body.prompt = req.prompt;
+  } else {
+    throw new Error("需要 tokenIds 或 prompt");
   }
-  addMsg("user", userHtml);
-  $("infer-prompt").value = "";
-  st.textContent = "思考中…";
-  $("send-btn").disabled = true;
-  try {
-    // 媒体已接入生成路径——作为 prompt 前缀参与编码
-    // （视觉/音频各走自己的线性投影到 d_model），生成仍是文本。
-    const body = {prompt,
-                  max_new_tokens: clampNum($("infer-maxnew").value, 1, 512, 32),
-                  temperature: clampNum($("infer-temp").value, 0.05, 5, 0.8),
-                  top_p: clampNum($("infer-topp").value, 0.01, 1, 0.95)};
-    if (lastMedia) {
-      const MAX_MEDIA_BYTES = 64 * 1024 * 1024;
-      if (lastMedia.size > MAX_MEDIA_BYTES) {
-        throw new Error(`附件 ${(lastMedia.size / 1048576).toFixed(1)}MB `
-                      + `超过上限 ${MAX_MEDIA_BYTES / 1048576}MB，未发送`);
-      }
-      const kind = lastMedia.type.startsWith("image/") ? "image"
-                 : lastMedia.type.startsWith("video/") ? "video" : "audio";
-      body.media = [{kind, b64: await fileToB64(lastMedia),
-                     filename: lastMedia.name}];
+  const r = await api("/api/infer", body, {signal});
+  const sid = r.task_id;
+  if (h.onStart) h.onStart({taskId: sid});
+  const t0 = Date.now();
+  let from = 0;
+  let fails = 0;
+  for (;;) {
+    if (aborted()) throw new Error("已取消");
+    if (Date.now() - t0 > INFER_WALL_MS) {
+      throw new Error(`推理超时（${Math.round(INFER_WALL_MS / 1000)}s）`);
     }
-    const {task_id} = await api("/api/infer", body);
-    const t = await pollTask(task_id, {
-      interval: 1500, timeout: 600000,
-      onTick: x => { st.textContent = "思考中… " + x.status; }});
-    addMsg("model", esc(t.result.text || "（无文本输出）"));
-    st.textContent = t.result.archive ? "已存档 id" : "";
-    st.title = t.result.archive || "";
-    $("attach-preview").style.display = "none";
-    $("attach-preview").innerHTML = "";
-    $("infer-media").value = "";
-    lastMedia = null;
-    return;
-  } catch (e) { st.textContent = "错误: " + e.message; addMsg("model", "⚠ " + esc(e.message)); }
-  finally { $("send-btn").disabled = false; }
-};
-$("infer-prompt").addEventListener("keydown", e => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("send-btn").click(); }
+    let s;
+    try {
+      s = await api(
+        `/api/infer/stream?task_id=${encodeURIComponent(sid)}&from=${from}`,
+        undefined, {timeout: 120000, signal});
+      fails = 0;
+    } catch (e) {
+      if (aborted()) throw new Error("已取消");
+      if (++fails <= 3) {                 // 瞬时失败：退避重试，不整轮报废
+        await new Promise(res => setTimeout(res, 250 * fails));
+        continue;
+      }
+      throw e;
+    }
+    const got = s.tokens || [];
+    for (const tk of got) {
+      from += 1;
+      if (h.onToken) h.onToken(tk, from);
+    }
+    // 服务端的 next 是权威游标（慢轮询/丢帧时靠它对齐，不靠本地累加）
+    if (typeof s.next === "number") from = s.next;
+    if (s.status === "done") { if (h.onDone) h.onDone(s.result || {}, s); break; }
+    if (s.status === "error") {
+      if (h.onError) h.onError(new Error(s.error || "推理失败"));
+      break;
+    }
+    await new Promise(res => setTimeout(res, 90));
+  }
+}
+
+function makePluginCtx(meta, host, signal) {
+  const cleanups = [];
+  const ctx = {
+    root: host,
+    plugin: {id: meta.id, name: meta.name},
+    signal,                       // 插件可自选监听：异步回调别碰已卸载的 DOM
+    api: {
+      infer: (req, h) => inferStream(req, h, signal),
+      reset: () => api("/api/infer/reset", {}),
+      stats: () => api("/api/infer/stats"),
+      status: () => api("/api/status"),
+      models: () => api("/api/models"),
+      loadModel: (name) => api("/api/model/load", {name}),
+      toast: (msg, bad) => toast(msg, bad),
+      confirm: (title, body) => modalOpen(title, body, "确定", true),
+      fmtBytes,
+    },
+    /* 每个插件一份命名空间，互不污染；值走 JSON，读不到就用默认 */
+    config: {
+      get(k, d) {
+        try {
+          const v = localStorage.getItem(`gargantua.plugin.${meta.id}.${k}`);
+          return v === null ? d : JSON.parse(v);
+        } catch (e) { return d; }
+      },
+      set(k, v) {
+        try {
+          localStorage.setItem(`gargantua.plugin.${meta.id}.${k}`,
+                               JSON.stringify(v));
+        } catch (e) {}
+      },
+    },
+    onCleanup(fn) { if (typeof fn === "function") cleanups.push(fn); },
+  };
+  ctx._cleanup = () => {
+    cleanups.splice(0).forEach(fn => { try { fn(); } catch (e) {} });
+  };
+  return ctx;
+}
+
+/* 把侧栏的采样参数（temperature / top_p）推到当前插件的配置命名空间。
+   插件在 submit 时读 ctx.config，所以这里只要保持 config 与滑块同步即可，
+   不碰插件内部状态。两个滑块在 init 时各挂一次监听，切换/重挂插件后也
+   靠挂载末尾的调用补同步。 */
+function syncSamplingToPlugin() {
+  if (PLUGIN_CUR && PLUGIN_CUR.ctx) {
+    const t = parseFloat($("infer-temp").value);
+    const p = parseFloat($("infer-topp").value);
+    if (Number.isFinite(t)) PLUGIN_CUR.ctx.config.set("temperature", t);
+    if (Number.isFinite(p)) PLUGIN_CUR.ctx.config.set("topP", p);
+  }
+}
+
+/* 挂载世代机制（替换原来的 PLUGIN_MOUNTING 布尔丢弃）：
+   旧实现在 await import() 期间若再来一次切换会直接 return，localStorage
+   已写新值而 UI 仍是旧插件，且 PLUGIN_CUR 非空导致重进页面也不重挂。
+   现在每次请求先 ++gen 作废旧挂载；import 回来后校验 gen 与当前选中 id，
+   不一致就丢弃结果，最后一次请求一定能生效。 */
+async function mountInferPlugin(force) {
+  const host = $("plugin-host");
+  if (!host) return;
+  const gen = ++PLUGIN_GEN;
+  const meta = pluginById(selectedPluginId());
+  if (PLUGIN_CUR && PLUGIN_CUR.id === meta.id && !force) return;
+  unmountInferPlugin();
+  host.innerHTML = `<div class="plugin-boot">正在加载「${esc(meta.name)}」…</div>`;
+  let cssEl = null;
+  try {
+    if (meta.css) {
+      cssEl = document.createElement("link");
+      cssEl.rel = "stylesheet";
+      cssEl.href = meta.css;
+      cssEl.dataset.plugin = meta.id;
+      document.head.appendChild(cssEl);
+    }
+    const mod = await import("./" + meta.entry);
+    // 期间又切了一次插件 / 改了选择：这次结果已过期，别覆盖新插件
+    if (gen !== PLUGIN_GEN || pluginById(selectedPluginId()).id !== meta.id) {
+      if (cssEl) cssEl.remove();
+      return;
+    }
+    const def = mod.default || mod;
+    if (typeof def.mount !== "function") {
+      throw new Error("插件没有导出 mount(root, ctx)");
+    }
+    host.innerHTML = "";
+    const controller = new AbortController();
+    const ctx = makePluginCtx(meta, host, controller.signal);
+    const instance = await def.mount(host, ctx);
+    if (gen !== PLUGIN_GEN) {                 // mount 自身也可能是异步的
+      try { if (instance && instance.destroy) instance.destroy(); } catch (e) {}
+      controller.abort();
+      if (cssEl) cssEl.remove();
+      return;
+    }
+    PLUGIN_CUR = {id: meta.id, instance: instance || {}, cssEl,
+                  cleanup: ctx._cleanup, ctx, controller};
+    // 侧栏的 temperature / top_p 是全局采样参数：把它们写进当前插件的
+    // 配置命名空间，插件 submit 时从 ctx.config 读——这样滑块真的能控制生成。
+    syncSamplingToPlugin();
+  } catch (e) {
+    if (gen !== PLUGIN_GEN) return;         // 过期失败不该盖掉新插件的错误态
+    if (cssEl) cssEl.remove();
+    host.innerHTML = `<div class="plugin-boot err">插件「${esc(meta.name)}」
+      加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+function unmountInferPlugin() {
+  if (!PLUGIN_CUR) return;
+  try {
+    if (PLUGIN_CUR.instance && PLUGIN_CUR.instance.destroy) {
+      PLUGIN_CUR.instance.destroy();
+    }
+  } catch (e) {}
+  try { if (PLUGIN_CUR.controller) PLUGIN_CUR.controller.abort(); } catch (e) {}
+  try { if (PLUGIN_CUR.cleanup) PLUGIN_CUR.cleanup(); } catch (e) {}
+  if (PLUGIN_CUR.cssEl) PLUGIN_CUR.cssEl.remove();
+  PLUGIN_CUR = null;
+  const host = $("plugin-host");
+  if (host) host.innerHTML = "";
+}
+
+/* ---------------- 开发者选项：上下文占用 + fast weight ---------------- */
+let STATS_TIMER = null;
+const FW_WRITES = [];          // 客户端也留一份（服务没起来时也有曲线）
+
+function meterSet(barId, valId, used, total) {
+  const bar = $(barId), val = $(valId);
+  if (!bar || !val) return;
+  const r = total > 0 ? Math.min(1, used / total) : 0;
+  bar.style.width = (r * 100).toFixed(2) + "%";
+  bar.classList.toggle("warn", r >= 0.75 && r < 0.98);
+  bar.classList.toggle("full", r >= 0.98);
+  val.textContent = `${used} / ${total}`;
+}
+
+function renderCtxMeters(s) {
+  const full = s.ctx_full || 0, comp = s.ctx_compress || 0;
+  const n = s.kv_steps || 0;
+  const fu = Math.min(n, full);
+  const cu = Math.max(0, Math.min(n - full, comp));
+  meterSet("ctx-full-bar", "ctx-full-val", fu, full);
+  meterSet("ctx-comp-bar", "ctx-comp-val", cu, comp);
+  const kv = $("ctx-kv-val");
+  if (kv) {
+    kv.textContent = n
+      ? (s.kv_bytes ? `${fmtBytes(s.kv_bytes)} · ` : "") + `${n} tok`
+      : "—";
+    kv.title = n
+      ? `共享 KV 序列：${n} 步 × d_model ${s.d_model} × ${
+          s.kv_bytes && n ? Math.round(s.kv_bytes / n / Math.max(1, s.d_model)) : 0
+        } 字节`
+      : "尚未推理（KV 为空）";
+  }
+}
+
+function cssVar(name, dflt) {
+  const v = getComputedStyle(document.documentElement)
+    .getPropertyValue(name).trim();
+  return v || dflt;
+}
+
+/* fast weight 可视化：
+   左图 = 状态 |S| 的头均值（bins×bins 热力图，越亮写得越重）；
+   右图 = 每步写入幅度（‖S_t − S_{t−1}‖ 的折线，最近 N 步）。
+   两张图都是纯 canvas 自绘，没有系统控件。 */
+function renderFastWeight(s) {
+  const cv = $("fw-canvas"), wr = $("fw-write");
+  const normEl = $("fw-norm"), writeEl = $("fw-write-val");
+  if (!cv || !wr) return;
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const fw = s.fw;
+  const track = cssVar("--track", "#242b35");
+  const accent = cssVar("--accent", "#4c8dff");
+  const fg3 = cssVar("--fg3", "#7a8699");
+
+  // —— 状态热力图 ——
+  const w = cv.clientWidth || 200;
+  const side = Math.round(w * dpr);
+  if (cv.width !== side) { cv.width = side; cv.height = side; }
+  const c1 = cv.getContext("2d");
+  c1.fillStyle = track;
+  c1.fillRect(0, 0, cv.width, cv.height);
+  if (fw && fw.matrix && fw.matrix.length) {
+    const bins = fw.matrix.length;
+    let max = 1e-9;
+    // 后端已把 NaN/Inf 消毒成 0，这里再守一道：一个脏值会让整张热力图
+    // 的 max 变成 NaN，随后 Math.pow(NaN) 把全图静默画成空白。
+    for (const row of fw.matrix) for (const v of row)
+      if (Number.isFinite(v) && v > max) max = v;
+    const cell = cv.width / bins;
+    c1.fillStyle = accent;
+    for (let y = 0; y < bins; y++) {
+      for (let x = 0; x < bins; x++) {
+        const v = Number(fw.matrix[y][x]);
+        const t = Math.pow(Math.min(1, (Number.isFinite(v) ? v : 0) / max), 0.65);
+        c1.globalAlpha = 0.05 + 0.95 * t;
+        c1.fillRect(x * cell, y * cell, Math.ceil(cell), Math.ceil(cell));
+      }
+    }
+    c1.globalAlpha = 1;
+    if (normEl) normEl.textContent = `‖S‖ ${fw.norm}`;
+  } else {
+    c1.fillStyle = fg3;
+    c1.font = `${11 * dpr}px ui-monospace, monospace`;
+    c1.fillText("尚未推理", 10 * dpr, 20 * dpr);
+    if (normEl) normEl.textContent = "—";
+  }
+
+  // —— 写入幅度 ——
+  const vals = ((s.fw_writes && s.fw_writes.length) ? s.fw_writes : FW_WRITES)
+    .filter(v => Number.isFinite(Number(v))).map(Number);
+  const h = Math.round(52 * dpr);
+  if (wr.width !== side) { wr.width = side; wr.height = h; }
+  const c2 = wr.getContext("2d");
+  c2.clearRect(0, 0, wr.width, wr.height);
+  c2.fillStyle = track;
+  c2.fillRect(0, 0, wr.width, wr.height);
+  if (vals.length) {
+    const max = Math.max(...vals, 1e-9);
+    const n = vals.length;
+    c2.strokeStyle = accent;
+    c2.lineWidth = Math.max(1, dpr);
+    c2.beginPath();
+    vals.forEach((v, i) => {
+      const x = n === 1 ? wr.width / 2 : i / (n - 1) * (wr.width - 2) + 1;
+      const y = wr.height - 2 - (v / max) * (wr.height - 4);
+      i ? c2.lineTo(x, y) : c2.moveTo(x, y);
+    });
+    c2.stroke();
+    if (writeEl) writeEl.textContent = `Δ ${vals[vals.length - 1]}`;
+  } else if (writeEl) {
+    writeEl.textContent = "—";
+  }
+}
+
+async function refreshInferStats() {
+  try {
+    const s = await api("/api/infer/stats");
+    renderCtxMeters(s);
+    renderFastWeight(s);
+    if (s.fw_writes && s.fw_writes.length) {
+      FW_WRITES.length = 0;
+      FW_WRITES.push(...s.fw_writes.slice(-96));
+    }
+  } catch (e) {}
+}
+function startInferStats() {
+  if (STATS_TIMER) return;
+  refreshInferStats();
+  STATS_TIMER = setInterval(refreshInferStats, 1200);
+}
+function stopInferStats() {
+  if (!STATS_TIMER) return;
+  clearInterval(STATS_TIMER);
+  STATS_TIMER = null;
+}
+
+/* 插件选择器（自绘下拉，值仍然是 <select>）。
+   只有已可用的插件进下拉；开发中的 base 不注册，自然也不会出现。 */
+function fillPluginSelect() {
+  const sel = $("plugin-select");
+  if (!sel) return;
+  sel.innerHTML = PLUGINS.filter(p => !p.status).map(p =>
+    `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("");
+  sel.value = selectedPluginId();
+  const sync = () => {
+    const p = PLUGINS.find(x => x.id === sel.value) || PLUGINS[0];
+    if ($("plugin-hint")) $("plugin-hint").textContent = p.desc || "";
+  };
+  // 导入/移除会重绘 options，但 change 监听只绑一次
+  if (!sel.dataset.pluginBound) {
+    sel.dataset.pluginBound = "1";
+    sel.addEventListener("change", () => {
+      setSelectedPluginId(sel.value);
+      sync();
+      mountInferPlugin(true);
+    });
+  }
+  sync();
+}
+
+/* ---------------- 导入插件（开发者选项 → 显示插件） ----------------
+   服务端把 .js/.css 落到 service/web/plugins/ 并登记在 _imported.json，
+   前端只从 /api/plugin/list 读清单；注册表放在服务端而不是 localStorage，
+   换一个 WebView 配置也不会「插件还在、文件没了」。 */
+function renderImportedPlugins() {
+  const box = $("plugin-imported");
+  if (!box) return;
+  box.innerHTML = "";
+  for (const p of PLUGINS.filter(x => x.imported)) {
+    const row = document.createElement("div");
+    row.className = "plugin-row";
+    const nm = document.createElement("span");
+    nm.className = "nm"; nm.textContent = p.name;
+    nm.title = p.desc || "";
+    const tag = document.createElement("span");
+    tag.className = "tag"; tag.textContent = p.id;
+    const del = document.createElement("button");
+    del.className = "del"; del.type = "button";
+    del.textContent = "✕"; del.title = `移除「${p.name}」`;
+    del.onclick = async () => {
+      const ok = await uiConfirm(
+        `移除显示插件「${p.name}」？\n本地文件 ${p.entry} 会被删除；` +
+        `若正在使用它，界面会自动切回「纯 token 显示」。`);
+      if (!ok) return;
+      try {
+        await api("/api/plugin/remove", {id: p.id});
+        toast(`已移除「${p.name}」`);
+        await refreshPluginRegistry();
+      } catch (e) { toast("移除失败: " + e.message, true); }
+    };
+    row.append(nm, tag, del);
+    box.appendChild(row);
+  }
+}
+
+async function refreshPluginRegistry() {
+  let list = [];
+  let outdated = false;
+  try { list = (await api("/api/plugin/list")).plugins || []; }
+  catch (e) {
+    // 旧 server 进程没有 /api/plugin/*：别静默装作「没有插件」，明确告诉
+    // 用户重启后端，否则点导入只会看到一个莫名的 404。
+    outdated = !!(e && e.status === 404);
+  }
+  const hintEl = $("plugin-import-hint");
+  if (hintEl) hintEl.textContent = outdated
+    ? "后端还是旧进程：请重启 GARGANTUA 后再导入插件"
+    : "自带 ES 模块，协议见 plugins/README.md";
+  PLUGINS.length = 0;
+  PLUGINS.push(...BUILTIN_PLUGINS);
+  for (const p of list) {
+    if (!p || !p.id || typeof p.entry !== "string") continue;
+    const id = String(p.id);
+    if (PLUGINS.some(q => q.id === id)) continue;   // 内置同名 / 重复项
+    PLUGINS.push({id, name: String(p.name || id),
+                  entry: String(p.entry), css: p.css ? String(p.css) : "",
+                  desc: String(p.desc || "导入的显示插件"), imported: true});
+  }
+  renderImportedPlugins();
+  fillPluginSelect();
+  // 选中的导入插件被移除 → 回落到内置并立刻重挂，别留着死实例
+  if (PLUGIN_CUR && !PLUGINS.some(p => p.id === PLUGIN_CUR.id)) {
+    setSelectedPluginId(BUILTIN_PLUGINS[0].id);
+    $("plugin-select").value = BUILTIN_PLUGINS[0].id;
+    mountInferPlugin(true);
+  }
+}
+
+const readTextFile = f => new Promise((res, rej) => {
+  const rd = new FileReader();
+  rd.onload = () => res(String(rd.result || ""));
+  rd.onerror = () => rej(new Error("读取失败: " + f.name));
+  rd.readAsText(f);
 });
-/* 开发者选项：右侧抽屉，与左侧边栏镜像（状态挂在 <html data-dev> 上，
-   这样 #main 的让位、工具栏左移、抽屉滑入都吃同一套 CSS 过渡）。 */
+
+function bindPluginImport() {
+  const btn = $("plugin-import"), file = $("plugin-file");
+  if (!btn || !file) return;
+  btn.onclick = () => file.click();          // 隐藏的原生 input，外观全自绘
+  file.onchange = async () => {
+    const files = Array.from(file.files || []);
+    file.value = "";
+    if (!files.length) return;
+    const js = files.find(f => /\.js$/i.test(f.name));
+    if (!js) { toast("需要一个 .js 插件文件（可选附一份 .css）", true); return; }
+    const stem = js.name.replace(/\.js$/i, "").toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32);
+    const id = await uiPrompt("导入显示插件",
+      "插件 ID（小写字母 / 数字 / - / _，最长 32 字符）", stem || "my-plugin");
+    if (!id) return;
+    if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(id)) {
+      toast("插件 ID 不合法：需以小写字母或数字开头，只含 a-z 0-9 - _", true);
+      return;
+    }
+    const css = files.find(f => /\.css$/i.test(f.name));
+    try {
+      const body = {id, code: await readTextFile(js),
+                    css: css ? await readTextFile(css) : ""};
+      let r;
+      try {
+        r = await api("/api/plugin/import", body);
+      } catch (e) {
+        if (e.status !== 409) throw e;
+        const overwrite = await uiConfirm(
+          `插件「${id}」已存在，覆盖它？（旧 .js/.css 会被替换）`);
+        if (!overwrite) return;
+        r = await api("/api/plugin/import", {...body, force: true});
+      }
+      toast(`已导入「${r.plugin.name}」，在上面切换即可使用`);
+      await refreshPluginRegistry();
+    } catch (e) {
+      toast(e && e.status === 404
+        ? "后端还是旧进程：请重启 GARGANTUA 后再导入插件"
+        : "导入失败: " + e.message, true);
+    }
+  };
+}
+
+$("infer-clear").onclick = async () => {
+  if (PLUGIN_CUR && PLUGIN_CUR.instance && PLUGIN_CUR.instance.reset) {
+    try { PLUGIN_CUR.instance.reset(); } catch (e) {}
+  }
+  try {
+    // 后端：杀掉 infer 服务进程 → 释放持久 fast weight + KV 上下文
+    await api("/api/infer/reset", {});
+    toast("已清空会话；infer 服务已终止，下次推理重新加载模型");
+    refreshInferStats();
+  } catch (e) {
+    toast("后端重置失败: " + e.message, true);
+  }
+};
+/* 右侧边栏：左侧边栏的镜像（状态挂在 <html data-dev> 上）。
+   开合动画与左栏共用 --dur-side / --dur-tail / --move-ease：width 与
+   clip-path 同相，只有用户点击时挂 .right-anim（首帧恢复直接落位）。
+   固定的 #right-toggle 不属于这一层，全程原地不动。 */
 function setDevOpen(on) {
   const el = document.documentElement;
-  if (on) el.setAttribute("data-dev", "open");
-  else el.removeAttribute("data-dev");
-  const d = $("dev-drawer");
+  const next = on ? "open" : "closed";
+  if (el.getAttribute("data-dev") === next) return;
+  el.classList.add("right-anim");
+  el.setAttribute("data-dev", next);
+  const d = $("right-sidebar");
   if (d) d.setAttribute("aria-hidden", on ? "false" : "true");
+  const t = $("right-toggle");
+  if (t) t.title = on ? "收起开发者选项" : "开发者选项";
+  clearTimeout(setDevOpen._t);
+  setDevOpen._t = setTimeout(() => {
+    el.classList.remove("right-anim");
+  }, moveDurMs() + 60);
 }
 function devOpen() {
   return document.documentElement.getAttribute("data-dev") === "open";
 }
-$("dev-close").onclick = () => setDevOpen(false);
-/* 推理工具栏：清空 / 选模型 / 开发者选项（右侧抽屉） */
-$("infer-dev-btn").onclick = () => setDevOpen(!devOpen());
-$("infer-clear").onclick = async () => {
-  const ch = $("chat-history");
-  if (ch) ch.innerHTML = "";                 // 清空对话（前端）
-  const st = $("infer-status");
-  try {
-    // 后端：杀掉 infer 服务进程 → 释放持久 fast weight + KV 上下文，下次推理全新起
-    await api("/api/infer/reset");
-    if (st) st.textContent = "已清空对话 / 上下文 / 初始化 fast weight";
-  } catch (e) {
-    if (st) st.textContent = "前端已清空；后端重置失败: " + e.message;
-  }
+/* 右上角固定按钮：开 / 合右侧边栏（位置永不移动）。
+   侧栏底部不再有「收起」按钮——同一个按钮就是开合开关。 */
+$("right-toggle").onclick = () => {
+  setDevOpen(!devOpen());
+  if (devOpen()) refreshInferStats();
 };
 $("infer-model-btn").onclick = async () => {
   const pop = $("model-pop");
@@ -2142,6 +2704,8 @@ async function refreshVocabList() {
       if (main) el.value = main.name;
     }
   }
+  // 词表列表变了 → 建模页的参数量预测跟着重算（V 变了）
+  refreshModelEstimate();
   // 已被删除的词表：从打开的标签里摘掉
   VOCAB.tabs = VOCAB.tabs.filter(n => VOCAB.list.some(v => v.name === n));
   if (VOCAB.active && !VOCAB.tabs.includes(VOCAB.active)) VOCAB.active = "";
@@ -2720,6 +3284,7 @@ const TERM = {
   hist: [],          // 命令历史（↑↓ 翻）
   hi: -1,
   stick: true,       // 是否吸附在底部（用户往上翻就不抢滚动位置）
+  secret: false,     // 后端最后一行是密码提示 → 输入框切 password
 };
 
 function termScroll() {
@@ -2747,7 +3312,24 @@ async function termPoll() {
       termScroll();
     }
     $("term-cwd").textContent = r.cwd || "—";
+    // 密码提示（sudo / ssh / passwd）：输入框切成 password、不回显、
+    // 不进命令历史；提示结束后自动切回 text。
+    const inp = $("term-line");
+    if (inp) {
+      const secret = !!r.awaiting_secret;
+      if (secret !== TERM.secret) {
+        TERM.secret = secret;
+        inp.type = secret ? "password" : "text";
+        inp.placeholder = secret
+          ? "输入密码后回车（不回显，也不会记进历史）"
+          : "输入命令，回车执行（↑↓ 翻历史，Ctrl-C 中断）";
+        if (secret) inp.value = "";
+      }
+    }
     if (!r.alive) $("term-msg").textContent = "会话已结束，点「重开」";
+    else if (TERM.secret) $("term-msg").textContent = "正在等待密码输入…";
+    else if ($("term-msg").textContent === "正在等待密码输入…")
+      $("term-msg").textContent = "";
   } catch (e) {
     $("term-msg").textContent = "轮询失败: " + e.message;
   }
@@ -2772,13 +3354,28 @@ async function termInit() {
 async function termSubmit() {
   const inp = $("term-line");
   const line = inp.value;
+  const secret = TERM.secret;         // 密码行：不 trim 判空、不进历史
   inp.value = "";
-  if (!line.trim()) return;
-  TERM.hist.push(line);
-  TERM.hi = TERM.hist.length;
+  if (!secret && !line.trim()) return;
+  if (secret) TERM.secret = false;    // 发出去就退出密码模式，等下一轮 poll 判定
+  else {
+    TERM.hist.push(line);
+    TERM.hi = TERM.hist.length;
+  }
   TERM.stick = true;
   try {
-    await api("/api/term/input", {line});
+    await api("/api/term/input", {line, secret});
+  } catch (e) {
+    $("term-msg").textContent = e.message;
+  }
+  await termPoll();
+}
+
+/* 中断：写 Ctrl-C，并直接给前台进程组补一发 SIGINT（force）。
+   sudo / ssh 这类把终端设成原始模式的程序，单靠 \x03 可能没反应。 */
+async function termInterrupt(force) {
+  try {
+    await api("/api/term/interrupt", {force: !!force});
   } catch (e) {
     $("term-msg").textContent = e.message;
   }
@@ -2790,6 +3387,13 @@ async function termSubmit() {
   if (!inp) return;
   inp.addEventListener("keydown", e => {
     if (e.key === "Enter") { e.preventDefault(); termSubmit(); return; }
+    // Ctrl-C = 中断前台任务（与真实终端一致）；有选中文本时让浏览器复制
+    if (e.ctrlKey && !e.metaKey && !e.altKey &&
+        (e.key === "c" || e.key === "C")) {
+      const sel = String(window.getSelection() || "");
+      if (!sel) { e.preventDefault(); termInterrupt(true); }
+      return;
+    }
     if (e.key === "ArrowUp") {
       e.preventDefault();
       if (!TERM.hist.length) return;
@@ -2812,10 +3416,15 @@ async function termSubmit() {
     try { await api("/api/term/clear", {}); } catch (e) {}
     await termPoll();
   };
-  $("term-interrupt").onclick = async () => {
-    try { await api("/api/term/interrupt", {}); } catch (e) {
+  $("term-interrupt").onclick = () => termInterrupt(true);
+  $("term-kill").onclick = async () => {
+    try {
+      await api("/api/term/kill", {});
+      $("term-msg").textContent = "已强制结束前台进程";
+    } catch (e) {
       $("term-msg").textContent = e.message;
     }
+    await termPoll();
   };
   $("term-restart").onclick = async () => {
     try { await api("/api/term/close", {}); } catch (e) {}
@@ -3389,32 +3998,214 @@ async function primsTokensRefresh() {
   }
 }
 
-/* ---------------- 关于 ---------------- */
-function primsShowAbout() {
-  modalOpenHTML("关于图元绘画", `
-    <div class="about-p" style="text-align:left;line-height:1.75">
+/* ---------------- 工具说明（右上角「关于」） ----------------
+   所有工具页原先那行「小字介绍」统一搬到这里，并且写得更细。
+   工具页只留操作控件——右上角这一个入口，按当前页自动定位到对应条目。 */
+const TOOL_DOCS = [
+  {
+    id: "infer", name: "推理", title: "推理界面 = 可插拔的显示插件",
+    body: `
+      <p>推理页中间那一整块（左右边栏之间、顶栏之下，<b>含输入框</b>）不属于
+      主程序，而是由<b>显示插件</b>渲染。原因很直接：不同词表的 token 长得
+      完全不一样，把「怎么显示」写死在主程序里，每加一个词表就要改一次核心。</p>
+      <ul>
+        <li><b>推理只连两个端点</b>：插件把用户输入转成 infer 接受的格式
+        （含 <code>max_new_tokens</code> / temperature / top_p），调
+        <code>POST /api/infer</code> 起任务，再用
+        <code>GET /api/infer/stream</code> 按 <code>from</code> 游标拉增量
+        token；读出来怎么解释、怎么排版全归它，HTML 自己写。宿主另外提供
+        <code>reset / stats / status / models / toast</code> 等辅助能力，
+        但生成链路只有这两个端点。</li>
+        <li><b>宿主给什么</b>：一块满高容器 <code>root</code>，加
+        <code>ctx.api</code>、<code>ctx.config</code>（按插件隔离的
+        localStorage）、<code>ctx.signal</code>（卸载时中止异步回调）。</li>
+        <li><b>当前唯一可用插件</b>：<b>纯 token 显示</b>——逐 token 流式追加，
+        显示原 ID，并在顶部实时给出 <b>TTFT</b> 与 <b>tok/s</b>。输入只接受
+        token 格式（十六进制 ID、<code>{t:…}</code> / <code>{text: …}</code>、
+        固定名字的特殊 token），不解析自然语言。</li>
+        <li><b>base 词表插件</b>：开发中，按约定<b>不注册、不显示</b>。
+        协议与它未来要用的接口已经写完，见 <code>plugins/README.md</code>。</li>
+        <li><b>切换 / 导入</b>：右侧开发者选项 → 显示插件。选择会记住；
+        「导入插件…」可选一个本地 <code>.js</code>（可附同名 <code>.css</code>），
+        服务端落到 <code>service/web/plugins/</code> 并登记，导入后可直接在
+        下拉里切换、也可移除。</li>
+      </ul>
+      <div class="doc-tip">写自己的插件：默认导出
+      <code>{ id, name, mount(root, ctx) }</code> 的 ES 模块，然后从
+      「开发者选项 → 显示插件 → 导入插件…」导入即可（不需要改主程序）。
+      完整协议、生命周期、ctx 字段与流式时序见
+      <code>service/web/plugins/README.md</code>。</div>`
+  },
+  {
+    id: "text", name: "文本", title: "文本 → token 时间步",
+    body: `
+      <p>把一段自然语言按所选<b>词表</b>编码成 token-5 时间步序列。每个文本
+      token 独占一个时间步，时间步是模型的原子单位——压缩、滑窗、丢弃都不
+      允许把它切开。</p>
+      <ul>
+        <li><b>输入</b>：任意文本，UTF-8。英文词未命中词表时逐字母回退；
+        完全未收录的字符会被跳过并记入该步的 <code>skipped</code>，
+        不会让整次编码报错。</li>
+        <li><b>输出</b>：<code>{text: HEX}</code> 序列，<code>{ }</code> 是一个
+        时间步，步内多个 token 用 <code>|</code> 分隔。HEX 是词表 ID（十六进制，
+        统一大写）。</li>
+        <li><b>词表</b>：右上角下拉框选一个词表；不同词表的可见区可以完全不同，
+        但契约头（特殊/系统/图元区）一致。</li>
+        <li><b>清空</b>只清输出，输入文本保留，方便改一个词再编一次。</li>
+      </ul>
+      <div class="doc-tip">文本 token 有离散 ID、有 embedding、参与 loss；
+      与音频/视觉的「投影向量 token」不是一回事。</div>`
+  },
+  {
+    id: "audio", name: "音频", title: "音频 → 音元 token",
+    body: `
+      <p>音频被切成固定长度的<b>音元</b>：每 533 个采样点（16 kHz 单声道）
+      平铺成一条 533 维向量，再经 <code>audio_proj</code> 投影到 d_model。
+      533 采样 ≈ 30 个音元/秒。</p>
+      <ul>
+        <li><b>格式</b>：wav / mp3 / flac / ogg 都走 ffmpeg 解码，自动重采样到
+        16 kHz 单声道，不要求源文件格式统一。</li>
+        <li><b>时间步</b>：一个音元 = 一个时间步；时长决定步数，不补零、不跨步。</li>
+        <li><b>没有离散 ID</b>：音频 token 是连续投影向量，词表里查不到；
+        存档用 <code>.tokenvector</code>，而不是 <code>.tokens</code>。</li>
+        <li><b>预览</b>：编码后可直接播放，确认采样率/声道没被弄错。</li>
+      </ul>
+      <div class="doc-tip">训练与推理时音频向量与文本 ID 走同一条序列，
+      但只有文本 token 进 loss。</div>`
+  },
+  {
+    id: "image", name: "图片", title: "图片 → patch token",
+    body: `
+      <p>图片先拆成 <b>32×32 像素</b>的 patch，每个 patch 内部按 RGBA 平铺成
+      4096 维向量，再经 <code>visual_proj</code> 投影到 d_model。一张图的
+      <b>全部 patch 放在同一个时间步</b>里——图片是一个原子单位，不会被拆到
+      两步。</p>
+      <ul>
+        <li><b>坐标</b>：patch 的 (x, y) 不单独成 token，而是用可学习的 2D
+        位置嵌入加性注入该 patch 的向量。</li>
+        <li><b>颜色</b>：内部按 RGBA 各 10 bit 处理；PNG/JPEG 的 8 bit 会在
+        边界换算，不丢档位。</li>
+        <li><b>上限</b>：patch 总数有硬上限（防止一张超大图把内存打穿），
+        超限会直接报错而不是静默缩放。</li>
+        <li><b>存档</b>：视觉 token 同样是投影向量，用 <code>.tokenvector</code>。</li>
+      </ul>
+      <div class="doc-tip">视频就是「每帧一张图」，帧内规则与这里完全一致。</div>`
+  },
+  {
+    id: "video", name: "视频", title: "视频 → 每帧一个时间步",
+    body: `
+      <p>视频用 ffmpeg 抽帧（默认 30 fps）并单独提取音轨。每一帧 = 一个时间步，
+      该步内平铺这一帧的全部 patch token，以及这一帧对应的音频 token。</p>
+      <ul>
+        <li><b>格式</b>：mp4 / mov / webm / mkv / gif 等，取决于 ffmpeg 的解码能力。</li>
+        <li><b>帧 delta</b>：首帧全量；中间帧只送有变化的 patch；每秒首帧、
+        最后一帧、以及「整帧都变」的帧会回到全量。这样长视频的 token 量不会
+        随帧数线性爆炸。</li>
+        <li><b>音轨</b>：按帧时间轴切片，每帧最多携带固定数量的音元；音轨不会
+        被截断成「前半段有声音、后半段没有」。</li>
+        <li><b>统计</b>：编码后显示帧数、patch 数、音元数与总步数，方便判断
+        是不是抽帧太密。</li>
+      </ul>
+      <div class="doc-tip">视频是重活：几十秒的 1080p 就可能上万个 patch。
+      先用短片段试，确认参数再跑长的。</div>`
+  },
+  {
+    id: "prims", name: "图元绘画", title: "位图 → 矢量图元序列",
+    body: `
       <p><b>图元绘画</b>把一张位图「重画」成一串矢量图元（矩形 / 椭圆），
       每画一个都记录 9 个参数：位置 <code>x,y</code>、旋转 <code>theta</code>、
       尺寸 <code>w,h</code>、形状 <code>shape</code>、颜色 <code>r,g,b</code>。
       序列最前面还有一段<b>画布声明</b>，说明这张画有多大。</p>
-      <p><b>两条引擎</b>：<br>
-      · <b>GPU</b>：vendored 的 Rust/wgpu 转换器（<code>service/prims/fast_shape_render</code>）。
-      按目标画布的长宽比挑一个小画布拟合（长边 256），结果等比放大。
-      耗时与步数成正比，275 步约 20 秒。<br>
-      · <b>CPU</b>：本地 numpy 贪心拟合，单线程，几秒出结果，适合快速试。</p>
-      <p><b>步数</b>：GPU 下是「搜索轮数」，每轮最多采纳 1 个图元；CPU 下是迭代次数。<br>
-      <b>早停</b>：连续 1000 步没有明显改善就收工——这就是「填了 20000 只出
-      3975 个图元」的原因。关掉早停才会真的跑满。</p>
-      <p><b>画布</b>：1..1920 × 1..1080 任意尺寸。左边那个小按钮在
-      <code>auto</code> / <code>手动</code> 之间切换——<b>auto</b> 按原图长宽比
-      算出「塞得进上限的最大同比例画布」（竖图就是 810×1080 这种），
-      <b>手动</b> 才用你填的宽高。</p>
-      <p><b>任务列队</b>：一次只能跑一个（GPU 独占），其余排队；结果落在
-      <code>service/prims/output/jobs/&lt;id&gt;/</code>，随时可以回看、对比、取 token。</p>
-      <p><b>渲染</b>：左边原图、右边图元，都能滚轮缩放 / 拖动平移；跑的时候
-      边算边画，底部有进度条。<b>时间线</b>按步回放，可以拖、可以自动播放。</p>
-    </div>`, "知道了", false);
+      <ul>
+        <li><b>GPU 引擎</b>：项目内 vendored 的 Rust/wgpu 转换器
+        （<code>service/prims/fast_shape_render</code>）。按目标画布长宽比挑一个
+        小画布拟合（长边 256），结果等比放大；耗时与步数成正比。</li>
+        <li><b>CPU 引擎</b>：本地 numpy 贪心拟合，单线程，几秒出结果，适合快速试。</li>
+        <li><b>步数</b>：GPU 下是搜索轮数（每轮最多采纳 1 个图元）；CPU 下是
+        迭代次数。<b>早停</b>：连续 1000 步没有明显改善就收工——填了 20000
+        只出几千个图元通常就是它；关掉才会跑满。</li>
+        <li><b>画布</b>：1..1920 × 1..1080 任意尺寸。<code>auto</code> 按原图
+        长宽比算出「塞得进上限的最大同比例画布」；<code>手动</code> 才用你填的宽高。</li>
+        <li><b>任务列队</b>：一次只跑一个（GPU 独占），其余排队；结果落在
+        <code>service/prims/output/jobs/&lt;id&gt;/</code>，可回看、对比、取 token。</li>
+        <li><b>渲染</b>：左原图 / 右图元，都能滚轮缩放、拖动平移；边算边画，
+        底部有进度条；时间线可按步回放、拖动、自动播放。</li>
+      </ul>
+      <div class="doc-tip">图元序列的 token 是离散 ID（在词表的 DRAW 区），
+      所以它能直接进 <code>.tokens</code>，也能被模型学着画出来。</div>`
+  },
+  {
+    id: "json", name: "Token 编辑器", title: "手写 / 检查 token-5 序列",
+    body: `
+      <p>直接编辑 token-5 文本流：<code>{ }</code> 是时间步原子，步内元素用
+      <code>|</code> 分隔。<code>{ }</code> 和 <code>|</code> 本身不是 token，
+      不占位置、不进 loss。</p>
+      <ul>
+        <li><code>{text: C732}</code>：文本 token，有向量、进 loss，ID 为十六进制。</li>
+        <li><code>{wave: HEX}</code>：音频 token（533 采样），连续向量。</li>
+        <li><code>{visual: HEX x: 1 y: 2}</code>：视觉 patch（32×32，RGBA 各 10 bit）。</li>
+        <li><code>&lt;5&gt;</code>：扩展系统 token（有嵌入、不进 loss），也可以
+        直接写名字，如 <code>&lt;stop&gt;</code>。</li>
+        <li><b>格式化 / 压缩</b>只改排版，不改 token；<b>复制</b> 复制全文；
+        <b>导出 .tokens</b> 按所选词表解析 token 名并校验 ID，生成训练用的位流。</li>
+        <li><b>词表</b>：查询与增删统一在「词表」页，这里只做序列编辑。</li>
+      </ul>
+      <div class="doc-tip">导出前先确认词表：同一个 ID 在不同词表里可能是完全
+      不同的 token。</div>`
+  },
+  {
+    id: "pdraw", name: "图元编辑器", title: "手动摆图元，实时看 token",
+    body: `
+      <p>手动摆放图元：左边实时 SVG 画布，右边字段编辑，底部实时 token 流。
+      适合调单个图元的参数、检查画布声明、或手工拼一张小图。</p>
+      <ul>
+        <li><b>单击</b>空白处落一个图元；<b>拖动</b>平移画布；<b>滚轮</b>缩放。</li>
+        <li><b>图层</b>：右侧列表可拖拽排序，越靠后越在上层。</li>
+        <li><b>底图</b>：可开关、可调透明度，用来对比「画出来的」和「原图」差多少。</li>
+        <li><b>画布</b>：档位与字段 offset 全部来自 <code>/api/status</code>
+        （唯一真源是 <code>server/spec.py</code>），前端不抄常量。</li>
+        <li><b>token 序列</b>：画布声明打头，其后每个图元 9 个 token；改 token
+        会自动重绘，改图元会反写 token。</li>
+      </ul>
+      <div class="doc-tip">这里的 token 可以直接复制到「Token 编辑器」继续改，
+      或导出成训练数据。</div>`
+  },
+  {
+    id: "term", name: "终端", title: "项目目录内的交互式 shell",
+    body: `
+      <p>装依赖、跑测试、看日志的自留地。工作目录固定在项目根，<code>cd</code>
+      到项目外会被拒绝——这是防手滑，不是安全沙箱。</p>
+      <ul>
+        <li><b>sudo / ssh / passwd</b>：出现 <code>Password:</code> 时输入框会
+        自动切成密码模式，输入不回显、也不会记进命令历史；回车即提交。
+        需要的是本机当前用户的密码。</li>
+        <li><b>中断</b>：输入框里按 <b>Ctrl-C</b>，或点「中断」。它会写 Ctrl-C
+        并直接给前台进程组补一发 SIGINT，sudo 卡住时也能打断。</li>
+        <li><b>强制结束</b>：SIGKILL 只杀当前前台作业；空闲时等同于结束整个
+        shell，需要点「重开」。</li>
+        <li><b>重开</b>：关掉当前 shell 重开，环境变量与当前目录都会复位。</li>
+      </ul>
+      <div class="doc-tip">依赖与环境的安装 / 更新统一在终端里跑：
+      <code>python3 start/setup_env.py install</code> 或
+      <code>python3 start/setup_env.py update</code>。</div>`
+  },
+];
+let DOC_SELECTED = null;
+
+/* 「关于」是**每页独立**的：打开只显示当前工具那一条，没有目录、没有
+   跨页跳转。它描述的是「你现在在用的这个东西」，不是一个全局文档浏览器。 */
+function showToolDoc(id) {
+  const d = TOOL_DOCS.find(x => x.id === id);
+  if (!d) return Promise.resolve();
+  DOC_SELECTED = d.id;
+  return modalOpenHTML(`关于 · ${d.name}`, `
+    <div class="doc-body">
+      <h4>${esc(d.title)}</h4>
+      ${d.body}
+    </div>`, "知道了", false, true);
 }
+$("about-btn").onclick = () =>
+  showToolDoc(document.documentElement.getAttribute("data-page"));
 
 /* ---------------- 初始化 ---------------- */
 function primsInit() {
@@ -3465,7 +4256,6 @@ function primsInit() {
       };
     });
   }
-  if ($("prims-about")) $("prims-about").onclick = primsShowAbout;
   if ($("prims-add")) $("prims-add").onclick = primsResetForm;
   if ($("prims-create")) $("prims-create").onclick = primsCreate;
   if ($("prims-canvas-mode")) {
@@ -3503,3 +4293,192 @@ function primsInit() {
     });
   }
 })();
+
+/* ===========================================================================
+   自绘下拉：把每个 <select> 换成「按钮 + 自绘菜单」
+   ---------------------------------------------------------------------------
+   原生 <select> 的弹层由系统绘制，配色/圆角/字号跟不了主题（界面铁律：
+   每一个像素都由本文件画）。这里保留 select 本体当值容器——JS 里所有
+   `.value` 读写、`change` 事件、`selectedOptions` 全部照旧——只把外观换掉：
+     · 实例上重定义 value 的 setter，程序赋值后标签立即同步；
+     · MutationObserver 盯 option 增删（词表列表是异步填的）；
+     · 菜单往上/往下翻由可用空间决定，不贴边溢出。
+   =========================================================================== */
+function enhanceSelect(sel) {
+  if (!sel || sel.dataset.csel) return;
+  sel.dataset.csel = "1";
+
+  const wrap = document.createElement("span");
+  wrap.className = "csel";
+  // 宽度语义要跟着原 select 走：全局 input/select 是 width:100%（吃满容器），
+  // 写了 style="width:auto" 的才是「按内容收缩」。包装层必须复刻这个判断，
+  // 否则没写宽度的下拉会从「占满一行」变成「缩成一小截」。
+  if (sel.style.width) wrap.style.width = sel.style.width;
+  else wrap.classList.add("csel-fill");
+  if (sel.style.minWidth) wrap.style.minWidth = sel.style.minWidth;
+  sel.parentNode.insertBefore(wrap, sel);
+  wrap.appendChild(sel);
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "csel-btn";
+  btn.innerHTML = `<span class="csel-label"></span>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round">
+      <path d="M6 9l6 6 6-6"/></svg>`;
+  const menu = document.createElement("div");
+  menu.className = "csel-menu";
+  menu.hidden = true;
+  wrap.appendChild(btn);
+  // 菜单挂在 body 上（fixed 定位）：侧栏 / 表格 / 弹窗里的滚动容器都有
+  // overflow，菜单如果留在原地会被裁掉一半。
+  document.body.appendChild(menu);
+
+  const label = btn.querySelector(".csel-label");
+  const TICK = `<svg class="tick" viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" stroke-width="2.4" stroke-linecap="round"
+      stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>`;
+
+  const renderMenu = () => {
+    menu.innerHTML = Array.from(sel.options).map((o, i) =>
+      `<button type="button" class="csel-opt${o.selected ? " on" : ""}"
+               data-i="${i}"${o.disabled ? " disabled" : ""}>${
+        esc(o.textContent)}${TICK}</button>`).join("");
+    menu.querySelectorAll("[data-i]").forEach(b => {
+      b.onclick = ev => {
+        ev.stopPropagation();
+        const o = sel.options[+b.dataset.i];
+        if (!o || o.disabled) return;
+        sel.selectedIndex = +b.dataset.i;
+        sel.dispatchEvent(new Event("change", {bubbles: true}));
+        closeMenu();
+        btn.focus();
+      };
+    });
+  };
+
+  const sync = () => {
+    const o = sel.selectedOptions && sel.selectedOptions[0];
+    label.textContent = o ? o.textContent : "";
+    btn.disabled = !!sel.disabled;
+    wrap.title = o ? o.textContent : "";
+    if (!menu.hidden) renderMenu();
+  };
+
+  const closeMenu = () => {
+    menu.hidden = true;
+    wrap.classList.remove("open");
+  };
+
+  const openMenu = () => {
+    if (sel.disabled) return;
+    document.querySelectorAll(".csel.open").forEach(w => {
+      if (w === wrap) return;
+      w.classList.remove("open");
+      const m = w._cselMenu;
+      if (m) m.hidden = true;
+    });
+    renderMenu();
+    menu.hidden = false;
+    wrap.classList.add("open");
+    // fixed 定位：以按钮矩形为准，下方放不下就往上翻
+    const r = btn.getBoundingClientRect();
+    menu.style.width = r.width + "px";
+    // 水平钳制：右侧边栏里的下拉贴着窗口右沿，菜单不能溢出屏幕
+    menu.style.left = Math.round(Math.max(8, Math.min(
+      r.left, window.innerWidth - r.width - 8))) + "px";
+    const h = Math.min(260, menu.scrollHeight);
+    const below = window.innerHeight - r.bottom;
+    const above = r.top;
+    const top = (below < h + 12 && above > below)
+      ? Math.max(8, r.top - h - 6)
+      : Math.min(window.innerHeight - h - 8, r.bottom + 6);
+    menu.style.top = Math.round(Math.max(8, top)) + "px";
+    const on = menu.querySelector(".csel-opt.on");
+    if (on) on.scrollIntoView({block: "nearest"});
+  };
+  wrap._cselMenu = menu;
+
+  btn.onclick = ev => {
+    ev.stopPropagation();
+    menu.hidden ? openMenu() : closeMenu();
+  };
+  wrap.addEventListener("keydown", ev => {
+    if (ev.key === "Escape") { closeMenu(); btn.focus(); return; }
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+      if (menu.hidden) { openMenu(); ev.preventDefault(); return; }
+      const opts = Array.from(menu.querySelectorAll(".csel-opt:not([disabled])"));
+      if (!opts.length) return;
+      const cur = opts.findIndex(b => b.classList.contains("on"));
+      const step = ev.key === "ArrowDown" ? 1 : -1;
+      const next = opts[Math.max(0, Math.min(opts.length - 1,
+                                             (cur < 0 ? 0 : cur + step)))];
+      opts.forEach(b => b.classList.remove("on"));
+      next.classList.add("on");
+      next.scrollIntoView({block: "nearest"});
+      ev.preventDefault();
+      return;
+    }
+    if (ev.key === "Enter" && !menu.hidden) {
+      const on = menu.querySelector(".csel-opt.on");
+      if (on) on.click();
+      ev.preventDefault();
+    }
+  });
+
+  // 程序赋值（sel.value = ...）后标签要立刻跟上：重定义实例属性
+  const desc = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,
+                                                "value");
+  if (desc && desc.get && desc.set) {
+    Object.defineProperty(sel, "value", {
+      configurable: true, enumerable: true,
+      get() { return desc.get.call(sel); },
+      set(v) { desc.set.call(sel, v); sync(); },
+    });
+  }
+  new MutationObserver(sync).observe(sel, {childList: true, subtree: true});
+  sync();
+}
+
+// 点空白处 / Esc / 滚动 / 改窗口大小 → 关掉所有自绘下拉（全局监听，
+// 不是每个 select 一个；菜单挂在 body 上，滚动后 fixed 位置会错，必须关）
+function closeAllCsel() {
+  document.querySelectorAll(".csel.open").forEach(w => {
+    w.classList.remove("open");
+    const m = w._cselMenu;
+    if (m) m.hidden = true;
+  });
+}
+document.addEventListener("click", closeAllCsel);
+document.addEventListener("keydown", ev => {
+  if (ev.key === "Escape") closeAllCsel();
+});
+window.addEventListener("scroll", ev => {
+  // 菜单自己滚动（选项多时）不该把它关掉；其它任何容器滚动都会让
+  // fixed 坐标失效，必须关。
+  const t = ev.target;
+  if (t && t.closest && t.closest(".csel-menu")) return;
+  closeAllCsel();
+}, true);
+window.addEventListener("resize", closeAllCsel);
+
+$$("select").forEach(enhanceSelect);
+/* 运行时动态插入的 <select>（例如图元编辑器 pdrawForm 用 innerHTML 造的
+   `data-f="shape"`）也必须自绘。只增强一次的话，那个下拉会漏回系统原生
+   UI —— 这里用 body 级观察器兜住所有后来插入的节点。 */
+new MutationObserver(muts => {
+  for (const m of muts) for (const node of m.addedNodes) {
+    if (node.nodeType !== 1) continue;
+    if (node.matches && node.matches("select")) enhanceSelect(node);
+    if (node.querySelectorAll) node.querySelectorAll("select").forEach(enhanceSelect);
+  }
+}).observe(document.body, {childList: true, subtree: true});
+fillPluginSelect();
+bindPluginImport();
+refreshPluginRegistry();            // 异步拉导入插件清单，回来后重绘选择器
+
+// 采样参数滑块：任何改动都实时推到当前插件配置（切换插件后挂载末尾也会补一次）
+["infer-temp", "infer-topp"].forEach(id => {
+  const elx = $(id);
+  if (elx) elx.addEventListener("input", syncSamplingToPlugin);
+});

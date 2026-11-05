@@ -1,0 +1,110 @@
+/* ===========================================================================
+   默认显示插件「纯 token 流」的样式
+   ---------------------------------------------------------------------------
+   插件自带 CSS，由宿主在 mount 前以 <link> 注入、卸载时移除（见
+   plugins/README.md）。所有颜色都走 app.css 的 CSS 变量，自动跟随主题；
+   不引用任何主程序的类名，避免插件与宿主互相污染。
+   =========================================================================== */
+
+.tk-root {
+  display: flex; flex-direction: column;
+  height: 100%; min-height: 0;
+}
+
+/* ---------- 顶部指标条 ---------- */
+.tk-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 2px 2px 10px; flex-shrink: 0;
+}
+.tk-title {
+  font-size: 12px; font-weight: 800; letter-spacing: .08em;
+  color: var(--fg3); text-transform: uppercase;
+}
+.tk-metrics {
+  display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.tk-m { display: flex; align-items: baseline; gap: 5px; }
+.tk-m i {
+  font-style: normal; font-size: 11px; color: var(--fg3);
+  letter-spacing: .02em;
+}
+.tk-m b {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px; font-weight: 600; color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- 会话记录 ---------- */
+.tk-log {
+  flex: 1; min-height: 0; overflow-y: auto;
+  padding: 4px 2px 10px;
+  display: flex; flex-direction: column; gap: 18px;
+}
+.tk-empty {
+  margin: auto; max-width: 440px; text-align: center;
+  display: flex; flex-direction: column; gap: 8px;
+  color: var(--fg3); font-size: 12.5px; line-height: 1.75;
+}
+.tk-empty b { color: var(--fg2); font-size: 13.5px; }
+
+.tk-turn { display: flex; flex-direction: column; gap: 6px; }
+.tk-role {
+  font-size: 11px; color: var(--fg3); letter-spacing: .04em;
+  font-variant-numeric: tabular-nums;
+}
+.tk-role.out { margin-top: 8px; color: var(--fg2); }
+.tk-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+
+.tk-chip {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px; line-height: 1.2;
+  padding: 4px 7px; border-radius: 6px;
+  background: var(--fill); color: var(--fg2);
+  border: 1px solid transparent;
+  cursor: default;
+}
+.tk-chip.out { background: var(--accent-soft); color: var(--fg); }
+/* 生成中：最后一个 chip 描边，眼睛能盯住「正在长」的位置 */
+.tk-busy .tk-chips.out .tk-chip:last-child {
+  border-color: var(--accent);
+}
+.tk-note {
+  font-size: 11px; color: var(--fg3); margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.tk-err { font-size: 12px; color: #d9534f; line-height: 1.6; }
+
+/* ---------- 输入区 ---------- */
+.tk-dock { flex-shrink: 0; padding-top: 8px; }
+.tk-input-box {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 10px 12px;
+  transition: border-color .15s var(--ease);
+}
+.tk-input-box:focus-within { border-color: var(--accent); }
+.tk-input {
+  width: 100%; border: none; background: none; resize: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px; line-height: 1.6; color: var(--fg); padding: 0;
+}
+.tk-input:focus { outline: none; box-shadow: none; border: none; }
+.tk-tools {
+  display: flex; align-items: center; gap: 10px; margin-top: 8px;
+}
+.tk-hint {
+  flex: 1; min-width: 0; font-size: 11px; color: var(--fg3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tk-num {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px; color: var(--fg3); white-space: nowrap;
+}
+.tk-num input { width: 64px; }
+.tk-send {
+  height: 32px; padding: 0 18px; border-radius: var(--r);
+  background: var(--accent); color: var(--on-accent);
+  font-size: 13px; font-weight: 700; flex-shrink: 0;
+}
+.tk-send:hover { background: var(--accent-2); }
+.tk-send:disabled { opacity: .45; cursor: default; }

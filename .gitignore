@@ -8,6 +8,24 @@ __pycache__/
 # 再 re-include 其中的任何文件（git 不允许重新包含被排除目录内的文件）。
 environment/*
 !environment/README.md
+# 但每个依赖包的清单 pack.json 是契约的一部分（目录里有什么、怎么装、
+# 有哪些子目录），必须进仓库——否则容器化迁移时没人知道该装什么。
+# git 的规则要求「先放行目录、再放行文件、再挡回其余内容」，所以是三段：
+!environment/*/
+environment/*/*
+!environment/*/pack.json
+# 2026-11-04：下载的 standalone 解释器 / 工具二进制 / 缓存全是本地产物，
+# 随文件夹搬走但不进仓库（旧规则只挡两层，三级目录会漏出去）
+environment/python/*
+!environment/python/pack.json
+environment/tools/
+environment/certs/
+environment/_cache/
+environment/userbase/
+environment/config/
+environment/data/
+environment/go/
+environment/bin/
 
 # Rust 构建产物（service/prims/fast_shape_render，cargo build 生成）
 service/prims/fast_shape_render/target/
@@ -38,3 +56,19 @@ Thumbs.db
 # Agent 工作区数据（会话记录 / 记忆 / 快照，本地产物，不属于代码仓库）
 .workbuddy/
 .workbuddy-ai/
+
+# 各 service 的产物目录（2026-11-03 契约）：除了 README 之外都是本地产物
+service/*/output/*
+!service/*/output/README.md
+
+# 显示插件注册表 + 导入的插件文件都是用户本地数据，不进仓库。
+# 内置 tokens.js / tokens.css / README.md 是代码，保持跟踪。
+service/web/plugins/_imported.json
+service/web/plugins/*.js
+!service/web/plugins/tokens.js
+service/web/plugins/*.css
+!service/web/plugins/tokens.css
+
+# WorkBuddy 应用卡片预览文件（.wbapp_*.genie），本地产物，不进仓库
+.wbapp_*.genie
+.wbapp_*.genie/

@@ -10,14 +10,20 @@
 #   * 镜像自动测速选最快；下载物留在 environment/_cache/downloads/，
 #     离线时直接复用缓存，零网络也能装。
 #
-# 用法（必须由项目内 standalone Python 执行）：
-#   python start/setup_env.py --check                 环境是否就绪（0/1）
-#   python start/setup_env.py --stage runtime        建隔离 venv + 装 must + stamp
-#   python start/setup_env.py --stage tools          测速下载 ffmpeg / node
+# 用法（终端里直接跑；GUI 不再提供安装/更新入口）：
+#   python start/setup_env.py install                 装齐：venv + must + necessary + 工具链
+#   python start/setup_env.py update                  升级：把上述依赖全部升到允许的最新版
+#   python start/setup_env.py check                   环境是否就绪（0/1）
+#   python start/setup_env.py --check                 同上（兼容旧启动脚本）
+#   python start/setup_env.py --stage runtime         建隔离 venv + 装 must + stamp
+#   python start/setup_env.py --stage tools           测速下载 ffmpeg / node
 #   python start/setup_env.py --stage all
-#   python start/setup_env.py --install PKG...       窗口内手动安装/更新
+#   python start/setup_env.py --install PKG...        只装指定包（内部调用）
 #   python start/setup_env.py --install --upgrade PKG...
-#   python start/setup_env.py --python-assets        输出引导层要的资产名/URL
+#   python start/setup_env.py --python-assets         输出引导层要的资产名/URL
+#
+# install / update 是**唯一**的依赖与环境安装入口：GUI 只读展示状态，
+# 不再自动检查更新、也不再提供安装按钮（2026-11-04，steve 定）。
 #
 # 只依赖标准库 + server/paths.py；不 import torch / numpy。
 # ===========================================================================
@@ -450,7 +456,7 @@ def stage_tools() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 手动安装 / 更新（窗口内「环境与依赖」按钮走这里）
+# 单包安装（内部入口；终端统一入口是上面的 install / update）
 # ---------------------------------------------------------------------------
 def install(pkgs: list, upgrade: bool, constraints: str = "") -> None:
     vp = ensure_venv()
@@ -464,8 +470,63 @@ def install(pkgs: list, upgrade: bool, constraints: str = "") -> None:
     log("✓ 安装完成（所有下载/缓存均在项目内）")
 
 
+# ---------------------------------------------------------------------------
+# install / update：终端里的统一入口
+# ---------------------------------------------------------------------------
+# 不是 pip 包、但写在 requirements 里的名字（python 由底座提供，ffmpeg /
+# rust 由 stage_tools / 平台工具链负责）。安装 pip 依赖时跳过它们。
+_NON_PIP = {"python", "ffmpeg", "rust"}
+
+
+def _pip_requirements(fname: str) -> list:
+    """读 requirements/*.txt，返回可交给 pip 的包规格（跳过注释与非 pip 项）。"""
+    path = paths.project_dir("start", "requirements", fname)
+    out = []
+    if not os.path.isfile(path):
+        return out
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            name = line
+            for ch in "<>=!~ ":
+                name = name.split(ch, 1)[0]
+            if name.strip().lower() in _NON_PIP:
+                continue
+            out.append(line)
+    return out
+
+
+def install_all(upgrade: bool = False) -> None:
+    """装齐 / 升级全部依赖：must + necessary（pip）+ ffmpeg/node 工具链。
+
+    upgrade=False（install）：缺什么装什么，已满足的包 pip 会跳过；
+    upgrade=True（update）：所有 pip 包加 --upgrade 升到允许范围内的最新版。
+    工具链（ffmpeg / node）是固定版本、只在缺失时补齐，不参与 upgrade。
+    """
+    vp = ensure_venv()
+    # must：python 由底座提供；pywebview 必须先就位
+    must = _pip_requirements("must.txt")
+    if must and (upgrade or not must_ready(vp)):
+        pip_install(vp, (["--upgrade"] if upgrade else []) + must)
+    if not must_ready(vp):
+        raise RuntimeError("pywebview 安装后仍不可导入")
+    write_stamp()
+    # necessary：torch / numpy / pillow / safetensors / pytest
+    pkgs = _pip_requirements("necessary.txt")
+    if pkgs:
+        pip_install(vp, (["--upgrade"] if upgrade else []) + pkgs)
+    # 可选二进制（ffmpeg / node）——只落项目内
+    stage_tools()
+    log("✓ 环境与依赖" + ("已更新" if upgrade else "已安装") + "（全部在项目内）")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("command", nargs="?", default=None,
+                    choices=("install", "update", "check", "tools", "runtime"),
+                    help="install=装齐依赖与环境；update=升级到允许的最新版")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--stage", choices=("runtime", "tools", "all"))
     ap.add_argument("--install", nargs="*", default=None)
@@ -479,8 +540,17 @@ def main() -> int:
         for u in python_urls():
             print(u)
         return 0
-    if a.check:
+    if a.check or a.command == "check":
         return 0 if check() else 1
+    if a.command in ("install", "update"):
+        install_all(upgrade=(a.command == "update"))
+        return 0
+    if a.command == "runtime":
+        stage_runtime()
+        return 0
+    if a.command == "tools":
+        stage_tools()
+        return 0
     if a.install is not None:
         if not a.install:
             raise SystemExit("[setup] --install 至少需要一个包名")

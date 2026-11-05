@@ -72,8 +72,10 @@ SUITES = [
     ("test_dmodel", "service.test.test_dmodel", 600, "unittest"),
     # 2026-11-04 可移植性静态门：外部绝对路径 / 未固定 dir 的 tempfile
     ("test_portability", "service.test.test_portability", 120, "unittest"),
-    # 2026-10-31 图元编辑器：前端 JS 与 draw_codec 的编码对拍（需要 node）
+    # 2026-11-04 图元编辑器：前端 JS 与 draw_codec 的编码对拍（需要 node）
     ("test_pdraw_js", "service.test.test_pdraw_js", 120, "unittest"),
+    # 2026-11-04 显示插件导入契约 + 实时 fast weight 统计（不起服务，秒级）
+    ("test_plugins", "service.test.test_plugins", 120, "unittest"),
     ("verify_formats", "service/test/verify_formats.py", 600, "script"),
 ]
 

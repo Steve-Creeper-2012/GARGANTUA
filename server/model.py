@@ -926,8 +926,8 @@ class Gargantua(nn.Module):
         self.lm_head = nn.Linear(D, self.n_vocab, bias=False)
         # —— 模态输入投影（embedding 不统一，各自投影到 d_model）——
         self.visual_proj = nn.Linear(spec.PATCH_VEC_DIM, D, bias=False)
-        self.visual_coord_x = nn.Embedding(256, D)   # 2D 位置嵌入（加性，非 embed token）
-        self.visual_coord_y = nn.Embedding(256, D)
+        self.visual_coord_x = nn.Embedding(spec.VISUAL_COORD_BINS, D)   # 2D 位置嵌入（加性，非 embed token）
+        self.visual_coord_y = nn.Embedding(spec.VISUAL_COORD_BINS, D)
         self.audio_proj = nn.Linear(spec.AUDIO_SAMPLES_PER_TOKEN, D, bias=False)
         # —— KV 压缩器与共享流（压缩比是架构参数：pos_emb 形状随 ratio）——
         self.csa_compressor = StepCompressor(self.csa_ratio, D)

@@ -27,9 +27,17 @@
 #      decode 后把该 emb 持久化进 KV；不再单独写回生成 token 的 emb
 #      （旧实现因此让种子的 MODEL 嵌入从未进入 KV，且每个生成 token 比
 #      训练早一步——train/infer 分布偏差，已回归测试固定）。
+#
+# 2026-11-04 现状说明（纠正此前「跨调用持久 / 杀进程等于重置记忆」的不实文档）：
+#   杀掉 infer 服务进程 → 下次推理重新加载模型；当前实现每次 generate 从零
+#   开始（state={}、kv_vecs/kv_steps 都是局部变量，m.fast_weight.reset() 清的
+#   是没被使用的 self._state），跨轮持久状态尚未接线。下面注释里的「持久/共享
+#   KV」「状态跨调用推进」只指单次 generate 内 encode→decode 跨生成步递推，
+#   不表示跨 HTTP 请求保留。
 # ===========================================================================
 import argparse
 import json
+import math
 import os
 import queue
 import sys
@@ -322,11 +330,48 @@ def _trim_tail_steps(kv_vecs: torch.Tensor, kv_steps: torch.Tensor,
     return kv_vecs[:, start:], kv_steps[:, start:]
 
 
+def _safe(v, nd):
+    """NaN/Inf 消毒：非有限值一律返回 0.0，避免写出非法 JSON 炸掉前端。"""
+    f = float(v)
+    return round(f, nd) if math.isfinite(f) else 0.0
+
+
 @torch.no_grad()
-def generate(m, prompt: str, max_new: int = 32,
+def _fw_snapshot(state: dict, bins: int = spec.FW_VIZ_BINS):
+    """fast weight 状态的可视化快照（纯展示，不影响计算）。
+
+    状态 S 是 [B, H, dk, dv]；这里给三样东西：
+      · head_norms —— 每个头的 Frobenius 范数（谁在记东西）；
+      · matrix     —— |S| 对头取平均后 adaptive-avg-pool 到 bins×bins
+                      （状态本身的形状：哪些 (k,v) 方向被写得最重）；
+      · norm       —— 整体范数。
+    取绝对值是刻意的：fast weight 是带符号的联想矩阵，正负抵消后
+    直接画会接近全零，幅值才看得出「写到哪」。
+    """
+    cur = state.get("fw")
+    if not cur:
+        return None
+    S = cur[0]
+    if S is None:
+        return None
+    with torch.no_grad():
+        a = S.detach().float().abs().mean(0)          # [H, dk, dv]
+        head = a.flatten(1).norm(dim=1).tolist()
+        m = a.mean(0)[None, None]                     # [1, 1, dk, dv]
+        m = F.adaptive_avg_pool2d(m, (bins, bins))[0, 0]
+        # 每个数值都过 _safe：NaN/Inf 不能进 JSON（浏览器 JSON.parse 会炸）
+        mat = [[_safe(v, 5) for v in row] for row in m]
+        return {"head_norms": [_safe(x, 4) for x in head],
+                "matrix": mat,
+                "norm": _safe(S.detach().float().norm(), 4),
+                "bins": bins}
+
+
+def generate(m, prompt: str | None = None, max_new: int = 32,
              temperature: float = 0.8, top_p: float = 0.95,
              archive_dir: str | None = None, model_dir: str | None = None,
-             media_steps=None):
+             media_steps=None, on_token=None, token_ids=None,
+             fw_bins: int = spec.FW_VIZ_BINS, t0_wall=None):
     """ 编码 prompt → encoder → KV；decoder 逐步生成并回写共享 KV。
 
     media_steps：可选的图片/音频 Step 列表（image_codec / audio_codec 的
@@ -334,20 +379,40 @@ def generate(m, prompt: str, max_new: int = 32,
     （视觉走 visual_proj、音频走 audio_proj，都投影到 d_model），再整段
     编码进 KV——媒体只做上下文，生成仍然是文本。
 
-    返回 (生成的时间步序列, id 存档路径)。时间步序列是 List[Step]，
-    text codec 可直接 decode；存档路径是本次推理的 .tokens 文件
-    （相对项目根），存档不可用时为 None。
+    token_ids：直接给 token ID 列表（纯 token 输入，不经文本编码）。
+    与 prompt 互斥；给定时 prompt 被忽略。
+
+    on_token：每产出一个 token 回调一次（流式显示 / TTFT / 速度 / fast
+    weight 写入曲线都靠它）。回调里只放「这一步发生了什么」，不含整段结果。
+
+    返回 (生成的时间步序列, id 存档路径, 本次统计)。
     """
     max_new = int(max_new)
     if not (1 <= max_new <= MAX_NEW_TOKENS):
         raise ValueError(f"max_new 必须在 [1, {MAX_NEW_TOKENS}]: {max_new}")
-    if not (temperature > 0):
-        raise ValueError(f"temperature 必须 > 0: {temperature}")
+    # 补上界 100：与 server.api_infer 同一口径，且 logits 里 max(temp,1e-5)
+    # 已把下界钳到 1e-5，错误信息写清有效区间 [1e-5, 100]
+    if not (1e-5 <= temperature <= 100):
+        raise ValueError(f"temperature 必须在 [1e-5, 100]: {temperature}")
     if not (0 < top_p <= 1):
         raise ValueError(f"top_p 必须在 (0, 1]: {top_p}")
 
-    text_steps = text_encode(prompt)
-    ids = [t for st in text_steps for t in st["token_ids"]]
+    if token_ids is not None:
+        # 纯 token 输入：不经过文本编码器，ID 直接进 embedding。
+        # 越界立刻拒绝——embedding 索引越界会抛底层错误，用户看不懂。
+        try:
+            ids = [int(i) for i in token_ids]
+        except (TypeError, ValueError):
+            raise ValueError("token_ids 必须是整数数组")
+        bad = [i for i in ids if i < 0 or i >= int(m.n_vocab)]
+        if bad:
+            raise ValueError(
+                f"token id 越界: {bad[:5]}（词表 {int(m.n_vocab)}）")
+        text_steps = []
+        prompt = ""
+    else:
+        text_steps = text_encode(prompt)
+        ids = [t for st in text_steps for t in st["token_ids"]]
     if not ids:
         raise ValueError("prompt 编码为空（媒体输入也需要至少一个文本 token "
                          "作为解码种子）")
@@ -370,13 +435,20 @@ def generate(m, prompt: str, max_new: int = 32,
     # KV 向量、不丢 id；存档失败自动降级，不影响推理本身。
     archive = IdArchive(model_dir or "", archive_dir)
     out_ids: list = []
+    t0 = time.perf_counter()
+    t_first = None
+    t_first_wall = None
+    prev_S = None
+    writes: list = []                # fast weight 每步写入幅度（最近 N 步）
     try:
         # 存档顺序必须与模型实际看到的顺序一致：媒体在前、文本在后
         if media_steps:
             archive.add_items(tok5.from_steps(media_steps))
         archive.add(ids)
 
-        # 新生成序列：fast weight 状态从零开始；encode 写入的状态由 decode 继续推进
+        # 当前实现每次 generate 从零开始：state/kv 都是本次局部量，跨轮（跨 HTTP
+        # 请求）持久状态尚未接线；m.fast_weight.reset() 清的是没被使用的
+        # self._state。下面的「状态推进」只在本次调用内 encode→decode 有效。
         m.fast_weight.reset()
         # 2026-10-27 审计修复（S2）：decoder 逐层递推状态（KDA S + 短卷积
         # 历史 + fast weight）跨生成步持有——旧实现每层每步从零状态开始、
@@ -431,6 +503,37 @@ def generate(m, prompt: str, max_new: int = 32,
                 break
             out_ids.append(nxt)
             archive.add([nxt])
+            # —— 流式回调（2026-11-04）：每产一个 token 就报一次 ——
+            # t0_wall 是服务端收到请求那一刻的墙钟时间（跨进程用 time.time
+            # 对齐）：有它时 t_ms 才是用户「点发送 → 看见首 token」的真实
+            # 等待，含模型加载与排队；没有就退回本次 generate 内计时。
+            now = time.perf_counter()
+            now_wall = time.time()
+            if t_first is None:
+                t_first, t_first_wall = now, now_wall
+            t_ms = (int(max(0.0, (now_wall - t0_wall) * 1000))
+                    if t0_wall is not None else int((now - t0) * 1000))
+            # 写入幅度每步都要（结尾 meta.fw_writes 用）；整张热力图只在
+            # 真的有人订阅流式帧时算，非流式推理不必每步做一次全矩阵 pool。
+            cur_fw = state.get("fw")
+            write = None
+            if cur_fw is not None and cur_fw[0] is not None:
+                cur_S = cur_fw[0].detach().float()
+                if prev_S is not None:
+                    with torch.no_grad():
+                        write = _safe((cur_S - prev_S).norm(), 4)
+                prev_S = cur_S
+            if write is not None:
+                writes.append(write)
+                if len(writes) > spec.FW_WRITE_HISTORY:
+                    del writes[:-spec.FW_WRITE_HISTORY]
+            if on_token is not None:
+                snap = _fw_snapshot(state, fw_bins) if fw_bins else None
+                on_token({"id": nxt, "index": len(out_ids) - 1,
+                          "t_ms": t_ms,
+                          "kv_steps": min(int(kv_steps.shape[1]) + 1,
+                                          ctx_total),
+                          "fw": snap, "write": write})
             # 持久化【当前输入】的 emb（训练 KV 流同构）；下一轮输入即 nxt
             kv_vecs = torch.cat([kv_vecs, emb.detach()], 1)
             kv_steps = torch.cat([kv_steps, s_dec], 1)
@@ -440,7 +543,27 @@ def generate(m, prompt: str, max_new: int = 32,
             cur, cur_step = nxt, cur_step + 1
         out_steps = [{"token_ids": [i], "type": spec.TYPE_MODEL,
                       "modality": "text", "meta": {}} for i in out_ids]
-        return out_steps, archive.rel_path()
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        meta = {
+            "n_prompt": len(ids), "n_generated": len(out_ids),
+            "ttft_ms": (int(max(0.0, (t_first_wall - t0_wall) * 1000))
+                        if (t_first_wall is not None and t0_wall is not None)
+                        else (int((t_first - t0) * 1000) if t_first else None)),
+            "elapsed_ms": elapsed_ms,
+            # 非有限 tps 消毒（除法/计时异常时），避免非法 JSON
+            "tps": (_safe(len(out_ids) / max((time.perf_counter() - t_first),
+                                             1e-6), 2) if t_first else 0.0),
+            "ctx_full": int(getattr(m, "ctx_full", spec.CTX_FULL)),
+            "ctx_compress": int(getattr(m, "ctx_compress",
+                                        spec.CTX_COMPRESS)),
+            "kv_steps": int(kv_steps.shape[1]),
+            "kv_bytes": int(kv_vecs.numel() * kv_vecs.element_size()),
+            "d_model": int(getattr(m, "d_model", spec.D_MODEL)),
+            "vocab_size": int(getattr(m, "n_vocab", 0)),
+            "fw": _fw_snapshot(state, fw_bins) if fw_bins else None,
+            "fw_writes": list(writes),
+        }
+        return out_steps, archive.rel_path(), meta
     finally:
         archive.close(
             n_prompt=len(ids), n_generated=len(out_ids),
@@ -470,7 +593,7 @@ def _emit(obj: dict) -> None:
     sys.stdout.flush()
 
 
-def _serve_handle(req: dict, state: dict) -> dict:
+def _serve_handle(req: dict, state: dict, emit=None) -> dict:
     rid = req.get("id")
     op = req.get("op")
     try:
@@ -478,6 +601,7 @@ def _serve_handle(req: dict, state: dict) -> dict:
             model_dir = req["model_dir"]
             state["model"] = None            # 先放掉旧模型再加载新的
             state["dir"] = None
+            state["stats"] = None
             m = _load_model(model_dir)
             state["model"], state["dir"] = m, model_dir
             return {"id": rid, "ok": True,
@@ -489,19 +613,56 @@ def _serve_handle(req: dict, state: dict) -> dict:
             if state["model"] is None or state["dir"] != model_dir:
                 m = _load_model(model_dir)
                 state["model"], state["dir"] = m, model_dir
+                state["stats"] = None
             media_steps = _decode_media(req.get("media"))
-            steps, archive = generate(state["model"], req["prompt"],
-                                      req.get("max_new", 32),
-                                      req.get("temperature", 0.8),
-                                      req.get("top_p", 0.95),
-                                      archive_dir=req.get("archive_dir"),
-                                      model_dir=model_dir,
-                                      media_steps=media_steps)
-            return {"id": rid, "ok": True,
-                    "result": {"text": text_decode(steps),
+            # 流式：每产一个 token 就发一帧 partial（同一个 id，前端按序追加）
+            streaming = bool(req.get("stream")) and emit is not None
+
+            def on_token(info):
+                if streaming:
+                    emit({"id": rid, "ok": True, "partial": info})
+
+            steps, archive, meta = generate(
+                state["model"], req.get("prompt"),
+                req.get("max_new", 32),
+                req.get("temperature", 0.8),
+                req.get("top_p", 0.95),
+                archive_dir=req.get("archive_dir"),
+                model_dir=model_dir,
+                media_steps=media_steps,
+                on_token=on_token if streaming else None,
+                token_ids=req.get("token_ids"),
+                fw_bins=req.get("fw_bins", spec.FW_VIZ_BINS),
+                t0_wall=req.get("t0_wall"))
+            state["stats"] = meta
+            # 纯 token 输入解出来可能是乱码/不可显示字符，解码失败不该让
+            # 整次推理报错——ID 序列才是默认 plugin 的展示对象。
+            try:
+                text = text_decode(steps)
+            except Exception:
+                text = ""
+            return {"id": rid, "ok": True, "final": True,
+                    "result": {"text": text,
                                "token_ids": [s["token_ids"][0]
                                              for s in steps],
-                               "archive": archive}}
+                               "archive": archive,
+                               "stats": meta}}
+        if op == "stats":
+            # 只读快照：上下文占用 / KV / fast weight 可视化数据。
+            # 服务没跑过推理时 stats 为空，但模型配置照样要能报出来。
+            m = state.get("model")
+            st = dict(state.get("stats") or {})
+            if m is not None:
+                st.setdefault("ctx_full",
+                              int(getattr(m, "ctx_full", spec.CTX_FULL)))
+                st.setdefault("ctx_compress",
+                              int(getattr(m, "ctx_compress",
+                                          spec.CTX_COMPRESS)))
+                st.setdefault("d_model",
+                              int(getattr(m, "d_model", spec.D_MODEL)))
+                st.setdefault("vocab_size", int(getattr(m, "n_vocab", 0)))
+            return {"id": rid, "ok": True,
+                    "result": {"loaded": state.get("dir"), **st}}
         if op == "status":
             return {"id": rid, "ok": True,
                     "result": {"loaded": state["dir"]}}
@@ -514,7 +675,7 @@ def _serve_handle(req: dict, state: dict) -> dict:
 
 def serve(idle_timeout: int = 300) -> int:
     """常驻模式：读线程收请求 → 主线程串行处理 → 空闲超时自行退出。"""
-    state = {"model": None, "dir": None}
+    state = {"model": None, "dir": None, "stats": None}
     q: "queue.Queue" = queue.Queue()
 
     def _reader():
@@ -554,7 +715,7 @@ def serve(idle_timeout: int = 300) -> int:
         except Exception as e:
             _emit({"id": None, "ok": False, "error": f"请求解析失败: {e}"})
             continue
-        resp = _serve_handle(req, state)
+        resp = _serve_handle(req, state, _emit)
         _emit(resp)
         if req.get("op") == "shutdown":
             print("[infer] 收到 shutdown，退出", file=sys.stderr)
@@ -582,13 +743,17 @@ def main():
     if not args.model or not args.prompt:
         ap.error("CLI 模式需要 --model 与 --prompt（或用 --serve）")
     m = _load_model(args.model)
-    steps, archive = generate(m, args.prompt, args.max_new_tokens,
-                              args.temperature, args.top_p,
-                              archive_dir=args.archive_dir,
-                              model_dir=args.model)
+    steps, archive, meta = generate(m, args.prompt, args.max_new_tokens,
+                                    args.temperature, args.top_p,
+                                    archive_dir=args.archive_dir,
+                                    model_dir=args.model)
     print(text_decode(steps))
     if archive:
         print(f"[infer] id 存档: {archive}", file=sys.stderr)
+    if meta.get("ttft_ms") is not None:
+        print(f"[infer] TTFT {meta['ttft_ms']}ms · "
+              f"{meta['n_generated']} tok · {meta['tps']} tok/s",
+              file=sys.stderr)
     return 0
 
 
