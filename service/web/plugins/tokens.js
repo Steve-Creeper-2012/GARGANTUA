@@ -1,24 +1,32 @@
 // ===========================================================================
-// GARGANTUA — 默认显示插件：纯 token 流
+// GARGANTUA — 默认显示插件：token 对话（多轮、转换器格式）
 // ---------------------------------------------------------------------------
 // 这是「插件协议」的参考实现，也是当前唯一的可用插件。
 //
-// 它只做三件事：
-//   1. 把用户输入解析成 token ID（十六进制；只收 ID，不解析自然语言）；
-//   2. 调 ctx.api.infer() 发起流式推理，来一个 token 追加一个 chip；
-//   3. 实时显示 TTFT / tok/s / token 数。
+// 交互模型（steve 2026-11-05 定案）：
+//   - 像微信一样：这边（右）是我的输入，那边（左）是模型输出，多轮上下文保留。
+//   - 每个 token 直接以**转换器格式**呈现：文本 token 写成 {text: B46A}（大写
+//     十六进制、自界定），特殊 token 写成名字（<caps> / <user> / <model> /
+//     <stop> …，对应 server/spec.py::SPECIAL_TOKENS 的 0..5）。
+//   - Enter 不发送（防误触），只能点「发送」按钮。
+//   - 上下文：每一轮把用户输入 + 模型输出接在 token 序列尾部，下一轮整段重发；
+//     长度超 ctx_full 时截尾（滚动窗口），模型侧也会自行限长。
 //
-// 它**不碰**任何全局状态：DOM 全在 root 里，配置走 ctx.config（按插件
-// 隔离的 localStorage），卸载时 destroy() 会被调用。协议细节见 README.md。
+// 它只连 ctx.api.infer()，不碰任何全局状态：DOM 全在 root 里，配置走
+// ctx.config（按插件隔离的 localStorage），卸载时 destroy() 会被调用。
+// 协议细节见 README.md。
 // ===========================================================================
 
 const HEX = /^[0-9a-f]+$/i;
 /* 架构契约头里的固定 ID（server/spec.py::SPECIAL_TOKENS），不随词表变化，
-   所以插件不用查词表也能认这些名字。 */
+   所以插件不用查词表也能认这些名字；同时用于「转换器格式」的渲染。 */
 const NAMED_IDS = {
   "<caps>": 0, "<user>": 1, "<user/>": 2,
   "<model>": 3, "<model/>": 4, "<stop>": 5,
 };
+// 反向表：ID → 名字（0..5 的特殊 token 渲染成名字，其余渲染成 {text: HEX}）。
+const ID_TO_NAME = {};
+for (const [name, id] of Object.entries(NAMED_IDS)) ID_TO_NAME[id] = name;
 
 /** 造元素：不拼 innerHTML，用户数据一律 textContent。 */
 function el(tag, cls, text) {
@@ -26,6 +34,21 @@ function el(tag, cls, text) {
   if (cls) n.className = cls;
   if (text != null) n.textContent = text;
   return n;
+}
+
+/**
+ * 把一个 token ID 渲染成转换器格式的 DOM 片段（安全：textContent）。
+ *   id 0  → <caps>      （大写标记，名字来自 SPECIAL_TOKENS）
+ *   其它  → {text: B46A}（大写十六进制、自界定，与 tok5 可读格式一致）
+ */
+function tokenSpan(id) {
+  const name = ID_TO_NAME[id];
+  const s = el("span", "tk-tok" + (name ? " sp" : ""));
+  s.textContent = name ? name : "{text: " + id.toString(16).toUpperCase() + "}";
+  s.title = name
+    ? `特殊 token ${id}（${name}）`
+    : `token id ${id}（十进制）`;
+  return s;
 }
 
 /**
@@ -88,30 +111,33 @@ function fmtMs(ms) {
 
 export default {
   id: "tokens",
-  name: "纯 token 显示",
+  name: "token 对话",
 
   mount(root, ctx) {
     let dead = false;
     let busy = false;
-    let turn = null;          // 当前这一轮的 DOM 引用
-    let count = 0;
+    let count = 0;            // 当前这一轮已生成的 token 数
     let tFirst = null;
     let tLast = null;
     let vocabSize = 0;
-    let maxNewLimit = 2048;     // 由 /api/status.max_new_tokens 校准
+    let maxNewLimit = 2048;   // 由 /api/status.max_new_tokens 校准
+    let ctxCap = 2048;        // 由 /api/infer/stats.ctx_full 校准（滚动窗口）
     let noModel = false;
+    let ctxIds = [];          // 跨轮累积的 token 序列（唯一上下文真源）
+    let genIds = null;        // 当前轮已生成的 token（done 后并入 ctxIds）
 
     root.classList.add("tk-root");
 
     // ---------------- 顶部：指标条 ----------------
     const head = el("div", "tk-head");
-    const title = el("div", "tk-title", "token 流");
+    const title = el("div", "tk-title", "token 对话");
     const metrics = el("div", "tk-metrics");
     const mTTFT = metric("TTFT");
     const mTPS = metric("tok/s");
     const mCount = metric("tokens");
+    const mCtx = metric("上下文");
     const mModel = metric("model");
-    metrics.append(mTTFT.box, mTPS.box, mCount.box, mModel.box);
+    metrics.append(mTTFT.box, mTPS.box, mCount.box, mCtx.box, mModel.box);
     head.append(title, metrics);
     function metric(label) {
       const box = el("span", "tk-m");
@@ -121,15 +147,16 @@ export default {
       return {box, v};
     }
 
-    // ---------------- 中间：会话记录 ----------------
-    const log = el("div", "tk-log");
+    // ---------------- 中间：对话列表 ----------------
+    const chat = el("div", "tk-chat");
     const empty = el("div", "tk-empty");
     empty.append(
-      el("b", null, "输入 token ID 开始"),
+      el("b", null, "输入 token，开始多轮对话"),
       el("span", null,
-         "这个插件只认 token：十六进制 ID，空格或换行分隔。" +
+         "这边是你的输入，那边是模型输出，上下文逐轮保留。" +
+         "token 以转换器格式呈现：{text: B46A} 与 <caps> 等。" +
          "自然语言请先在「文本」页编码成 token。"));
-    log.appendChild(empty);
+    chat.appendChild(empty);
 
     // ---------------- 底部：输入区 ----------------
     const dock = el("div", "tk-dock");
@@ -137,7 +164,8 @@ export default {
     const ta = el("textarea", "tk-input");
     ta.rows = 2;
     ta.spellcheck = false;
-    ta.placeholder = "C732 C733 1F …（十六进制 token ID）";
+    ta.placeholder =
+      "粘贴 token：{text: B46A} 或 C732 …（支持 <caps> <user> <model> <stop>）";
     const tools = el("div", "tk-tools");
     const hint = el("span", "tk-hint", "max_new ≤ 2048");
     const numWrap = el("label", "tk-num");
@@ -153,7 +181,7 @@ export default {
     box.append(ta, tools);
     dock.appendChild(box);
 
-    root.append(head, log, dock);
+    root.append(head, chat, dock);
 
     // ---------------- 指标 / 会话 ----------------
     function updateHint() {
@@ -168,39 +196,37 @@ export default {
     function setMetrics() {
       mTTFT.v.textContent = tFirst == null ? "—" : fmtMs(tFirst);
       mCount.v.textContent = String(count);
-      // 先无条件清掉上一轮的 tok/s：旧实现在 tFirst==null（新轮 / reset）
-      // 和「多个 token 同一毫秒」两种情况下都不写它，指标会一直残留。
+      mCtx.v.textContent = String(ctxIds.length);
       mTPS.v.textContent = "—";
       if (tFirst != null && tLast != null && count > 1 && tLast > tFirst) {
         mTPS.v.textContent = ((count - 1) / ((tLast - tFirst) / 1000)).toFixed(2);
       }
     }
 
-    function newTurn(promptIds) {
-      empty.remove();
-      turn = el("div", "tk-turn");
-      const inRole = el("div", "tk-role", `prompt · ${promptIds.length} tok`);
-      const inChips = el("div", "tk-chips");
-      promptIds.forEach(id => inChips.appendChild(chip(id, false)));
-      const outRole = el("div", "tk-role out", "output · 0 tok");
-      const outChips = el("div", "tk-chips out");
-      turn.append(inRole, inChips, outRole, outChips);
-      log.appendChild(turn);
-      log.scrollTop = log.scrollHeight;
-      return {outRole, outChips};
-    }
-
-    function chip(id, isOut) {
-      const c = el("span", "tk-chip" + (isOut ? " out" : ""),
-                   id.toString(16).toUpperCase());
-      c.title = `id ${id}（十进制）`;
-      return c;
-    }
-
     function scrollFollow() {
       const nearBottom =
-        log.scrollHeight - log.scrollTop - log.clientHeight < 80;
-      if (nearBottom) log.scrollTop = log.scrollHeight;
+        chat.scrollHeight - chat.scrollTop - chat.clientHeight < 80;
+      if (nearBottom) chat.scrollTop = chat.scrollHeight;
+    }
+
+    /** 新建一条消息（气泡），返回 {bubble, toks}。who: "me" | "bot"。 */
+    function newMsg(who, label) {
+      empty.remove();
+      const msg = el("div", "tk-msg " + who);
+      const whoEl = el("div", "tk-who", label);
+      const bubble = el("div", "tk-bubble");
+      const toks = el("div", "tk-toks");
+      bubble.appendChild(toks);
+      msg.append(whoEl, bubble);
+      chat.appendChild(msg);
+      chat.scrollTop = chat.scrollHeight;
+      return {bubble, toks};
+    }
+
+    // 生成中的光标（尾巴那个 ▍），done / error 时摘掉
+    function caret() {
+      const c = el("span", "tk-caret", "▍");
+      return c;
     }
 
     function setBusy(on) {
@@ -212,7 +238,7 @@ export default {
       root.classList.toggle("tk-busy", on);
     }
 
-    // ---------------- 发送 ----------------
+    // ---------------- 发送（唯一入口：按钮） ----------------
     async function submit() {
       if (busy) return;
       const parsed = parseTokenInput(ta.value);
@@ -231,19 +257,31 @@ export default {
         ctx.api.toast(`token ID 超出词表范围（< ${vocabSize}）`, true);
         return;
       }
+
       const maxNew = Math.max(1, Math.min(maxNewLimit, Number(num.value) || 32));
       num.value = String(maxNew);
       ctx.config.set("maxNew", maxNew);
 
-      const view = newTurn(ids);
+      // 把用户输入接进上下文，并显示在「我」这一侧
+      ctxIds = ctxIds.concat(ids);
+      if (ctxIds.length > ctxCap) ctxIds = ctxIds.slice(-ctxCap);
+      const myMsg = newMsg("me", "你");
+      ids.forEach(id => myMsg.toks.appendChild(tokenSpan(id)));
+
+      // 模型这一侧的气泡，流式填充
+      const botMsg = newMsg("bot", "模型");
+      const c = caret();
+      botMsg.toks.appendChild(c);
+
       count = 0;
       tFirst = tLast = null;
+      genIds = [];
       setMetrics();
       setBusy(true);
       const t0 = performance.now();
       try {
         await ctx.api.infer({
-          tokenIds: ids,
+          tokenIds: ctxIds.slice(),
           maxNew,
           temperature: Number(ctx.config.get("temperature", 0.8)),
           topP: Number(ctx.config.get("topP", 0.95)),
@@ -251,52 +289,68 @@ export default {
           onToken: (tk) => {
             if (dead) return;
             count += 1;
+            genIds.push(tk.id);
             const t = tk.t_ms != null ? tk.t_ms : performance.now() - t0;
             if (tFirst == null) tFirst = t;
             tLast = t;
-            view.outChips.appendChild(chip(tk.id, true));
-            view.outRole.textContent = `output · ${count} tok`;
-            setMetrics();
+            botMsg.toks.insertBefore(tokenSpan(tk.id), c);
+            mCount.v.textContent = String(count);
+            // 先无条件清掉上一轮的 tok/s，再按需要重写
+            mTPS.v.textContent = "—";
+            if (tFirst != null && tLast != null && count > 1 && tLast > tFirst) {
+              mTPS.v.textContent = ((count - 1) / ((tLast - tFirst) / 1000)).toFixed(2);
+            }
+            mTTFT.v.textContent = fmtMs(tFirst);
             scrollFollow();
           },
           onDone: (result, s) => {
             if (dead) return;
-            view.outRole.textContent =
-              `output · ${count} tok` +
-              (result && result.archive ? ` · 存档 ${result.archive}` : "");
+            c.remove();
+            // 生成的 token 并入上下文，下一轮整段重发（滚动窗口）
+            ctxIds = ctxIds.concat(genIds);
+            if (ctxIds.length > ctxCap) ctxIds = ctxIds.slice(-ctxCap);
+            mCtx.v.textContent = String(ctxIds.length);
             if (s && s.elapsed_ms != null) {
-              const el2 = el("div", "tk-note",
-                `总耗时 ${fmtMs(s.elapsed_ms)} · TTFT ${fmtMs(s.ttft_ms)}`);
-              turn.appendChild(el2);
+              botMsg.bubble.appendChild(el("div", "tk-note",
+                `总耗时 ${fmtMs(s.elapsed_ms)} · TTFT ${fmtMs(s.ttft_ms)}`));
             }
+            if (result && result.archive) {
+              botMsg.bubble.appendChild(el("div", "tk-note",
+                `存档 ${result.archive}`));
+            }
+            scrollFollow();
           },
           onError: (e) => {
             if (dead) return;
-            turn.appendChild(el("div", "tk-err", "⚠ " + e.message));
+            c.remove();
+            botMsg.bubble.appendChild(el("div", "tk-err", "⚠ " + e.message));
           },
         });
       } catch (e) {
         if (!dead && e.message !== "已取消") {
-          turn.appendChild(el("div", "tk-err", "⚠ " + e.message));
+          c.remove();
+          botMsg.bubble.appendChild(el("div", "tk-err", "⚠ " + e.message));
         }
       } finally {
         // 任何路径都要解锁：done / error / 超时 / 卸载取消，不能留下
         // 一个永远灰着的「生成中…」按钮。
+        genIds = null;
         if (!dead) setBusy(false);
       }
+      ta.value = "";
+      ta.focus();
     }
 
+    // 注意：Enter 不发送（防误触），只能点「发送」。textarea 里 Enter 即换行。
     send.onclick = submit;
-    ta.addEventListener("keydown", ev => {
-      if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); submit(); }
-    });
 
-    // ---------------- 元信息（词表大小 / 当前模型 / 生成上限） ----------------
+    // ---------------- 元信息（词表大小 / 上下文上限 / 当前模型 / 生成上限） ----------------
     (async () => {
       try {
         const s = await ctx.api.stats();
         if (dead) return;
         vocabSize = Number(s.vocab_size) || 0;
+        ctxCap = Math.max(64, Number(s.ctx_full) || 2048);
         updateHint();
       } catch (e) {}
       try {
@@ -304,9 +358,7 @@ export default {
         if (dead) return;
         noModel = !st.model;
         mModel.v.textContent = st.model || "未加载";
-        // 上限以后端为准（common.MAX_NEW_TOKENS），不再前端写死 512
-        maxNewLimit = Math.max(1, Math.min(2048,
-          Number(st.max_new_tokens) || 2048));
+        maxNewLimit = Math.max(1, Math.min(2048, Number(st.max_new_tokens) || 2048));
         num.max = String(maxNewLimit);
         if (Number(num.value) > maxNewLimit) num.value = String(maxNewLimit);
         updateHint();
@@ -316,11 +368,12 @@ export default {
     ta.focus();
 
     return {
-      /** 宿主点「清空」时调用：清掉会话与指标（后端 reset 由宿主负责）。 */
+      /** 宿主点「清空」时调用：清掉对话、上下文与指标（后端 reset 由宿主负责）。 */
       reset() {
-        log.innerHTML = "";
-        log.appendChild(empty);
-        turn = null;
+        chat.innerHTML = "";
+        chat.appendChild(empty);
+        ctxIds = [];
+        genIds = null;
         count = 0;
         tFirst = tLast = null;
         setMetrics();

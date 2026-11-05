@@ -13,7 +13,7 @@
 ```
 service/web/plugins/
   README.md        本文件（协议 + 开发文档）
-  tokens.js        唯一内置插件：纯 token 流
+  tokens.js        唯一内置插件：token 对话（多轮、微信式、转换器格式）
   tokens.css       它的样式
   _imported.json   导入插件的注册表（由服务端维护，不要手改）
   <id>.js          开发者导入的插件（运行时生成）
@@ -46,7 +46,7 @@ service/web/plugins/
 ```js
 export default {
   id: "tokens",
-  name: "纯 token 显示",
+  name: "token 对话",
 
   /**
    * @param {HTMLElement} root  宿主给的满高容器（已清空、已挂到页面上）
@@ -177,7 +177,16 @@ GET  /api/infer/stream?task_id=<id>&from=<已消费数>
 
 ### 3.3 输入约定（默认插件）
 
-`tokens.js` 只接受 **token 格式**，不接受自然语言。实际可粘的形态：
+`tokens.js` 把推理界面做成**微信式多轮对话**：你的输入落在右侧气泡、模型输出
+落在左侧气泡，每一轮把输入 + 输出接在 token 序列尾部，下一轮整段重发（超
+`ctx_full` 时截尾，滚动窗口）。每个 token 直接以**转换器格式**呈现——文本
+token 写成 `{text: B46A}`（大写十六进制、自界定），特殊 token（`<caps>` /
+`<user>` / `<model>` / `<stop>` …）写成名字。
+
+**Enter 不发送（防误触）**：输入框里 Enter 即换行，只有点「发送」按钮才会发起
+推理。
+
+插件只接受 **token 格式**，不接受自然语言。实际可粘的形态：
 
 ```
 C732 C733 1F            裸十六进制 ID（可带 0x）

@@ -1259,14 +1259,16 @@ setInterval(refreshTrain, 2000);
    插件协议见 service/web/plugins/README.md——它只连 /api/infer 与
    /api/infer/stream 两个端点，其余（DOM、输入解析、展示方式）完全自理。
    =========================================================================== */
-/* 内置插件只注册「纯 token 显示」一个。base 词表插件仍在开发中，按需求
+/* 内置插件只注册「token 对话」一个。base 词表插件仍在开发中，按需求
    「不显示」——不注册、不出现在选择器里；开发计划写在 plugins/README.md。
    其它显示器由开发者用「开发者选项 → 显示插件 → 导入插件…」从本地 .js
    导入，服务端落到 service/web/plugins/ 并在 /api/plugin/list 登记。 */
 const BUILTIN_PLUGINS = [
-  {id: "tokens", name: "纯 token 显示", entry: "plugins/tokens.js",
+  {id: "tokens", name: "token 对话", entry: "plugins/tokens.js",
    css: "plugins/tokens.css",
-   desc: "逐 token 流式显示原 ID，带 TTFT 与 tok/s；输入只接受 token 格式。"},
+   desc: "微信式多轮对话：右边是你的输入、左边是模型输出，上下文逐轮保留；" +
+         "每个 token 以转换器格式 {text: B46A} / <caps> 呈现；Enter 不发送，" +
+         "只能点「发送」。"},
 ];
 const PLUGINS = BUILTIN_PLUGINS.slice();   // 运行期 append 导入的插件
 const PLUGIN_KEY = "gargantua.infer.plugin";
@@ -1666,7 +1668,7 @@ function renderImportedPlugins() {
     del.onclick = async () => {
       const ok = await uiConfirm(
         `移除显示插件「${p.name}」？\n本地文件 ${p.entry} 会被删除；` +
-        `若正在使用它，界面会自动切回「纯 token 显示」。`);
+        `若正在使用它，界面会自动切回「token 对话」。`);
       if (!ok) return;
       try {
         await api("/api/plugin/remove", {id: p.id});
@@ -3997,10 +3999,14 @@ const TOOL_DOCS = [
         <li><b>宿主给什么</b>：一块满高容器 <code>root</code>，加
         <code>ctx.api</code>、<code>ctx.config</code>（按插件隔离的
         localStorage）、<code>ctx.signal</code>（卸载时中止异步回调）。</li>
-        <li><b>当前唯一可用插件</b>：<b>纯 token 显示</b>——逐 token 流式追加，
-        显示原 ID，并在顶部实时给出 <b>TTFT</b> 与 <b>tok/s</b>。输入只接受
-        token 格式（十六进制 ID、<code>{t:…}</code> / <code>{text: …}</code>、
-        固定名字的特殊 token），不解析自然语言。</li>
+        <li><b>当前唯一可用插件</b>：<b>token 对话</b>——微信式多轮对话，右边是
+        你的输入、左边是模型输出，上下文逐轮保留；每个 token 以转换器格式
+        <code>{text: B46A}</code>（大写十六进制、自界定）或特殊 token
+        名字（<code>&lt;caps&gt;</code> / <code>&lt;user&gt;</code> /
+        <code>&lt;model&gt;</code> / <code>&lt;stop&gt;</code>…）呈现，顶部实时
+        给出 <b>TTFT</b> 与 <b>tok/s</b>。<b>Enter 不发送（防误触）</b>，只能点
+        「发送」。输入只接受 token 格式（十六进制 ID、<code>{t:…}</code> /
+        <code>{text: …}</code>、固定名字的特殊 token），不解析自然语言。</li>
         <li><b>base 词表插件</b>：开发中，按约定<b>不注册、不显示</b>。
         协议与它未来要用的接口已经写完，见 <code>plugins/README.md</code>。</li>
         <li><b>切换 / 导入</b>：右侧开发者选项 → 显示插件。选择会记住；
