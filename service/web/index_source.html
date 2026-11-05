@@ -1180,14 +1180,15 @@
         </div>
         <div class="meter-kv"><span>KV cache</span><b id="ctx-kv-val">—</b></div>
 
-        <!-- fast weight：状态本身（|S| 热力图）+ 每步写入幅度（折线） -->
+        <!-- fast weight：状态本身（|S| 热力图）+ 每头 ‖S‖ + 每步写入幅度（折线） -->
         <div class="nav-group"><span>fast weight</span></div>
         <div class="fw-card">
           <canvas id="fw-canvas" class="fw-canvas"></canvas>
-          <div class="fw-cap"><span>状态 |S| · 头均值</span>
+          <div class="fw-cap"><span>状态 |S| · 头均值（颜色=写得轻重）</span>
             <b id="fw-norm">—</b></div>
+          <div class="fw-heads" id="fw-heads" title="每个注意力头的 ‖S‖：哪颗头在记东西"></div>
           <canvas id="fw-write" class="fw-write"></canvas>
-          <div class="fw-cap"><span>写入幅度 / 步</span>
+          <div class="fw-cap"><span>写入幅度 / 步（Δ‖S‖）</span>
             <b id="fw-write-val">—</b></div>
         </div>
 

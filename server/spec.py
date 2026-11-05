@@ -345,6 +345,15 @@ SPECIAL_SIZE = len(SPECIAL_TOKENS)           # 6
 STOP_TOKEN = "<stop>"
 STOP_ID = SPECIAL_TOKENS.index(STOP_TOKEN)   # 5（与旧版一致）
 
+# 段边界 token：推理存档（.tokens）用它把「用户输入 / 模型输出」包成结构，
+# 与训练 .tokens 流同一套边界约定（<user>…<user/> 内 = TYPE_USER，
+# <model>…<model/> 内 = TYPE_MODEL）。推理里 generate 把它们写进 IdArchive，
+# 让存档本身可读出谁是谁，而不只是扁平 ID 流。
+USER_ID = SPECIAL_TOKENS.index("<user>")        # 1
+USER_END_ID = SPECIAL_TOKENS.index("<user/>")    # 2
+MODEL_ID = SPECIAL_TOKENS.index("<model>")       # 3
+MODEL_END_ID = SPECIAL_TOKENS.index("<model/>")  # 4
+
 # —— system 系统（不可显示，时间步结构）——
 # 显示即字面量：{ = 时间步开始，} = 时间步结束，| = 步内 token 分隔。
 TS_OPEN = "{"

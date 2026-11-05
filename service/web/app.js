@@ -1527,11 +1527,40 @@ function cssVar(name, dflt) {
 }
 
 /* fast weight 可视化：
-   左图 = 状态 |S| 的头均值（bins×bins 热力图，越亮写得越重）；
+   左图 = 状态 |S| 的头均值（bins×bins 热力图，颜色越暖=写得越重）；
+   中行 = 每个注意力头的 ‖S‖（哪颗头在记东西）；
    右图 = 每步写入幅度（‖S_t − S_{t−1}‖ 的折线，最近 N 步）。
-   两张图都是纯 canvas 自绘，没有系统控件。 */
+   三样都是纯 canvas 自绘，没有系统控件。
+
+   颜色ramp（fwColorRamp）：旧版用固定蓝色 + 只调透明度，所以「永远蓝、
+   看不出加深」。改成 暗→蓝→青→黄→红 的感知梯度，轻重写在色相+
+   亮度上同时编码，热点一眼可见。 */
+function fwColorRamp(t) {
+  // t ∈ [0,1] → [r,g,b]。低值贴近背景(暗)，高值偏暖(亮)。
+  t = Math.max(0, Math.min(1, t));
+  const stops = [
+    [0.00, [36, 43, 53]],    // 暗灰（≈背景，空区域）
+    [0.25, [40, 95, 165]],   // 蓝
+    [0.50, [40, 175, 180]],  // 青
+    [0.75, [232, 190, 60]],  // 黄
+    [1.00, [220, 70, 50]],   // 红（最重）
+  ];
+  for (let i = 1; i < stops.length; i++) {
+    if (t <= stops[i][0]) {
+      const a = stops[i - 1], b = stops[i];
+      const k = (t - a[0]) / (b[0] - a[0]);
+      return [
+        Math.round(a[1][0] + (b[1][0] - a[1][0]) * k),
+        Math.round(a[1][1] + (b[1][1] - a[1][1]) * k),
+        Math.round(a[1][2] + (b[1][2] - a[1][2]) * k),
+      ];
+    }
+  }
+  return stops[stops.length - 1][1];
+}
+
 function renderFastWeight(s) {
-  const cv = $("fw-canvas"), wr = $("fw-write");
+  const cv = $("fw-canvas"), wr = $("fw-write"), headsEl = $("fw-heads");
   const normEl = $("fw-norm"), writeEl = $("fw-write-val");
   if (!cv || !wr) return;
   const dpr = Math.min(2, window.devicePixelRatio || 1);
@@ -1540,7 +1569,7 @@ function renderFastWeight(s) {
   const accent = cssVar("--accent", "#4c8dff");
   const fg3 = cssVar("--fg3", "#7a8699");
 
-  // —— 状态热力图 ——
+  // —— 状态热力图（颜色 ramp，不再固定蓝）——
   const w = cv.clientWidth || 200;
   const side = Math.round(w * dpr);
   if (cv.width !== side) { cv.width = side; cv.height = side; }
@@ -1555,12 +1584,12 @@ function renderFastWeight(s) {
     for (const row of fw.matrix) for (const v of row)
       if (Number.isFinite(v) && v > max) max = v;
     const cell = cv.width / bins;
-    c1.fillStyle = accent;
     for (let y = 0; y < bins; y++) {
       for (let x = 0; x < bins; x++) {
         const v = Number(fw.matrix[y][x]);
         const t = Math.pow(Math.min(1, (Number.isFinite(v) ? v : 0) / max), 0.65);
-        c1.globalAlpha = 0.05 + 0.95 * t;
+        const [r, g, b] = fwColorRamp(t);
+        c1.fillStyle = `rgb(${r},${g},${b})`;
         c1.fillRect(x * cell, y * cell, Math.ceil(cell), Math.ceil(cell));
       }
     }
@@ -1571,6 +1600,25 @@ function renderFastWeight(s) {
     c1.font = `${11 * dpr}px ui-monospace, monospace`;
     c1.fillText("尚未推理", 10 * dpr, 20 * dpr);
     if (normEl) normEl.textContent = "—";
+  }
+
+  // —— 每头 ‖S‖（后端已算好 head_norms，这里画成小柱；空则清掉）——
+  if (headsEl) {
+    const hs = (fw && fw.head_norms) || [];
+    if (hs.length) {
+      const hmax = Math.max(...hs, 1e-9);
+      let html = "";
+      hs.forEach((hn, i) => {
+        const pct = (hn / hmax * 100).toFixed(1);
+        html += `<i class="fw-head" style="height:${pct}%" `
+              + `title="head ${i}: ‖S‖=${hn}"></i>`;
+      });
+      headsEl.innerHTML = html;
+      headsEl.style.display = "flex";
+    } else {
+      headsEl.innerHTML = "";
+      headsEl.style.display = "none";
+    }
   }
 
   // —— 写入幅度 ——

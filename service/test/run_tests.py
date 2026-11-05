@@ -76,6 +76,8 @@ SUITES = [
     ("test_pdraw_js", "service.test.test_pdraw_js", 120, "unittest"),
     # 2026-11-04 显示插件导入契约 + 实时 fast weight 统计（不起服务，秒级）
     ("test_plugins", "service.test.test_plugins", 120, "unittest"),
+    # 2026-11-05 推理存档 user/model 段边界包裹往返（不起服务，秒级）
+    ("test_infer_archive", "service.test.test_infer_archive", 600, "unittest"),
     ("verify_formats", "service/test/verify_formats.py", 600, "script"),
 ]
 

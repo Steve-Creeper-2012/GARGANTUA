@@ -441,10 +441,14 @@ def generate(m, prompt: str | None = None, max_new: int = 32,
     prev_S = None
     writes: list = []                # fast weight 每步写入幅度（最近 N 步）
     try:
-        # 存档顺序必须与模型实际看到的顺序一致：媒体在前、文本在后
+        # 存档顺序必须与模型实际看到的顺序一致：媒体在前、文本在后。
+        # 用段边界 token 把「用户输入」包成 <user>…<user/>（含媒体与文本），
+        # 让 .tokens 存档本身可区分谁是谁，而不是扁平 ID 流。
+        archive.add([spec.USER_ID])
         if media_steps:
             archive.add_items(tok5.from_steps(media_steps))
         archive.add(ids)
+        archive.add([spec.USER_END_ID])
 
         # 当前实现每次 generate 从零开始：state/kv 都是本次局部量，跨轮（跨 HTTP
         # 请求）持久状态尚未接线；m.fast_weight.reset() 清的是没被使用的
@@ -480,6 +484,8 @@ def generate(m, prompt: str | None = None, max_new: int = 32,
         kv_steps = s_in
         cur = ids[-1]                            # 用 prompt 尾 token 播种
         # cur_step 已在上面的分支里按「最后一个输入步 + 1」算好
+        # 模型输出段：<model>…<model/> 包住本轮生成的所有 token
+        archive.add([spec.MODEL_ID])
         for _ in range(max_new):
             # 输入 token 的 embedding 放在其预测步上（s_dec = cur_step），
             # 与训练 make_batch 的 s_dec=arange(half, …) 约定一致
@@ -541,6 +547,8 @@ def generate(m, prompt: str | None = None, max_new: int = 32,
                 kv_vecs, kv_steps = _trim_tail_steps(kv_vecs, kv_steps,
                                                      ctx_total)
             cur, cur_step = nxt, cur_step + 1
+        # 模型输出段收尾：无生成也写一对空边界，保持存档结构完整
+        archive.add([spec.MODEL_END_ID])
         out_steps = [{"token_ids": [i], "type": spec.TYPE_MODEL,
                       "modality": "text", "meta": {}} for i in out_ids]
         elapsed_ms = int((time.perf_counter() - t0) * 1000)

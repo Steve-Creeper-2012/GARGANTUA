@@ -969,6 +969,18 @@
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 11px; color: var(--fg2); font-weight: 600;
   }
+  /* 每头 ‖S‖ 小柱：横向一排，高度∝该头范数（谁的联想记忆更满） */
+  .fw-heads {
+    display: flex; align-items: flex-end; gap: 3px;
+    height: 34px; margin-top: 7px; padding: 0 1px;
+  }
+  .fw-heads[style*="none"] { display: none; }
+  .fw-head {
+    flex: 1 1 0; min-width: 0; align-self: flex-end;
+    background: linear-gradient(var(--accent), var(--accent-2, #2f6fd0));
+    border-radius: 2px 2px 0 0; height: 0;
+    transition: height .18s ease;
+  }
   .field { margin-bottom: 12px; }
   .field label { display: block; color: var(--fg3); font-size: 12px; margin-bottom: 5px; }
 
