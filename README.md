@@ -35,7 +35,19 @@ layer reused five times. `spec.BLOCK_ORDER` is the single source of truth.)
 
 ### Fast Weight Memory
 
-A global `FastWeightBank` serves as long-term memory. It is **structurally one KDA layer** (same q/k/v projections, causal short conv, L2 norm, channel-wise forget gate, output gate, RMSNorm); the only difference is that its state persists across calls. It is invoked once after the first block in both encoder and decoder, reading with the old state and then writing every token (no selective filtering yet). Based on Schmidhuber's 1991 fast weight paper.
+A global `FastWeightBank` serves as long-term memory. It is **structurally one KDA layer** (same q/k/v projections, causal short conv, L2 norm, channel-wise forget gate, output gate, RMSNorm); the only difference is that its state persists across calls. It is invoked once after the first block in both encoder and decoder, reading with the old state and then writing every token. Based on Schmidhuber's 1991 fast weight paper.
+
+### MoMW — optional three-stage memory valve
+
+`MoMW` (Mixture-of-Memory-Weights) adds the selective filtering that the single global bank lacks. It is **off by default** and sits next to the fast-weight bank after the first block. Every pool layer shares the same `KDAAttention` reference and only keeps its own recurrence state `S_i`, so enabling it adds **zero parameters and zero persistent buffers**: `state_dict()` is identical with the valve on or off, and existing model folders load unchanged.
+
+Routing runs in three stages:
+
+1. **Cold start (anchor seeding).** Each layer is bound to a class anchor `P_k`, computed lazily on the first forward as the mean embedding of deterministically sampled representative tokens from `wte.weight` (modeling-time embeddings are still random, so this cannot happen in `__init__`). `set_anchor_provider()` can inject real text-embedding means instead.
+2. **Drift from anchor to state feature.** A one-step power iteration on `G_h = S_hᵀS_h` (once every `eigen_interval` writes) yields the principal direction, projected back to `d_model` through the KDA `w_o` to form `E_i`. The mix `γ_i = 1 − exp(−writes/k)` moves the score from `cos(H_t, P_i)` toward `cos(H_t, E_i)`, i.e. from the external prototype to what the layer actually remembers.
+3. **Expansion (empty-layer split).** When `‖S_i‖` grows faster than `expand_delta` (or exceeds `saturation_limit`), a **zero-state** layer is appended. States are never cloned; only the anchor direction is inherited. New layers get an exponentially decaying bonus `B₀·e^(−age/M)` to break the cold-start deadlock, and same-type layers are softly load-balanced toward the layer with more headroom.
+
+Nothing is activated below `threshold` — the block then returns `H_1` unchanged. Un-recalled layers are never forwarded, so their state does not advance. The valve is gradient-free (`torch.no_grad()`), isolated per session (`state["momw"]`), and can run in **silent mode**: routing and writes continue, but `ΔH` is not injected into the output. The inference panel shows per-layer γ / writes / ‖S‖ / activation and can clear the pool or toggle silent mode; `/api/momw/control` and the `momw control` CLI command cover the same operations.
 
 ### KV Cache Design
 
@@ -80,11 +92,13 @@ or in the web UI's model-creation form (four number inputs, defaults shown), or 
 
 ## Token System
 
-All text tokens are discrete. The `.tokens` binary is **token-5**: a 5-bit
-bitstream over an alphabet of exactly 27 symbols
-(`0-9 { } < > | : w t v A-F x y`), terminated by code 27 and zero-padded to a
-byte boundary. Any other program opening it sees garbage; `tokens/tok5.py` is
-the interpreter.
+All text tokens are discrete. The `.tokens` binary is **token-6** (2026-11-05):
+a 6-bit bitstream over 29 single characters
+(`0-9 { } < > | : w t v A-F x y [ ]`) plus 6 atomic boundary tokens
+(`[model] [user] [model/] [user/] [sys] [sys/]`, codes 29–34), terminated by
+code 63 and zero-padded to a byte boundary. Codes 35–62 are reserved.
+Any other program opening it sees garbage; `tokens/tok6.py` is the interpreter.
+**No backward compatibility**: token-5 (5-bit) files are no longer readable.
 
 Inside the stream, every element is wrapped in a time step:
 
@@ -93,17 +107,82 @@ Inside the stream, every element is wrapped in a time step:
 | `{t:00001}` | text token — visible, has a vector, enters the loss |
 | `{w:<hex>}` | audio token — 533 samples × 16 bit = 2132 hex chars |
 | `{v:<hex>x:10y:24}` | visual patch — 32×32 px, RGBA 10 bit each = 10240 hex chars |
-| `<00005>` | extended system token — has an embedding, no position coordinate, never in the loss |
-| `{ } \|` | structure characters — **not** tokens (no position, no loss, no embedding) |
+| `[00005]` / `[user]` | extended token / atomic boundary — has an embedding, not displayed as content, still enters the main AR loss |
+| `<00000>` / `<caps>` | `core` mechanism marker (single-handled category) — has KV, **enters** the loss |
+| `<0000C>` / `<s0>` | numbered slot token — has KV, **enters** the loss, rendered as a "slot N" badge |
+| `{ } \| [ ] < >` | structure characters — **not** tokens (no position, no loss, no embedding) |
 
-Multiple elements in one step are separated by `|`; `<...>` lives at stream
-level, outside `{}`. The human-readable form is `{text: 00001}`,
-`{wave: <hex>}`, `{visual: <hex> x: 10 y: 24}` — the editor accepts both.
+Multiple elements in one step are separated by `|`; `[...]` and `<...>` live at
+stream level, outside `{}`. The human-readable form is `{text: 00001}`,
+`{wave: <hex>}`, `{visual: <hex> x: 10 y: 24}`, `[user]`, `<caps>`, `<s0>` —
+the editor accepts both compact and display forms.
+
+**Wrapping semantics**: `[]` is for the six `boundary` segment markers
+(`[user] … [sys/]`); `<>` is for the three `core` mechanism markers and the
+numbered `slot` tokens. `spec.py` is the single source of truth for every
+code and ID.
 
 Why extended tokens carry the "position embedding" role: KDA lets the model
 learn relative order itself, so the standard Transformer position-embedding
 job is delegated to these extensible tokens; plain structure characters need
 no embedding at all.
+
+### base1.3.0 vocabulary and numbered slots
+
+The base vocabulary is versioned: `vocabs/base1.3.0/{vocab.vfc, config.json}`
+(`vocab_version: "1.3.0"`, `token_encoding: "token-6"`). The head layout has
+**six segments**: `core 3 + boundary 6 + system 3 + slot N + typst 228 +
+draw 9605 = 9845 + N` IDs, where **N is `config.json`'s `slot_count`, not a
+constant in `spec.py`**. The `typst` segment is **228 `<>` tools** — 114 Typst
+syntax constructs, each with an explicit open/close pair (`<DOC>`/`</DOC>`,
+`<H1>`/`</H1>`, … `<ATTR>`/`</ATTR>`); like `core` they are invisible, enter
+the loss, have KV and carry `TYPE_NONE`. It sits between `slot` and `draw`
+(`TYPST_BEGIN = 12 + N`, `TYPST_END = 240 + N`).
+**The base vocabulary has zero reserved slots** (N=0 → `HEAD_SIZE = 9845`,
+`DRAW_BEGIN = 240`, visible IDs start at 9845).
+
+To get reserved slots, generate a new vocabulary from base:
+
+```bash
+python service/tokens/gen_vocab.py --name mymodel --slots 128
+# vocabs/mymodel/{vocab.vfc, config.json}, config.slot_count=128
+# --activate makes it the global runtime layout (restart the server)
+```
+
+`spec.head_layout(n)` is the pure layout function; `vfc.infer_slot_count()`
+reads N back from any `.vfc`, so a derived vocabulary loads correctly even
+when the global spec layout differs.
+
+**Since 1.2.0 every predefined agent tool / formatting token is removed.**
+Slots `<s0>`…`<sN-1>` (IDs `12 .. 11+N`) are shown by number with **no preset
+semantics at all**; define names, kinds and open/close pairing in
+`spec.SLOT_DEFS`. Tool execution is **disabled entirely** for now (this repo
+is a tooling/test bench; the runtime will live in a separate inference app).
+`GET /api/agent/spec` is the only source for IDs — see
+`service/web/plugins/AGENT_TOKENS.md` for the full contract.
+
+`<caps>` / `<stop>` / `<draw:end>` are **not** slots: they are the earliest
+mechanism markers and get their own `core` category — `<>` shaped, no closing
+form, not `[]` boundaries, not system/special tokens, not tool calls. They
+still enter the loss and have KV.
+
+At the end of the visible area (after the `code` region) 1.3.0 appends a
+**`unicode_ext` region of 3537 characters** drawn from 31 Unicode blocks
+(Latin extended, Cyrillic, Greek, kana, mathematical symbols, …), all in the
+`regular` category. The total `vocab_size` is **80262** (76497 + 228 + 3537);
+`MAX_VOCAB_SIZE` stays 100000.
+
+Version history: `1.0.0` introduced token-6; `1.1.0` appended a `code` region
+(474 cross-language code tokens) at the end of the visible area; `1.2.0`
+rewrote the head; `1.3.0` inserted the `typst` head segment and the
+`unicode_ext` visible region. **IDs shifted wholesale in 1.2.0, and again in
+1.3.0 (draw and the whole visible area +228) — old `.tokens` files, weights
+and archives are not readable.**
+
+`[sys]…[sys/]` is the system segment (`TYPE_SYS`, a 4th type embedding) used
+for tool results / system prompts. Infer-Plug v1.0.0 renders tool calls,
+streams text, previews draw output with a draggable timeline, and ends the
+preview on `<draw:end>`.
 
 The old tok-32 (big-endian `uint32`) format is retired; `tokens/tok32.py`
 remains only as a reader for historical files.
@@ -134,15 +213,15 @@ only ever looks up the two visible ones:
   look up regular tokens, then fallback letters; unmapped chars are skipped
   and reported. Output: hex string or `.tokens` binary.
   `--vocab <vocab.txt|模型目录>` 可用指定词表编码（见「每模型词表」）。
-- **tok5** (`tokens/tok5.py`): the token-5 codec — characters ↔ 5-bit
+- **tok6** (`tokens/tok6.py`): the token-6 codec — characters ↔ 6-bit
   bitstream ↔ elements ↔ time-step stream, plus payload helpers
   (`samples_to_hex`, `rgba8_to_hex`) and `to_display` / `parse_display`.
 - **dectok** (`python service/tokens/dectok.py stream.tokens`): renders a
-  token-5 file as `{text: 00001}` …; `--text` renders surface text.
+  token-6 file as `{text: 00001}` …; `--text` renders surface text.
 - **gts** (`tokens/gts.py`): *legacy* tok-32-era editor parser, kept read-only.
-  The editor now speaks token-5 directly (`POST /api/tokens/export`).
+  The editor now speaks token-6 directly (`POST /api/tokens/export`).
 - **tokenset** (`tokens/tokenset.py`): the only reader used by training —
-  token-5 `.tokens` → `(ids, step_ids)`, rejecting files without a valid
+  token-6 `.tokens` → `(ids, step_ids)`, rejecting files without a valid
   time-step structure and files carrying `{w:}`/`{v:}` elements (the current
   `forward_train` only consumes discrete IDs).
 
@@ -271,7 +350,7 @@ overrides the binary path. Converter env vars (`SHAPE_RENDERER_INPUT_DIR`,
 - Muon can be disabled — falls back to full AdamW.
 
 ### Data Format
-Training data is a **`.tokens` file** — the token-5 bitstream, with the
+Training data is a **`.tokens` file** — the token-6 bitstream, with the
 `{ }` time-step structure written out explicitly. The Token editor exports
 exactly this format (Export .tokens), and it is the only accepted training
 input; JSON/JSONL uploads are rejected with `400`.
@@ -321,7 +400,7 @@ one text token is required as the decode seed.
 Every inference call persists its token ids before/while generating:
 
 ```
-logs/infer_archive/<YYYYmmdd_HHMMSS>_<id>.tokens   # token-5，每个 { id } 一步
+logs/infer_archive/<YYYYmmdd_HHMMSS>_<id>.tokens   # token-6，每个 { id } 一步
 logs/infer_archive/<...>.json                      # model / counts / ctx_total / n_evicted
 ```
 
@@ -343,16 +422,20 @@ A built-in web UI provides:
   由**可插拔显示插件**渲染，因为不同词表的 token 显示方式不同。插件只负责
   「把用户输入转成 infer 请求（含 max_new_tokens / temperature / top_p）→
   读流式输出 → 自己画 HTML」。选择器与导入入口在「开发者选项 → 显示插件」，
-  默认插件是「纯 token 显示」（逐 token 追加原 ID + TTFT/tok/s）；base 词表
-  插件开发中、不显示。完整协议与开发文档见 `service/web/plugins/README.md`。
+  默认插件是 **Infer-Plug v1.0.0**（正常文字输入、文件 chip 内联拼接、
+  图元画布实时预览 + 可拖拽时间轴、流式输出、工具调用徽标）；另一个内置
+  插件「token 对话」保留转换器格式 `[]`/`<>` 显示。完整协议与开发文档见
+  `service/web/plugins/README.md`。
 - **开发者选项**（右侧边栏）：上下文占用、KV cache、**fast weight 状态热力图
-  与逐步写入幅度折线**、显示插件选择/导入、采样参数。
+  与逐步写入幅度折线**、**MoMW 记忆阀门面板**（状态条常驻指标；点开看每层
+  类型 / γ / 写入次数 / ‖S‖ / 是否激活，并可清空记忆池或切换静默激活）、
+  显示插件选择/导入、采样参数。
 - **Codec Visualizers**:
   - Text → Token conversion
   - Audio → Wave token conversion
   - Image/Video → Patch token conversion
   - Image → Primitive sequence conversion
-  - Token editor with a spec-aligned palette and **Export .tokens** (writes the same token-5 stream training consumes)
+  - Token editor with a spec-aligned palette and **Export .tokens** (writes the same token-6 stream training consumes)
   - **Vocabulary page**: ID-region occupancy, presets, plus global search / add-token (the editor itself no longer carries vocabulary operations)
 
 ### Launch

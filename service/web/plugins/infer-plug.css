@@ -1,0 +1,267 @@
+/* ===========================================================================
+   Infer-Plug v1.0.0 样式（微信式多轮气泡 + 内联文件 chip + 图元画布时间轴）
+   ---------------------------------------------------------------------------
+   插件自带 CSS，由宿主以 <link data-plugin> 注入、卸载时移除。所有规则写在
+   .ip-root 作用域下，不引用主程序类名；颜色 / 圆角一律走 app.css 的 CSS 变量，
+   自动跟随亮 / 暗主题。user-select:text 在根上显式放开（app.css 全局 none）。
+   =========================================================================== */
+
+.ip-root {
+  display: flex; flex-direction: column;
+  height: 100%; min-height: 0;
+  user-select: text; -webkit-user-select: text;
+}
+
+/* ---------- 对话流 ---------- */
+.ip-root .ip-chat {
+  flex: 1 1 auto; min-height: 0;
+  overflow-y: auto; overflow-x: hidden;
+  display: flex; flex-direction: column;
+  gap: 14px; padding: 4px 2px 12px;
+  scroll-behavior: smooth;
+}
+.ip-root .ip-empty {
+  margin: auto; max-width: 460px; text-align: center;
+  display: flex; flex-direction: column; gap: 8px;
+  color: var(--fg3); font-size: 12.5px; line-height: 1.75;
+}
+.ip-root .ip-empty b { color: var(--fg2); font-size: 13.5px; }
+
+.ip-root .ip-msg {
+  display: flex; flex-direction: column; max-width: 84%;
+}
+.ip-root .ip-msg.me  { align-self: flex-end;   align-items: flex-end; }
+.ip-root .ip-msg.bot { align-self: flex-start; align-items: flex-start; }
+/* 系统段：工具结果（[sys]…[sys/]），居中偏左、用琥珀色边与普通回答区分 */
+.ip-root .ip-msg.sys {
+  align-self: flex-start; align-items: flex-start; max-width: 92%;
+}
+.ip-root .ip-msg.sys .ip-bubble {
+  border-left: 2px solid var(--amber);
+  background: var(--fill);
+}
+.ip-root .ip-who {
+  font-size: 11px; color: var(--fg3);
+  letter-spacing: .03em; margin-bottom: 3px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ip-root .ip-bubble {
+  max-width: 100%;
+  padding: 8px 10px;
+  border-radius: var(--r);
+  border: 1px solid var(--border);
+  background: var(--panel);
+  line-height: 1.6;
+  transition: border-color .15s var(--ease);
+}
+.ip-root .ip-msg.me .ip-bubble {
+  background: var(--accent-soft);
+  border-color: transparent;
+}
+.ip-root .ip-busy .ip-msg.bot .ip-bubble { border-left: 2px solid var(--accent); }
+
+/* 气泡正文：文字与 chip 在同一行内联无缝拼接 */
+.ip-root .ip-body {
+  white-space: pre-wrap; word-break: break-word;
+}
+.ip-root .ip-text {
+  white-space: pre-wrap;
+}
+
+/* ---------- 文件胶囊（inline-flex、深色圆角、整体不可拆） ---------- */
+.ip-root .ip-file {
+  display: inline-flex; align-items: center; gap: 5px;
+  position: relative;
+  vertical-align: middle;
+  white-space: nowrap;
+  margin: 0;                       /* 与相邻文字 0 间距，无缝拼接 */
+  padding: 2px 7px 2px 6px;
+  border-radius: var(--r-pill);
+  background: var(--fill-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  font-size: 12px; line-height: 1.3;
+  max-width: 220px;
+}
+.ip-root .ip-file-icon {
+  display: inline-flex; flex-shrink: 0;
+  color: var(--accent);            /* 蓝色文件小图标 */
+}
+.ip-root .ip-file-name {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  min-width: 0; color: var(--fg);
+}
+.ip-root .ip-file-name, .ip-root .ip-file-icon { user-select: text; }
+/* 「我」气泡里的 chip 用 accent 描边高亮，只显示文件名、无预览 */
+.ip-root .ip-msg.me .ip-file {
+  background: var(--panel);
+  border-color: var(--accent);
+}
+.ip-root .ip-file-static { cursor: default; }
+/* 右上角 × 删除 */
+.ip-root .ip-file-x {
+  position: absolute; top: -7px; right: -7px;
+  width: 15px; height: 15px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  background: var(--panel-2); color: var(--fg2);
+  border: 1px solid var(--border);
+  font-size: 12px; line-height: 1; cursor: pointer;
+}
+.ip-root .ip-file-x:hover { color: var(--red); border-color: var(--red); }
+.ip-root .ip-file-pending { opacity: .6; }
+
+/* ---------- agent / 特殊 / 工具小徽标 ---------- */
+.ip-root .ip-badge {
+  display: inline-flex; align-items: center;
+  vertical-align: middle;
+  margin: 0 3px; padding: 1px 7px;
+  border-radius: var(--r-pill);
+  font-size: 11px; line-height: 1.4; white-space: nowrap;
+  background: var(--fill); color: var(--fg2);
+  border: 1px solid var(--border);
+  font-weight: 600;
+}
+.ip-root .ip-badge-agent { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+.ip-root .ip-badge-tool  { background: var(--panel-2); color: var(--amber); border-color: var(--amber); }
+
+/* 流式光标 */
+.ip-root .ip-caret {
+  color: var(--accent); font-weight: 700;
+  animation: ip-blink 1s steps(1, end) infinite;
+}
+@keyframes ip-blink { 50% { opacity: 0; } }
+
+.ip-root .ip-note { font-size: 11px; color: var(--fg3); margin-top: 6px;
+                    font-variant-numeric: tabular-nums; }
+.ip-root .ip-err  { font-size: 12px; color: var(--red); line-height: 1.6; margin-top: 6px; }
+
+/* ---------- DRAW 画布预览 + 可拖拽时间轴 ---------- */
+.ip-root .ip-draw {
+  display: block; margin: 8px 0 4px;
+  max-width: 100%;
+}
+.ip-root .ip-canvas {
+  display: inline-block; max-width: 100%;
+  padding: 4px;
+  border-radius: var(--r);
+  border: 1px solid var(--border);
+  background: var(--panel);           /* 背景：透明 / 中性，图元覆盖其上 */
+  line-height: 0; overflow: hidden;
+}
+.ip-root .ip-svg { display: block; border-radius: 4px; }
+.ip-root .ip-prims { line-height: 0; }
+
+.ip-root .ip-timeline {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 6px; max-width: 440px;
+}
+.ip-root .ip-play {
+  flex-shrink: 0;
+  width: 26px; height: 26px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--fill); color: var(--fg2);
+  cursor: pointer;
+}
+.ip-root .ip-play:hover { color: var(--accent); border-color: var(--accent); }
+/* 自绘 range：不用系统默认外观，thumb 用 accent */
+.ip-root .ip-range {
+  flex: 1 1 auto; min-width: 60px;
+  -webkit-appearance: none; appearance: none;
+  height: 4px; border-radius: var(--r-pill);
+  background: var(--track);
+  cursor: pointer; outline: none;
+}
+.ip-root .ip-range::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 12px; height: 12px; border-radius: 50%;
+  background: var(--accent); border: none; cursor: pointer;
+}
+.ip-root .ip-range::-moz-range-thumb {
+  width: 12px; height: 12px; border-radius: 50%;
+  background: var(--accent); border: none; cursor: pointer;
+}
+.ip-root .ip-step {
+  flex-shrink: 0; font-size: 11px; color: var(--fg3);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+
+/* ---------- 输入区：+ / contenteditable / 发送 ---------- */
+.ip-root .ip-dock { flex-shrink: 0; padding-top: 8px; }
+.ip-root .ip-input-box {
+  display: flex; align-items: flex-end; gap: 8px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 8px;
+  transition: border-color .15s var(--ease);
+}
+.ip-root .ip-input-box:focus-within { border-color: var(--accent); }
+.ip-root .ip-dock.ip-drag .ip-input-box { border-color: var(--accent-2); }
+
+/* 左下角加号：圆形描边按钮，CSS 画 + */
+.ip-root .ip-add {
+  position: relative; flex-shrink: 0;
+  width: 32px; height: 32px; padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: transparent; color: var(--fg2);
+  cursor: pointer;
+}
+.ip-root .ip-add:hover { color: var(--accent); border-color: var(--accent); }
+.ip-root .ip-add:disabled { opacity: .4; cursor: default; }
+.ip-root .ip-add::before, .ip-root .ip-add::after {
+  content: ""; position: absolute; left: 50%; top: 50%;
+  background: currentColor; border-radius: 1px;
+  transform: translate(-50%, -50%);
+}
+.ip-root .ip-add::before { width: 13px; height: 2px; }
+.ip-root .ip-add::after  { width: 2px; height: 13px; }
+
+/* contenteditable：auto-grow，正常情况下无内部竖滚动条，超出才用细滚动条 */
+.ip-root .ip-input {
+  flex: 1 1 auto; min-width: 0;
+  box-sizing: border-box;
+  min-height: 2.6em; max-height: 9.6em;
+  overflow-y: auto;
+  white-space: pre-wrap; word-break: break-word;
+  font-family: inherit; font-size: 13px; line-height: 1.6;
+  color: var(--fg); background: none; border: none; padding: 4px 0;
+  outline: none;
+}
+.ip-root .ip-input:focus { outline: none; box-shadow: none; border: none; }
+/* :empty 占位符 */
+.ip-root .ip-input:empty::before {
+  content: attr(data-ph);
+  color: var(--fg3);
+  pointer-events: none;
+}
+.ip-root .ip-input::-webkit-scrollbar { width: 6px; }
+.ip-root .ip-input::-webkit-scrollbar-track { background: transparent; }
+.ip-root .ip-input::-webkit-scrollbar-thumb {
+  background: var(--fill-2); border-radius: var(--r-pill);
+}
+
+/* 右下角发送：36×36 圆角方形，上箭头居中 */
+.ip-root .ip-send {
+  flex-shrink: 0;
+  width: 36px; height: 36px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: var(--r);          /* 圆角方形 */
+  background: var(--accent); color: var(--on-accent);
+  border: none; cursor: pointer;
+}
+.ip-root .ip-send:hover { background: var(--accent-2); }
+.ip-root .ip-send:disabled { opacity: .45; cursor: default; }
+.ip-root .ip-send svg { display: block; }
+
+/* 隐藏 file input（动态创建，不占布局） */
+.ip-root .ip-file-input { display: none; }
+
+/* ---------- reduced-motion 兜底 ---------- */
+@media (prefers-reduced-motion: reduce) {
+  .ip-root .ip-chat { scroll-behavior: auto; }
+  .ip-root .ip-caret { animation: none; }
+  .ip-root .ip-bubble, .ip-root .ip-input-box { transition: none; }
+}

@@ -79,15 +79,17 @@
            transform 会给 fixed 子元素造出新的包含块与层叠上下文，按钮先被
            磨砂条盖住、动画结束才「冒出来」（2026-11-04 报的闪烁）。 -->
       <div id="topbar-actions">
-        <!-- 推理页工具栏：清空 / 选模型（开发者选项按钮已独立固定在窗口右上角） -->
+        <!-- 推理页工具栏：对话标签 / 新开 / 历史 / 选模型
+             （开发者选项按钮已独立固定在窗口右上角） -->
         <div id="infer-toolbar" hidden>
-          <button class="act sec" id="infer-clear"
-                  title="清空会话并终止 infer 服务（下次推理重新加载模型）">清空</button>
+          <div class="conv-tabs" id="conv-tabs"></div>
+          <button class="act sec conv-add" id="conv-add" title="新开一个对话" aria-label="新开一个对话">＋</button>
+          <button class="act sec" id="conv-history" title="查看历史对话">历史</button>
           <button class="act sec" id="infer-model-btn" title="选择对话模型">模型
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
                  stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M6 9l6 6 6-6"/></svg></button>
-          <div id="model-pop" class="pop" hidden>
+          <div id="model-pop" class="pop wide" hidden>
             <div class="pop-head"><span>选择模型</span>
               <button class="act sec xs" id="model-pop-refresh">刷新</button></div>
             <div class="pop-list" id="model-pop-list"><div class="hint">加载中…</div></div>
@@ -100,6 +102,16 @@
             <button data-v="queue" class="on">任务列队</button>
             <button data-v="render">渲染</button>
             <button data-v="tokens">token 输出</button>
+          </div>
+        </div>
+
+        <!-- 训练：三视图滑块（与图元页同款控件，切训练页才出现）。
+             三个视图各自占满整页，互不叠放；选中态沿用 .seg button.on。 -->
+        <div class="prims-bar" id="train-bar" hidden>
+          <div class="seg" id="train-viewseg">
+            <button data-v="tasks" class="on">训练任务</button>
+            <button data-v="logs">训练日志</button>
+            <button data-v="loss">loss 曲线</button>
           </div>
         </div>
 
@@ -218,6 +230,11 @@
               <input type="number" id="model-hca-ratio" value="32" min="2" max="256"></label>
             <label class="form-field"><span>词表预设</span>
               <select id="model-vocab"></select></label>
+            <label class="form-field"><span>MoMW 记忆阀门</span>
+              <select id="model-momw">
+                <option value="off" selected>关闭（默认）</option>
+                <option value="on">启用（无训练记忆池）</option>
+              </select></label>
             <label class="form-field"><span>精度</span>
               <select id="model-dtype">
                 <option value="fp32" selected>fp32</option>
@@ -272,6 +289,17 @@
             <b>d_model</b> 只改语义向量宽度（128 的倍数，无上限，默认 1024）；
             注意力头数/头维、MLA 低秩秩、FFN 隐藏宽度仍是冻结架构值。
             宽度越大，embedding 与 lm_head 占用内存越多。
+          </div>
+          <div class="hint" style="margin-top:8px">
+            <b>MoMW（默认关闭）</b>：启用后在第一个 Block 之后多一条<b>无训练三阶段记忆阀门</b>。
+            <b>阶段一</b>用类别锚点（代表性 token Embedding 均值）与输入算余弦做冷启动路由；
+            <b>阶段二</b>用 SᵀS 的增量幂迭代提取状态主特征 E，按 γ=1−e^(−writes/k) 从锚点逐步
+            漂移到层内语义；<b>阶段三</b>在状态范数增长过快时分裂出<b>零状态空层</b>（绝不复制原层），
+            给指数衰减 bonus 强制冷启动，并在同类层间软均衡。按动态阈值召回 Top-N 层加权注入
+            <code>ΔH</code>；没有相关记忆时输出与标准模型逐值一致。池层共享同一份 KDA 权重、
+            只各自持独立递推状态，<b>不新增任何参数</b>——参数量预估与权重文件都不变，旧模型目录不受影响。
+            推理界面可查看每层 γ/写入/‖S‖/激活状态，并可清空记忆池或切换<b>静默激活</b>。
+            阈值是保守占位，需在真实权重上观察分数分布后标定。
           </div>
         </div>
 
@@ -331,20 +359,19 @@
           <div id="vocab-pane-form">
             <div class="row">
               <input class="grow" id="vtok-token" type="text" autocomplete="off"
-                     placeholder="token 文本（如 hello / 你 / &lt;mood&gt; / { ）">
-              <select id="vtok-cat" style="width:auto"
-                      title="可显示 = 引号包裹形态；不可显示 = 尖括号包裹形态">
-                <option value="regular">regular 可显示</option>
-                <option value="special">special 不可显示</option>
-              </select>
+                     placeholder="token 文本（文本子区随意 / slot 写名字或 &lt;名字&gt;）">
+              <select id="vtok-region" style="width:auto"
+                      title="选择把新 token 加到哪个子区"></select>
               <button class="act" id="vtok-add">添加</button>
               <button class="act sec" id="vtok-remove">删除</button>
               <button class="act sec" id="vtok-query">查询</button>
             </div>
             <div class="hint" id="vtok-msg"></div>
+            <div class="hint" id="vtok-hint"></div>
             <div class="hint">查询只读，不改动词表；添加 / 删除会写入词表文件。
-              只有「可显示 / 不可显示」两种形态可选：可显示且为单个 a–z 字母的 token 会自动兼作 fallback；
-              { } | 属架构契约头，后端会拒绝添加。</div>
+              下拉列出全部子区，格式规则由所选子区决定（选中后上方会提示）；
+              架构契约头（core / boundary / system / typst / draw）不可增删，
+              slot 的名字不得与全表已有 token 重名。</div>
           </div>
 
           <!-- 模式二：文本式（裸文本编辑区，保存时做语法校验） -->
@@ -371,57 +398,160 @@
         </div>
       </section>
 
-      <!-- ==================== 训练 ==================== -->
+      <!-- ==================== 训练 ====================
+           三个视图由顶栏右上角 #train-viewseg 滑块切换，各自占满整页：
+             训练任务  左右两半（左：整块都是创建/编辑训练任务；
+                       右：上=未完成队列、下=已完成任务队列）
+             训练日志  训练日志 + 事件
+             loss 曲线 每个文件一个标签页，横轴按训练 step / 样本
+           普通训练只收 .tokens；对比训练强制定死「数据集文件夹格式 v1」
+           （由 /api/train/dataset/spec 下发说明，前端不抄常量），解析出
+           N 对真实配对同批做对称 InfoNCE（100% CLIP）。
+           #train-type / value=clip / #train-clip-batch / #train-mode-hint
+           是旧格式与终端 CLI 的静态对拍锚点，不出现在可见 UI 里。 -->
       <section class="page" id="p-train">
-        <div class="train-top">
-          <div class="card">
-            <div class="card-head"><span class="card-title">创建训练任务</span></div>
-            <div class="hint">上传 .tokens 训练数据（必须带 { } | 时间步结构；Token 编辑器可直接导出）。一次上传 = 一条 token 流。</div>
-            <div class="row" style="margin-top:12px">
-              <label class="file-pick" for="train-file">
-                <input type="file" id="train-file" accept=".tokens">
-                <span class="file-btn">选择文件</span>
-                <span class="file-name" id="train-file-name">未选择</span></label>
+
+        <!-- ============ 视图 1：训练任务 ============ -->
+        <div class="train-view train-tasks" id="train-view-tasks">
+          <div class="train-col">
+            <div class="card train-create-card">
+              <div class="card-head">
+                <span class="card-title" id="train-form-title">创建训练任务</span>
+                <span class="row" style="margin:0">
+                  <button class="act sec xs" id="train-form-reset" hidden>取消编辑</button>
+                  <button class="act sec xs" id="queue-refresh">刷新</button>
+                </span>
+              </div>
+              <div class="train-form-scroll">
+
+                <div class="tf-row">
+                  <span class="tf-label">训练方式</span>
+                  <div class="seg tf-seg" id="train-type-seg">
+                    <button data-v="lm" class="on">普通训练</button>
+                    <button data-v="clip">对比训练</button>
+                  </div>
+                </div>
+                <select id="train-type" hidden aria-hidden="true">
+                  <option value="lm" selected>普通训练</option>
+                  <option value="clip">对比训练（数据集文件夹 v1）</option>
+                </select>
+                <div class="hint" id="train-mode-hint">一次上传 = 一条 token 流；每步随机取一个窗口，在因果掩码下逐 token 预测下一个 token、算 loss、梯度下降。</div>
+
+                <div class="tf-row tf-row-top"><span class="tf-label">训练数据</span>
+                  <span class="hint" id="train-data-hint">只接受 .tokens；可同时上传多个，每个文件 = 一个训练任务</span></div>
+                <div id="train-data-lm">
+                  <div class="dropzone" id="dz-lm" tabindex="0" role="button"
+                       aria-label="点击选择或拖拽上传 .tokens 训练文件（可多选）">
+                    <input type="file" id="train-file" accept=".tokens" multiple hidden>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4m0 0L7 9m5-5 5 5"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+                    <div class="dz-title">点击选择，或把 .tokens 拖到这里</div>
+                    <div class="dz-sub">允许多选 · 只接受 .tokens · 每个文件 = 一个训练任务</div>
+                    <div class="dz-files" id="dz-lm-files"></div>
+                  </div>
+                </div>
+                <div id="train-data-folder" hidden>
+                  <div class="dropzone" id="dz-folder" tabindex="0" role="button"
+                       aria-label="点击选择或拖拽一个 CLIP 数据集文件夹">
+                    <input type="file" id="train-folder-input" webkitdirectory multiple hidden>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/><path d="M12 11v5m-2-2 2 2 2-2"/></svg>
+                    <div class="dz-title">点击选择，或把一个数据集文件夹拖到这里</div>
+                    <div class="dz-sub">只允许一个文件夹 · 强制定死格式 v1 · 至少 2 对配对</div>
+                    <div class="dz-files" id="dz-folder-info"></div>
+                  </div>
+                  <div class="folder-spec" id="train-folder-spec"><span class="hint">格式说明加载中…</span></div>
+                </div>
+                <div class="hint tf-explain" id="train-edit-data" hidden></div>
+
+                <div class="tf-row tf-row-top">
+                  <span class="tf-label">优化器</span>
+                  <select id="train-mode">
+                    <option value="adamw">全部 AdamW</option>
+                    <option value="allmuon">全部 Muon</option>
+                    <option value="muon" selected>参杂（Muon + AdamW）</option>
+                  </select>
+                  <span class="tf-opt-wrap">
+                    <button class="about-mini" id="train-opt-about" aria-label="关于参杂方式">?</button>
+                    <span class="tf-tip" id="train-opt-tip" role="tooltip">
+                      <b>参杂方式</b><br>
+                      隐藏层 2D 权重矩阵 → <b>Muon</b>（Newton–Schulz 正交化 + RMS 对齐，lr 2e-2）；<br>
+                      embedding / lm_head / RMSNorm / 标量 / 卷积 → <b>AdamW</b>（lr 3e-4）。<br>
+                      两组各用各的学习率与动量，互不同步。<br>
+                      <i>「全部 Muon」会把 embedding、lm_head 等 2D 矩阵也交给 Muon；1D 参数仍走 AdamW——矩阵正交化对向量没有意义。</i>
+                    </span>
+                  </span>
+                </div>
+
+                <div class="tf-row"><span class="tf-label">目标模型</span>
+                  <select id="train-target"></select></div>
+
+                <div class="tf-row"><span class="tf-label">上下文窗口</span>
+                  <input type="number" id="train-block" value="32" min="2" max="1024" step="2">
+                  <span class="hint">token 数，偶数</span></div>
+                <div class="hint tf-explain">一次前向看多少个 token（偶数，user / model 各半）。窗口内每个位置在因果掩码下只预测下一个 token，整窗算一次平均 loss。越大越能学长依赖，但显存/内存按窗口平方涨；越小越快。保留它是因为它真实决定每步采样的窗口宽度，不是摆设。</div>
+
+                <div class="tf-row"><span class="tf-label">steps / 文件</span>
+                  <input type="number" id="train-steps" value="20" min="1" step="1">
+                  <span class="hint">固定采样次数</span></div>
+                <div class="hint tf-explain">每个队列文件训练多少步：每步从该文件随机取一个窗口（block_size 个 token），窗口内逐 token 做 next-token 预测 → 整窗一次平均 loss → 一次梯度下降。步数与文件长度无关，是固定的采样次数；文件走完 steps 步即落盘归档。对比训练同样按这个步数跑。</div>
+
+                <label class="form-field" id="clip-batch-field" style="display:none"><span>CLIP 配对批量（旧格式兼容）</span>
+                  <input type="number" id="train-clip-batch" value="4" min="2" max="64" step="1"></label>
+              </div>
+              <div class="row train-form-foot">
+                <button class="act" id="train-enqueue">提交训练任务</button>
+                <span class="hint" id="train-enqueue-msg"></span>
+              </div>
             </div>
-            <div class="form-grid" style="margin-top:12px">
-              <label class="form-field"><span>优化器（Muon 隐藏层矩阵 / AdamW 其余）</span>
-                <select id="train-mode">
-                  <option value="muon" selected>muon + adamw（分工）</option>
-                  <option value="adamw">全部 adamw</option>
-                </select></label>
-              <label class="form-field"><span>目标模型</span>
-                <select id="train-target"><option value="">当前活动模型</option></select></label>
-              <label class="form-field"><span>上下文窗口 block_size</span>
-                <input type="number" id="train-block" value="16" min="4" step="2"></label>
-              <label class="form-field"><span>steps / 文件</span>
-                <input type="number" id="train-steps" value="20" min="1"></label>
-            </div>
-            <div class="row" style="margin-top:14px">
-              <button class="act" id="train-enqueue">提交训练任务</button>
-              <span class="hint" id="train-enqueue-msg"></span>
-            </div>
+
           </div>
-          <div class="card">
-            <div class="card-head"><span class="card-title">训练队列</span>
-              <button class="act sec xs" id="queue-refresh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6"/></svg>刷新</button></div>
-            <div id="train-queue"><span class="hint">加载中…</span></div>
-          </div>
-        </div>
-        <div class="train-bottom">
-          <div class="card" id="train-log-card">
-            <div class="card-head"><span class="card-title">训练日志</span>
-              <span class="row" style="margin:0">
+
+          <div class="train-col">
+            <div class="card train-queue-card">
+              <div class="card-head"><span class="card-title">未完成</span>
+                <span class="hint" id="train-pending-count">0 项</span></div>
+              <div class="train-list" id="train-queue"><span class="hint">加载中…</span></div>
+              <div class="train-controls">
                 <button class="act xs" id="train-start">开始训练</button>
                 <button class="act danger xs" id="train-stop">停止</button>
                 <span class="hint" id="train-state"></span>
-              </span>
+              </div>
             </div>
+            <div class="card train-done-card">
+              <div class="card-head"><span class="card-title">已经完成的任务列队</span>
+                <span class="hint" id="train-done-count">0 项</span></div>
+              <div class="train-list" id="train-done-list"><span class="hint">加载中…</span></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ============ 视图 2：训练日志 ============ -->
+        <div class="train-view train-logs" id="train-view-logs" hidden>
+          <div class="card" id="train-log-card">
+            <div class="card-head"><span class="card-title">训练日志</span>
+              <span class="row" style="margin:0">
+                <button class="act sec xs" id="train-log-refresh">刷新</button>
+                <span class="hint" id="train-log-state">—</span>
+              </span></div>
             <pre id="train-log">—</pre>
           </div>
+          <div class="card" id="train-events-card">
+            <div class="card-head"><span class="card-title">事件</span>
+              <span class="hint" id="train-events-count"></span></div>
+            <div class="train-events" id="train-events"><span class="hint">加载中…</span></div>
+          </div>
+        </div>
+
+        <!-- ============ 视图 3：loss 曲线 ============ -->
+        <div class="train-view train-loss" id="train-view-loss" hidden>
           <div class="card" id="train-loss-card">
             <div class="card-head"><span class="card-title">Loss 曲线</span>
-              <span class="hint">每步 = 单个样本随机窗口的独立 loss；点与点之间不做平均</span></div>
-            <canvas class="chart" id="loss-canvas" width="1200" height="240"></canvas>
+              <span class="row" style="margin:0">
+                <button class="act sec xs" id="train-loss-refresh">刷新</button>
+                <span class="hint" id="train-loss-summary">—</span>
+              </span></div>
+            <div class="loss-tabs" id="loss-tabs"><span class="hint">暂无 loss 数据</span></div>
+            <div class="loss-chart-wrap"><canvas class="chart" id="loss-canvas" width="1200" height="240"></canvas></div>
+            <div class="hint" id="loss-legend">每个标签页 = 一个训练文件；横轴为训练 step，每个点 = 单个样本窗口的独立 loss，点与点之间不做平均。</div>
           </div>
         </div>
       </section>
@@ -434,6 +564,54 @@
            所有：宿主只给一块满高容器 + 受控 API，插件自己画 DOM、自己
            解析输入、自己决定怎么展示 token。见 plugins/README.md。 -->
       <section class="page" id="p-infer">
+        <!-- 状态/指标条：2026-11-05 起【归宿主】画，不再属于显示插件。
+             原先默认插件 tokens.js 自己画 .tk-head（左「TOKEN 对话」+ 右
+             TTFT/tok/s/tokens/上下文/model），换插件就会整条消失或各画一套。
+             现在宿主统一负责，插件只管对话流与输入区。
+             状态文字由 app.js::renderInferStatus 按推理阶段更新：
+             空闲 / 加载中 / encoding / decoding / 已完成 / 出错 / 已取消。
+             注意：此条已在源码中，集成阶段请勿重复插入 #infer-statusbar
+             （重复 id 会让 $() 只取第一个，状态更新会落到错误那条上）。 -->
+        <div id="infer-statusbar" class="infer-statusbar">
+          <div class="infer-status" id="infer-status" data-phase="idle">
+            <i class="dot"></i><span id="infer-status-text">空闲</span>
+          </div>
+          <div class="infer-metrics" id="infer-metrics">
+            <span class="im"><i>TTFT</i><b id="im-ttft">—</b></span>
+            <span class="im"><i>tok/s</i><b id="im-tps">—</b></span>
+            <span class="im"><i>tokens</i><b id="im-count">0</b></span>
+            <span class="im"><i>上下文</i><b id="im-ctx">0</b></span>
+            <span class="im"><i>model</i><b id="im-model">—</b></span>
+            <!-- 2026-11-08：MoMW 常驻指标 + 浮层面板入口。走 /api/infer/stats
+                 的 momw 字段 1.2s 轮询，不额外起定时器、不占插件布局高度。 -->
+            <span class="im" id="momw-open" style="cursor:pointer"
+                  title="查看 MoMW 三阶段记忆阀门"><i>MoMW</i><b id="im-momw">—</b></span>
+          </div>
+        </div>
+
+        <!-- MoMW 记忆阀门面板（宿主侧渲染，absolute 浮层） -->
+        <div id="momw-panel" class="card" hidden
+             style="position:absolute;right:12px;top:38px;width:360px;max-width:calc(100% - 24px);z-index:40;padding:10px 12px;box-shadow:0 10px 32px rgba(0,0,0,.35)">
+          <div class="row" style="align-items:center;gap:8px">
+            <span class="card-title" style="font-size:13px">MoMW 记忆阀门</span>
+            <span class="badge" id="momw-state">未启用</span>
+            <span style="flex:1"></span>
+            <button class="act sec xs" id="momw-close">关闭</button>
+          </div>
+          <div class="hint" id="momw-summary" style="margin-top:6px">—</div>
+          <div id="momw-layers" style="margin-top:8px"></div>
+          <div class="row" style="margin-top:10px;gap:6px">
+            <button class="act sec xs" id="momw-silent" aria-pressed="false">静默激活</button>
+            <button class="act sec xs" id="momw-clear">清空记忆池</button>
+          </div>
+          <div class="hint" style="margin-top:8px">
+            <b>阶段一</b> 锚点播种（类别 Embedding 均值）→
+            <b>阶段二</b> 状态特征漂移（γ 越大越依赖层内记忆）→
+            <b>阶段三</b> 空层分裂与同类软均衡。
+            <code>γ = 1 − e^(−writes/k)</code>，E 由 SᵀS 增量幂迭代提取。
+            静默激活时路由与写入照常，但不把 ΔH 注入输出。
+          </div>
+        </div>
         <div id="plugin-host" class="plugin-host"></div>
       </section>
 
@@ -455,7 +633,7 @@
           </div>
           <div class="pane">
             <div class="pane-head"><span>输出 token</span>
-              <span class="note">token-5 时间步格式</span></div>
+              <span class="note">token-6 时间步格式</span></div>
             <div class="pane-body"><pre id="text-out">—</pre></div>
           </div>
         </div>
@@ -674,6 +852,8 @@
           <button class="act sec" id="json-minify">压缩</button>
           <button class="act sec" id="json-copy">复制</button>
           <button class="act" id="json-export">导出 .tokens</button>
+          <button class="act sec" id="json-import">导入 .tokens</button>
+          <input type="file" id="json-import-file" accept=".tokens" hidden>
           <button class="act sec" id="json-clear" title="清空编辑器里的全部 token">清空</button>
           <select id="json-vocab" style="width:auto;min-width:160px"
                   title="导出时按哪个词表解析 token 名（&lt;stop&gt; 等）与校验 ID"></select>
@@ -864,6 +1044,19 @@
             模型宽度 <b>d_model</b> 建模时也可选（默认 1024，128 的倍数、无上限）：
             它只改语义向量宽度，注意力头数/头维、MLA 低秩秩与 FFN 隐藏宽度仍是冻结架构值。
           </p>
+          <p class="about-p">
+            <b>第一个 Block 之后是记忆阀门</b>：全局 <b>fast weight</b>（一个 KDA 层，状态跨调用持久，
+            encoder 与 decoder 共享同一份）先用旧状态读出、再按门控 delta 规则写入。
+            可选启用 <b>MoMW（Mixture-of-Memory-Weights）</b> 后，同址再并列一个<b>无训练</b>的三阶段记忆池：
+            <b>锚点播种</b>（类别代表性 token Embedding 均值定初始路由）→
+            <b>状态特征漂移</b>（SᵀS 增量幂迭代取主特征 E，γ 随写入次数增长，路由从外部锚点
+            过渡到层内实际记住的语义）→ <b>空层分裂</b>（‖S‖ 增长过快时新建零状态层、绝不 clone，
+            配指数衰减 bonus 与同类软均衡）。按阈值召回 Top-N 层加权注入 <code>ΔH</code>；
+            没有相关记忆就直接返回 <code>H_1</code>，退化为标准形态。
+            池层共享同一份 KDA 权重、只各自持独立递推状态，<b>不新增任何参数、不改检查点</b>；
+            未被召回的层完全不前向，状态也就不推进（未被召回则不遗忘）。
+            锚点在首次前向惰性计算、不进检查点；状态按会话隔离，可在推理面板清空或静默激活。
+          </p>
           <svg class="about-svg" viewBox="0 0 680 130" role="img"
                aria-label="block 内部：KDA 与 FFN 交替三次，接 MLA-CSA、FFN、MLA-HCA、FFN，块末 AttnRes">
             <text x="6" y="20" style="font-size:11px;fill:var(--fg3)">输入 → 残差流（每个子层前：AttnRes 深度聚合 → RMSNorm）</text>
@@ -952,35 +1145,70 @@
         </div>
 
         <div class="card">
-          <div class="card-head"><span class="card-title">4. 词表：冻结的契约头 + 可变的可见区</span></div>
+          <div class="card-head"><span class="card-title">4. 词表 base1.3.0：六段契约头 + config 决定的预留槽位</span></div>
           <p class="about-p">
-            词表不是「一个 txt」，而是一个文件夹（<code>vocabs/&lt;name&gt;/{vocab.vfc, config.json}</code>）。
-            ID 必须严格连续 <code>0..N-1</code>，一个空位都不留——空位也要吃一行 embedding。
-            前 <b>9614</b> 个 ID 是<b>架构契约头</b>（special 6 + system 3 + draw 9605），
-            所有词表逐字一致、不可增删；可见区（数字 / 空白 / 符号 / emoji / 中日韩 / 英文 / 兜底字母）长度由各词表自己决定。
+            词表不是「一个 txt」，而是一个文件夹（<code>vocabs/&lt;name&gt;/{vocab.vfc, config.json}</code>），
+            基础词表带版本号 <b>base1.3.0</b>。ID 必须严格连续 <code>0..N-1</code>。
+            契约头 = <b>六段</b>：<b>core 3</b>（<code>&lt;caps&gt;</code>/<code>&lt;stop&gt;</code>/<code>&lt;draw:end&gt;</code>，
+            最早就有的机制单标记，单开一类、<code>&lt;&gt;</code> 形态、无闭合、挂 TYPE_NONE）、
+            <b>boundary 6</b>（<code>[user]</code> 等 <code>[]</code> 段边界）、
+            <b>system 3</b>（<code>{ } |</code>）、<b>slot N</b>、
+            <b>typst 228</b>（114 个 Typst 语法构造 × 显式开/闭对，
+            <code>&lt;DOC&gt;</code>/<code>&lt;/DOC&gt;</code> …
+            <code>&lt;ATTR&gt;</code>/<code>&lt;/ATTR&gt;</code>；
+            <code>&lt;&gt;</code> tools，与 core 同类、不可显示、进 loss、挂 TYPE_NONE）、
+            <b>draw 9605</b>。typst 插在 slot 之后、draw 之前
+            （TYPST_BEGIN = 12+N、TYPST_END = 240+N）。
+            <b>N 不由 spec 钉死，而由每份词表 config 的 <code>slot_count</code> 决定</b>：
+            <b>base 零预留</b>（N=0 → HEAD_SIZE 9845、DRAW_BEGIN 240）；
+            想要 N 个槽位就跑 <code>gen_vocab.py --name NAME --slots N</code>
+            以 base 为模板生成新词表（HEAD_SIZE = 9845+N、DRAW_BEGIN = 240+N）。
+            <b>1.2.0 起不再预定义任何工具 / 排版 token</b>：槽位按编号显示、语义
+            由使用者在 <code>spec.SLOT_DEFS</code> 自己定义，执行先全部不接
+            （工具台与测试台）；槽位整段挂 <b>TYPE_SYS</b>。
+            可见区（数字 / 空白 / 符号 / emoji / 中日韩 / 英文 / 兜底字母 /
+            1.1.0 追加的 474 个<b>代码</b> token）长度由各词表自己决定；
+            1.3.0 在末尾再追加 <b>unicode_ext 区 3537 个字符</b>（31 个 Unicode
+            区块：拉丁扩展 / 西里尔 / 希腊 / 假名 / 数学符号等，category=regular），
+            全表 <b>vocab_size = 80262</b>（76497 + 228 + 3537），MAX_VOCAB_SIZE 仍 100000。
+            <b>本轮 ID 整体位移</b>（DRAW_BEGIN 64 → 12 → 240；1.3.0 中 draw 与
+            全部可见区 +228），旧 .tokens / 权重 / 存档一律不可读。
+            .tokens 用 <b>token-6</b> 编码（6 bit/字符，29 单字符 + 6 原子边界，终止码 63）。
           </p>
-          <svg class="about-svg" viewBox="0 0 680 120" role="img"
-               aria-label="词表布局：契约头与可见区">
+          <svg class="about-svg" viewBox="0 0 680 128" role="img"
+               aria-label="词表布局：六段契约头（含 typst 段与 config 决定的预留槽位）与可见区">
             <g style="font-size:10.5px">
-              <rect x="6" y="30" width="52" height="30" style="fill:var(--amber)" opacity=".55"/>
-              <text x="32" y="49" text-anchor="middle" style="fill:var(--fg)">special</text>
-              <rect x="58" y="30" width="30" height="30" style="fill:var(--green)" opacity=".55"/>
-              <text x="73" y="49" text-anchor="middle" style="fill:var(--fg)">sys</text>
-              <rect x="88" y="30" width="230" height="30" style="fill:var(--accent)" opacity=".55"/>
-              <text x="203" y="49" text-anchor="middle" style="fill:var(--fg)">draw（含画布声明 token）</text>
-              <rect x="318" y="30" width="70" height="30" style="fill:var(--fill-2)"/>
-              <text x="353" y="49" text-anchor="middle" style="fill:var(--fg2)">数字/空白</text>
-              <rect x="388" y="30" width="80" height="30" style="fill:var(--fill)"/>
-              <text x="428" y="49" text-anchor="middle" style="fill:var(--fg2)">符号/emoji</text>
-              <rect x="468" y="30" width="120" height="30" style="fill:var(--fill-2)"/>
-              <text x="528" y="49" text-anchor="middle" style="fill:var(--fg2)">中日韩 27584</text>
-              <rect x="588" y="30" width="66" height="30" style="fill:var(--fill)"/>
-              <text x="621" y="49" text-anchor="middle" style="fill:var(--fg2)">英文 3 万</text>
+              <rect x="6" y="30" width="46" height="30" style="fill:var(--amber)" opacity=".6"/>
+              <text x="29" y="49" text-anchor="middle" style="font-size:9px;fill:var(--fg)">core</text>
+              <rect x="52" y="30" width="50" height="30" style="fill:var(--green)" opacity=".55"/>
+              <text x="77" y="49" text-anchor="middle" style="font-size:9px;fill:var(--fg)">boundary</text>
+              <rect x="102" y="30" width="26" height="30" style="fill:var(--fill-2)"/>
+              <text x="115" y="49" text-anchor="middle" style="font-size:8px;fill:var(--fg2)">sys</text>
+              <rect x="128" y="30" width="92" height="30" style="fill:var(--red)" opacity=".6"/>
+              <text x="174" y="49" text-anchor="middle" style="font-size:9px;fill:var(--fg)">slot N（base 0）</text>
+              <rect x="220" y="30" width="30" height="30" style="fill:var(--amber)" opacity=".8"/>
+              <text x="235" y="49" text-anchor="middle" style="font-size:8px;fill:var(--fg)">typst</text>
+              <rect x="250" y="30" width="120" height="30" style="fill:var(--accent)" opacity=".55"/>
+              <text x="310" y="49" text-anchor="middle" style="font-size:9px;fill:var(--fg)">draw（含画布声明）</text>
+              <rect x="370" y="30" width="52" height="30" style="fill:var(--fill-2)"/>
+              <text x="396" y="49" text-anchor="middle" style="font-size:8px;fill:var(--fg2)">数字/空白</text>
+              <rect x="422" y="30" width="62" height="30" style="fill:var(--fill)"/>
+              <text x="453" y="49" text-anchor="middle" style="font-size:8px;fill:var(--fg2)">符号/emoji</text>
+              <rect x="484" y="30" width="88" height="30" style="fill:var(--fill-2)"/>
+              <text x="528" y="49" text-anchor="middle" style="font-size:8px;fill:var(--fg2)">中日韩 27584</text>
+              <rect x="572" y="30" width="54" height="30" style="fill:var(--fill)"/>
+              <text x="599" y="49" text-anchor="middle" style="font-size:8px;fill:var(--fg2)">英文 3 万</text>
+              <rect x="626" y="30" width="20" height="30" style="fill:var(--fill-2)"/>
+              <text x="636" y="49" text-anchor="middle" style="font-size:8px;fill:var(--fg2)">兜</text>
+              <rect x="646" y="30" width="28" height="30" style="fill:var(--accent)" opacity=".55"/>
+              <rect x="646" y="30" width="28" height="30" style="fill:none;stroke:var(--accent)"/>
+              <text x="660" y="49" text-anchor="middle" style="font-size:8px;fill:var(--fg)">code</text>
             </g>
-            <path d="M6,70 L6,78 M294,70 L294,78" style="stroke:var(--fg3);stroke-width:1"/>
-            <text x="150" y="92" text-anchor="middle" style="font-size:11px;fill:var(--fg3)">架构契约头 0 … 9613（所有词表一致，冻结）</text>
-            <path d="M300,70 L300,78 M654,70 L654,78" style="stroke:var(--fg3);stroke-width:1"/>
-            <text x="477" y="92" text-anchor="middle" style="font-size:11px;fill:var(--fg3)">可见区 9614 … N-1（每个词表可以不同）</text>
+            <path d="M6,70 L6,78 M370,70 L370,78" style="stroke:var(--fg3);stroke-width:1"/>
+            <text x="188" y="92" text-anchor="middle" style="font-size:11px;fill:var(--fg3)">架构契约头 0 … 9844+N（base N=0 → 9845 个，含 typst 228）</text>
+            <path d="M370,70 L370,78 M674,70 L674,78" style="stroke:var(--fg3);stroke-width:1"/>
+            <text x="522" y="92" text-anchor="middle" style="font-size:11px;fill:var(--fg3)">可见区 9845+N … 末尾（含 1.3.0 追加的 unicode_ext 3537 字）</text>
+            <text x="174" y="112" text-anchor="middle" style="font-size:9.5px;fill:var(--fg3)">↑ slot N 由 config 决定；base 零预留，gen_vocab.py 生成带槽位的新词表</text>
           </svg>
         </div>
 
@@ -993,6 +1221,8 @@
             全部 <b>1 token = 1 像素</b>（上限即画布上限 1920×1080）、
             <code>theta</code>（3 bin/度，≥90° 交换宽高）、
             <code>shape</code>（背景/矩形/椭圆）、<code>r</code>/<code>g</code>/<code>b</code>（10 bit，1024 档）。
+            专用的 <code>&lt;draw:end&gt;</code> token 表示绘画结束，之后的输出恢复为普通文本；
+            Infer-Plug v1.0.0 检测到画布声明就实时渲染画布，时间轴可拖回任意一步。
           </p>
           <svg class="about-svg" viewBox="0 0 680 96" role="img"
                aria-label="一条图元序列：画布 token 加每图元 9 个 token">
@@ -1063,88 +1293,205 @@
 
       <!-- ==================== 设置 ==================== -->
       <section class="page scroll" id="p-settings">
-        <div class="card">
-          <div class="card-head"><span class="card-title">主题</span></div>
-
-          <div class="set-row">
-            <div class="set-info">
-              <div class="set-name">模式</div>
-              <div class="set-desc">界面底色。「跟随系统」会随 macOS 外观自动切换。</div>
-            </div>
-            <div class="seg" id="set-theme">
-              <button data-v="dark">深色</button>
-              <button data-v="light">浅色</button>
-              <button data-v="auto">跟随系统</button>
-            </div>
+        <div class="set-layout">
+          <div class="set-nav" id="set-nav">
+            <button class="set-nav-item on" type="button" data-cat="appearance">外观</button>
+            <button class="set-nav-item" type="button" data-cat="hotkeys">快捷键</button>
+            <button class="set-nav-item" type="button" data-cat="history">历史对话</button>
+            <button class="set-nav-item" type="button" data-cat="env">环境与依赖</button>
           </div>
 
-          <div class="set-row">
-            <div class="set-info">
-              <div class="set-name">对比度</div>
-              <div class="set-desc">高对比给每个框加一圈边线，边界更清楚。</div>
-            </div>
-            <div class="seg" id="set-contrast">
-              <button data-v="normal">普通</button>
-              <button data-v="high">高对比</button>
-            </div>
-          </div>
+          <div class="set-panes" id="set-panes">
+            <!-- 外观 -->
+            <div class="set-pane" id="set-pane-appearance">
+              <div class="card">
+                <div class="card-head"><span class="card-title">主题</span></div>
 
-          <div class="set-row">
-            <div class="set-info">
-              <div class="set-name">圆角半径</div>
-              <div class="set-desc">全站唯一的一个 R 值：卡片、按钮、表格、弹窗、边栏共用它，小徽章与胶囊由它派生。</div>
-            </div>
-            <div class="set-ctl">
-              <input type="range" class="slider" id="set-radius"
-                     min="0" max="24" step="1" value="16"
-                     aria-label="圆角半径">
-              <span class="set-val" id="set-radius-val">16px</span>
-            </div>
-          </div>
-        </div>
+                <div class="set-row">
+                  <div class="set-info">
+                    <div class="set-name">模式</div>
+                    <div class="set-desc">界面底色。「跟随系统」会随 macOS 外观自动切换。</div>
+                  </div>
+                  <div class="seg" id="set-theme">
+                    <button data-v="dark">深色</button>
+                    <button data-v="light">浅色</button>
+                    <button data-v="auto">跟随系统</button>
+                  </div>
+                </div>
 
-        <div class="card">
-          <div class="card-head">
-            <span class="card-title">快捷键</span>
-            <button class="act sec xs" id="hotkey-reset">恢复默认</button>
-          </div>
+                <div class="set-row">
+                  <div class="set-info">
+                    <div class="set-name">对比度</div>
+                    <div class="set-desc">高对比给每个框加一圈边线，边界更清楚。</div>
+                  </div>
+                  <div class="seg" id="set-contrast">
+                    <button data-v="normal">普通</button>
+                    <button data-v="high">高对比</button>
+                  </div>
+                </div>
 
-          <div class="set-row">
-            <div class="set-info">
-              <div class="set-name">隐藏 / 展开边栏</div>
-              <div class="set-desc">切换左侧导航栏的显示状态。</div>
+                <div class="set-row">
+                  <div class="set-info">
+                    <div class="set-name">圆角半径</div>
+                    <div class="set-desc">全站唯一的一个 R 值：卡片、按钮、表格、弹窗、边栏共用它，小徽章与胶囊由它派生。</div>
+                  </div>
+                  <div class="set-ctl">
+                    <input type="range" class="slider" id="set-radius"
+                           min="0" max="24" step="1" value="16"
+                           aria-label="圆角半径">
+                    <span class="set-val" id="set-radius-val">16px</span>
+                  </div>
+                </div>
+              </div>
             </div>
-            <div class="set-ctl">
-              <span class="kbd" id="hk-label-toggleSidebar">—</span>
-              <button class="act sec xs" data-hk="toggleSidebar">录制</button>
-            </div>
-          </div>
 
-          <div class="set-row">
-            <div class="set-info">
-              <div class="set-name">切换工具（上一个）</div>
-              <div class="set-desc">在 文本 / 音频 / 图片 / 视频 / 图元绘画 / Token 编辑器 / 图元编辑器 间依次切换。</div>
-            </div>
-            <div class="set-ctl">
-              <span class="kbd" id="hk-label-prevTool">—</span>
-              <button class="act sec xs" data-hk="prevTool">录制</button>
-            </div>
-          </div>
+            <!-- 快捷键 -->
+            <div class="set-pane" id="set-pane-hotkeys" hidden>
+              <div class="card">
+                <div class="card-head">
+                  <span class="card-title">快捷键</span>
+                  <button class="act sec xs" id="hotkey-reset">恢复默认</button>
+                </div>
 
-          <div class="set-row">
-            <div class="set-info">
-              <div class="set-name">切换工具（下一个）</div>
-              <div class="set-desc">在转换工具组内循环，未在工具页时跳到第一个工具。</div>
-            </div>
-            <div class="set-ctl">
-              <span class="kbd" id="hk-label-nextTool">—</span>
-              <button class="act sec xs" data-hk="nextTool">录制</button>
-            </div>
-          </div>
+                <div class="set-row">
+                  <div class="set-info">
+                    <div class="set-name">隐藏 / 展开边栏</div>
+                    <div class="set-desc">切换左侧导航栏的显示状态。</div>
+                  </div>
+                  <div class="set-ctl">
+                    <span class="kbd" id="hk-label-toggleSidebar">—</span>
+                    <button class="act sec xs" data-hk="toggleSidebar">录制</button>
+                  </div>
+                </div>
 
-          <div class="hint" id="hotkey-msg" style="margin-top:10px">
-            点击「录制」后按下组合键即可绑定；Esc 取消。若新组合与其它动作冲突，会自动解绑旧的那一项。
-            输入框内仅带 ⌘/Ctrl 或 ⌥/Alt 的组合会生效，避免干扰打字。
+                <div class="set-row">
+                  <div class="set-info">
+                    <div class="set-name">切换工具（上一个）</div>
+                    <div class="set-desc">在 文本 / 音频 / 图片 / 视频 / 图元绘画 / Token 编辑器 / 图元编辑器 间依次切换。</div>
+                  </div>
+                  <div class="set-ctl">
+                    <span class="kbd" id="hk-label-prevTool">—</span>
+                    <button class="act sec xs" data-hk="prevTool">录制</button>
+                  </div>
+                </div>
+
+                <div class="set-row">
+                  <div class="set-info">
+                    <div class="set-name">切换工具（下一个）</div>
+                    <div class="set-desc">在转换工具组内循环，未在工具页时跳到第一个工具。</div>
+                  </div>
+                  <div class="set-ctl">
+                    <span class="kbd" id="hk-label-nextTool">—</span>
+                    <button class="act sec xs" data-hk="nextTool">录制</button>
+                  </div>
+                </div>
+
+                <div class="hint" id="hotkey-msg" style="margin-top:10px">
+                  点击「录制」后按下组合键即可绑定；Esc 取消。若新组合与其它动作冲突，会自动解绑旧的那一项。
+                  输入框内仅带 ⌘/Ctrl 或 ⌥/Alt 的组合会生效，避免干扰打字。
+                </div>
+
+                <div class="set-sub">工具直达</div>
+
+                <div class="set-row">
+                  <div class="set-info"><div class="set-name">主页</div><div class="set-desc">直达「主页」页面</div></div>
+                  <div class="set-ctl"><span class="kbd" id="hk-label-gotoHome">—</span>
+                    <button class="act sec xs" data-hk="gotoHome">录制</button></div>
+                </div>
+                <div class="set-row">
+                  <div class="set-info"><div class="set-name">推理</div><div class="set-desc">直达「推理」页面</div></div>
+                  <div class="set-ctl"><span class="kbd" id="hk-label-gotoInfer">—</span>
+                    <button class="act sec xs" data-hk="gotoInfer">录制</button></div>
+                </div>
+                <div class="set-row">
+                  <div class="set-info"><div class="set-name">模型</div><div class="set-desc">直达「模型」页面</div></div>
+                  <div class="set-ctl"><span class="kbd" id="hk-label-gotoModels">—</span>
+                    <button class="act sec xs" data-hk="gotoModels">录制</button></div>
+                </div>
+                <div class="set-row">
+                  <div class="set-info"><div class="set-name">训练</div><div class="set-desc">直达「训练」页面</div></div>
+                  <div class="set-ctl"><span class="kbd" id="hk-label-gotoTrain">—</span>
+                    <button class="act sec xs" data-hk="gotoTrain">录制</button></div>
+                </div>
+                <div class="set-row">
+                  <div class="set-info"><div class="set-name">文本</div><div class="set-desc">直达「文本」页面</div></div>
+                  <div class="set-ctl"><span class="kbd" id="hk-label-gotoText">—</span>
+                    <button class="act sec xs" data-hk="gotoText">录制</button></div>
+                </div>
+                <div class="set-row">
+                  <div class="set-info"><div class="set-name">音频</div><div class="set-desc">直达「音频」页面</div></div>
+                  <div class="set-ctl"><span class="kbd" id="hk-label-gotoAudio">—</span>
+                    <button class="act sec xs" data-hk="gotoAudio">录制</button></div>
+                </div>
+                <div class="set-row">
+                  <div class="set-info"><div class="set-name">图片</div><div class="set-desc">直达「图片」页面</div></div>
+                  <div class="set-ctl"><span class="kbd" id="hk-label-gotoImage">—</span>
+                    <button class="act sec xs" data-hk="gotoImage">录制</button></div>
+                </div>
+                <div class="set-row">
+                  <div class="set-info"><div class="set-name">视频</div><div class="set-desc">直达「视频」页面</div></div>
+                  <div class="set-ctl"><span class="kbd" id="hk-label-gotoVideo">—</span>
+                    <button class="act sec xs" data-hk="gotoVideo">录制</button></div>
+                </div>
+                <div class="set-row">
+                  <div class="set-info"><div class="set-name">图元绘画</div><div class="set-desc">直达「图元绘画」页面</div></div>
+                  <div class="set-ctl"><span class="kbd" id="hk-label-gotoPrims">—</span>
+                    <button class="act sec xs" data-hk="gotoPrims">录制</button></div>
+                </div>
+                <div class="set-row">
+                  <div class="set-info"><div class="set-name">Token 编辑器</div><div class="set-desc">直达「Token 编辑器」页面</div></div>
+                  <div class="set-ctl"><span class="kbd" id="hk-label-gotoJson">—</span>
+                    <button class="act sec xs" data-hk="gotoJson">录制</button></div>
+                </div>
+                <div class="set-row">
+                  <div class="set-info"><div class="set-name">图元编辑器</div><div class="set-desc">直达「图元编辑器」页面</div></div>
+                  <div class="set-ctl"><span class="kbd" id="hk-label-gotoPdraw">—</span>
+                    <button class="act sec xs" data-hk="gotoPdraw">录制</button></div>
+                </div>
+                <div class="set-row">
+                  <div class="set-info"><div class="set-name">词表</div><div class="set-desc">直达「词表」页面</div></div>
+                  <div class="set-ctl"><span class="kbd" id="hk-label-gotoVocab">—</span>
+                    <button class="act sec xs" data-hk="gotoVocab">录制</button></div>
+                </div>
+                <div class="set-row">
+                  <div class="set-info"><div class="set-name">终端</div><div class="set-desc">直达「终端」页面</div></div>
+                  <div class="set-ctl"><span class="kbd" id="hk-label-gotoTerm">—</span>
+                    <button class="act sec xs" data-hk="gotoTerm">录制</button></div>
+                </div>
+                <div class="set-row">
+                  <div class="set-info"><div class="set-name">设置</div><div class="set-desc">直达「设置」页面</div></div>
+                  <div class="set-ctl"><span class="kbd" id="hk-label-gotoSettings">—</span>
+                    <button class="act sec xs" data-hk="gotoSettings">录制</button></div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 历史对话 -->
+            <div class="set-pane" id="set-pane-history" hidden>
+              <div class="hist-layout">
+                <div class="hist-list" id="hist-list"></div>
+                <div class="hist-detail" id="hist-detail">
+                  <div class="card-head"><span class="card-title">会话详情</span>
+                    <span class="row" style="margin:0">
+                      <button class="act sec xs" id="set-hist-refresh">刷新</button>
+                      <button class="act sec xs" id="hist-open">在推理页继续</button>
+                      <button class="act danger xs" id="hist-delete">删除会话</button></span></div>
+                  <div class="field"><label>内容解析插件</label><select id="hist-plugin"></select></div>
+                  <div class="hint">默认用该会话自己的插件解析内容，也可以临时换一个。</div>
+                  <div id="hist-content" class="hist-content"></div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 环境与依赖 -->
+            <div class="set-pane" id="set-pane-env" hidden>
+              <div class="card-head"><span class="card-title">环境与依赖</span>
+                <button class="act sec xs" id="set-env-refresh">刷新</button></div>
+              <div class="note" id="set-env-msg"></div>
+              <div class="env-dep-list" id="env-dep-list"></div>
+              <div class="sec-head"><h2 class="sec-title">本机可用 binaries</h2></div>
+              <div class="env-bin-list" id="env-bin-list"></div>
+            </div>
           </div>
         </div>
       </section>
@@ -1166,8 +1513,12 @@
         <div class="brand">开发者选项</div>
       </div>
       <div class="right-nav">
-        <!-- 上下文占用：两条 bar 分别对应完整区 / 压缩区，数值在右侧 -->
-        <div class="nav-group first"><span>上下文</span></div>
+        <!-- 组 1：KV 与上下文 -->
+        <div class="nav-group first"><span>KV 与上下文</span></div>
+        <div class="dev-switch-row"><span>启用 KV cache</span>
+          <button id="dev-kv-enable" class="dev-toggle" type="button" role="switch" aria-checked="true"
+            title="关掉后每轮重发完整上下文，省内存但重复计算"><i></i></button></div>
+        <div class="hint">每个对话独立：开启时只发送新增 token 并复用服务端 KV；关闭时每轮重发完整上下文。内存不够可关掉。</div>
         <div class="meter">
           <div class="meter-top"><span>完整上下文</span>
             <b class="meter-val" id="ctx-full-val">0 / 0</b></div>
@@ -1178,12 +1529,14 @@
             <b class="meter-val" id="ctx-comp-val">0 / 0</b></div>
           <div class="meter-bar"><i id="ctx-comp-bar"></i></div>
         </div>
-        <div class="meter-kv"><span>KV cache</span><b id="ctx-kv-val">—</b></div>
+        <div class="meter-kv"><span>KV 内存占用</span><b id="kv-mem-val">—</b></div>
+        <div class="meter-bar"><i id="kv-pct-bar"></i></div>
+        <div class="meter-kv"><span>占用率</span><b id="kv-pct-val">—</b></div>
 
-        <!-- fast weight：状态本身（|S| 热力图）+ 每头 ‖S‖ + 每步写入幅度（折线） -->
+        <!-- 组 2：fast weight：状态本身（|S| 热力图）+ 每头 ‖S‖ + 每步写入幅度（折线） -->
         <div class="nav-group"><span>fast weight</span></div>
         <div class="fw-card">
-          <canvas id="fw-canvas" class="fw-canvas"></canvas>
+          <canvas id="fw-canvas" class="fw-canvas" width="600" height="600"></canvas>
           <div class="fw-cap"><span>状态 |S| · 头均值（颜色=写得轻重）</span>
             <b id="fw-norm">—</b></div>
           <div class="fw-heads" id="fw-heads" title="每个注意力头的 ‖S‖：哪颗头在记东西"></div>
@@ -1191,10 +1544,13 @@
           <div class="fw-cap"><span>写入幅度 / 步（Δ‖S‖）</span>
             <b id="fw-write-val">—</b></div>
         </div>
+        <button class="act sec xs" id="fw-clear" title="把这个会话的 fast weight 状态初始化">清空 fast weight</button>
+        <div class="hint">同一会话内逐轮累积、不清空；会话之间互相隔离。</div>
 
-        <!-- 显示插件：整个推理界面由它渲染。选择器只列已可用的插件；
-             「开发中」的 base 插件不注册、不显示。导入的插件由服务端
-             /api/plugin/list 下发，出现在同一个自绘下拉里。 -->
+        <!-- 组 3：显示插件：整个推理界面由它渲染。内置两个：默认插件
+             Infer-Plug v1.0.0（正常文字 / 文件 chip / 画布预览）与
+             token 对话（转换器格式）。导入的插件由服务端 /api/plugin/list
+             下发，出现在同一个自绘下拉里。 -->
         <div class="nav-group"><span>显示插件</span></div>
         <div class="field"><label>推理界面渲染器</label>
           <select id="plugin-select" style="width:100%"></select></div>
@@ -1206,11 +1562,14 @@
         <input type="file" id="plugin-file" accept=".js,.css" multiple hidden>
         <div class="plugin-imported" id="plugin-imported"></div>
 
+        <!-- 组 4：采样参数 -->
         <div class="nav-group"><span>采样参数</span></div>
         <div class="field" title="采样温度：越低输出越确定"><label>temperature</label>
           <input type="number" id="infer-temp" value="0.8" step="0.1" min="0.05"></div>
         <div class="field" title="核采样累计概率阈值"><label>top_p</label>
           <input type="number" id="infer-topp" value="0.95" step="0.01" min="0.01" max="1"></div>
+        <div class="field" title="本轮最多生成多少个 token"><label>max new token</label>
+          <input type="number" id="infer-maxnew" value="32" min="1" max="2048" step="1"></div>
       </div>
     </div>
   </aside>

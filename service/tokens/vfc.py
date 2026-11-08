@@ -10,8 +10,10 @@
 # 编码 UTF-8，一行一个 token，每行严格是 `内容:ID`：
 #   "hello":A1B2         可显示 token（双引号包裹）
 #   'hello':A1B3         可显示 token（单引号包裹，与上行语义相同）
-#   <model>:3            不可显示标记（尖括号包裹）
-#   <cx:0>:9             不可显示标记（draw 图元；尖括号内允许 ':'）
+#   [user]:3             不可显示边界标记（方括号包裹，2026-11-05 起）
+#   <s0>:C               不可显示编号槽位标记（尖括号包裹，1.2.0）
+#   </H1>:F2             不可显示 Typst 闭标签（尖括号，1.3.0；前导 '/'）
+#   <cx:0>:9C            不可显示标记（draw 图元；包裹内允许 ':'）
 # ID 是**十六进制**（2026-10-31 steve 定案：所有 token 的 ID 都是 16 进
 # 制，长度因不同词表而异），解析大小写都收、写出统一大写。冒号必须半
 # 角，且后面直接跟十六进制数字（不允许空格）。
@@ -24,16 +26,17 @@
 #   "<stop>":40000  → 文本内容恰好是 "<stop>" 这 6 个字符的可显示 token
 #                     （text = '<stop>'，visible=True）
 #
-# 【不可显示条目的 text **自带尖括号**】
-#   与 spec.SPECIAL_TOKENS / vocab.json 的 id_to_token 完全一致，例如
-#   '<caps>'、'<cx:0>'。写出时原样输出、再加 `:ID`——不二次加括号（否则
-#   会写成 '<<caps>>'）。
+# 【不可显示条目的 text **自带包裹**】
+#   与 spec.CORE_TOKENS / SPECIAL_TOKENS / SLOT_TOKENS / id_to_token 完全
+#   一致，例如 '<caps>'、'[user]'、'<s0>'、'<cx:0>'。写出时原样输出、再加
+#   `:ID`——不二次加括号（否则会写成 '<<caps>>'）。
+#   2026-11-06（1.2.0）两种包裹各有语义：<> = core 机制单标记 / slot 编号
+#   槽位，[] = 6 个 boundary 段边界。两者都不可显示、都进头部契约。
 #
 #   为什么不用裸名（'caps'）：基础词表里 stop / model / user / caps 全都
-#   是收录的英文单词（vocab.json 里分别是 ID 50948 / 52544 / 62187 /
-#   61131）。若不可显示条目取裸名，它们就会和这些可见英文词撞在「文本
-#   全表唯一」这条规则上——基础词表根本无法用 .vfc 表达。带尖括号则天然
-#   与英文单词区分开。
+#   是收录的英文单词。若不可显示条目取裸名，它们就会和这些可见英文词撞在
+#   「文本全表唯一」这条规则上——基础词表根本无法用 .vfc 表达。带包裹则
+#   天然与英文单词区分开。
 #
 #   代价：<stop>:5 与 "<stop>":N 的文本相同，受唯一性规则约束不能同时出现
 #   在同一个文件里。可接受——两者的区别由 visible 标记保留，且反查映射里
@@ -51,11 +54,19 @@
 # 重排。需要空位的场景（模型权重对齐）不通过 .vfc 表达。
 #
 # —— 架构契约头 ——
-# 文件开头 spec.HEAD_SIZE（9614）行是架构契约，名字与顺序全部从 spec.py
-# 推导（禁止硬编码）：
-#   [0, 6)     SPECIAL：spec.SPECIAL_TOKENS 的 6 个不可显示标记
-#   [6, 9)     SYSTEM ：spec.SYSTEM_CHARS（{ } |）
-#   [9, 9614)  DRAW   ：图元输出 token（spec.DRAW_VOCAB_SIZE = 9605 个：
+# 文件开头 head_size 行是架构契约，名字与顺序全部从 spec.py 推导
+# （禁止硬编码）。N = 该词表 config 的 slot_count，**base 的 N=0**：
+#   [0, 3)       CORE    ：spec.CORE_TOKENS 的 3 个机制单标记
+#   [3, 9)       BOUNDARY：spec.BOUNDARY_TOKENS 的 6 个 [] 段边界
+#                          （两者合称 spec.SPECIAL_TOKENS，共 9 个）
+#   [9, 12)      SYSTEM  ：spec.SYSTEM_CHARS（{ } |）
+#   [12, 12+N)   SLOT    ：N 个 <名字> 工具位（数量由 config 决定，spec
+#                          不钉死；名字由使用者自定义、只要求不与全表重名，
+#                          编号 <s0>..<sN-1> 是建表时的默认写法。见
+#                          infer_slot_count / _check_head）
+#   [12+N, 240+N) TYPST  ：spec.TYPST_TOKENS 的 228 个 <> 结构 token
+#                          （114 个构造 × 开/闭，base1.3.0 新增）
+#   [240+N, 9845+N) DRAW：图元输出 token（spec.DRAW_VOCAB_SIZE = 9605 个：
 #              画布定界符 4 + x 1920 + y 1080 + theta 270 + w 1920 + h 1080
 #              + shape 256 + rgb 1024×3（10 bit）+ special 3）
 # 2026-10-30 契约重构后 spec 的头也是紧凑的（不再留预留空位），所以 .vfc
@@ -83,19 +94,45 @@ MAGIC = "#gargantua-vfc-v1"
 # ID 上界：spec.MAX_VOCAB_SIZE = 100000。它不是 spec 规定的词表长度
 # （长度由每个词表的 config.json 声明），也不是格式约束（ID 是自界定
 # 十六进制，宽度不限）——纯粹是 RAM 防呆上界（每 ID 约 8KB embedding，
-# 见 spec.py），与 tok5 的 ID_LIMIT 对齐。
+# 见 spec.py），与 tok6 的 ID_LIMIT 对齐。
 MAX_VOCAB_SIZE = spec.MAX_VOCAB_SIZE
 
 # system 区：spec 有 SYSTEM_CHARS；旧版没有，退回三个 TS_* 常量
 SYSTEM_CHARS = list(getattr(spec, "SYSTEM_CHARS", None)
                     or [spec.TS_OPEN, spec.TS_CLOSE, spec.TS_SEP])
 
-# 尖括号内允许的名字：一个标识符式名字，不含空白、不含 '>'；允许 ':' 是
-# 因为 draw token 的名字形如 'cx:0'、'draw:special:0'——'>' 是唯一终止符，
+# 包裹内允许的名字：一个标识符式名字，不含空白、不含终止符；允许 ':' 是
+# 因为 draw token 的名字形如 'cx:0'、'draw:special:0'——终止符是唯一边界，
 # 所以含冒号并不产生歧义。
 _NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_./:-]*\Z")
-# 不可显示条目的 text 形态：必须是 `<名字>`（含尖括号）
-_ANGLED_TEXT_RE = re.compile(r"<[A-Za-z_][A-Za-z0-9_./:-]*>\Z")
+# 2026-11-07（base1.3.0）：Typst 结构 token 的**闭标签**形如 '</H1>'，
+# 名字以 '/' 开头——单给尖括号放宽，方括号边界仍不许前导 '/'。
+_ANGLED_NAME_RE = re.compile(r"/?[A-Za-z_][A-Za-z0-9_./:-]*\Z")
+# 不可显示条目的 text 形态（2026-11-06，token-6 / base1.2.0；
+# 2026-11-07 补 typst 闭标签）：
+#   <名字>   core 机制单标记 / slot 编号槽位 / draw（<caps>/<s0>/<cx:0>）
+#   </名字>  Typst 结构闭标签（</H1> / </DOC> …）
+#   [名字]   6 个 boundary 段边界（[user] / [user/] / [model] / [sys] …）
+# 尖括号与方括号各自成对，不允许混搭。
+_ANGLED_TEXT_RE = re.compile(r"</?[A-Za-z_][A-Za-z0-9_./:-]*>\Z")
+_BRACKET_TEXT_RE = re.compile(r"\[[A-Za-z_][A-Za-z0-9_./:-]*\]\Z")
+# 2026-11-07：slot 段的用户自定义工具名。比 _ANGLED_TEXT_RE 更严——不许
+# 前导 '/'（那是 Typst 闭标签的专属形态），也不许方括号（boundary 专属）。
+_SLOT_TEXT_RE = re.compile(r"<[A-Za-z_][A-Za-z0-9_./:-]*>\Z")
+
+
+def slot_text_ok(text: str) -> bool:
+    """slot 段的自定义工具名是否合法：`<名字>`，无前导 '/'，无空白。
+
+    名字内容不限（编号 <sN> 只是其中一种写法），唯一硬约束是「不与全表
+    已有 token 重名」——由 _check_semantics / Vocab.add_token 各自把关。
+    """
+    return isinstance(text, str) and bool(_SLOT_TEXT_RE.match(text))
+
+
+def _is_marked(text: str) -> bool:
+    """不可显示 token 的整词形态：<名字> 或 [名字]。"""
+    return bool(_ANGLED_TEXT_RE.match(text) or _BRACKET_TEXT_RE.match(text))
 
 # 行尾 `:<ID>`：冒号后紧跟十六进制数字（0-9/A-F/a-f），直到行尾（不允许
 # 空格/符号）；解析大小写都收，写出统一大写。
@@ -194,27 +231,40 @@ def draw_head_names() -> list:
 _draw_head_names = draw_head_names
 
 
-def head_entries() -> list:
+def head_entries(slot_count: int | None = None) -> list:
     """架构契约头条目：[(id, text, visible), ...]，id 从 0 起严格连续。
 
-    三段的名字与顺序全部取自 spec（spec 一改这里自动跟随，无硬编码）：
-      [0, 6)    SPECIAL：spec.SPECIAL_TOKENS（'<caps>' '<user>' '<user/>'
-                '<model>' '<model/>' '<stop>'），不可显示 → 尖括号形态；
-      [6, 9)    SYSTEM ：SYSTEM_CHARS（'{' '}' '|'）；
-      [9, 9614) DRAW   ：图元输出 token（第 0 段是画布声明的 4 个定界符
-                <x> <x/> <y> <y/>，其后 9 个图元字段 + 3 个 special bins），
-                名字由 spec 的字段布局推导。
+    六段的名字与顺序全部取自 spec（spec 一改这里自动跟随，无硬编码）：
+      CORE     spec.CORE_TOKENS（'<caps>' '<stop>' '<draw:end>'）——
+               最早就有的机制单标记，单开一类，<> 形态、无闭合；
+      BOUNDARY spec.BOUNDARY_TOKENS（'[user]' … '[sys/]'）六个段边界；
+      SYSTEM   SYSTEM_CHARS（'{' '}' '|'）；
+      SLOT     spec.SLOT_TOKENS（'<s0>'…'<sN-1>'）—— N 个编号槽位，
+               语义由使用者自己定义；
+      TYPST    spec.TYPST_TOKENS（base1.3.0）——114 个 Typst 语法构造
+               的开/闭对，'<H1>' / '</H1>' …，共 228 个 <> tools；
+      DRAW     图元输出 token（第 0 段是画布声明的 4 个定界符
+               <x> <x/> <y> <y/>，其后 9 个图元字段 + 3 个 special bins），
+               名字由 spec 的字段布局推导。
+    注意：spec.SPECIAL_TOKENS 是 CORE + BOUNDARY 的兼容别名，这里遍历它
+    等价于依次产出前两段，ID 仍严格连续。
 
     SYSTEM 区是一个例外：spec 把 { } | 归类为「不可显示」，但它们不是合法
-    标识符（尖括号内的名字必须匹配 [A-Za-z_][A-Za-z0-9_./:-]*），无法写成
+    标识符（包裹内的名字必须匹配 [A-Za-z_][A-Za-z0-9_./:-]*），无法写成
     <{> 这种形态，只能落引号 → 条目的 visible=True。也就是说 **visible 标记
     只描述文件里的包裹形态，不完全等同 spec 的「可显示/不可显示」分类**。
     加载侧按 ID 落在 [SYSTEM_BEGIN, SYSTEM_BEGIN + SYSTEM_SIZE) 判定，不受
     包裹形态影响。
 
-    头部编号与 spec 运行时 ID **是一致的**（spec 的头部区间已压缩为
-    SPECIAL 0–5 / SYSTEM 6–8 / DRAW 9–2969，中间无空位）。
+    2026-11-06（base1.2.0）：53 个预定义 agent token 全部退役，改为编号
+    槽位；caps/stop/draw:end 提到最前单开 core 段。**槽位数量由词表
+    config 决定**（spec 不定死）：base 零预留，gen_vocab.py 生成的新词表
+    可以有 N 个。slot_count=None 时用 spec 当前运行时布局。
+    2026-11-07（base1.3.0）：slot 之后、draw 之前插入 typst 段；闭标签
+    '</NAME>' 的名字以前导 '/' 开头，故本文件的 _ANGLED_* 正则放宽。
     """
+    n = spec.SLOT_COUNT if slot_count is None else int(slot_count)
+    layout = spec.head_layout(n)
     entries = []
     tid = 0
     for text in spec.SPECIAL_TOKENS:
@@ -223,23 +273,54 @@ def head_entries() -> list:
     for text in SYSTEM_CHARS:
         entries.append((tid, text, True))
         tid += 1
+    for text in layout["slot_tokens"]:
+        entries.append((tid, text, False))
+        tid += 1
+    for text in layout["typst_tokens"]:
+        entries.append((tid, text, False))
+        tid += 1
     for text in draw_head_names():
         entries.append((tid, text, False))
         tid += 1
-    assert len(entries) == spec.HEAD_SIZE, (
-        f"vfc 头部条目数 {len(entries)} != spec.HEAD_SIZE {spec.HEAD_SIZE}"
-        f"（spec 与 vfc 的契约头推导不一致）")
+    assert len(entries) == layout["head_size"], (
+        f"vfc 头部条目数 {len(entries)} != 布局 head_size "
+        f"{layout['head_size']}（slot_count={n}）")
     return entries
 
 
-def head_size() -> int:
-    """架构契约头的长度（= 头部条目数，当前 6 + 3 + 9605 = 9614）。
+def head_size(slot_count: int | None = None) -> int:
+    """架构契约头长度 = 3 + 6 + 3 + slot_count + 228 + 9605。
 
-    直接取 spec.HEAD_SIZE（spec 里由 SPECIAL_SIZE + SYSTEM_SIZE +
-    MODAL_SIZE 算出）；head_entries 里的 assert 保证这两个推导不会因为
-    spec 变更而悄悄分叉。
+    base（零预留）= 9845；每多 1 个预留槽位，head_size 与 DRAW_BEGIN 各 +1。
     """
-    return spec.HEAD_SIZE
+    return spec.head_layout(
+        spec.SLOT_COUNT if slot_count is None else slot_count)["head_size"]
+
+
+def infer_slot_count(entries) -> int:
+    """从 .vfc 条目里数出 slot 段长度（文件自描述，不依赖全局 spec）。
+
+    固定前缀 = core 3 + boundary 6 + system 3 = 12 条；其后直到**第一个
+    Typst 结构 token 之前**的条目都算 slot。
+
+    2026-11-07 放宽：slot 段的名字由使用者自定义（`<mood>` / `<mytool>`
+    都行，只要不重名），不再只认连续的 `<s0> / <s1> / …`。改用 Typst 段
+    当结束哨兵，是因为那 228 个名字由 spec 冻结、且 slot 名不得与全表
+    已有 token 重名，这个边界唯一且无歧义；12 / 228 等数字一律从 spec
+    取，不写死。旧的编号槽位词表仍然兼容（`<sN>` 本就是合法的自定义名）。
+    """
+    prefix = spec.CORE_SIZE + spec.BOUNDARY_SIZE + spec.SYSTEM_SIZE
+    typst_names = frozenset(spec.TYPST_TOKENS)
+    n = 0
+    for row in entries[prefix:]:
+        if row[1] in typst_names:
+            break
+        n += 1
+        if n > spec.MAX_SLOT_COUNT:
+            # 头部被改坏时别让 head_layout(n) 抛非 VfcError 的异常；
+            # 交给 _check_head 报「契约头对不上」，错误信息更可诊断。
+            return spec.MAX_SLOT_COUNT
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -381,11 +462,13 @@ def _dump_entry(entry) -> str:
     if visible:
         quote = _pick_quote(text)
         return quote + _escape(text, quote) + quote + f":{tid:X}"
-    # 不可显示：text 自带尖括号，原样写出后接 :ID（不二次加括号）
-    if not _ANGLED_TEXT_RE.match(text):
+    # 不可显示：text 自带包裹（<名字> 工具 / [名字] 边界），原样写出后接
+    # :ID（不二次加括号）
+    if not _is_marked(text):
         raise VfcError(
-            f"不可显示 token 的 text 必须是 <名字> 形态（名字匹配 "
-            f"[A-Za-z_][A-Za-z0-9_./:-]*）: {text!r}")
+            f"不可显示 token 的 text 必须是 <名字> / </名字> 或 [名字] 形态"
+            f"（名字匹配 /?[A-Za-z_][A-Za-z0-9_./:-]*，仅尖括号允许前导 "
+            f"'/'）: {text!r}")
     return f"{text}:{tid:X}"
 
 
@@ -439,15 +522,20 @@ def _scan(text: str, source: str):
                 errors.append(_Err(lineno, str(e)))
                 continue
             visible = True
-        elif len(body) >= 2 and body[0] == "<" and body[-1] == ">":
+        elif len(body) >= 2 and (
+                (body[0] == "<" and body[-1] == ">")
+                or (body[0] == "[" and body[-1] == "]")):
             name = body[1:-1]
-            if not _NAME_RE.match(name):
+            # 尖括号允许可选前导 '/'（Typst 闭标签 </H1>）；方括号不允许
+            name_re = _ANGLED_NAME_RE if body[0] == "<" else _NAME_RE
+            if not name_re.match(name):
                 errors.append(_Err(
                     lineno,
-                    f"{source}:{lineno} 尖括号内的名字非法: <{name}>"
-                    f"（必须匹配 [A-Za-z_][A-Za-z0-9_./:-]*）"))
+                    f"{source}:{lineno} 标记内的名字非法: {body}"
+                    f"（必须匹配 /?[A-Za-z_][A-Za-z0-9_./:-]*，"
+                    f"仅尖括号允许前导 '/'）"))
                 continue
-            # text 自带尖括号：与 spec.SPECIAL_TOKENS / vocab.json 一致
+            # text 自带包裹：与 spec.SPECIAL_TOKENS / AGENT_TOKENS 一致
             text_tok = body
             visible = False
         elif body and body[0] in "\"'":
@@ -459,11 +547,16 @@ def _scan(text: str, source: str):
                 lineno, f"{source}:{lineno} 尖括号未闭合（必须以 '>' 结尾）: "
                         f"{line}"))
             continue
+        elif body and body[0] == "[":
+            errors.append(_Err(
+                lineno, f"{source}:{lineno} 方括号未闭合（必须以 ']' 结尾）: "
+                        f"{line}"))
+            continue
         else:
             errors.append(_Err(
                 lineno,
                 f"{source}:{lineno} 内容必须用单引号/双引号（可显示 token）"
-                f"或尖括号（不可显示标记）包裹: {line}"))
+                f"或尖括号/方括号（不可显示标记）包裹: {line}"))
             continue
 
         tid = int(id_s, 16)
@@ -540,9 +633,19 @@ def _check_semantics(entries) -> list:
 
 
 def _check_head(entries) -> list:
-    """架构契约头校验：前 head_size() 个条目的 ID、文本、形态必须逐一对上。"""
+    """架构契约头校验：前 head_size() 个条目的 ID、文本、形态必须逐一对上。
+
+    槽位数从文件本身推断（infer_slot_count）——派生词表可以带任意数量
+    预留槽位，加载时不必要求全局 spec 刚好也是同一个布局。
+
+    唯一放宽的一段是 slot：它的**名字**由使用者自定义（只要求 <名字>
+    形态 + 不可显示 + 不重名），段长仍由 infer_slot_count 自描述，
+    typst / draw / core / boundary / system 五段照旧逐字冻结。
+    """
     errors = []
-    expected = head_entries()
+    slot_n = infer_slot_count(entries)
+    expected = head_entries(slot_n)
+    slot_begin = spec.CORE_SIZE + spec.BOUNDARY_SIZE + spec.SYSTEM_SIZE
     n = min(len(entries), len(expected))
     for i in range(n):
         tid, text, visible, lineno = entries[i]
@@ -551,6 +654,13 @@ def _check_head(entries) -> list:
             errors.append(_Err(
                 lineno,
                 f"架构契约头第 {i + 1} 条 ID 应为 {eid}，实际为 {tid}"))
+        elif slot_begin <= i < slot_begin + slot_n:
+            if visible or not slot_text_ok(text):
+                errors.append(_Err(
+                    lineno,
+                    f"slot 段第 {i - slot_begin + 1} 条必须是 <名字> 形态的"
+                    f"不可显示工具名（名字自定义、不允许前导 '/' 或方括号），"
+                    f"实际为 {text!r}"))
         elif text != etext or visible != evisible:
             errors.append(_Err(
                 lineno,

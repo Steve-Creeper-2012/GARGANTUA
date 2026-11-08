@@ -103,10 +103,32 @@ def build_optimizers(model, optimizer: str = "muon",
                      adamw_lr: float = 3e-4, muon_lr: float = 2e-2,
                      muon_momentum: float = 0.95):
     """ 按 spec 13 分组构建优化器。
-    返回 List[Optimizer]（训练循环里对每个 step()）。 """
+    返回 List[Optimizer]（训练循环里对每个 step()）。
+
+    optimizer 三档（2026-11-07 训练界面新增）：
+      "adamw"    全部参数 AdamW；
+      "muon"     参杂：隐藏层 2D 矩阵 Muon，embedding / lm_head / norm /
+                 标量 / 卷积等其余参数 AdamW（历史默认分工）；
+      "allmuon"  全 Muon：把 **所有 2D 参数**（含 embedding / lm_head）
+                 都交给 Muon；只有 1D 参数仍走 AdamW——Muon 的核心是
+                 矩阵正交化，对向量参数没有意义，且 2e-2 的 lr 会把
+                 RMSNorm / bias 直接推爆。这是 Muon 的物理边界，不是
+                 「没做到全 Muon」。
+    """
     import model as _m
     groups = _m.param_groups_for_optimizers(model)
     opts: List[torch.optim.Optimizer] = []
+    if optimizer == "allmuon":
+        matrices = [p for p in groups["muon"] + groups["adamw"]
+                    if p.ndim == 2]
+        vectors = [p for p in groups["adamw"] if p.ndim != 2]
+        if matrices:
+            opts.append(Muon(matrices, lr=muon_lr, momentum=muon_momentum))
+        if vectors:
+            opts.append(torch.optim.AdamW(vectors, lr=adamw_lr,
+                                          betas=(0.9, 0.95),
+                                          weight_decay=0.0))
+        return opts
     if optimizer == "muon" and groups["muon"]:
         opts.append(Muon(groups["muon"], lr=muon_lr, momentum=muon_momentum))
     else:

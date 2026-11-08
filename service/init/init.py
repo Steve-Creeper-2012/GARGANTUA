@@ -48,7 +48,8 @@ boot.bootstrap()
 import spec
 from common import (MAX_BLOCKS, model_exists, model_init_lock,
                     normalize_shared_blocks, save_checkpoint,
-                    valid_model_name, validate_ctx_config)
+                    valid_model_name, validate_ctx_config,
+                    validate_momw_config)
 from model import Gargantua
 
 
@@ -83,6 +84,16 @@ def _run(args) -> dict:
               else spec.check_d_model(args.d_model))
     except ValueError as e:
         raise SystemExit(f"[init] {e}")
+
+    # 2026-11-08：MoMW 可选记忆阀门（JSON 字符串下发完整配置）。
+    # 不传 = None = 关闭，config 里也不写这个键——旧目录 / 旧请求的
+    # config.json 逐字不变，build_model 的 strict load 完全不受影响。
+    momw_cfg = None
+    if args.momw is not None:
+        try:
+            momw_cfg = validate_momw_config(json.loads(args.momw))
+        except ValueError as e:
+            raise SystemExit(f"[init] --momw 非法: {e}")
 
     # 2026-10-25：模型精度（fp64/32/16/8/4 + int16/8/4/2）；非法名 → 拒绝
     from precision import validate_dtype
@@ -126,6 +137,7 @@ def _run(args) -> dict:
                       n_dec_blocks=dec_blocks,
                       share_enc_dec=args.share_enc_dec,
                       d_model=dm,
+                      momw=momw_cfg,
                       vocab_size=vocab_size, **ctx)
         # parameters() 由 PyTorch 去重——共享模型的 n 只算一份参数
         n = sum(p.numel() for p in m.parameters())
@@ -155,11 +167,20 @@ def _run(args) -> dict:
             "dtype": dtype_name,
             "vocab_preset": preset_name,
         }
+        # 2026-11-08：把规范化后的 MoMW 配置整份落进 manifest
+        # （build_model 的 read_momw_config 据此构造；缺键 = 关闭）。
+        if momw_cfg is not None:
+            config["momw"] = momw_cfg
         save_checkpoint(d, m, config)
         # 词表已在建模之前复制进 models/NAME/vocab/（见上方 install_model_vocab）
         # ——这里不再重复 seed：重复复制会覆盖用户在建模期间可能做的改动。
     _say(f"[init] 词表预设: {preset_name}  dtype: {dtype_name}"
          f"  d_model: {m.d_model}")
+    if momw_cfg is not None:
+        _say(f"[init] MoMW 记忆阀门: "
+             f"{'启用' if momw_cfg['enabled'] else '关闭'}"
+             f"（N={momw_cfg['N']} tau={momw_cfg['tau']} "
+             f"threshold={momw_cfg['threshold']} M={momw_cfg['M']}）")
     _say(f"[init] 权重模式: " + (
         f"共享（enc/dec 各 {len(m.enc_blocks)} 层逐层绑定，只落一份参数）"
         if args.share_enc_dec else "分离"))
@@ -171,6 +192,7 @@ def _run(args) -> dict:
          f"（两视图都读完整区）")
     return {"name": args.name, "dir": d, "params": n,
             "d_model": m.d_model,
+            "momw_enabled": bool(momw_cfg and momw_cfg["enabled"]),
             "share_enc_dec": bool(args.share_enc_dec),
             "n_enc_blocks": len(m.enc_blocks),
             "n_dec_blocks": len(m.dec_blocks),
@@ -207,6 +229,9 @@ def main():
     ap.add_argument("--hca-ratio", type=int, default=None,
                     help=f"HCA 压缩比 N:1（默认 {spec.HCA_RATIO}，"
                          f"全局概括视图；须 ≥ csa-ratio）")
+    ap.add_argument("--momw", default=None,
+                    help="MoMW 可选记忆阀门配置（JSON 对象，例如 "
+                         '{"enabled": true}）；不传 = 关闭（默认）')
     ap.add_argument("--json", action="store_true",
                     help="末行输出 JSON 结果（server run_oneshot 协议）")
     # ---- 词表预设 + 精度（2026-10-25）----

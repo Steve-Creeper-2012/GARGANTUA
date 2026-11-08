@@ -36,12 +36,15 @@ data/
 logs/
 *.safetensors
 
-# 词表预设（vocabs/<name>/vocab.txt）：base 由 service/tokens/vocab.json
-# 的可见区确定性派生（vocab_presets.ensure_base 幂等重建）。
-# 策略：原始 base 词表（vocabs/base/）是共享资产，供 fork 用户直接使用，进仓库；
-# 其余自定义预设仍是用户本地产物，不进仓库（与 models/ 同性质）。models/ 也保持忽略。
+# 词表预设（vocabs/<name>/{vocab.vfc, config.json}）：base 由
+# service/tokens/build_vocab.py 确定性构建，再整份复制到
+# vocabs/<spec.BASE_VOCAB_NAME>/（含 typst_map.json 等表格产物）。
+# 策略：带版本号的 base 目录是共享资产，进仓库；其余自定义预设 / fork
+# 仍是用户本地产物，不进仓库（与 models/ 同性质）。models/ 也保持忽略。
+# 2026-11-07：base 已版本化（1.0.0 → … → base1.3.0），旧的单数
+# !vocabs/base/ 规则会让新版本目录被静默忽略，故放行为 base*。
 vocabs/*
-!vocabs/base/
+!vocabs/base*/
 
 # 测试/构建缓存
 .pytest_cache/
@@ -62,12 +65,14 @@ service/*/output/*
 !service/*/output/README.md
 
 # 显示插件注册表 + 导入的插件文件都是用户本地数据，不进仓库。
-# 内置 tokens.js / tokens.css / README.md 是代码，保持跟踪。
+# 内置 tokens.* / infer-plug.* / README.md 是代码，保持跟踪。
 service/web/plugins/_imported.json
 service/web/plugins/*.js
 !service/web/plugins/tokens.js
+!service/web/plugins/infer-plug.js
 service/web/plugins/*.css
 !service/web/plugins/tokens.css
+!service/web/plugins/infer-plug.css
 
 # WorkBuddy 应用卡片预览文件（.wbapp_*.genie），本地产物，不进仓库
 .wbapp_*.genie

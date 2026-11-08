@@ -20,6 +20,7 @@
 #   python start/setup_env.py --stage all
 #   python start/setup_env.py --install PKG...        只装指定包（内部调用）
 #   python start/setup_env.py --install --upgrade PKG...
+#   python start/setup_env.py --uninstall NAME        卸载指定依赖（pip 包 / 本地工具）
 #   python start/setup_env.py --python-assets         输出引导层要的资产名/URL
 #
 # install / update 是**唯一**的依赖与环境安装入口：GUI 只读展示状态，
@@ -522,6 +523,103 @@ def install_all(upgrade: bool = False) -> None:
     log("✓ 环境与依赖" + ("已更新" if upgrade else "已安装") + "（全部在项目内）")
 
 
+# ---------------------------------------------------------------------------
+# 卸载：--uninstall <name>（成员 C，2026-11-05）
+#   * pip 包 → 项目内 venv 里 pip uninstall -y（与 pip_install 同一套
+#     isolated_env / 项目内缓存 / 项目内解释器，绝不用系统 pip/解释器）；
+#   * 本地工具/工具链（ffmpeg/node/rust…）→ realpath 白名单校验后 rmtree；
+#   * 绝不删 environment/python/ 与 environment/venv/（运行时底座）。
+# ---------------------------------------------------------------------------
+# 依赖名 → 相对 environment/ 的目录（删掉 = 卸载，下次装会重新下载/构建）
+_UNINSTALL_PACKS = {
+    "ffmpeg": os.path.join("tools", "ffmpeg"),
+    "node": os.path.join("tools", "node"),
+    "rust": "rust",
+    "cargo": "rust",
+}
+# 禁止卸载的依赖名（must 启动必备 + 运行时底座，删了起不来）
+_UNINSTALL_FORBIDDEN = {"python", "venv", "pywebview"}
+# 禁止删除的目录名（realpath 白名单之外再兜一层）
+_UNINSTALL_DIR_PROTECTED = {"python", "venv"}
+
+
+def _within(root: str, path: str) -> bool:
+    """path 是否落在 root 之内（含相等）；跨盘等异常一律判 False。"""
+    try:
+        return os.path.commonpath([root, path]) == root
+    except ValueError:
+        return False
+
+
+def pip_uninstall(vp: str, name: str) -> None:
+    """在项目内 venv 里 pip uninstall -y <name>。
+
+    与 pip_install(:326) 共用同一套上下文：项目内 venv 解释器（绝不是系统
+    Python）、项目内 pip 缓存目录、paths.isolated_env()（临时/缓存/HOME
+    全部项目内）。pip uninstall 不访问 PyPI 镜像，故不传 -i/--trusted-host
+    （那两个不是 uninstall 支持的选项）；镜像测速只在真正要下载的
+    pip_install 里发生。
+    """
+    cmd = [vp, "-m", "pip", "uninstall", "-y",
+           "--disable-pip-version-check",
+           "--cache-dir", paths.project_cache_dir("pip"),
+           name]
+    log("pip 卸载（项目内 venv，缓存/临时目录均在项目内）……")
+    r = subprocess.run(cmd, env=paths.isolated_env(), cwd=ROOT,
+                       capture_output=True, text=True, timeout=3600)
+    if r.returncode != 0:
+        raise RuntimeError("pip 卸载失败: " + (r.stderr or r.stdout)[-800:])
+
+
+def _is_pip_dep(name: str) -> bool:
+    """name 是否是 requirements/*.txt 里的 pip 依赖（跳过 _NON_PIP）。"""
+    for fname in ("must.txt", "necessary.txt"):
+        for line in _pip_requirements(fname):
+            n = line
+            for ch in "<>=!~ ":
+                n = n.split(ch, 1)[0]
+            if n.strip().lower() == name:
+                return True
+    return False
+
+
+def _uninstall_pack_dir(name: str) -> str:
+    """本地工具/工具链 → 白名单校验后的绝对目录；不合法抛 ValueError。"""
+    rel = _UNINSTALL_PACKS.get(name, name)   # 没有显式映射就按 environment/<name>/
+    target = os.path.realpath(os.path.join(paths.ENV_ROOT, rel))
+    env_root = os.path.realpath(paths.ENV_ROOT)
+    # 必须严格落在 <项目根>/environment/ 之内（不能等于 environment 根）
+    if target == env_root or not _within(env_root, target):
+        raise ValueError(f"拒绝删除不在 environment/ 内的路径: {target}")
+    # 二次兜底：任何落在 python/ 或 venv/ 内的目标一律拒绝
+    for protected in _UNINSTALL_DIR_PROTECTED:
+        prot = os.path.realpath(os.path.join(env_root, protected))
+        if _within(prot, target):
+            raise ValueError(f"禁止删除运行时底座 environment/{protected}/")
+    return target
+
+
+def uninstall(name: str) -> None:
+    """卸载单个依赖（--uninstall <name> 的实现）。"""
+    key = (name or "").strip().lower()
+    if not key:
+        raise ValueError("--uninstall 需要一个依赖名")
+    if key in _UNINSTALL_FORBIDDEN:
+        raise ValueError(f"{key} 是启动必备 / 运行时底座，"
+                         f"删除会导致环境无法启动")
+    if _is_pip_dep(key):
+        vp = ensure_venv()
+        pip_uninstall(vp, key)
+        log(f"✓ 已从项目内 venv 卸载 {key}")
+        return
+    target = _uninstall_pack_dir(key)
+    if not os.path.isdir(target):
+        log(f"{key} 未安装（{target} 不存在），无需卸载")
+        return
+    shutil.rmtree(target)
+    log(f"✓ 已删除本地工具/工具链 {key} → {target}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("command", nargs="?", default=None,
@@ -532,6 +630,9 @@ def main() -> int:
     ap.add_argument("--install", nargs="*", default=None)
     ap.add_argument("--upgrade", action="store_true")
     ap.add_argument("--constraints", default="")
+    ap.add_argument("--uninstall", metavar="NAME", default=None,
+                    help="卸载指定依赖：pip 包走项目内 venv，"
+                         "本地工具走 environment/ 白名单删除")
     ap.add_argument("--python-assets", action="store_true")
     a = ap.parse_args()
 
@@ -555,6 +656,9 @@ def main() -> int:
         if not a.install:
             raise SystemExit("[setup] --install 至少需要一个包名")
         install(a.install, a.upgrade, a.constraints)
+        return 0
+    if a.uninstall is not None:
+        uninstall(a.uninstall)
         return 0
     if a.stage in ("runtime", "all"):
         stage_runtime()

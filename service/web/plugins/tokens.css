@@ -5,7 +5,8 @@
    plugins/README.md）。所有颜色都走 app.css 的 CSS 变量，自动跟随主题；
    不引用任何主程序的类名，避免插件与宿主互相污染。
 
-   布局：root 竖向三栏 —— 顶部指标条 / 中间对话流（可滚）/ 底部输入区。
+   布局：root 竖向两栏 —— 中间对话流（可滚、吃满高度）/ 底部输入区。
+   顶部状态 / 指标条整条由宿主 #infer-statusbar 绘制，插件不再自建。
    对话流里「我」（右、accent-soft 气泡）与「模型」（左、panel 气泡）分列
    两侧，像微信；每个 token 是气泡里的一枚小 chip，文本 token 显示成
    {text: B46A}，特殊 token（<caps> 等）高亮成 accent 实色 pill。
@@ -14,33 +15,18 @@
 .tk-root {
   display: flex; flex-direction: column;
   height: 100%; min-height: 0;
+  /* (b) app.css 全局 user-select:none（白名单只有 input/textarea/pre/code/
+     [contenteditable]/.msg），聊天气泡、token chip、耗时小注都不在白名单里，
+     会被继承成不可选。这里在插件根统一放开，覆盖给所有后代。 */
+  user-select: text; -webkit-user-select: text;
+}
+/* (b) 关键可读文本再显式声明一遍，避免未来宿主规则把它盖回去 */
+.tk-bubble, .tk-toks, .tk-tok, .tk-who, .tk-note, .tk-err,
+.tk-hint, .tk-empty, .tk-input {
+  user-select: text; -webkit-user-select: text;
 }
 
-/* ---------- 顶部指标条 ---------- */
-.tk-head {
-  display: flex; align-items: center; justify-content: space-between;
-  gap: 12px; padding: 2px 2px 10px; flex-shrink: 0;
-}
-.tk-title {
-  font-size: 12px; font-weight: 800; letter-spacing: .08em;
-  color: var(--fg3); text-transform: uppercase;
-}
-.tk-metrics {
-  display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
-  justify-content: flex-end;
-}
-.tk-m { display: flex; align-items: baseline; gap: 5px; }
-.tk-m i {
-  font-style: normal; font-size: 11px; color: var(--fg3);
-  letter-spacing: .02em;
-}
-.tk-m b {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px; font-weight: 600; color: var(--fg);
-  font-variant-numeric: tabular-nums;
-}
-
-/* ---------- 对话流（可滚动） ---------- */
+/* ---------- 对话流（可滚动、吃满高度） ---------- */
 .tk-chat {
   flex: 1 1 auto; min-height: 0;
   overflow-y: auto; overflow-x: hidden;
@@ -100,7 +86,7 @@
   padding: 2px 6px; border-radius: 6px;
   background: var(--fill); color: var(--fg2);
   border: 1px solid transparent;
-  cursor: default;
+  cursor: text;                 /* (b) 允许选中复制 */
 }
 /* 特殊 token（<caps> / <user> / <model> / <stop> …）：accent 实色 pill */
 .tk-tok.sp {
@@ -121,7 +107,7 @@
   font-variant-numeric: tabular-nums;
 }
 .tk-err {
-  font-size: 12px; color: #d9534f; line-height: 1.6; margin-top: 6px;
+  font-size: 12px; color: var(--red); line-height: 1.6; margin-top: 6px;
 }
 
 /* ---------- 输入区 ---------- */
@@ -130,14 +116,34 @@
   background: var(--panel); border: 1px solid var(--border);
   border-radius: var(--r); padding: 10px 12px;
   transition: border-color .15s var(--ease);
+  /* (c) 不裁切：让 auto-grow 的 textarea 完整落在圆角边框内，别把内部
+     滚动条压成一条被外围边框遮挡的竖线。 */
+  overflow: visible;
 }
 .tk-input-box:focus-within { border-color: var(--accent); }
 .tk-input {
+  display: block; box-sizing: border-box;
   width: 100%; border: none; background: none; resize: none;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 13px; line-height: 1.6; color: var(--fg); padding: 0;
+  /* (c) auto-grow：JS 随内容把 height 设为 scrollHeight，正常情况下不出现
+     内部滚动条；超过 max-height 才滚动，避免窄输入区里被 9px 全局滚动条
+     （app.css:1463）挤成竖条。min-height 替代原 rows=2 的初始两行高度。 */
+  min-height: 3.2em;            /* 约两行 */
+  max-height: 9.6em;            /* 约六行，超出才滚动 */
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--fill-2) transparent;
 }
 .tk-input:focus { outline: none; box-shadow: none; border: none; }
+/* (c) 兜底用的细滚动条：6px、thumb 用 var(--fill-2)，覆盖全局 9px */
+.tk-input::-webkit-scrollbar { width: 6px; }
+.tk-input::-webkit-scrollbar-track { background: transparent; }
+.tk-input::-webkit-scrollbar-thumb {
+  background: var(--fill-2); border-radius: var(--r-pill);
+}
+.tk-input::-webkit-scrollbar-thumb:hover { background: var(--fg3); }
+
 .tk-tools {
   display: flex; align-items: center; gap: 10px; margin-top: 8px;
 }
@@ -145,11 +151,6 @@
   flex: 1; min-width: 0; font-size: 11px; color: var(--fg3);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.tk-num {
-  display: flex; align-items: center; gap: 6px;
-  font-size: 11px; color: var(--fg3); white-space: nowrap;
-}
-.tk-num input { width: 64px; }
 .tk-send {
   height: 32px; padding: 0 18px; border-radius: var(--r);
   background: var(--accent); color: var(--on-accent);

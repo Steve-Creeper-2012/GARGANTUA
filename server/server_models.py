@@ -46,6 +46,9 @@ class ModelManager:
         self.name = None                  # 活动模型名（登记簿）
         self.params = 0                   # 来自 config.json（非实测）
         self.ctx = None                   # 活动模型的上下文长度配置
+        # 2026-11-05：把「活动选中」(name) 与「权重已加载进 infer 进程」
+        # (loaded) 拆开——preload/unload 只动 loaded，select 只动 name。
+        self.loaded = None                # 已加载权重的模型名（str|None）
         os.makedirs(model_dir, exist_ok=True)
 
     def ctx_note(self) -> str:
@@ -73,7 +76,9 @@ class ModelManager:
                 continue
             info = {"name": os.path.basename(d), "params": None,
                     # 2026-11-04：前端在模型列表里标注共享权重模型
-                    "share_enc_dec": False}
+                    "share_enc_dec": False,
+                    # 2026-11-08：标注启用 MoMW 记忆阀门的模型
+                    "momw": False}
             cfg = os.path.join(d, "config.json")
             if os.path.exists(cfg):
                 try:
@@ -81,6 +86,10 @@ class ModelManager:
                         meta = json.load(f)
                     info["params"] = meta.get("params")
                     info["share_enc_dec"] = meta.get("share_enc_dec") is True
+                    mc = meta.get("momw")
+                    # 兼容 bool 简写与完整 dict 两种 config 写法
+                    info["momw"] = (mc.get("enabled") is True
+                                    if isinstance(mc, dict) else mc is True)
                 except Exception:
                     pass
             out.append(info)

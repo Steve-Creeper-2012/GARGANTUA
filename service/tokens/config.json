@@ -1,13 +1,21 @@
 {
-  "name": "base",
+  "name": "base1.3.0",
   "format": "gargantua-vocab-folder-v1",
+  "vocab_version": "1.3.0",
+  "token_encoding": "token-6",
   "is_main": true,
-  "built_at": "2026-11-02T12:12:28Z",
-  "vocab_size": 76020,
-  "head_size": 9614,
+  "built_at": "2026-11-07T20:33:13Z",
+  "vocab_size": 80262,
+  "head_size": 9845,
+  "slot_count": 0,
   "regions": [
     {
-      "region": "special",
+      "region": "core",
+      "category": "special",
+      "size": 3
+    },
+    {
+      "region": "boundary",
       "category": "special",
       "size": 6
     },
@@ -15,6 +23,16 @@
       "region": "system",
       "category": "system",
       "size": 3
+    },
+    {
+      "region": "slot",
+      "category": "special",
+      "size": 0
+    },
+    {
+      "region": "typst",
+      "category": "special",
+      "size": 228
     },
     {
       "region": "draw",
@@ -60,6 +78,16 @@
       "region": "fallback",
       "category": "fallback",
       "size": 26
+    },
+    {
+      "region": "code",
+      "category": "regular",
+      "size": 474
+    },
+    {
+      "region": "unicode_ext",
+      "category": "regular",
+      "size": 3537
     }
   ],
   "append_region": "extra",
@@ -71,6 +99,12 @@
     "emoji_count": 1517,
     "symbol": "Unicode P*/S* 类码点（UCD 15.0.0）排除 emoji + 全角字母数字",
     "symbol_count": 7263,
+    "typst": "gargantua-typst-token-spec.md §3 + §2（结构 token 唯一真源 spec.TYPST_CONSTRUCTS）",
+    "typst_construct_count": 114,
+    "typst_size": 228,
+    "unicode_ext": "词表新增内容.md（31 个 区块，UCD 15.0.0 已分配且 base 未逻辑覆盖）",
+    "unicode_ext_block_count": 31,
+    "unicode_ext_count": 3537,
     "unidata_version": "15.0.0"
   }
 }

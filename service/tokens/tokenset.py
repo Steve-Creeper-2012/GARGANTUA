@@ -2,7 +2,7 @@
 # GARGANTUA v1 — tokenset：.tokens 训练流的读取与展开
 # ---------------------------------------------------------------------------
 # 训练数据格式（2026-10-28 起，spec 第 5b/8 节）：
-#   .tokens = token-5 位流（tokens/tok5.py，5 bit/字符）。
+#   .tokens = token-6 位流（tokens/tok6.py，6 bit/字符）。
 #   内容必须带 { } 时间步结构，元素形态 {t:}/{w:}/{v:}/<id>。
 #   Token 编辑器「导出 .tokens」产出的就是这种文件；训练侧直接读它，
 #   不再接受 JSON/JSONL。
@@ -23,7 +23,7 @@ from __future__ import annotations
 import random
 
 import spec
-from tokens import tok5
+from tokens import tok6
 
 # 单文档位置上限：多模态要预装配整篇嵌入（N × d_model），长视频会吃光
 # 内存。超限直接拒绝，让用户切分文件，而不是把训练进程 OOM 掉。
@@ -46,14 +46,14 @@ def read_doc(path) -> dict:
     }
     """
     try:
-        items = tok5.read_file(path)
-    except tok5.Tok5Error as e:
-        raise TokensetError(f"{path}: 不是合法的 token-5 .tokens: {e}") from e
+        items = tok6.read_file(path)
+    except tok6.Tok6Error as e:
+        raise TokensetError(f"{path}: 不是合法的 token-6 .tokens: {e}") from e
     if not items:
         raise TokensetError(f"{path}: 空 .tokens 文件")
     try:
-        steps = tok5.to_steps(items)
-    except tok5.Tok5Error as e:
+        steps = tok6.to_steps(items)
+    except tok6.Tok6Error as e:
         raise TokensetError(f"{path}: {e}") from e
     if not steps:
         raise TokensetError(f"{path}: 没有任何时间步")

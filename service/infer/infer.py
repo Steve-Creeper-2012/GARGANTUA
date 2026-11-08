@@ -28,14 +28,15 @@
 #      （旧实现因此让种子的 MODEL 嵌入从未进入 KV，且每个生成 token 比
 #      训练早一步——train/infer 分布偏差，已回归测试固定）。
 #
-# 2026-11-04 现状说明（纠正此前「跨调用持久 / 杀进程等于重置记忆」的不实文档）：
-#   杀掉 infer 服务进程 → 下次推理重新加载模型；当前实现每次 generate 从零
-#   开始（state={}、kv_vecs/kv_steps 都是局部变量，m.fast_weight.reset() 清的
-#   是没被使用的 self._state），跨轮持久状态尚未接线。下面注释里的「持久/共享
-#   KV」「状态跨调用推进」只指单次 generate 内 encode→decode 跨生成步递推，
-#   不表示跨 HTTP 请求保留。
+# 2026-11-05 会话状态化：generate 增加可选 session 容器，跨轮复用递推
+#   state（含 fast weight "fw" 与 KDA 递推 "kda1/2/3"）、KV 向量与写入记录；
+#   serve() 用 LRU 维护最多 16 个会话。session=None（CLI）时仍每次从零开始，
+#   与旧行为逐位一致。m.fast_weight.reset() 只清模块内部 self._state，不清
+#   外部会话 state——fast weight 由此外部容器实现跨请求累积。KV 是否驻留由
+#   kv_enabled 控制，与 fast weight 累积相互独立。
 # ===========================================================================
 import argparse
+import gc
 import json
 import math
 import os
@@ -63,7 +64,7 @@ boot.bootstrap()
 import spec
 from common import (MAX_NEW_TOKENS, MAX_PROMPT_TOKENS,
                     build_model, model_exists)
-from tokens import tok5
+from tokens import tok6
 from tokens.text_codec import encode as text_encode, decode as text_decode
 from tokens.vocab import set_model_vocab
 
@@ -171,7 +172,7 @@ def _decode_media(items):
 # ===========================================================================
 # 推理侧 token id 存档（2026-10-25，steve：KV 可丢，id 必须落盘）
 # ---------------------------------------------------------------------------
-# 每次推理一个 .tokens 文件（token-5，每个 token 写成一个 {t:NNNNN}
+# 每次推理一个 .tokens 文件（token-6，每个 token 写成一个 {t:NNNNN}
 # 时间步），prompt 与生成 token 边产边写并 flush——KV 超出上下文上限只丢
 # KV 向量，原始 id 已经在磁盘上；进程崩溃 / 空闲退出也不丢。
 # 目录：server 传入 logs/infer_archive（随 log_path 走，测试用临时目录）；
@@ -188,7 +189,7 @@ class IdArchive:
             Path(boot.project_root()) / "logs" / "infer_archive")
         self.path: Path | None = None
         self._fh = None
-        self._w: tok5.BitWriter | None = None
+        self._w: tok6.BitWriter | None = None
         self._disabled = False
         self.n_tokens = 0
         self._vocab = vocab
@@ -216,7 +217,7 @@ class IdArchive:
                     f"{uuid.uuid4().hex[:8]}.tokens")
             self.path = self.root / name
             self._fh = open(self.path, "wb")
-            self._w = tok5.BitWriter(self._fh)
+            self._w = tok6.BitWriter(self._fh)
             return True
         except OSError as e:
             print(f"[infer] id 存档不可用（不影响推理）: {e}", file=sys.stderr)
@@ -226,8 +227,9 @@ class IdArchive:
     def add(self, ids) -> None:
         """把一批 token id 以「一 token 一步」写入存档并 flush。
 
-        不可显示 token 的 id 按扩展系统 token 写成 <NNNNN>，其余写成
-        {t:NNNNN}——与 token-5 语义一致（后者才是有向量的内容 token）。
+        不可显示 token 按 token-6 的 [] 包裹写成 [NNNNN]（6 个段边界
+        token 由 element_to_chars 写成 [user]/[sys] 等原子名），其余写成
+        {t:NNNNN}。<> 现在是工具调用，不能再拿来写扩展系统 token。
         """
         ids = [int(i) for i in ids]
         if not ids or not self._ensure():
@@ -235,8 +237,14 @@ class IdArchive:
         try:
             chars = []
             for i in ids:
-                if self._is_invisible(i):
-                    chars.append("<%X>" % i)       # ID 大写十六进制（spec 5b）
+                if ((spec.CORE_BEGIN <= i < spec.CORE_END)
+                        or (spec.SLOT_BEGIN <= i < spec.SLOT_END)
+                        or (spec.TYPST_BEGIN <= i < spec.TYPST_END)):
+                    # core 单标记 + slot 槽位 + typst 结构 token：<> 形态、
+                    # 有 KV、进 loss（base1.3.0）
+                    chars.append(tok6.element_to_chars(tok6.tool(i)))
+                elif self._is_invisible(i):
+                    chars.append(tok6.element_to_chars(tok6.ext(i)))
                 else:
                     chars.append("{t:%X}" % i)
             self._w.write_chars("".join(chars))
@@ -247,15 +255,15 @@ class IdArchive:
             self._disabled = True
 
     def add_items(self, items) -> None:
-        """把 token-5 流项直接写进存档（媒体载荷 {v:}/{w:} 用）。
+        """把 token-6 流项直接写进存档（媒体载荷 {v:}/{w:} 用）。
 
-        媒体没有词表 ID，但存档要能回放完整输入，所以按 token-5 原样
+        媒体没有词表 ID，但存档要能回放完整输入，所以按 token-6 原样
         落盘；n_tokens 按元素个数累计。
         """
         if not items or not self._ensure():
             return
         try:
-            self._w.write_chars(tok5.items_to_chars(items))
+            self._w.write_chars(tok6.items_to_chars(items))
             self._fh.flush()
             self.n_tokens += sum(len(it.get("elements") or [])
                                  for it in items if it.get("kind") == "step")
@@ -336,6 +344,37 @@ def _safe(v, nd):
     return round(f, nd) if math.isfinite(f) else 0.0
 
 
+def _detach_tree(v):
+    """递归 detach 张量：跨轮驻留会话的状态不能挂计算图（只断梯度，
+    不改数值/形状/结构）。state 值是 (S, conv_cache) 这类 tuple/dict 嵌套。"""
+    if torch.is_tensor(v):
+        return v.detach()
+    if isinstance(v, tuple):
+        return tuple(_detach_tree(x) for x in v)
+    if isinstance(v, list):
+        return [_detach_tree(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _detach_tree(x) for k, x in v.items()}
+    return v
+
+
+def _momw_snapshot(m, state: dict):
+    """MoMW 记忆阀门的实时快照（纯展示，不参与计算、不落盘）。
+
+    模型没启用 MoMW 时返回 None；前端据此隐藏面板。stats() 是纯 Python
+    数值（层类型 / γ / 写入次数 / 范数 / 激活标记 / 打分），每 token 发一次
+    也只有几 KB，不会像 fw 热力图那样吃穿内存。
+    """
+    mo = getattr(m, "momw", None)
+    if mo is None:
+        return None
+    try:
+        return mo.stats(state)
+    except Exception as e:
+        print(f"[infer] momw stats 失败: {e}", file=sys.stderr)
+        return None
+
+
 @torch.no_grad()
 def _fw_snapshot(state: dict, bins: int = spec.FW_VIZ_BINS):
     """fast weight 状态的可视化快照（纯展示，不影响计算）。
@@ -371,7 +410,9 @@ def generate(m, prompt: str | None = None, max_new: int = 32,
              temperature: float = 0.8, top_p: float = 0.95,
              archive_dir: str | None = None, model_dir: str | None = None,
              media_steps=None, on_token=None, token_ids=None,
-             fw_bins: int = spec.FW_VIZ_BINS, t0_wall=None):
+             fw_bins: int = spec.FW_VIZ_BINS, t0_wall=None,
+             session: dict | None = None, kv_enabled: bool = True,
+             on_phase=None, session_id: str | None = None):
     """ 编码 prompt → encoder → KV；decoder 逐步生成并回写共享 KV。
 
     media_steps：可选的图片/音频 Step 列表（image_codec / audio_codec 的
@@ -384,6 +425,14 @@ def generate(m, prompt: str | None = None, max_new: int = 32,
 
     on_token：每产出一个 token 回调一次（流式显示 / TTFT / 速度 / fast
     weight 写入曲线都靠它）。回调里只放「这一步发生了什么」，不含整段结果。
+
+    session：可选跨轮会话状态容器（字段见 _new_session）。给定时递推
+    state（含 fast weight / KDA 递推）、KV 向量与 fw_writes 跨调用复用；
+    None 时每次从零开始，行为与 CLI 逐位一致。
+    kv_enabled：会话模式是否驻留 KV 向量。False 时清掉会话 KV（省显存），
+    但 fast weight 仍跨轮累积——二者相互独立。
+    on_phase：阶段回调（"encoding" / "decoding" / "done"），供流式服务发帧。
+    session_id：可选，写进 meta 供前端区分会话。
 
     返回 (生成的时间步序列, id 存档路径, 本次统计)。
     """
@@ -442,35 +491,51 @@ def generate(m, prompt: str | None = None, max_new: int = 32,
     writes: list = []                # fast weight 每步写入幅度（最近 N 步）
     try:
         # 存档顺序必须与模型实际看到的顺序一致：媒体在前、文本在后。
-        # 用段边界 token 把「用户输入」包成 <user>…<user/>（含媒体与文本），
+        # 用段边界 token 把「用户输入」包成 [user]…[user/]（含媒体与文本），
         # 让 .tokens 存档本身可区分谁是谁，而不是扁平 ID 流。
         archive.add([spec.USER_ID])
         if media_steps:
-            archive.add_items(tok5.from_steps(media_steps))
+            archive.add_items(tok6.from_steps(media_steps))
         archive.add(ids)
         archive.add([spec.USER_END_ID])
 
-        # 当前实现每次 generate 从零开始：state/kv 都是本次局部量，跨轮（跨 HTTP
-        # 请求）持久状态尚未接线；m.fast_weight.reset() 清的是没被使用的
-        # self._state。下面的「状态推进」只在本次调用内 encode→decode 有效。
-        m.fast_weight.reset()
-        # 2026-10-27 审计修复（S2）：decoder 逐层递推状态（KDA S + 短卷积
-        # 历史 + fast weight）跨生成步持有——旧实现每层每步从零状态开始、
-        # 短卷积无历史缓存，与训练的整段前向不等价（长程记忆/位置递推
-        # 全丢）。encode 的 fast weight 写入也存进同一容器。
-        state: dict = {}
+        # —— 会话状态化（2026-11-05）——
+        # state 是跨轮复用的递推状态容器（fast weight "fw" + KDA 递推
+        # "kda1/2/3" + 可选 MoMW 池 "momw"，见 model.py decode 注释）。
+        # m.reset_memory() 只清模块内部状态；本函数始终传外部 state=，
+        # 故不会清掉会话里累积的记忆——这正是「跨轮记忆」的载体，不能
+        # reset 掉。reset_memory 内部仍会调 fast_weight.reset()，顺序契约
+        # （reset 必须先于第一次 encode）不变。
+        session_mode = session is not None
+        state: dict = session.setdefault("state", {}) if session_mode else {}
+        m.reset_memory()
+
+        # KV 复用：仅当开启 KV、会话里已有 KV、且模型未变时成立。此时
+        # token_ids 是本轮增量输入，step 从会话 cur_step 接续，编码输出拼到
+        # 历史 KV 之后；m.encode 仍用延续的 state 调用。
+        reuse_kv = (session_mode and kv_enabled
+                    and session.get("kv_vecs") is not None
+                    and session.get("model_dir") == model_dir)
+        base_step = int(session.get("cur_step", 0)) if reuse_kv else 0
+
+        # 装配本轮输入（媒体在前、文本在后）。base_step=0 即旧「从零」路径，
+        # 保证 session=None 时逐位不变。输入段类型按 _input_type_ids 给定：
+        # [sys] 段内 / agent 调用 token → TYPE_SYS，其余 → TYPE_USER。
         if media_steps:
-            # 媒体在前、文本在后；统一装配成 [1, N, D]
-            for st in text_steps:
-                st["type"] = spec.TYPE_USER
+            for st, _t in zip(text_steps, _input_type_ids(ids)):
+                st["type"] = _t
             steps = media_steps + text_steps
-            emb_in, s_in = m.assemble_embeddings(steps, base_step=0)
+            emb_in, s_in = m.assemble_embeddings(steps, base_step=base_step)
             cur_step = int(s_in.max()) + 1
         else:
             x_in = torch.tensor([ids])
-            s_in = torch.arange(len(ids)).unsqueeze(0)
-            emb_in = m.embed_text(x_in, torch.full_like(x_in, spec.TYPE_USER))
-            cur_step = len(ids)
+            s_in = (base_step + torch.arange(len(ids))).unsqueeze(0)
+            emb_in = m.embed_text(
+                x_in,
+                torch.tensor([_input_type_ids(ids)], dtype=torch.long))
+            cur_step = base_step + len(ids)
+        if on_phase is not None:
+            on_phase("encoding")
         enc_out = m.encode(emb_in, s_in, state=state)
 
         # 共享 KV 初始 = encoder 输出；decoder 每步把当前输入 emb 拼进视图，
@@ -480,18 +545,29 @@ def generate(m, prompt: str | None = None, max_new: int = 32,
         # 已在 archive 落盘（丢 KV 不丢 id）。
         ctx_total = getattr(m, "ctx_full", spec.CTX_FULL) + \
             getattr(m, "ctx_compress", spec.CTX_COMPRESS)
-        kv_vecs = enc_out.detach()
-        kv_steps = s_in
+        d_model = int(getattr(m, "d_model", spec.D_MODEL))
+        if reuse_kv:
+            kv_vecs = torch.cat([session["kv_vecs"], enc_out.detach()], 1)
+            kv_steps = torch.cat([session["kv_steps"], s_in], 1)
+        else:
+            kv_vecs = enc_out.detach()
+            kv_steps = s_in
         cur = ids[-1]                            # 用 prompt 尾 token 播种
         # cur_step 已在上面的分支里按「最后一个输入步 + 1」算好
-        # 模型输出段：<model>…<model/> 包住本轮生成的所有 token
+        # 模型输出段：[model]…[model/] 包住本轮生成的所有 token
         archive.add([spec.MODEL_ID])
+        if on_phase is not None:
+            on_phase("decoding")
         for _ in range(max_new):
             # 输入 token 的 embedding 放在其预测步上（s_dec = cur_step），
-            # 与训练 make_batch 的 s_dec=arange(half, …) 约定一致
+            # 与训练 make_batch 的 s_dec=arange(half, …) 约定一致。
+            # 2026-11-06：生成侧按 token 定型——core 单标记挂 TYPE_NONE、
+            # slot 编号槽位挂 TYPE_SYS，其余挂 TYPE_MODEL。
             s_dec = torch.tensor([[cur_step]])
             dec_in = torch.tensor([[cur]])
-            emb = m.embed_text(dec_in, torch.full_like(dec_in, spec.TYPE_MODEL))
+            _dec_type = _gen_type(cur)
+            emb = m.embed_text(dec_in, torch.tensor([[_dec_type]],
+                                                dtype=torch.long))
             kv_hca, kv_csa = m.build_views(
                 torch.cat([kv_vecs, emb], 1),
                 torch.cat([kv_steps, s_dec], 1))
@@ -539,7 +615,10 @@ def generate(m, prompt: str | None = None, max_new: int = 32,
                           "t_ms": t_ms,
                           "kv_steps": min(int(kv_steps.shape[1]) + 1,
                                           ctx_total),
-                          "fw": snap, "write": write})
+                          "fw": snap, "write": write,
+                          # 2026-11-08：三阶段 MoMW 面板的实时数据走同一条
+                          # /api/infer/stats 轮询通道（宿主侧统一渲染）
+                          "momw": _momw_snapshot(m, state)})
             # 持久化【当前输入】的 emb（训练 KV 流同构）；下一轮输入即 nxt
             kv_vecs = torch.cat([kv_vecs, emb.detach()], 1)
             kv_steps = torch.cat([kv_steps, s_dec], 1)
@@ -547,10 +626,18 @@ def generate(m, prompt: str | None = None, max_new: int = 32,
                 kv_vecs, kv_steps = _trim_tail_steps(kv_vecs, kv_steps,
                                                      ctx_total)
             cur, cur_step = nxt, cur_step + 1
+        if on_phase is not None:
+            on_phase("done")
         # 模型输出段收尾：无生成也写一对空边界，保持存档结构完整
         archive.add([spec.MODEL_END_ID])
-        out_steps = [{"token_ids": [i], "type": spec.TYPE_MODEL,
-                      "modality": "text", "meta": {}} for i in out_ids]
+        # 2026-11-06：生成结果 step 的段类型与生成循环 _dec_type 同口径
+        # （见 _gen_type），避免 archive / 前端拿到的 type 与实际 embed
+        # 用的 type 不一致。
+        out_steps = [
+            {"token_ids": [i], "type": _gen_type(i),
+             "modality": "text", "meta": {}}
+            for i in out_ids
+        ]
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         meta = {
             "n_prompt": len(ids), "n_generated": len(out_ids),
@@ -566,11 +653,37 @@ def generate(m, prompt: str | None = None, max_new: int = 32,
                                         spec.CTX_COMPRESS)),
             "kv_steps": int(kv_steps.shape[1]),
             "kv_bytes": int(kv_vecs.numel() * kv_vecs.element_size()),
-            "d_model": int(getattr(m, "d_model", spec.D_MODEL)),
+            "kv_pct": _safe(100 * kv_steps.shape[1] / ctx_total, 1),
+            "kv_capacity_bytes": ctx_total * d_model * 4,
+            "d_model": d_model,
             "vocab_size": int(getattr(m, "n_vocab", 0)),
             "fw": _fw_snapshot(state, fw_bins) if fw_bins else None,
             "fw_writes": list(writes),
+            "momw": _momw_snapshot(m, state),
         }
+        if session_id is not None:
+            meta["session_id"] = session_id
+
+        # —— 写回会话（会话模式）——
+        if session_mode:
+            # 就地 detach state 里的张量：跨轮持有不能挂计算图（只断梯度、
+            # 不改数值/结构，fast weight 与 KDA 递推数值都保留）。
+            for k in list(state.keys()):
+                state[k] = _detach_tree(state[k])
+            session["state"] = state
+            if kv_enabled:
+                session["kv_vecs"] = kv_vecs.detach()
+                session["kv_steps"] = kv_steps.detach()
+            else:
+                # 关 KV：不驻留向量（省显存），但 state 里的 fast weight 保留——
+                # fw 累积与 KV 开关相互独立。
+                session["kv_vecs"] = None
+                session["kv_steps"] = None
+            session["cur_step"] = cur_step
+            session["model_dir"] = model_dir or ""
+            session["kv_enabled"] = kv_enabled
+            session["fw_writes"] = (list(session.get("fw_writes") or [])
+                                    + writes)[-spec.FW_WRITE_HISTORY:]
         return out_steps, archive.rel_path(), meta
     finally:
         archive.close(
@@ -601,35 +714,145 @@ def _emit(obj: dict) -> None:
     sys.stdout.flush()
 
 
-def _serve_handle(req: dict, state: dict, emit=None) -> dict:
+MAX_SESSIONS = 16                 # 会话 LRU 上限（超出淘汰最久未用）
+FW_STATE_KEY = "fw"              # model.py FastWeightBank 外部 state 的 key
+
+
+def _gen_type(tid: int) -> int:
+    """生成侧段类型：core / typst → NONE、slot → SYS、其余 → MODEL。"""
+    if spec.CORE_BEGIN <= tid < spec.CORE_END:
+        return spec.TYPE_NONE
+    # base1.3.0：typst 结构与 core 同型（spec.segment_type_of 口径）
+    if spec.TYPST_BEGIN <= tid < spec.TYPST_END:
+        return spec.TYPE_NONE
+    if spec.SLOT_BEGIN <= tid < spec.SLOT_END:
+        return spec.TYPE_SYS
+    return spec.TYPE_MODEL
+
+
+def _input_type_ids(ids: list) -> list:
+    """输入 token id 流 → 每个 token 的段类型（2026-11-06）。
+
+    规则（与 spec.segment_type_of 一致，但额外处理 [sys]…[sys/] 跨段）：
+      - [sys] 段内（含两端边界 token）→ TYPE_SYS（系统提示 / 工具结果）；
+      - core 区（caps/stop/draw:end，单开一类）→ TYPE_NONE；
+      - typst 结构 token（base1.3.0）→ TYPE_NONE；
+      - slot 区编号槽位 → TYPE_SYS；
+      - 其余（用户输入文本、媒体占位、普通扩展 token）→ TYPE_USER。
+    生成循环里模型产出的 token 另行按 _gen_type 定型，不在此函数内。
+    """
+    out: list = []
+    in_sys = False
+    for tid in ids:
+        if tid == spec.SYS_ID:
+            in_sys = True
+            out.append(spec.TYPE_SYS)
+        elif tid == spec.SYS_END_ID:
+            in_sys = False
+            out.append(spec.TYPE_SYS)
+        elif in_sys:
+            out.append(spec.TYPE_SYS)
+        elif spec.CORE_BEGIN <= tid < spec.CORE_END:
+            out.append(spec.TYPE_NONE)
+        elif spec.TYPST_BEGIN <= tid < spec.TYPST_END:
+            out.append(spec.TYPE_NONE)   # base1.3.0：typst 与 core 同型
+        elif spec.SLOT_BEGIN <= tid < spec.SLOT_END:
+            out.append(spec.TYPE_SYS)
+        else:
+            out.append(spec.TYPE_USER)
+    return out
+
+
+def _new_session(model_dir: str = "") -> dict:
+    """会话状态容器：字段固定，B/E/F 按此结构对接。"""
+    return {"state": {}, "kv_vecs": None, "kv_steps": None, "cur_step": 0,
+            "kv_enabled": True, "fw_writes": [], "model_dir": model_dir,
+            "stats": {}}
+
+
+def _release_session(s: dict) -> None:
+    """丢掉会话里的大张量引用，交给 GC 回收。"""
+    s["kv_vecs"] = None
+    s["kv_steps"] = None
+    s["state"] = {}
+    s["fw_writes"] = []
+
+
+def _get_session(sessions: dict, session_id: str, create: bool = True):
+    """取会话并 touch（LRU：dict 首项即最久未用，pop+重插=最近使用）。
+    新建会话前若已达上限，淘汰并释放最久未用的那个。"""
+    sid = session_id or "default"
+    if sid in sessions:
+        s = sessions.pop(sid)
+        sessions[sid] = s
+        return s
+    if not create:
+        return None
+    if len(sessions) >= MAX_SESSIONS:
+        old_id, old = next(iter(sessions.items()))
+        del sessions[old_id]
+        _release_session(old)
+    s = _new_session()
+    sessions[sid] = s
+    return s
+
+
+def _serve_handle(req: dict, state: dict, sessions: dict, emit=None) -> dict:
     rid = req.get("id")
     op = req.get("op")
     try:
         if op == "load":
             model_dir = req["model_dir"]
-            state["model"] = None            # 先放掉旧模型再加载新的
-            state["dir"] = None
-            state["stats"] = None
-            m = _load_model(model_dir)
-            state["model"], state["dir"] = m, model_dir
+            preload_only = bool(req.get("preload_only", False))
+            # 预加载：已加载同一模型时不重载，避免打断现有会话/递推状态；
+            # 返回结构与普通 load 一致。
+            if (preload_only and state["model"] is not None
+                    and state["dir"] == model_dir):
+                m = state["model"]
+            else:
+                state["model"] = None        # 先放掉旧模型再加载新的
+                state["dir"] = None
+                state["stats"] = None
+                m = _load_model(model_dir)
+                state["model"], state["dir"] = m, model_dir
             return {"id": rid, "ok": True,
                     "result": {"loaded": model_dir,
                                "params": sum(p.numel()
                                              for p in m.parameters())}}
         if op == "infer":
             model_dir = req["model_dir"]
-            if state["model"] is None or state["dir"] != model_dir:
+            streaming = bool(req.get("stream")) and emit is not None
+            need_load = state["model"] is None or state["dir"] != model_dir
+            if need_load:
+                # 换模型：KV 向量绑定的是旧模型的表示空间，绝不能跨模型复用。
+                # 清掉所有会话的 KV；generate 会因 kv_vecs=None 走从零重建路径。
+                # state（含 fast weight / KDA 递推）按会话语义保留，用户可用
+                # clear_fw / drop_session 显式重置。
+                for s in sessions.values():
+                    s["kv_vecs"] = None
+                    s["kv_steps"] = None
+                # 阶段帧（仅流式，见 on_phase 注释）：进入模型加载前先报 loading
+                if streaming:
+                    emit({"id": rid, "ok": True, "phase": "loading"})
                 m = _load_model(model_dir)
                 state["model"], state["dir"] = m, model_dir
                 state["stats"] = None
             media_steps = _decode_media(req.get("media"))
-            # 流式：每产一个 token 就发一帧 partial（同一个 id，前端按序追加）
-            streaming = bool(req.get("stream")) and emit is not None
 
             def on_token(info):
                 if streaming:
                     emit({"id": rid, "ok": True, "partial": info})
 
+            def on_phase(phase):
+                # 阶段帧只发流式：非流式走 server_services.send()，它只取第一
+                # 帧当结果；多帧会让它拿到 phase 帧而返回空 result，破坏旧
+                # /api/infer。流式 send_stream 会一直 yield 到 final 帧。
+                if streaming:
+                    emit({"id": rid, "ok": True, "phase": phase})
+
+            session_id = req.get("session_id", "default")
+            kv_enabled = bool(req.get("kv_enabled", True))
+            session = _get_session(sessions, session_id)
             steps, archive, meta = generate(
                 state["model"], req.get("prompt"),
                 req.get("max_new", 32),
@@ -641,8 +864,13 @@ def _serve_handle(req: dict, state: dict, emit=None) -> dict:
                 on_token=on_token if streaming else None,
                 token_ids=req.get("token_ids"),
                 fw_bins=req.get("fw_bins", spec.FW_VIZ_BINS),
-                t0_wall=req.get("t0_wall"))
+                t0_wall=req.get("t0_wall"),
+                session=session,
+                kv_enabled=kv_enabled,
+                on_phase=on_phase if streaming else None,
+                session_id=session_id)
             state["stats"] = meta
+            session["stats"] = meta
             # 纯 token 输入解出来可能是乱码/不可显示字符，解码失败不该让
             # 整次推理报错——ID 序列才是默认 plugin 的展示对象。
             try:
@@ -659,7 +887,24 @@ def _serve_handle(req: dict, state: dict, emit=None) -> dict:
             # 只读快照：上下文占用 / KV / fast weight 可视化数据。
             # 服务没跑过推理时 stats 为空，但模型配置照样要能报出来。
             m = state.get("model")
-            st = dict(state.get("stats") or {})
+            sid = req.get("session_id")
+            if sid is not None:
+                # 指定会话：取该会话 stats，并用驻留的 KV 张量补实时占用。
+                s = _get_session(sessions, sid, create=False)
+                st = dict(((s or {}).get("stats")) or {})
+                kv = (s or {}).get("kv_vecs")
+                ks = (s or {}).get("kv_steps")
+                ctx_total = (int(getattr(m, "ctx_full", spec.CTX_FULL))
+                             + int(getattr(m, "ctx_compress",
+                                           spec.CTX_COMPRESS)))
+                if kv is not None and ks is not None:
+                    st["kv_bytes"] = int(kv.numel() * kv.element_size())
+                    st["kv_pct"] = _safe(100 * int(ks.shape[1]) / ctx_total, 1)
+                else:
+                    st.setdefault("kv_bytes", 0)
+                    st.setdefault("kv_pct", 0.0)
+            else:
+                st = dict(state.get("stats") or {})
             if m is not None:
                 st.setdefault("ctx_full",
                               int(getattr(m, "ctx_full", spec.CTX_FULL)))
@@ -670,10 +915,66 @@ def _serve_handle(req: dict, state: dict, emit=None) -> dict:
                               int(getattr(m, "d_model", spec.D_MODEL)))
                 st.setdefault("vocab_size", int(getattr(m, "n_vocab", 0)))
             return {"id": rid, "ok": True,
-                    "result": {"loaded": state.get("dir"), **st}}
+                    "result": {"loaded": state.get("dir"), **st,
+                               "sessions": list(sessions.keys())}}
         if op == "status":
             return {"id": rid, "ok": True,
-                    "result": {"loaded": state["dir"]}}
+                    "result": {"loaded": state["dir"],
+                               "sessions": list(sessions.keys())}}
+        if op == "clear_fw":
+            sid = req.get("session_id", "default")
+            s = _get_session(sessions, sid, create=False)
+            if s is not None:
+                st = s.setdefault("state", {})
+                # 只清 fast weight 键（"fw"，见 model.py FastWeightBank）。
+                # KDA 递推键 "kda1/2/3" 必须保留，否则会打断 decoder 逐层递推。
+                st.pop(FW_STATE_KEY, None)
+                s["fw_writes"] = []
+            # 不动 kv_vecs：KV 与 fast weight 相互独立。
+            return {"id": rid, "ok": True, "result": {"cleared": True}}
+        if op == "momw_control":
+            # 2026-11-08：会话级 MoMW 控制。
+            #   clear  → 丢掉该会话的记忆池，下次前向重建全新空池（S 全零）
+            #   silent → 静默激活：路由/写入照常，但 ΔH 不注入输出
+            # 与 clear_fw 同口径：只动会话 state，不动模型单例 / 其它会话 /
+            # KV；所有状态读写仍在这个串行服务进程内，不存在并发写冲突。
+            import momw as _momw
+            sid = req.get("session_id", "default")
+            s = _get_session(sessions, sid, create=False)
+            action = req.get("action")
+            if s is None:
+                return {"id": rid, "ok": False,
+                        "error": f"会话不存在: {sid}"}
+            st = s.setdefault("state", {})
+            if action == "clear":
+                st.pop(_momw.MoMW.STATE_KEY, None)
+            elif action == "silent":
+                st[_momw.MoMW.SILENT_KEY] = bool(req.get("value", True))
+            else:
+                return {"id": rid, "ok": False,
+                        "error": f"未知 momw action: {action!r}"}
+            mo = getattr(state.get("model"), "momw", None)
+            snap = mo.stats(st) if mo is not None else None
+            # 立即刷新非生成期的 stats 缓存，避免前端轮询拿到清空前的旧值
+            if isinstance(s.get("stats"), dict):
+                s["stats"]["momw"] = snap
+            return {"id": rid, "ok": True,
+                    "result": {"cleared": action == "clear",
+                               "silent": bool(st.get(
+                                   _momw.MoMW.SILENT_KEY, False)),
+                               "momw": snap}}
+        if op == "drop_session":
+            sid = req.get("session_id", "default")
+            old = sessions.pop(sid, None)
+            if old is not None:
+                _release_session(old)
+            return {"id": rid, "ok": True, "result": {"dropped": True}}
+        if op == "unload":
+            state["model"] = None
+            state["dir"] = None
+            state["stats"] = None
+            gc.collect()
+            return {"id": rid, "ok": True, "result": {"loaded": None}}
         if op == "shutdown":
             return {"id": rid, "ok": True, "result": {"bye": True}}
         return {"id": rid, "ok": False, "error": f"未知 op: {op!r}"}
@@ -684,6 +985,7 @@ def _serve_handle(req: dict, state: dict, emit=None) -> dict:
 def serve(idle_timeout: int = 300) -> int:
     """常驻模式：读线程收请求 → 主线程串行处理 → 空闲超时自行退出。"""
     state = {"model": None, "dir": None, "stats": None}
+    sessions: dict = {}          # session_id -> 会话状态（LRU 上限 MAX_SESSIONS）
     q: "queue.Queue" = queue.Queue()
 
     def _reader():
@@ -723,7 +1025,7 @@ def serve(idle_timeout: int = 300) -> int:
         except Exception as e:
             _emit({"id": None, "ok": False, "error": f"请求解析失败: {e}"})
             continue
-        resp = _serve_handle(req, state, _emit)
+        resp = _serve_handle(req, state, sessions, _emit)
         _emit(resp)
         if req.get("op") == "shutdown":
             print("[infer] 收到 shutdown，退出", file=sys.stderr)

@@ -660,16 +660,22 @@ class TestInferIdArchive(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_archive_marks_system_tokens(self):
-        """不可见区的 ID 必须写成扩展系统 token <NNNNN>，不是 {t:}。"""
+        """core / typst 是 <> tools（写 tool 元素）；其余不可见才写 [] ext。
+
+        1.2.0 把 core（caps/stop/draw:end）单开一类后，STOP_ID 从 5 变成 1
+        并落进 core 区间，原先期望 ext 的断言已过时；1.3.0 的 typst 结构
+        token 与 core 同属 <> tools，一并在此固化（不是 {t:} 文本元素）。
+        """
         from infer import IdArchive
         from tokens import tok5
         tmp = tempfile.mkdtemp(prefix="garg_arch2_")
         try:
             a = IdArchive("models/demo", tmp)
-            a.add([spec.STOP_ID])
+            a.add([spec.STOP_ID, spec.TYPST_ID["DOC"]])
             a.close(n_prompt=0, n_generated=1)
             self.assertEqual(tok5.read_file(a.path),
-                             [{"kind": "ext", "id": spec.STOP_ID}])
+                             [{"kind": "tool", "id": spec.STOP_ID},
+                              {"kind": "tool", "id": spec.TYPST_ID["DOC"]}])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

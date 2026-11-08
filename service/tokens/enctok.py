@@ -49,7 +49,7 @@ else:
 import boot
 boot.bootstrap()
 import spec  # noqa: E402
-from tokens import tok5  # noqa: E402
+from tokens import tok6  # noqa: E402
 from tokens.tok32 import ids_to_hex  # noqa: E402
 from tokens.vocab import get_vocab, set_vocab_source  # noqa: E402
 
@@ -68,6 +68,15 @@ def _emit_word(word: str, v):
     字母——拼不出的字母跳过并报告，而不是 KeyError 崩掉整次编码。
     <caps> 标记只在「至少还有一个字母能映射」时保留，避免给纯垃圾
     输入打光头标记。"""
+    # 2026-11-06（base1.1.0）：大小写敏感的代码 token（None / True /
+    # SELECT / useState / HashMap …）必须按**原样**先查一次，否则下面的
+    # lower 查表永远命中不到它们，这些 ID 就成了训练/推理都产不出的死行。
+    # 对旧词表零影响：旧词表的可显示多字 token 全是全小写英文词、单字符
+    # 符号 / CJK / emoji，不存在大小写混合条目，原样查表必然 miss，控制流
+    # 与改动前完全一致（Hello / HELLO 仍走 <caps> + 词 / 逐字母 fallback）。
+    wid = v.regular_ids.get(word)
+    if wid is not None:
+        return [wid], []
     lower = word.lower()
     wid = v.regular_ids.get(lower)
     if wid is not None:
@@ -118,6 +127,24 @@ def encode_text(text: str, vocab=None):
             while j < n and (("a" <= text[j] <= "z")
                              or ("A" <= text[j] <= "Z")):
                 j += 1
+            word_len = j - i
+            # 2026-11-06（base1.1.0）：含连字符的跨语言代码 token
+            # （background-color / font-size / linear-gradient …）不做这一步
+            # 就永远被切成「英文词 + '-' + 英文词」，code 区那几十个 ID 成了
+            # 训练时产不出的死行。只尝试「比当前字母段更长」的匹配：纯字母
+            # 英文词（hello / Hello / HELLO）扫描范围为空，行为逐位不变；
+            # 命中时整体消费，解码仍逐字还原原串，文本无损。
+            if max_match > word_len:
+                hit = None
+                for L in range(min(max_match, n - i), word_len, -1):
+                    tid = v.regular_ids.get(text[i:i + L])
+                    if tid is not None:
+                        hit = (tid, L)
+                        break
+                if hit is not None:
+                    ids.append(hit[0])
+                    i += hit[1]
+                    continue
             wids, wskip = _emit_word(text[i:j], v)
             ids.extend(wids)
             skipped.extend(wskip)
@@ -181,10 +208,10 @@ def main(argv=None):
     if args.out:
         out = Path(args.out)
         if out.suffix.lower() == ".tokens":
-            items = [tok5.step(tok5.text(i)) for i in ids]
-            tok5.write_file(out, items)
+            items = [tok6.step(tok6.text(i)) for i in ids]
+            tok6.write_file(out, items)
             print(f"已写出 {out}（{len(ids)} token，"
-                  f"{out.stat().st_size} 字节 token-5 位流）", file=sys.stderr)
+                  f"{out.stat().st_size} 字节 token-6 位流）", file=sys.stderr)
         else:
             out.write_text(ids_to_hex(ids), encoding="utf-8")
             print(f"已写出 {out}（{len(ids)} token）", file=sys.stderr)

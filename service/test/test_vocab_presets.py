@@ -115,11 +115,11 @@ class PresetLifecycleTest(unittest.TestCase):
         self.assertEqual(info["vocab_size"],
                          len(vp.load_vocab(vp.BASE)))
         names = {p["name"] for p in vp.list_vocabs()}
-        self.assertIn("base", names)
+        self.assertIn(vp.BASE, names)
         self.assertIn("p1", names)
         # fork 出来的新词表与源同长（整目录复制）
         p1 = next(p for p in vp.list_vocabs() if p["name"] == "p1")
-        base = next(p for p in vp.list_vocabs() if p["name"] == "base")
+        base = next(p for p in vp.list_vocabs() if p["name"] == vp.BASE)
         self.assertEqual(p1["vocab_size"], base["vocab_size"])
         self.assertTrue(p1["is_main"] is False)
         self.assertTrue(base["is_main"] is True)
@@ -282,7 +282,7 @@ class GlobalVocabTest(unittest.TestCase):
         """全局词表 = service/tokens/{vocab.vfc, config.json}，与 base 同构。"""
         from tokens.vocab import Vocab
         g = Vocab.global_vocab()
-        self.assertEqual(g.name, "base")
+        self.assertEqual(g.name, vp.BASE)
         self.assertEqual(g.config.get("vocab_size"), len(g))
         regions = g.config.get("regions") or []
         self.assertEqual(sum(r["size"] for r in regions), len(g))

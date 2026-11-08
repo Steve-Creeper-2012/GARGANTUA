@@ -299,7 +299,7 @@ class TestModelVocabTxt(unittest.TestCase):
             try:
                 set_model_vocab(tmp2)
                 self.assertIsNone(get_vocab().token_to_id.get("onlytok"))
-                self.assertEqual(get_vocab().name, "base")
+                self.assertEqual(get_vocab().name, spec.BASE_VOCAB_NAME)
             finally:
                 shutil.rmtree(tmp2, ignore_errors=True)
         finally:

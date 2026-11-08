@@ -1,8 +1,8 @@
 # ===========================================================================
 # GARGANTUA v1 — gts：Token 编辑器文本（.gts）→ token ID 流
 # ---------------------------------------------------------------------------
-# 【历史格式】2026-10-28 起 .tokens 改为 token-5（tokens/tok5.py，spec 第
-# 5b 节），编辑器的导出走 tok5.parse_display。本模块保留为 tok-32 时代的
+# 【历史格式】2026-10-28 起 .tokens 改为 token-6（tokens/tok6.py，spec 第
+# 5b 节），编辑器的导出走 tok6.parse_display。本模块保留为 tok-32 时代的
 # 只读解析器：仍可把老 .gts 文本转成 ID 流，但不再被 HTTP 端点使用。
 # ---------------------------------------------------------------------------
 # .gts 是 Token 编辑器里的可读形态（dectok 的逆过程）：
@@ -31,8 +31,18 @@ class GtsError(ValueError):
     """编辑器文本无法解析成合法 token 流。"""
 
 
+# 2026-11-05：段边界由 <> 改 [] 包裹（<> 让给工具调用）。老 .gts 文本
+# 里还写着 <user> 这类名字，解析器按等价的新名字查表，避免历史文档
+# 静默变成一串可见符号（不产出 5-bit 兼容，只是名字层面的容错）。
+_LEGACY_BOUND = {
+    "<user>": "[user]", "<user/>": "[user/]",
+    "<model>": "[model]", "<model/>": "[model/]",
+}
+
+
 def _special_id(v, cand: str):
-    """<...> 整词命中 special/system 才当特殊 token（否则是普通文本）。"""
+    """<...> / [...] 整词命中 special/system 才当特殊 token。"""
+    cand = _LEGACY_BOUND.get(cand, cand)
     tid = v.special_ids.get(cand)
     if tid is None:
         tid = v.system_ids.get(cand)
@@ -99,8 +109,11 @@ def parse_gts(text: str, vocab=None) -> list:
             need_sep = False
             i += 1
             continue
-        if ch == "<":
-            j = text.find(">", i + 1)
+        # <...> 是特殊/工具标记，[...] 是段边界；整词命中词表才当作
+        # 标记消费，否则原样留作可见文本。
+        close = ">" if ch == "<" else ("]" if ch == "[" else None)
+        if close:
+            j = text.find(close, i + 1)
             if j != -1:
                 cand = text[i:j + 1]
                 tid = _special_id(v, cand)

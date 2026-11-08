@@ -38,7 +38,7 @@ else:
 import boot
 boot.bootstrap()
 import spec  # noqa: E402
-from tokens import tok5  # noqa: E402
+from tokens import tok6  # noqa: E402
 from tokens.tok32 import hex_to_ids  # noqa: E402
 from tokens.vocab import get_vocab, set_vocab_source  # noqa: E402
 
@@ -84,7 +84,7 @@ def decode_hex(text: str, mode: str = "ids") -> str:
 # ---------------------------------------------------------------------------
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="dectok：token-5 .tokens / 历史 hex 流 → 可读形式")
+        description="dectok：token-6 .tokens / 历史 hex 流 → 可读形式")
     src = ap.add_mutually_exclusive_group()
     src.add_argument("hexish", nargs="?", default=None,
                      help="8 位十六进制/token 的文本，或 .tokens 文件路径")
@@ -100,19 +100,19 @@ def main(argv=None):
         set_vocab_source(args.vocab)
 
     mode = "text" if args.text else "ids"
-    # 文件输入 = token-5 位流（现行格式）
+    # 文件输入 = token-6 位流（现行格式）
     path = args.file
     if path is None and args.hexish is not None and Path(args.hexish).is_file():
         path = args.hexish
     if path is not None:
-        items = tok5.read_file(path)
+        items = tok6.read_file(path)
         if mode == "text":
             ids = [e["id"] for it in items if it["kind"] == "step"
                    for e in it["elements"] if e["kind"] == "text"]
             print(decode_ids(ids, "text"))
         else:
-            print(tok5.to_display(
-                items, name_of=tok5.vocab_name_of(get_vocab())))
+            print(tok6.to_display(
+                items, name_of=tok6.vocab_name_of(get_vocab())))
         return
     # 其余：历史 hex 文本（8 位/token）
     if args.hexish is not None:

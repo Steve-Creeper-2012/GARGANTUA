@@ -1,7 +1,7 @@
 # ===========================================================================
 # GARGANTUA v1 — train.py：文本预训练（教师强制，B=1，FP32）
 # ---------------------------------------------------------------------------
-# 数据：data/ 下所有 .tokens 文件（token-5 位流，必须带 { } 时间步结构），
+# 数据：data/ 下所有 .tokens 文件（token-6 位流，必须带 { } 时间步结构），
 # 由 tokens/tokenset 展开成「扁平 token_ids + 并行 step_ids」；
 # 每个窗口切成 user 段（encoder）+ model 段（decoder 预测目标）。
 # 优化器：Muon（隐藏层 2D）+ AdamW（embedding/head/norm），--optimizer 可关。

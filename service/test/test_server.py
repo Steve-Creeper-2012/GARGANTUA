@@ -190,7 +190,7 @@ class TestServer(unittest.TestCase):
     def test_03_vocab_query(self):
         code, j = http("GET", self.port, "/api/vocab?q=user")
         self.assertEqual(code, 200)
-        self.assertTrue(any(h["token"] == "<user>" for h in j["hits"]))
+        self.assertTrue(any(h["token"] == "[user]" for h in j["hits"]))
         self.assertLessEqual(len(j["hits"]), 50)
         self.assertIn("categories", j)
         self.assertTrue(all("category" in h for h in j["hits"]))
@@ -556,10 +556,10 @@ class TestServer(unittest.TestCase):
         code, j9 = http("POST", self.port, "/api/tokens/decode",
                         {"tokens_b64": "not-base64!!"})
         self.assertEqual(code, 400)
-        # Token 编辑器 → .tokens 导出（token-5 文本；ID 十六进制，
+        # Token 编辑器 → .tokens 导出（token-6 文本；ID 十六进制，
         # C766 = 十进制 51046）
         code, je = http("POST", self.port, "/api/tokens/export",
-                        {"text": "<00001>{text: C766}<00002>"})
+                        {"text": "[00001]{text: C766}[00002]"})
         self.assertEqual(code, 200)
         self.assertEqual(je["n_steps"], 1)
         self.assertEqual(je["n_tokens"], 1)
@@ -578,7 +578,7 @@ class TestServer(unittest.TestCase):
         # 新契约：token 必须落到具体词表；main（base）受保护，先 Fork
         # 再加，测完删除（服务端写的是 vocabs/ 下的 fork，不碰仓库词表）
         code, jf = http("POST", self.port, "/api/vocab/fork",
-                        {"name": "base", "new_name": "srv_test_vocab"})
+                        {"name": spec.BASE_VOCAB_NAME, "new_name": "srv_test_vocab"})
         self.assertEqual(code, 200, jf)
         base_size = jf["vocab_size"]
         try:
@@ -612,7 +612,7 @@ class TestServer(unittest.TestCase):
             self.assertEqual(code, 400)
             # main 直接加 → 400（先 Fork）
             code, _ = http("POST", self.port, "/api/vocab/token",
-                           {"name": "base", "action": "add",
+                           {"name": spec.BASE_VOCAB_NAME, "action": "add",
                             "token": "\U00020000", "category": "regular"})
             self.assertEqual(code, 400)
             # 新增后可被 enctok 收录（指定词表编码，常规优先）

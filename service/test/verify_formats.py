@@ -7,7 +7,7 @@
 #      - 与同一文本的 UTF-8 字节对比（证明是不同编码）
 #      - 用【不依赖 tokens 包】的裸位循环解析（证明格式自描述）
 #      - 文本 / 音频 / 视觉三类载荷的定长约束与往返
-#      - enctok → token-5 → dectok roundtrip
+#      - enctok → token-6 → dectok roundtrip
 #   B. .tokenvector（UTF-8 文本）：dim+precision 头 + { } | 结构
 #      - f32 / f16 / bf16 三精度 roundtrip（逐位一致）
 #      - 时间步结构解析（{} 之间、| 分隔）
@@ -35,7 +35,7 @@ import numpy as np
 ROOT = Path(boot.project_root())   # 2026-10-24：项目根
 
 import spec  # noqa: E402
-from tokens import dectok, enctok, text_codec, tokenvector, tok5  # noqa: E402
+from tokens import dectok, enctok, text_codec, tokenvector, tok6  # noqa: E402
 
 
 def section(title):
@@ -45,89 +45,89 @@ def section(title):
 
 
 def _independent_decode(data: bytes) -> str:
-    """不 import tokens 的裸解码器：每 5 bit 一个字符，码 T5_END_CODE 终止。
+    """不 import tokens 的裸解码器：每 6 bit 一个字符，码 T6_END_CODE 终止。
 
-    码 27-30 还原成原子绑定 token 的展示名（与 spec 第 5b 节一致）。
+    码 29-34 还原成原子边界 token 的展示名（与 spec 第 5b 节一致）。
     """
-    chars = spec.T5_CHARS                            # 与 spec 第 5b 节一致
-    bound = spec.T5_BOUND_TOKENS
+    chars = spec.T6_CHARS                            # 与 spec 第 5b 节一致
+    bound = spec.T6_BOUND_TOKENS
     acc = nbits = 0
     out = []
     for byte in data:
         acc = (acc << 8) | byte
         nbits += 8
-        while nbits >= 5:
-            nbits -= 5
-            code = (acc >> nbits) & 0x1F
+        while nbits >= spec.T6_BITS_PER_CHAR:
+            nbits -= spec.T6_BITS_PER_CHAR
+            code = (acc >> nbits) & 0x3F
             acc &= (1 << nbits) - 1
-            if code == spec.T5_END_CODE:
+            if code == spec.T6_END_CODE:
                 return "".join(out)
-            if 27 <= code <= 30:
+            if code in bound:
                 out.append(bound[code])
                 continue
             out.append(chars[code])
     raise AssertionError("缺少终止符")
 
 
-def verify_tok5():
-    section("A. token-5 / .tokens 位流格式")
+def verify_tok6():
+    section("A. token-6 / .tokens 位流格式")
     text = "Hello 世界 123 😀"
     ids, skipped = enctok.encode_text(text)
-    items = [tok5.step(tok5.text(i)) for i in ids]
-    chars = tok5.items_to_chars(items)
+    items = [tok6.step(tok6.text(i)) for i in ids]
+    chars = tok6.items_to_chars(items)
     print(f"输入文本      : {text!r}")
     print(f"未收录字符    : {skipped or '无'}")
     print(f"token 数      : {len(ids)}")
     print(f"字符流        : {chars}")
-    print(f"可读形式      : {tok5.to_display(items)}")
+    print(f"可读形式      : {tok6.to_display(items)}")
 
-    data = tok5.dumps(items)
+    data = tok6.dumps(items)
     utf8 = text.encode("utf-8")
     print(f"\n.tokens 位流 : {len(data)} 字节"
-          f"（{len(chars)} 字符 × 5 bit + 终止符 → 补零）")
+          f"（{len(chars)} 字符 × 6 bit + 终止符 → 补零）")
     print(f"  前 32 字节  : {data[:32].hex(' ')}")
     print(f"同文本 UTF-8  : {len(utf8)} 字节")
-    assert data != utf8, "token-5 不应该等于 UTF-8"
-    print("  → 两种编码字节不同：token-5 必须用专用解释器读写 ✓")
+    assert data != utf8, "token-6 不应该等于 UTF-8"
+    print("  → 两种编码字节不同：token-6 必须用专用解释器读写 ✓")
 
     # 独立读取器：不 import tokens 包
     independent = _independent_decode(data)
     print(f"\n独立读取器（裸位循环）: {independent[:40]}…")
     assert independent == chars, "独立读取结果与编码不一致"
-    print("  → 格式自描述：按「5 bit/字符 + 终止符 %d」即可解析 ✓" % spec.T5_END_CODE)
+    print("  → 格式自描述：按「6 bit/字符 + 终止符 %d」即可解析 ✓" % spec.T6_END_CODE)
 
     # 文件读写
     with tempfile.TemporaryDirectory() as d:
         f = Path(d) / "demo.tokens"
-        tok5.write_file(f, items)
-        assert tok5.read_file(f) == items
+        tok6.write_file(f, items)
+        assert tok6.read_file(f) == items
         print("文件写入 / 读回一致 ✓")
 
     # 编解码 roundtrip
-    back_ids = [e["id"] for it in tok5.loads(data)
+    back_ids = [e["id"] for it in tok6.loads(data)
                 for e in it["elements"]]
     out = dectok.decode_ids(back_ids, "text")
     print(f"\ndectok 还原   : {out!r}")
     assert out == text
     steps = text_codec.encode(text)
     assert text_codec.decode(steps) == text
-    print("enctok → token-5 → dectok / text_codec 全链路 roundtrip ✓")
+    print("enctok → token-6 → dectok / text_codec 全链路 roundtrip ✓")
 
     # 载荷定长约束
     print("\n载荷尺寸:")
-    wave = tok5.samples_to_hex([0] * spec.AUDIO_SAMPLES_PER_TOKEN)
+    wave = tok6.samples_to_hex([0] * spec.AUDIO_SAMPLES_PER_TOKEN)
     print(f"  音频 {spec.AUDIO_SAMPLES_PER_TOKEN} 采样 × "
           f"{spec.AUDIO_SAMPLE_BITS} bit → {len(wave)} hex 字符 ✓")
-    assert len(wave) == spec.T5_WAVE_HEX
-    patch = tok5.rgba8_to_hex([0] * spec.PATCH_VEC_DIM)
-    print(f"  视觉 {spec.PATCH_PIXELS} 像素 × {spec.T5_PIXEL_BITS} bit "
+    assert len(wave) == spec.T6_WAVE_HEX
+    patch = tok6.rgba8_to_hex([0] * spec.PATCH_VEC_DIM)
+    print(f"  视觉 {spec.PATCH_PIXELS} 像素 × {spec.T6_PIXEL_BITS} bit "
           f"→ {len(patch)} hex 字符 ✓")
-    assert len(patch) == spec.T5_PATCH_HEX
+    assert len(patch) == spec.T6_PATCH_HEX
     for bad in ("{t:GG}", "{}", "{t:00001", "t:00001"):
         try:
-            tok5.parse_items(bad)
+            tok6.parse_items(bad)
             raise AssertionError(f"未拒绝: {bad}")
-        except tok5.Tok5Error:
+        except tok6.Tok6Error:
             pass
     print("  非法结构（4 位 ID / 空步 / 未闭合 / 游离 token）全部拒绝 ✓")
 
@@ -169,10 +169,10 @@ def verify_tokenvector():
 
 
 def main():
-    verify_tok5()
+    verify_tok6()
     verify_tokenvector()
     print("\n" + "=" * 62)
-    print("两种格式全部验证通过：.tokens（token-5 位流）与 "
+    print("两种格式全部验证通过：.tokens（token-6 位流）与 "
           ".tokenvector（UTF-8）均可正常读写解析")
     print("=" * 62)
 

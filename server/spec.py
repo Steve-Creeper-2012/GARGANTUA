@@ -112,6 +112,64 @@
 #   - KV 超出上下文上限：丢 KV，保留原始 token id 存档（不保留向量）。
 #   - 训练数据 = .tokens（tok-32，必须带 { } | 时间步结构），不再用 JSON。
 #   - Token 编辑器导出 .tokens；词表操作全部归「词表」页。
+# 定案记录（2026-11-05，steve 拍板，token-6 + base1.0.0 + 工具调用）：
+#   - .tokens 升级为 token-6：6 bit/字符（2^6=64 码位），终止符码 63。
+#     字符集 29 个单字符（原 27 + '[' ']'），6 个原子边界 token 各占一个
+#     码位（29-34），码 35-62 预留。**不做向后兼容**：token-5 位流不再可读，
+#     旧 base 词表整份删除重建为 base1.0.0。
+#   - 边界 token 的显示方式改变：<user>/<user/>/<model>/<model/> 四个
+#     token 语义与 ID 照旧，但改用 [] 包裹 → [user]/[user/]/[model]/[model/]；
+#     另加系统段边界 [sys]/[sys/]（ID 6/7），供工具结果、系统提示注入。
+#   - 原先 <> 的含义变成**工具调用**：< > 是两个独立字符，词表里的
+#     <asktime>/<bash>/<thinking>/<b> 等专用 token 都是模型可预测、
+#     有 KV、进 loss 的 agent 区 token，不再是「扩展系统 token」。
+#   - 新增 agent 区（架构契约头内，位于 system 与 draw 之间）：工具调用
+#     段边界、排版专用 token（全部是 token 而非 markdown 字面量）、
+#     工具动作 token，以及专门的绘画结束 token <draw:end>。
+#   - 词表带版本号：全局 base → base1.0.0（vocab_version 1.0.0），
+#     vocabs/base/ 删除；旧的 ID 布局不兼容，下次再做兼容层。
+# 定案记录（2026-11-06，steve 拍板，base1.1.0 + agent 段类型语义化）：
+#   - 词表升到 base1.1.0（vocab_version 1.1.0）：可见区**末尾追加** code 区
+#     （跨语言代码专用 token，去重后 474 条），只追加不插队——契约头与
+#     全部既有可见区 ID 一个不动，旧权重 / .tokens / 插件缓存 ID 全兼容。
+#     vocabs/base1.0.0/ 退役为 base1.1.0/。
+#   - agent 区 53 个 token 的 type_emb 从 TYPE_NONE / TYPE_MODEL 改为
+#     TYPE_SYS（与 [sys] 系统段同型），统一由 segment_type_of() 给定；
+#     tok6.to_steps / infer._input_type_ids / 生成循环 _dec_type / out_steps
+#     四处口径一致。token ID 不变，只改类型嵌入取值。
+#   - 进 loss 的 token 一律注入 KV + fast weight（模型侧无按 token 类别的
+#     过滤）；DRAW 图元 prims 不输入模型，故不涉及。
+# 定案记录（2026-11-06 下午，steve 拍板，base1.2.0 契约头重排）：
+#   - **一个预定义工具都不要**：53 个 agent token（边界/排版/动作）全部
+#     退役，改成 **编号槽位** `<s0>`…`<sN-1>`（N 由词表 config 决定），
+#     base 零预留；语义由使用者自己定义，
+#     编号直接显示；工具执行先全部不接（工具台与测试台，留给推理 app）。
+#   - `<caps>` / `<stop>` / `<draw:end>` 这类最早就有的机制单标记**单开
+#     core 一类**：` <>` 形态、无闭合、进 loss、有 KV；不是 [] 段边界、
+#     不是系统/特殊、也不是工具调用。段类型挂 TYPE_NONE。
+#   - 头部五段：core 3 + boundary 6 + system 3 + slot N + draw 9605
+#     = HEAD_SIZE 9617+N，DRAW_BEGIN 12+N。**N 由词表 config 的
+#     slot_count 决定，spec 不钉死**；base 的 N=0 → 9617 / 12。
+#     `gen_vocab.py` 以 base 为模板生成带 N 个槽位的新词表。
+#     ID 整体位移，旧 .tokens / 权重 / 存档一律不可读。词表升 base1.2.0。
+#
+# 定案记录（2026-11-07，steve 拍板，base1.3.0 扩表 + Typst 结构 token）：
+#   - 依据两份桌面文档：`gargantua-typst-token-spec.md`（全量 Typst
+#     语法构造）与 `词表新增内容.md`（31 个 Unicode 区块、精确 3537 字）。
+#   - **Typst 结构 token 并入架构契约头**（用户明确选定「ID 整体位移」
+#     而非末尾追加）：114 个语法构造 × 显式开/闭 = 228 个 `<>` tools，
+#     插在 slot 与 draw 之间。HEAD_SIZE 9617+N → 9845+N，
+#     DRAW_BEGIN 12+N → 240+N。旧 .tokens / 权重 / 存档全部不可读。
+#   - **形态约定**：`{}|` = system、`[]` = border、`<>` = tools
+#     （core 机制单标记 + Typst 结构）、`<>` = 用户自定义预留（slot）、
+#     `内容:HEX` = 可见常规 token。Typst 结构 token 与 core 同走 token-6
+#     的 `<HEX>` tool 元素：进 loss、有 KV、段类型 TYPE_NONE。
+#   - **3537 个新字符末尾追加** `unicode_ext` 区（code 之后），
+#     category=regular，enctok 自动覆盖，无需改编码逻辑。
+#   - 本次**不实现映射器**（token 流 → .typ）；改为交付机器可读
+#     `typst_map.json` + 人可读 `TYPST_TOKENS.md` 对应表格，由
+#     `service/tokens/gen_typst_map.py` 从 spec 唯一真源生成，禁止手抄 ID。
+#
 # 定案记录（2026-11-04，steve 拍板，enc/dec 权重模式可选）：
 #   - 创建模型时可选「分离权重」（默认，v1 现状）或「共享权重」。共享 =
 #     enc_blocks[i] 与 dec_blocks[i] 逐层共用同一批参数（两侧 final norm 也
@@ -147,8 +205,62 @@
 #     4.1GB（fp32）。建模时可用 d_model / block 数 / 共享权重控制规模。
 #   - state_dict 的 FFN 键从 enc_blocks.N.ffn_up/down 变成
 #     enc_blocks.N.ffns.i.ffn_up/down；旧检查点结构不同，需重新建模。
+#
+# 定案记录（2026-11-08，steve 交付 MoMW 规格，实现侧按本机架构适配）：
+#   - MoMW（Mixture-of-Memory-Weights）是**可选记忆阀门**，插在第一个
+#     Block 之后、与既有 fast weight 同址并列（H_out = H_1 + ΔH）。
+#     **默认关闭**：旧模型目录零影响——build_model 是 strict load，
+#     state_dict 一个 key 都不许变。
+#   - Router 无训练：不注册任何 nn.Parameter。Query 直接复用 fast weight
+#     里 KDA 的 w_q 投影（已训练、确定性），按 head 分块与各层状态 S
+#     做 einsum 打分；项目里 S 是 [B,H,dk,dv] 递推终态，不是 [D,D] 矩阵。
+#   - Pool 层共享同一份 KDAAttention 权重（参数零新增），只各自持有独立
+#     递推状态 (S, conv_cache)——沿用「共享参数不共享实例」的既有口径；
+#     未被召回的层不前向，状态就不推进（未被召回则不遗忘）。
+#   - 动态扩展只改运行时状态（层数 / bonus / coverage 不落盘），不改变
+#     权重契约；新层零状态必须靠 bonus 路由偏置打破激活死锁。
+#   - 与 fast weight 一样，MoMW 状态在样本边界由 reset_memory() 复位，
+#     推理会话则放在外部 state 容器里跨轮持久。
+#
+# 定案记录（2026-11-08 第二版，steve 交付三阶段规格）：
+#   - Router 打分从「Q@S 能量范数」改为**余弦混合**：阶段一锚点原型 P_k
+#     （wte 代表性 token Embedding 均值，惰性首次 forward 计算、
+#     persistent=False 缓存），阶段二幂迭代提取状态主特征 E_i 并用
+#     γ_i=1-exp(-writes/k) 混合，阶段三空层分裂（禁止 clone）+ 指数衰减
+#     bonus + 同类软负载均衡。详见 4b 节。
+#   - 余弦打分量级 [-1,1]，threshold / B0 默认值随之整体重标；v1 的 10 个
+#     config 字段全部保留，旧 config 无需迁移即可加载（新增字段取默认）。
+#   - 「全异步 / 静默激活」落地为会话级 silent 开关：路由与写入照常执行
+#     （后台实时写入），但 ΔH 不注入输出；状态读写仍在同一串行推理进程内，
+#     不做跨线程并发写（避免竞争，也符合规格自己的工程提醒）。
+#   - 推理界面加 MoMW 面板，统计走既有 /api/infer/stats 1.2s 轮询通道。
 # ===========================================================================
+import json
 import math
+from pathlib import Path
+
+# 全局词表 config 决定「预留槽位数量」：spec 自己**不定死**这个数。
+# base 词表零预留（slot_count=0），要预留就跑 service/tokens/gen_vocab.py
+# 以 base 为模板生成一份新词表，它自己的 config 里写明 slot_count。
+# 运行时布局常量从这里读到的值派生；读不到 / 非法一律回退 0（= base）。
+_GLOBAL_VOCAB_CONFIG = (Path(__file__).resolve().parent.parent
+                        / "service" / "tokens" / "config.json")
+BASE_SLOT_COUNT = 0                 # base 永远零预留
+MAX_SLOT_COUNT = 4096               # 防呆：一份词表最多预留这么多
+
+
+def _global_slot_count() -> int:
+    """从全局词表 config 读 slot_count；缺省 / 非法 → 0（base 布局）。"""
+    try:
+        cfg = json.loads(_GLOBAL_VOCAB_CONFIG.read_text(encoding="utf-8"))
+        n = cfg.get("slot_count", BASE_SLOT_COUNT)
+        if (isinstance(n, int) and not isinstance(n, bool)
+                and 0 <= n <= MAX_SLOT_COUNT):
+            return n
+    except Exception:
+        pass
+    return BASE_SLOT_COUNT
+
 
 # ---------------------------------------------------------------------------
 # 1. 词表布局
@@ -330,29 +442,55 @@ def draw_canvas_auto(img_w, img_h):
 # ---------------------------------------------------------------------------
 # 1b. 架构契约头（冻结：名字 + 顺序 + ID；所有词表共享，不得占用/重排）
 # ---------------------------------------------------------------------------
-# —— special 特殊（不可显示）——
-SPECIAL_TOKENS = [
-    "<caps>",                 # 大写标记：其后单词/字母首字母大写
-    "<user>", "<user/>",      # 用户输入段边界（TYPE_USER）
-    "<model>", "<model/>",    # 模型输出段边界（TYPE_MODEL）
-    "<stop>",                 # 生成停止标记：模型输出即停止
+# 2026-11-06（steve 定案）：不再预定义任何工具 / 排版 token。整个 agent
+# 区改成 **编号槽位**，数量 N 由每份词表 config 的 slot_count 决定
+# （spec 不钉死；base 的 N=0，gen_vocab.py 生成带 N 个槽位的新词表），
+# 语义由使用者自己定义；而 <caps>/<stop>/<draw:end> 这种最早就有的
+# 机制单标记 **单开 core 一类**——既不是 [] 段边界，也不是工具调用。
+# 头部六段顺序冻结（前 12 个 ID 恒定，其余随 N 平移；base1.3.0 起）：
+#   core(3) → boundary(6) → system(3) → slot(N) → typst(228) → draw(9605)
+#   = 9845+N，DRAW_BEGIN = 240+N。
+# 本轮 ID 布局全变，按项目约定不做向后兼容（旧 .tokens / 权重不可读）。
+# typst 段在 slot **之后**是刻意的：vfc.infer_slot_count() 靠「固定前缀
+# 12 + 直到第一个 Typst 结构 token 之前」自描述槽位段长度（2026-11-07
+# 起 slot 名字可自定义、不再只认连续 <sN>），typst 放前面会把它截断。
+
+# —— core 控制标记（<> 形态、无闭合、进 loss、有 KV）——
+CORE_TOKENS = [
+    "<caps>",        # 0 大写标记：其后单词/字母首字母大写
+    "<stop>",        # 1 生成停止标记：模型输出即停止
+    "<draw:end>",    # 2 绘画结束：其后输出恢复为文本
 ]
-SPECIAL_BEGIN = 0x00000000
-# 旧值 64（6 已用 + 58 预留）→ 现在不留预留：按实际收录数排布
-SPECIAL_SIZE = len(SPECIAL_TOKENS)           # 6
-
-# 生成停止 token：模型输出该 token 即停止生成
+CORE_BEGIN = 0x00000000
+CORE_SIZE = len(CORE_TOKENS)                     # 3
+CORE_END = CORE_BEGIN + CORE_SIZE
+CAPS_ID = CORE_TOKENS.index("<caps>")            # 0
 STOP_TOKEN = "<stop>"
-STOP_ID = SPECIAL_TOKENS.index(STOP_TOKEN)   # 5（与旧版一致）
+STOP_ID = CORE_TOKENS.index(STOP_TOKEN)          # 1
+DRAW_END_TOKEN = "<draw:end>"
+DRAW_END_ID = CORE_TOKENS.index(DRAW_END_TOKEN)  # 2
 
-# 段边界 token：推理存档（.tokens）用它把「用户输入 / 模型输出」包成结构，
-# 与训练 .tokens 流同一套边界约定（<user>…<user/> 内 = TYPE_USER，
-# <model>…<model/> 内 = TYPE_MODEL）。推理里 generate 把它们写进 IdArchive，
-# 让存档本身可读出谁是谁，而不只是扁平 ID 流。
-USER_ID = SPECIAL_TOKENS.index("<user>")        # 1
-USER_END_ID = SPECIAL_TOKENS.index("<user/>")    # 2
-MODEL_ID = SPECIAL_TOKENS.index("<model>")       # 3
-MODEL_END_ID = SPECIAL_TOKENS.index("<model/>")  # 4
+# —— boundary 段边界（[] 形态；界定 TYPE_USER / TYPE_MODEL / TYPE_SYS）——
+# 推理存档（.tokens）用它把「用户输入 / 模型输出 / 系统」包成结构。
+BOUNDARY_TOKENS = [
+    "[user]", "[user/]",      # 3/4 用户输入段
+    "[model]", "[model/]",    # 5/6 模型输出段
+    "[sys]", "[sys/]",        # 7/8 系统段
+]
+BOUNDARY_BEGIN = CORE_END                        # 3
+BOUNDARY_SIZE = len(BOUNDARY_TOKENS)             # 6
+BOUNDARY_END = BOUNDARY_BEGIN + BOUNDARY_SIZE
+USER_ID = BOUNDARY_BEGIN + BOUNDARY_TOKENS.index("[user]")          # 3
+USER_END_ID = BOUNDARY_BEGIN + BOUNDARY_TOKENS.index("[user/]")      # 4
+MODEL_ID = BOUNDARY_BEGIN + BOUNDARY_TOKENS.index("[model]")        # 5
+MODEL_END_ID = BOUNDARY_BEGIN + BOUNDARY_TOKENS.index("[model/]")    # 6
+SYS_ID = BOUNDARY_BEGIN + BOUNDARY_TOKENS.index("[sys]")            # 7
+SYS_END_ID = BOUNDARY_BEGIN + BOUNDARY_TOKENS.index("[sys/]")        # 8
+
+# 兼容别名：头两段合称 special（vfc.head_entries / 加载侧沿用这个名字）。
+SPECIAL_TOKENS = CORE_TOKENS + BOUNDARY_TOKENS
+SPECIAL_BEGIN = CORE_BEGIN
+SPECIAL_SIZE = CORE_SIZE + BOUNDARY_SIZE        # 9
 
 # —— system 系统（不可显示，时间步结构）——
 # 显示即字面量：{ = 时间步开始，} = 时间步结束，| = 步内 token 分隔。
@@ -360,22 +498,324 @@ TS_OPEN = "{"
 TS_CLOSE = "}"
 TS_SEP = "|"
 SYSTEM_CHARS = [TS_OPEN, TS_CLOSE, TS_SEP]
-SYSTEM_BEGIN = SPECIAL_BEGIN + SPECIAL_SIZE   # 6（旧：64）
+SYSTEM_BEGIN = SPECIAL_BEGIN + SPECIAL_SIZE   # 9
 # 旧值 32（3 已用 + 29 预留）→ 按实际收录数
 SYSTEM_SIZE = len(SYSTEM_CHARS)               # 3
-TS_OPEN_ID = SYSTEM_BEGIN + 0                  # 6（旧：64）
-TS_CLOSE_ID = SYSTEM_BEGIN + 1                 # 7（旧：65）
-TS_SEP_ID = SYSTEM_BEGIN + 2                   # 8（旧：66）
+TS_OPEN_ID = SYSTEM_BEGIN + 0                  # 9
+TS_CLOSE_ID = SYSTEM_BEGIN + 1                 # 10
+TS_SEP_ID = SYSTEM_BEGIN + 2                   # 11
+
+# —— slot 编号槽位（**数量由词表 config 决定，spec 不定死**）——
+# 名字 <s0>..<sN-1>：s 不是十六进制字符，不会被 tok6 的 <HEX> 解析误吞；
+# 编号直接显示，不预设任何工具 / 排版 / 段边界语义。使用者自己在 SLOT_DEFS
+# 里给槽位起名、配对、接执行；项目默认**一个都不接**（工具台与测试台，
+# 实际执行留给将来的推理 app）。
+#
+# base 词表零预留（slot_count=0 → 没有 slot 段，DRAW_BEGIN=240）。
+# 想要预留槽位：python service/tokens/gen_vocab.py --name NAME --slots N
+# 以 base 为模板生成新词表，新词表的 config 自己写明 slot_count=N。
+SLOT_COUNT = _global_slot_count()
+SLOT_TOKENS = tuple(f"<s{i}>" for i in range(SLOT_COUNT))
+SLOT_BEGIN = SYSTEM_BEGIN + SYSTEM_SIZE         # 12（固定）
+SLOT_SIZE = SLOT_COUNT
+SLOT_END = SLOT_BEGIN + SLOT_SIZE
+SLOT_ID = {name: SLOT_BEGIN + i
+           for i, name in enumerate(SLOT_TOKENS)}
+SLOT_NAME_BY_ID = {i: n for n, i in SLOT_ID.items()}
+
+
+# ---------------------------------------------------------------------------
+# 1b-2. Typst 结构 token（2026-11-07 base1.3.0 新增，并入架构契约头）
+# ---------------------------------------------------------------------------
+# 唯一真源：gargantua-typst-token-spec.md §3「全量 token 词表」+ §2 属性机制。
+# 硬约束（steve）：每个语法构造都有**显式开/闭两个 token**，无 hybrid；
+# 结构用特殊 token 承担、散文用普通子词；模型只吐 token ID，映射器
+# （确定性代码，后续独立实现）翻译成 .typ 再编译 PDF。
+#
+# 形态约定（steve 2026-11-07）：`{}|` = system、`[]` = border、
+# `<>` = tools（core 机制单标记 + 本节 Typst 结构）、`<>` = 用户自定义
+# 预留（slot 编号槽位）、`内容:HEX` = 可见常规 token。
+#
+# 命名：开 `<NAME>` / 闭 `</NAME>`。闭标签首字符是 '/'，所以 vfc 的标记
+# 名字正则必须允许可选前导 '/'（见 tokens/vfc.py）。
+# 排布：每个构造占**两个连续 ID，开在前、闭在后**，配对 id = open_id + 1。
+# 映射器与生成表格都可直接按此取，不必再查一次表。
+#
+# 字段：(name, section, typst, kind, empty, attrs, note)
+#   typst = 规范 §3「Typst」列原文（保留原文，不臆断精确语法）
+#   kind  = 构造大类；empty = 无内容元素（仍保留显式空对，见规范 §2）
+#   attrs = 允许的具名属性（由 <ATTR> 承载），多个用 ',' 分隔
+TYPST_CONSTRUCT_FIELDS = ("name", "section", "typst", "kind", "empty",
+                          "attrs", "note")
+TYPST_CONSTRUCTS = (
+    # —— §3.1 文档根与页面 ——
+    ("DOC", "3.1", "（文档根，可省略）", "root", False, "", "顶层包裹"),
+    ("PAGESET", "3.1", "set page(..)", "page", False, "margin,paper,columns", "页边距/纸张/分栏"),
+    ("TEXTSET", "3.1", "set text(..)", "page", False, "font,size,lang,cjk", "字体/字号/CJK"),
+    ("PARSET", "3.1", "set par(..)", "page", False, "spacing,justify,leading", "段落间距/对齐"),
+    ("DOCSET", "3.1", "set document(..)", "page", False, "title,author", "标题/作者"),
+    ("HEADER", "3.1", "page(header: ..)", "page", False, "", "页眉"),
+    ("FOOTER", "3.1", "page(footer: ..)", "page", False, "", "页脚"),
+    ("BIB", "3.1", "bibliography(..)", "empty", True, "path,style", "参考文献 ∅"),
+    ("OUTLINE", "3.1", "outline", "empty", True, "title,depth", "目录 ∅"),
+    ("INCLUDE", "3.1", 'include ".."', "empty", True, "src", "引入模块 ∅"),
+    ("IMPORT", "3.1", 'import ".."', "page", False, "src", "导入"),
+    # —— §3.2 标题 / 段落 / 块级容器 ——
+    ("H1", "3.2", "= ", "heading", False, "", "一级标题"),
+    ("H2", "3.2", "== ", "heading", False, "", "二级标题"),
+    ("H3", "3.2", "=== ", "heading", False, "", "三级标题"),
+    ("H4", "3.2", "==== ", "heading", False, "", "四级标题"),
+    ("H5", "3.2", "===== ", "heading", False, "", "五级标题"),
+    ("H6", "3.2", "====== ", "heading", False, "", "六级标题"),
+    ("P", "3.2", "段落（空行分隔）", "block", False, "", "显式段落"),
+    ("QUOTE", "3.2", "quote[..]", "block", False, "", "引用块"),
+    ("BLOCK", "3.2", "block(..)[..]", "block", False, "width,height,fill", "通用块"),
+    ("BOX", "3.2", "box(..)[..]", "block", False, "width,height", "行内块"),
+    ("PAD", "3.2", "pad(..)[..]", "block", False, "x,y,left,right,top,bottom", "内边距"),
+    ("COLUMNS", "3.2", "columns(2)[..]", "block", False, "n", "分栏"),
+    ("GRID", "3.2", "grid(..)", "block", False, "columns,rows,gutter", "网格布局"),
+    ("STACK", "3.2", "stack(..)", "block", False, "dir,spacing", "堆叠布局"),
+    ("ALIGN", "3.2", "align(center)[..]", "block", False, "mode", "对齐"),
+    ("PLACE", "3.2", "place(..)[..]", "block", False, "dx,dy", "绝对定位"),
+    ("FIGURE", "3.2", "figure(..)", "block", False, "caption", "图/表浮动体"),
+    ("CAPTION", "3.2", "figure 的 caption", "block", False, "", "图注"),
+    ("PARBREAK", "3.2", "parbreak", "empty", True, "", "段落分隔 ∅"),
+    ("LINEBREAK", "3.2", "linebreak", "empty", True, "", "换行 ∅"),
+    ("PAGEBREAK", "3.2", "pagebreak", "empty", True, "", "分页 ∅"),
+    ("SPACER", "3.2", "v(..) / h(..)", "empty", True, "amount", "间距 ∅"),
+    # —— §3.3 行内强调与文本 ——
+    ("B", "3.3", "*..*", "inline", False, "", "加粗"),
+    ("I", "3.3", "_.._", "inline", False, "", "斜体"),
+    ("CODE", "3.3", "行内代码反引号", "inline", False, "", "行内代码"),
+    ("LINK", "3.3", 'link("..")[..]', "inline", False, "url", "链接"),
+    ("RAW", "3.3", "围栏原始块", "inline", False, "lang", "代码块（保留格式）"),
+    ("LABEL", "3.3", "label 名", "inline", False, "", "标签"),
+    ("REF", "3.3", "@name", "inline", False, "", "引用"),
+    ("SYM", "3.3", "-> 等符号简写", "empty", True, "name", "符号 ∅"),
+    ("COMMENT", "3.3", "/* .. */", "inline", False, "", "注释（输出丢弃）"),
+    # —— §3.4 列表 ——
+    ("UL", "3.4", "list(..)[..]", "list", False, "", "无序列表"),
+    ("OL", "3.4", "enum(..)[..]", "list", False, "", "有序列表"),
+    ("TERMS", "3.4", "terms(..)[..]", "list", False, "", "术语列表"),
+    ("LI", "3.4", "列表项", "list", False, "", "UL/OL 子项"),
+    ("TERM", "3.4", "术语", "list", False, "", "TERMS 子项"),
+    ("DESC", "3.4", "描述", "list", False, "", "TERMS 子项"),
+    # —— §3.5 表格 ——
+    ("TABLE", "3.5", "#table(columns:.., ..)", "table", False, "columns", "表格"),
+    ("ROW", "3.5", "一行", "table", False, "", "含若干 CELL"),
+    ("CELL", "3.5", "单元格内容", "table", False, "colspan,rowspan", "单元格"),
+    ("TH", "3.5", "表头单元格", "table", False, "colspan", "加粗表头"),
+    # —— §3.6 数学（通道 + 构造，全 token 化，不使用自由数学文本）——
+    ("MATH", "3.6", "$..$", "math", False, "", "行内数学"),
+    ("MATHB", "3.6", "$ .. $", "math", False, "", "块级数学"),
+    ("MSUB", "3.6", "_", "math", False, "", "下标"),
+    ("MSUP", "3.6", "^", "math", False, "", "上标"),
+    ("MFRAC", "3.6", "frac(..)", "math", False, "", "分数（含 NUM/DEN）"),
+    ("NUM", "3.6", "分子", "math", False, "", "MFRAC 分子"),
+    ("DEN", "3.6", "分母", "math", False, "", "MFRAC 分母"),
+    ("MSQRT", "3.6", "sqrt(..)", "math", False, "", "平方根"),
+    ("MROOT", "3.6", "root(..)", "math", False, "", "n 次根"),
+    ("MSUM", "3.6", "sum", "math", False, "", "求和（含 MBELOW/MABOVE）"),
+    ("MBELOW", "3.6", "下限", "math", False, "", "MSUM 下限"),
+    ("MABOVE", "3.6", "上限", "math", False, "", "MSUM 上限"),
+    ("MINT", "3.6", "integral", "math", False, "", "积分"),
+    ("MLIM", "3.6", "lim", "math", False, "", "极限"),
+    ("MMAT", "3.6", "mat(..)", "math", False, "", "矩阵（含 MROW）"),
+    ("MROW", "3.6", "矩阵一行", "math", False, "", "MMAT 子项"),
+    ("MCASE", "3.6", "cases(..)", "math", False, "", "分段"),
+    ("MALIGN", "3.6", "&", "empty", True, "", "对齐点 ∅"),
+    ("MFUNC", "3.6", "sin(..)", "math", False, "name", "数学函数"),
+    ("MID", "3.6", "变量名", "math", False, "", "标识符"),
+    ("MN", "3.6", "数字字面量", "math", False, "", "数字"),
+    ("MOP", "3.6", "+ - * / = < > 等", "math", False, "", "运算符（允许集见规范）"),
+    ("MTEXT", "3.6", '数学中文本 ".."', "math", False, "", "数学中文本"),
+    # —— §3.7 代码 / 脚本 / 样式 ——
+    ("CODEBLOCK", "3.7", "#{ .. }", "code", False, "", "代码块"),
+    ("CBLOCK", "3.7", "[..]", "code", False, "", "内容块"),
+    ("SET", "3.7", "set text(..)", "code", False, "sel", "设值规则"),
+    ("SETIF", "3.7", "set text(..) if ..", "code", False, "sel,cond", "条件设值"),
+    ("SHOW", "3.7", "show heading: ..", "code", False, "sel", "显示规则"),
+    ("SHOWSET", "3.7", "show heading: set ..", "code", False, "sel", "显示-设值"),
+    ("SHOWFUNC", "3.7", "show raw: it => ..", "code", False, "sel", "变换规则"),
+    ("SHOWALL", "3.7", "show: template", "code", False, "", "全局套用"),
+    ("SHOWTEXT", "3.7", 'show "badly": ..', "code", False, "text", "文本替换"),
+    ("SHOWREGEX", "3.7", "show regex(..): ..", "code", False, "pat", "正则选择"),
+    ("CONTEXT", "3.7", "context ..", "code", False, "", "自省上下文"),
+    ("LET", "3.7", "let x = ..", "code", False, "name", "绑定"),
+    ("DEF", "3.7", "let f(x) = ..", "code", False, "name", "具名函数"),
+    ("IF", "3.7", "if ..", "code", False, "", "条件"),
+    ("ELIF", "3.7", "else if ..", "code", False, "cond", "条件分支"),
+    ("ELSE", "3.7", "else ..", "code", False, "", "条件分支"),
+    ("FOR", "3.7", "for x in ..", "code", False, "var,in", "循环"),
+    ("WHILE", "3.7", "while ..", "code", False, "cond", "循环"),
+    ("RETURN", "3.7", "return ..", "code", False, "", "返回"),
+    ("BREAK", "3.7", "break", "empty", True, "", "循环控制 ∅"),
+    ("CONTINUE", "3.7", "continue", "empty", True, "", "循环控制 ∅"),
+    ("CALL", "3.7", "#rect(..)[..]", "code", False, "name", "通用函数调用"),
+    ("ARG", "3.7", "具名参数 k: v", "code", False, "name", "CALL 参数"),
+    # —— §3.8 值 / 字面量（代码通道内）——
+    ("STR", "3.8", '"hello"', "value", False, "", "字符串"),
+    ("INT", "3.8", "10", "value", False, "", "整数"),
+    ("FLOAT", "3.8", "3.14", "value", False, "", "浮点"),
+    ("BOOL", "3.8", "true / false", "value", False, "", "布尔"),
+    ("NONE", "3.8", "none", "empty", True, "", "占位 ∅"),
+    ("AUTO", "3.8", "auto", "empty", True, "", "占位 ∅"),
+    ("LEN", "3.8", "2pt", "value", False, "", "长度"),
+    ("ANG", "3.8", "90deg", "value", False, "", "角度"),
+    ("FRAC", "3.8", "2fr", "value", False, "", "弹性比例"),
+    ("RATIO", "3.8", "50%", "value", False, "", "百分比"),
+    ("ARR", "3.8", "(..)", "value", False, "", "数组（含 ITEM）"),
+    ("ITEM", "3.8", "数组项", "value", False, "", "ARR 子项"),
+    ("DICT", "3.8", "(k: v)", "value", False, "", "字典（含 KV）"),
+    ("KV", "3.8", "k: v", "value", False, "k", "DICT 子项"),
+    ("CITE", "3.8", "cite(..)", "empty", True, "key", "引用 ∅"),
+    # —— §2 通用属性机制（规范 §4.1/§4.3 需要；本次按显式开/闭对实现，
+    #     属性字面走内容通道，避免引入单 token 的 hybrid 例外）——
+    ("ATTR", "2", 'name="k" value="v"', "meta", False, "name,value",
+     "通用属性，紧跟开标签，映射器聚合成具名参数"),
+)
+
+_TYPST_NAMES = tuple(c[0] for c in TYPST_CONSTRUCTS)
+TYPST_OPEN_TOKENS = tuple(f"<{n}>" for n in _TYPST_NAMES)
+TYPST_CLOSE_TOKENS = tuple(f"</{n}>" for n in _TYPST_NAMES)
+# 交错排布：<NAME>, </NAME>, <NEXT>, </NEXT>, …
+TYPST_TOKENS = tuple(t for pair in zip(TYPST_OPEN_TOKENS, TYPST_CLOSE_TOKENS)
+                     for t in pair)
+TYPST_CONSTRUCT_COUNT = len(TYPST_CONSTRUCTS)      # 114
+TYPST_SIZE = len(TYPST_TOKENS)                     # 228
+assert TYPST_SIZE == 2 * TYPST_CONSTRUCT_COUNT
+assert len(set(_TYPST_NAMES)) == TYPST_CONSTRUCT_COUNT, "Typst 构造重名"
+assert len(set(TYPST_TOKENS)) == TYPST_SIZE, "Typst token 重名"
+
+# 契约头内位置：紧跟 slot 段（插在 slot 与 draw 之间）。放在 slot 之后是
+# 为了让 vfc.infer_slot_count() 的「固定前缀 12 + 到首个 Typst token 为止」
+# 自描述逻辑保持原样（slot 名字自定义也照数不误）；gen_vocab.py 的
+# tail = entries[12+base_slots:] 也自动包含本段。
+TYPST_BEGIN = SLOT_END
+TYPST_END = TYPST_BEGIN + TYPST_SIZE
+TYPST_ID = {name: TYPST_BEGIN + 2 * i
+            for i, name in enumerate(_TYPST_NAMES)}       # 开 token ID
+TYPST_CLOSE_ID = {name: TYPST_BEGIN + 2 * i + 1
+                  for i, name in enumerate(_TYPST_NAMES)}  # 闭 token ID
+TYPST_TOKEN_ID = {t: TYPST_BEGIN + i
+                  for i, t in enumerate(TYPST_TOKENS)}
+TYPST_NAME_BY_ID = {i: t for t, i in TYPST_TOKEN_ID.items()}
+TYPST_BY_NAME = {c[0]: dict(zip(TYPST_CONSTRUCT_FIELDS, c))
+                 for c in TYPST_CONSTRUCTS}
+
+
+def slot_tokens(n: int) -> tuple:
+    """任意预留数 N → N 个编号槽位名字（gen_vocab 用，不依赖运行时布局）。"""
+    if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+        raise ValueError(f"slot_count 必须是 ≥0 的整数: {n!r}")
+    if n > MAX_SLOT_COUNT:
+        raise ValueError(f"slot_count 超过上限 {MAX_SLOT_COUNT}: {n}")
+    return tuple(f"<s{i}>" for i in range(n))
+
+
+def head_layout(n: int = None) -> dict:
+    """给定预留数 N → 该词表的完整头部布局（纯函数，不读全局状态）。
+
+    core / boundary / system 三段固定（0..11），slot 段长度 N，
+    typst 段固定 TYPST_SIZE（base1.3.0 起并入契约头），draw 段固定 9605；
+    DRAW_BEGIN 与 HEAD_SIZE 随 N 平移。gen_vocab 与前端用它算任意词表的
+    ID，不必 import 时就把 128 之类的数字钉死在 spec 里。
+    """
+    if n is None:
+        n = SLOT_COUNT
+    names = slot_tokens(n)
+    slot_begin = SYSTEM_BEGIN + SYSTEM_SIZE
+    typst_begin = slot_begin + n
+    draw_begin = typst_begin + TYPST_SIZE
+    return {
+        "slot_count": n,
+        "core_begin": CORE_BEGIN, "core_size": CORE_SIZE,
+        "boundary_begin": BOUNDARY_BEGIN, "boundary_size": BOUNDARY_SIZE,
+        "system_begin": SYSTEM_BEGIN, "system_size": SYSTEM_SIZE,
+        "slot_begin": slot_begin, "slot_size": n,
+        "slot_tokens": names,
+        "typst_begin": typst_begin, "typst_size": TYPST_SIZE,
+        "typst_tokens": TYPST_TOKENS,
+        "draw_begin": draw_begin, "draw_size": DRAW_VOCAB_SIZE,
+        "head_size": draw_begin + DRAW_VOCAB_SIZE,
+    }
+
+# 兼容别名：旧代码里的 AGENT_* 现在统一指向 slot 区。
+AGENT_TOKENS = SLOT_TOKENS
+AGENT_BEGIN = SLOT_BEGIN
+AGENT_SIZE = SLOT_SIZE
+AGENT_END = SLOT_END
+AGENT_ID = SLOT_ID
+AGENT_NAME_BY_ID = SLOT_NAME_BY_ID
+
+# 自定义槽位元数据（**默认全空**）。想定义工具/排版时自己填，例如：
+#   SLOT_DEFS = {
+#       0: {"name": "bash", "kind": "action", "close": 1,
+#           "executable": False, "description": "终端命令", "arg_hint": "命令"},
+#       1: {"name": "bash/", "kind": "close"},
+#   }
+# kind ∈ {"action","format","boundary","close"}；close 是闭合槽位编号（可选）。
+# executable=True 才会被 /api/agent/tool 放行——默认全部 False。
+SLOT_DEFS: dict = {}
+TOOL_SPECS: dict = {}          # 退役（2026-11-06）：工具语义改由 SLOT_DEFS 自定义
+TOOL_EXECUTABLE = frozenset()  # 先全部不接
 
 # —— modal 模态输出（图元 DRAW；token 布局见 1a）——
-MODAL_BEGIN = SYSTEM_BEGIN + SYSTEM_SIZE      # 9（旧：96）
-# 旧值 12288（DRAW 2961 + 9327 预留）→ 只留实际用到的
+# base1.3.0：typst 结构段插在 slot 与 draw 之间，DRAW_BEGIN 随之 +TYPST_SIZE。
+MODAL_BEGIN = TYPST_END
 MODAL_SIZE = DRAW_VOCAB_SIZE                   # 9605（= DRAW_VOCAB_SIZE）
-DRAW_BEGIN = MODAL_BEGIN                       # 9（旧：96）
+DRAW_BEGIN = MODAL_BEGIN                      # 12 + SLOT_COUNT + 228（base = 240）
 
-# 架构契约头长度 = special + system + modal。**所有词表共享、固定**。
-# 可见区从这里开始；头内不允许任何空位（空位同样吃 embedding 行）。
-HEAD_SIZE = SPECIAL_SIZE + SYSTEM_SIZE + MODAL_SIZE     # 9614（旧：12384）
+# 架构契约头长度 = core 3 + boundary 6 + system 3 + slot N
+#                + typst 228 + draw 9605 = 9845 + N，N 由全局词表
+# config 的 slot_count 决定。可见区从这里开始。slot 区虽是预留位，但每个
+# 都是真实 token（有 ID、有 embedding、进 loss、有 KV），只是语义未定义；
+# typst 段是结构 token，同样不可显示、进 loss、有 KV，段类型挂 TYPE_NONE。
+HEAD_SIZE = (CORE_SIZE + BOUNDARY_SIZE + SYSTEM_SIZE + SLOT_SIZE
+             + TYPST_SIZE + MODAL_SIZE)       # base N=0 → 9845
+assert HEAD_SIZE == (SPECIAL_SIZE + SYSTEM_SIZE + AGENT_SIZE
+                     + TYPST_SIZE + MODAL_SIZE)
+assert HEAD_SIZE == head_layout(SLOT_COUNT)["head_size"]
+
+# 词表版本（2026-11-05 base1.0.0 → 11-06 base1.1.0 → 11-06 base1.2.0
+#           → 11-07 base1.3.0）：
+#   1.1.0：可见区末尾追加 code 代码专用 token 区，旧 ID 全兼容。
+#   1.2.0：**契约头重排**（core/boundary/system/slot N/draw），
+#         agent 区 53 个预定义工具全部退役；N 交给词表 config（base=0，
+#         gen_vocab.py 生成带 N 个槽位的派生词表）。ID 布局整体位移。
+#   1.3.0：**契约头新增 typst 结构段**（slot 之后、draw 之前，228 个
+#         = 114 个构造 × 开/闭）+ 可见区末尾追加 unicode_ext 区
+#         （3537 个字符，31 个 Unicode 区块）。draw 与全部可见区 ID
+#         整体 +228，旧 .tokens / 旧权重 / 旧存档一律不可读，不做兼容。
+#         映射器（token 流 → .typ）留作后续独立实现；本次只交付词表 +
+#         机器/人可读的对应表格（service/tokens/typst_map.py 生成）。
+BASE_VOCAB_NAME = "base1.3.0"
+VOCAB_VERSION = "1.3.0"
+TOKEN_ENCODING = "token-6"
+
+# 上传文件的扩展名 → 转换器种类（/api/agent/spec 下发，前端不抄常量）。
+# 取值与 server_codecs.py 的 /api/codec/* 一一对应：
+#   text → /api/codec/text（离散 token，可直接拼进 tokenIds）
+#   image/audio/video → 连续投影，走 /api/infer 的 media 通道
+#   draw → /api/codec/draw 的图元 CSV/tokens（离散 token）
+AGENT_FILE_KINDS = {
+    ".txt": "text", ".md": "text", ".json": "text", ".log": "text",
+    ".csv": "text", ".py": "text", ".js": "text", ".html": "text",
+    ".css": "text", ".xml": "text", ".yaml": "text", ".yml": "text",
+    ".vfc": "text", ".gts": "text", ".tokens": "text",
+    ".png": "image", ".jpg": "image", ".jpeg": "image",
+    ".bmp": "image", ".webp": "image", ".gif": "image",
+    ".wav": "audio", ".mp3": "audio", ".flac": "audio",
+    ".ogg": "audio", ".m4a": "audio", ".aac": "audio",
+    ".mp4": "video", ".mov": "video", ".webm": "video",
+    ".mkv": "video", ".avi": "video",
+    ".prim": "draw", ".prim.csv": "draw",
+}
+AGENT_FILE_LABELS = {
+    "text": "文本", "image": "图片", "audio": "音频",
+    "video": "视频", "draw": "图元",
+}
+AGENT_MAX_FILE_BYTES = 64 * 1024 * 1024
 
 # 词表长度防呆上界。**这不是 spec 规定的长度**——词表多长由各词表的
 # config.json 说了算，token ID 是自界定十六进制（见第 5b 节），格式本身
@@ -395,8 +835,59 @@ VOCAB_CONFIG_NAME = "config.json"   # 词表配置（含 vocab_size）
 # 可见区从 HEAD_SIZE 起，各子区按 VISIBLE_REGION_ORDER 的顺序**连续**
 # 排布；每个子区的长度 = 它实际收录的 token 数，不带任何预留。
 # 因此**不同词表的分区表是不同的**——这正是前端词表页要渲染的"分区"。
+# 2026-11-06（base1.1.0）：末尾追加 "code" 区（跨语言代码语法/标识符/
+# 运算符 token）。**只追加、不插队**——可见区既有子区的 ID 区间保持不动，
+# 老 ID 全部兼容；code 区文本与已收录文本撞名的由 build_vocab 去重跳过。
+# 2026-11-07（base1.3.0）：再在 code 之后追加 "unicode_ext" 区——31 个
+# Unicode 区块里 base1.2.0 未逻辑覆盖的 3537 个已分配字符（拉丁扩展、
+# 西里尔、希腊、假名、数学/字母符号等）。同样只追加、不插队：可见区
+# 既有子区 ID 一个不动（但契约头 +228 会让整段可见区平移）。
 VISIBLE_REGION_ORDER = ("digit", "whitespace", "symbol", "emoji",
-                        "cjk", "english", "extra", "fallback")
+                        "cjk", "english", "extra", "fallback", "code",
+                        "unicode_ext")
+
+# ---------------------------------------------------------------------------
+# 1c-2. 子区添加策略（2026-11-07，唯一真源）
+# ---------------------------------------------------------------------------
+# 词表页「增删 token」表单不再让用户选 regular / special 两档形态，而是选
+# **加到哪个子区**（全部子区都列出）。每个子区的 token 文本有强制格式：
+#   locked  架构契约头（core / boundary / system / typst / draw）——
+#           名字与顺序由本文件冻结，插一条会让后面所有 ID 位移，旧
+#           .tokens / 权重 / 存档全部报废，故只展示、禁用增删。
+#   angled  slot——用户自定义预留工具名，必须写成 <名字>；名字任意、
+#           只要不与全表已有 token 重名（编号 <sN> 只是其中一种写法）。
+#   text    可见文本子区——文本无格式要求，非空且不重名即可。
+# 前端一律通过 /api/vocab/regions 拿 regions[].add_policy 与
+# add_policy_hints，禁止在 JS 里抄子区名或规则。
+HEAD_REGION_ORDER = ("core", "boundary", "system", "slot", "typst", "draw")
+REGION_ORDER = HEAD_REGION_ORDER + VISIBLE_REGION_ORDER
+REGION_LOCKED = frozenset(r for r in HEAD_REGION_ORDER if r != "slot")
+POLICY_LOCKED = "locked"
+POLICY_ANGLED = "angled"
+POLICY_TEXT = "text"
+REGION_ADD_POLICY = {
+    **{r: POLICY_LOCKED for r in REGION_LOCKED},
+    "slot": POLICY_ANGLED,
+    **{r: POLICY_TEXT for r in VISIBLE_REGION_ORDER},
+}
+ADD_POLICY_HINTS = {
+    POLICY_LOCKED: "架构契约头，不可增删（名字与顺序由 spec 冻结）",
+    POLICY_ANGLED: "必须用 <名字> 包裹；名字自定义，全表不得重名",
+    POLICY_TEXT: "文本无格式要求（非空、不与现有 token 重名即可）",
+}
+
+
+def check_add_region(region: str) -> str:
+    """校验「添加到哪个子区」→ 返回策略；锁定 / 未知子区抛 ValueError。"""
+    if region not in REGION_ADD_POLICY:
+        raise ValueError(
+            f"未知子区: {region!r}（合法：{', '.join(REGION_ORDER)}）")
+    policy = REGION_ADD_POLICY[region]
+    if policy == POLICY_LOCKED:
+        raise ValueError(
+            f"子区 {region!r} 属架构契约头，不可修改：{ADD_POLICY_HINTS[policy]}")
+    return policy
+
 
 # 各类字符来源（build_vocab.py 生成基础词表时取用；**不是长度上限**）
 WHITESPACE_CHARS = [" ", "\t", "\n", "\r", "\u00a0", "\u3000"]
@@ -405,7 +896,8 @@ FALLBACK_LETTERS = "abcdefghijklmnopqrstuvwxyz"
 REGION_CATEGORY = {
     "digit": "regular", "whitespace": "regular", "symbol": "regular",
     "emoji": "regular", "cjk": "regular", "english": "regular",
-    "extra": "regular", "fallback": "fallback",
+    "extra": "regular", "fallback": "fallback", "code": "regular",
+    "unicode_ext": "regular",
 }
 
 # 2026-10-24：MIDI 输出 token 暂时删除（steve：研究后再定），midi_codec
@@ -417,10 +909,35 @@ REGION_CATEGORY = {
 
 # 边界 token → 类型嵌入 id（「有 token 无 embedding 投影」的边界 token
 # 本身不查词表投影，但其界定的区间内容会加类型嵌入）
-TYPE_USER = 0          # <user>..<user/> 之间：用户输入
-TYPE_MODEL = 1         # <model>..<model/> 之间：模型输出
+TYPE_USER = 0          # [user]..[user/] 之间：用户输入
+TYPE_MODEL = 1         # [model]..[model/] 之间：模型输出
 TYPE_NONE = 2          # 边界之外 / 边界 token 自身
-NUM_TYPES = 3
+TYPE_SYS = 3           # [sys]..[sys/] 之间：系统提示 / 工具结果（2026-11-05）
+NUM_TYPES = 4
+
+# 段类型归类（2026-11-06，11-07 补 typst）：给定 token id → type_emb。
+#   core 区（caps/stop/draw:end）单开一类 → TYPE_NONE：它们不属于任何段，
+#     只是机制单标记；但仍进 loss、有 KV（type_emb 与是否进 loss 无关）。
+#   typst 结构 token（base1.3.0）→ TYPE_NONE：与 core 同类的 <> tools，
+#     不属于任何对话段，段类型由外层上下文决定；仍进 loss、有 KV。
+#   slot 区编号槽位 → TYPE_SYS（与系统段同型），语义由使用者自定义。
+#   boundary 六个段边界各归其类；普通文本/媒体按上下文默认值处理。
+def segment_type_of(tid: int) -> int:
+    if not isinstance(tid, int) or tid < 0:
+        return TYPE_NONE
+    if CORE_BEGIN <= tid < CORE_END:
+        return TYPE_NONE
+    if TYPST_BEGIN <= tid < TYPST_END:
+        return TYPE_NONE
+    if tid in (USER_ID, USER_END_ID):
+        return TYPE_USER
+    if tid in (MODEL_ID, MODEL_END_ID):
+        return TYPE_MODEL
+    if tid in (SYS_ID, SYS_END_ID):
+        return TYPE_SYS
+    if SLOT_BEGIN <= tid < SLOT_END:
+        return TYPE_SYS
+    return TYPE_NONE
 
 # ---------------------------------------------------------------------------
 # 2. 模型维度
@@ -562,8 +1079,123 @@ FW_CHUNK = KDA_CHUNK_SIZE
 # 可视化（2026-11-04，/api/infer/stats）：状态 S 是 [H, dk, dv] 的实矩阵，
 # 前端不可能画 8×128×128 个点——降采样成 FW_VIZ_BINS² 的平均幅值热力图，
 # 写入幅度按步保留最近 FW_WRITE_HISTORY 个点。纯展示，不参与任何计算。
-FW_VIZ_BINS = 24
+#
+# 2026-11-05：24² → 48²（线性分辨率翻倍、像素数 4 倍），开发者选项里那张
+# 热力图不再是一块糊掉的马赛克。代价只是流式每帧多带 ~1.7K 个已消毒浮点
+# （服务端仍只把最新一份快照存进 buf["fw"]，token 里的 fw 恒为 None），
+# 不参与任何计算、不改 checkpoint 布局，也不影响训练/推理数值。
+FW_VIZ_BINS = 48
 FW_WRITE_HISTORY = 96
+
+# ---------------------------------------------------------------------------
+# 4b. MoMW —— Mixture-of-Memory-Weights（无训练记忆阀门，2026-11-08）
+# ---------------------------------------------------------------------------
+# 位置：第一个 Block 之后、与既有 fast weight 并列的一条可选记忆支路。
+#       H_out = H_1 + ΔH；无层被激活 → 直接返回 H_1（退化为标准模型）。
+#       2026-11-08 第二版：三阶段路由（锚点播种 → 状态特征漂移 → 空层分裂）。
+#
+# 阶段一 · 冷启动（锚点播种）
+#   每个 MW 层绑定一个类别锚点 P_k ∈ R^D（外部原型）。默认由 wte.weight
+#   中确定性采样的「代表性 token Embedding 均值」得到，可经
+#   MoMW.set_anchor_provider() 注入真正的文本→embedding 均值实现。
+#   **惰性在首次 forward 计算**（建模期 wte 还是随机初始化，此时算锚点
+#   没有意义），缓存为 persistent=False buffer：随 .to() 迁移、不进
+#   state_dict（strict load 契约）。H_t = normalize(mean_{B,T} H_1)，
+#   Score = cos(H_t, P_k)。用序列均值而非逐 token：池状态是按整个输入
+#   序列推进的，逐 token 路由会让同一序列写进不同层，破坏「未召回则不遗忘」。
+#
+# 阶段二 · 运行期（从锚点向状态特征漂移）
+#   每 eigen_interval 次写入做**一步幂迭代**（不是全量 SVD）：对
+#   G_h = S_hᵀ S_h 迭代主特征向量 v_h，拼成 [H*dv] 后过 KDA 的 w_o
+#   投影回 D 维得到 E_i —— 该层「实际在记什么」的隐空间方向。
+#   γ_i = 1 - exp(-writes_i / gamma_k) 随写入次数单调递增，
+#   Score_i = (1-γ_i)·cos(H_t,P_i) + γ_i·cos(H_t,E_i)。
+#
+# 阶段三 · 扩展期（空层分裂 + 负载均衡）
+#   ‖S_i‖ 单步增长 > expand_delta 或 绝对范数 > saturation_limit → 扩展。
+#   **绝不 clone 原层状态**：S_new = None（全零）、E/v/writes/γ 全部从零开始。
+#   P_new 继承父层当前 E_i（已积累语义）或初始锚点。
+#   bonus = B0·exp(-age/M)（指数衰减，仅前 M 步），强制引导输入写入新层；
+#   同类层之间按「当前激活范数低于同类均值」加软均衡偏置 load_lambda，
+#   把写入导向余量更大的层，而不是硬分配。
+#
+# 与 v1 的兼容：v1 的 10 个 config 字段全部保留；新增字段缺省即默认。
+# v1 的阈值是「能量范数」量级，v2 改余弦相似度（[-1,1]）后默认值整体
+# 重标（threshold 1.0 → 0.2、B0 2.0 → 0.6），否则 v2 会永远不激活。
+# B0 > threshold 仍是硬约束（否则零状态层永远跨不过阈值）。
+#
+# 【阈值仍是保守占位，必须在真实权重上标定】余弦打分的分布取决于训练后
+# 的 wte / KDA 权重，未训练模型上推不出合适绝对值。启用前用 MoMW.stats()
+# 观察分数分布再调，否则模块会长期退化为恒等映射。
+MOMW_CONFIG_KEY = "momw"          # config.json / /api/model/init 的键名
+MOMW_ENABLED_DEFAULT = False      # 默认关闭：旧目录零影响、训练路径不变
+MOMW_TOP_N = 2                    # N：每次激活的记忆层数
+MOMW_TAU = 1.0                    # tau：路由 softmax 温度
+MOMW_THRESHOLD = 0.2              # v2：余弦相似度阈值（不是 v1 的能量范数）
+MOMW_WINDOW = 8                   # M：bonus 指数衰减时间常数 / 生效步数
+MOMW_BONUS = 0.6                  # B_0：新层 bonus 幅值（须 > threshold）
+MOMW_STARVE_THRESHOLD = 0.0       # v1 兼容：饥饿窗口（0 = 不启用该触发）
+MOMW_SATURATION_LIMIT = 100.0     # ‖S‖ 绝对范数上限，超过即判过载
+MOMW_INITIAL_LAYERS = 1           # 初始池层数（每次只扩 1 层）
+MOMW_MAX_LAYERS = 8               # 硬上限：防无训练扩展把池撑爆
+
+# v2 三阶段新增
+MOMW_EXPAND_DELTA = 8.0           # ‖S‖ 单步增长超过它 → 判定写入密度过载
+MOMW_GAMMA_K = 32.0               # γ = 1 - exp(-writes / k) 的收敛尺度
+MOMW_EIGEN_INTERVAL = 16          # 每 N 次写入做一步幂迭代（不做全量 SVD）
+MOMW_LOAD_LAMBDA = 0.05           # 同类层软均衡强度
+MOMW_ANCHOR_SAMPLE = 32           # 每类锚点采样的代表性 token 行数
+MOMW_EIGEN_MIN_WRITES = 4         # E_i 至少积累几次写入才可被继承为 P_new
+
+# 锚点类别（MW 层类型）。同类层之间才做软均衡；类型名会下发前端展示。
+MOMW_ANCHOR_GROUPS = ("general", "error", "code", "math")
+MOMW_ANCHOR_SEED = 0x4D4F4D57     # "MOMW"：确定性采样，禁用全局随机状态
+
+# 合法范围（HTTP / CLI 校验用；非法值一律拒绝而非静默钳制）
+MOMW_TOP_N_RANGE = (1, 16)
+MOMW_WINDOW_RANGE = (1, 256)
+MOMW_MAX_LAYERS_RANGE = (1, 64)
+MOMW_INITIAL_LAYERS_RANGE = (1, 16)
+MOMW_TAU_MIN = 1e-3               # tau > 0，太小会让 softmax 退化成 argmax
+MOMW_POSITIVE_MIN = 0.0           # threshold / B0 / starve / 范数阈值 ≥ 0
+MOMW_GAMMA_K_MIN = 1.0
+MOMW_EIGEN_INTERVAL_RANGE = (1, 1024)
+MOMW_ANCHOR_SAMPLE_RANGE = (1, 512)
+MOMW_EIGEN_MIN_WRITES_RANGE = (0, 1024)
+MOMW_LOAD_LAMBDA_MAX = 1.0        # 软均衡不能盖过语义打分
+
+# config 里允许的字段（唯一真源；前端从 /api/status.momw 拿，不许抄常量）
+# v1 的 10 个字段全部保留 → 上一版创建的 config.json 不做迁移也能加载。
+MOMW_CONFIG_FIELDS = ("enabled", "N", "tau", "threshold", "M", "B0",
+                      "starve_threshold", "saturation_limit",
+                      "initial_layers", "max_layers", "expand_delta",
+                      "gamma_k", "eigen_interval", "load_lambda",
+                      "anchor_sample", "eigen_min_writes")
+
+
+def momw_default_config() -> dict:
+    """MoMW 默认配置（唯一真源）。enabled=False 时其余字段只是备用值。
+
+    前端 / CLI 都从这份 dict 派生，避免把十六个数字抄到三个地方。
+    """
+    return {
+        "enabled": MOMW_ENABLED_DEFAULT,
+        "N": MOMW_TOP_N,
+        "tau": MOMW_TAU,
+        "threshold": MOMW_THRESHOLD,
+        "M": MOMW_WINDOW,
+        "B0": MOMW_BONUS,
+        "starve_threshold": MOMW_STARVE_THRESHOLD,
+        "saturation_limit": MOMW_SATURATION_LIMIT,
+        "initial_layers": MOMW_INITIAL_LAYERS,
+        "max_layers": MOMW_MAX_LAYERS,
+        "expand_delta": MOMW_EXPAND_DELTA,
+        "gamma_k": MOMW_GAMMA_K,
+        "eigen_interval": MOMW_EIGEN_INTERVAL,
+        "load_lambda": MOMW_LOAD_LAMBDA,
+        "anchor_sample": MOMW_ANCHOR_SAMPLE,
+        "eigen_min_writes": MOMW_EIGEN_MIN_WRITES,
+    }
 
 # ---------------------------------------------------------------------------
 # 5. 模态参数
@@ -588,83 +1220,103 @@ AUDIO_SAMPLES_PER_TOKEN = 533        # 533 采样/token ≈ 30 tok/s
 # 输入 embedding：533 个采样点平铺成一条向量 → 线性投影 → d_model
 
 # ---------------------------------------------------------------------------
-# 5b. token-5 编码（2026-10-28 定案，取代 tok-32 的 .tokens 二进制）
+# 5b. token-6 编码（2026-11-05 定案，取代 token-5 的 .tokens 二进制）
 # ---------------------------------------------------------------------------
-# 动机：tok-32 的 .tokens 只能装「离散 ID」，音频/视觉必须另存 .tokenvector，
-# 训练与存档是两套文件。token-5 把三种模态压进同一个字符流：
+# 动机：token-5 只有 32 个码位，27 单字符 + 4 边界 + 1 终止全占满，
+# 装不下新的一代边界（sys）与工具调用语法。token-6 每字符 6 bit
+# （2^6 = 64 码位），载荷语法与 token-5 完全一样，只是位宽和字符集变了：
 #   {t:<id>}               文本 token（可见、有向量、进 loss）
 #   {w:<hex>}              音频 token（533 采样）
 #   {v:<hex>x:<gx>y:<gy>}  视觉 patch token（32×32 像素）
-#   <id>                   扩展系统 token（有嵌入、不进 loss、不可显示）
+#   [HEX] / [name]         扩展系统 token（有嵌入、不进 loss、不可显示）
+#   <HEX> / <name>         core 单标记 / slot 编号槽位（有 KV、进 loss）
+#   [HEX] / [name]         扩展 / boundary 段边界 token（有嵌入、进主 AR loss）
 #   { } |                  结构字符（不是独立 token，不占位置、不进 loss）
 #
-# —— 字符集：27 个单字符（码 0-26）+ 4 个原子绑定 token（码 27-30）——
-#   5 bit/字符（2^5 = 32 码位）。码 31 为流终止符，不对应任何字符。
+# —— 字符集：29 个单字符（码 0-28）+ 6 个原子边界 token（码 29-34）——
+#   6 bit/字符。码 35-62 预留，码 63 为流终止符（不对应任何字符）。
 #
-#   —— 27 个单字符（T5_CHARS，码即下表顺序 0..26）——
+#   —— 29 个单字符（T6_CHARS，码即下表顺序 0..28）——
 #   '0'-'9'  数字（坐标十进制 / ID 十六进制数字位；ID 另用 'A'-'F'）
 #   '{' '}'  时间步边界
-#   '<' '>'  扩展系统 token 边界
+#   '<' '>'  **core 单标记 / slot 编号槽位**边界（token-5 里是扩展系统 token）
+#   '[' ']'  **边界 token** 包裹（新加入的两个字符）
 #   '|'      步内 token 分隔 / patch 分隔
 #   ':'      字段分隔
-#   'w'      音频载荷标识（wave）
-#   't'      文本载荷标识（text）
-#   'v'      视觉载荷标识（visual）
+#   'w' 't' 'v'   音频 / 文本 / 视觉载荷标识
 #   'A'-'F'  十六进制字母（大写；小写不属于字符集）
 #   'x' 'y'  视觉坐标标识
 #   没有空格，没有其它字母（w/t/v/x/y 是仅有的小写，只作载荷/坐标标识）。
 #
-#   —— 4 个原子绑定 token（码 27-30，各占一个 5-bit 码位，不是多字符）——
-#   编码时把字符流里的整串 <model>/<user>/<model/>/<user/> 当作一个码位；
-#   解码时码 27/28/29/30 还原成各自的多字符展示名（见 T5_BOUND_TOKENS）。
-#   它们分别绑定到扩展系统 token 的 ID：<model>=3、<user>=1、<model/>=4、
-#   <user/>=2（与词表契约头里的名字一致），所以既能被位流当作原子字符存，
-#   又能在元素层当作普通 ext 元素（带 ID）参与编解码。
-T5_CHARS = "0123456789{}<>|:wtvABCDEFxy"
-T5_ALPHABET_SIZE = 27                     # 单字符码 0..26（绑定 token 不计入）
-T5_BITS_PER_CHAR = 5
-T5_END_CODE = 31                          # 终止符：码 31（2^5-1），解码到此为止
-T5_CHAR_CODE = {c: i for i, c in enumerate(T5_CHARS)}
-# 原子绑定 token：码位 → 多字符展示名（编码/解码的原子单元）
-T5_BOUND_TOKENS = {27: "<model>", 28: "<user>", 29: "<model/>", 30: "<user/>"}
-# 绑定 token 名字 → 码位（编码时整串匹配）
-T5_BOUND_NAME_TO_CODE = {"<model>": 27, "<user>": 28, "<model/>": 29, "<user/>": 30}
-# 绑定 token 名字 → 扩展系统 token ID（解析为元素用）
-T5_NAME_TO_BOUND_ID = {"<model>": 3, "<user>": 1, "<model/>": 4, "<user/>": 2}
-# 扩展系统 token ID → 绑定 token 名字（元素→字符流时写出名字而非 <id>）
-T5_BOUND_ID_TO_NAME = {3: "<model>", 1: "<user>", 4: "<model/>", 2: "<user/>"}
-T5_HEX_CHARS = "0123456789ABCDEF"
+#   —— 6 个原子边界 token（码 29-34，各占一个 6-bit 码位）——
+#   编码时把整串 [model]/[user]/[model/]/[user/]/[sys]/[sys/] 当作一个
+#   码位；解码时码 29-34 还原成展示名。它们绑定到 boundary 区的 ID
+#   （1.2.0：ID 3..8，由 T6_NAME_TO_BOUND_ID 从 USER_ID / MODEL_ID /
+#   SYS_ID 等常量派生，不硬编码），所以既是位流里的原子字符，又是元素层
+#   带 ID 的 ext 元素。
+T6_CHARS = "0123456789{}<>|:wtvABCDEFxy[]"
+T6_ALPHABET_SIZE = len(T6_CHARS)          # 29（单字符码 0..28）
+T6_BITS_PER_CHAR = 6
+T6_END_CODE = 63                          # 2^6-1，解码到此为止
+T6_CHAR_CODE = {c: i for i, c in enumerate(T6_CHARS)}
+T6_BOUND_TOKENS = {
+    29: "[model]", 30: "[user]", 31: "[model/]", 32: "[user/]",
+    33: "[sys]", 34: "[sys/]",
+}
+T6_BOUND_NAME_TO_CODE = {v: k for k, v in T6_BOUND_TOKENS.items()}
+T6_NAME_TO_BOUND_ID = {
+    "[model]": MODEL_ID, "[user]": USER_ID,
+    "[model/]": MODEL_END_ID, "[user/]": USER_END_ID,
+    "[sys]": SYS_ID, "[sys/]": SYS_END_ID,
+}
+T6_BOUND_ID_TO_NAME = {v: k for k, v in T6_NAME_TO_BOUND_ID.items()}
+T6_HEX_CHARS = "0123456789ABCDEF"
+# 码 35-62 预留（28 个），留给后续模态/结构化 token；不得挪作终止符。
+T6_RESERVED_CODES = tuple(range(len(T6_BOUND_TOKENS) + T6_ALPHABET_SIZE,
+                                T6_END_CODE))
 
 # —— 载荷尺寸 ——
 # 文本/扩展 token 的 ID：**大写十六进制、自界定**——{t:...} 里读到 '}' 或
 # '|' 为止，<...> 里读到 '>' 为止。长度因词表而异（小词表 ID 短、大词表
 # ID 长），格式本身不给 ID 定宽、定上限；前导零允许（<00005> 就是 5）。
-# 十六进制必须大写：5 bit 字符表只有 31 个码位，装不下小写 a-f。
+# 十六进制必须大写：token-6 的 29 字符集里没有小写 a-f。
 # 坐标（{v:...x:N y:M} 的 N/M）仍是自界定十进制。
-T5_COORD_LIMIT = 100_000        # x/y 坐标防呆上界（自界定十进制）
+T6_COORD_LIMIT = 100_000        # x/y 坐标防呆上界（自界定十进制）
 
 # 音频：每 token 恰好 533 个采样点，16 bit 有符号 PCM（mp3/flac 解码后的
 # 通用形态），按时间顺序拼接 → 533*16 = 8528 bit = 2132 个十六进制字符。
 AUDIO_SAMPLE_BITS = 16
-T5_WAVE_BITS = AUDIO_SAMPLES_PER_TOKEN * AUDIO_SAMPLE_BITS   # 8528
-T5_WAVE_HEX = T5_WAVE_BITS // 4                              # 2132
+T6_WAVE_BITS = AUDIO_SAMPLES_PER_TOKEN * AUDIO_SAMPLE_BITS   # 8528
+T6_WAVE_HEX = T6_WAVE_BITS // 4                              # 2132
 
 # 视觉：一个 patch 32×32 像素，逐行（第 1 行→第 32 行）、行内从左到右，
 # 每个像素 R/G/B/A 各 10 bit 共 40 bit，按 R→G→B→A 拼接。
 # 1024 * 40 = 40960 bit = 10240 个十六进制字符。
-T5_PIXEL_BITS = 4 * 10                    # RGBA 各 10 bit
-T5_PATCH_BITS = PATCH_PIXELS * T5_PIXEL_BITS    # 40960
-T5_PATCH_HEX = T5_PATCH_BITS // 4               # 10240
-T5_CHANNEL_MAX = (1 << 10) - 1            # 1023
+T6_PIXEL_BITS = 4 * 10                    # RGBA 各 10 bit
+T6_PATCH_BITS = PATCH_PIXELS * T6_PIXEL_BITS    # 40960
+T6_PATCH_HEX = T6_PATCH_BITS // 4               # 10240
+T6_CHANNEL_MAX = (1 << 10) - 1            # 1023
 
 # —— 语义 ——
 # {t:} {w:} {v:} 元素：可见 token，有向量坐标（走 embedding / 投影），进 loss。
-# <id> 元素：扩展系统 token，有嵌入但【没有】位置坐标——KDA 让模型自己学
-#   位置关系，标准 Transformer 位置嵌入的职责就交给这类 token；它们不进
-#   loss，也不作为可见内容显示。
-# { } | ：结构字符，本身不是 token（不占 token 位置、不进 loss、无嵌入）。
+# [id] / [name] 元素：扩展系统 token，有嵌入但【没有】位置坐标，不进 loss。
+# <id> / <name> 元素：agent 区工具调用与排版 token，模型可预测、有 KV、
+#   进 loss，UI 按名字渲染（粗体/思考段/工具徽标），后端按 ID 拦截执行。
+# { } | 以及 [ ] < > 本身：结构字符，不是 token（不占 token 位置、不进 loss）。
 # 时间步仍是原子单位：{} 必须至少含一个元素，空步非法。
-# 落盘（.tokens）：5 bit/字符的位流，末字符后跟终止符码 27，再补零到字节。
+# 落盘（.tokens）：6 bit/字符的位流，末字符后跟终止符码 63，再补零到字节。
+
+# 旧名别名：位宽升级后仍有一些模块/测试按 T5_ 前缀取**载荷尺寸**（那些
+# 常量与 bit 宽无关）。别名一律指向 token-6 的真值，避免两份常量分叉；
+# token-5 的 5 bit 位流不再可读（本次不做向后兼容）。
+T5_HEX_CHARS = T6_HEX_CHARS
+T5_COORD_LIMIT = T6_COORD_LIMIT
+T5_WAVE_BITS = T6_WAVE_BITS
+T5_WAVE_HEX = T6_WAVE_HEX
+T5_PIXEL_BITS = T6_PIXEL_BITS
+T5_PATCH_BITS = T6_PATCH_BITS
+T5_PATCH_HEX = T6_PATCH_HEX
+T5_CHANNEL_MAX = T6_CHANNEL_MAX
 
 # 绘图输出（仅输出，token 区间见词表布局）
 # 2026-10-31：画布不再钉死 256×256——序列开头的画布 token 决定尺寸，
@@ -678,12 +1330,29 @@ DRAW_KV_COMPRESS = 9            # 输出完一个图元后 KV 就地 9:1 压成 
 # ---------------------------------------------------------------------------
 # 6. 优化器
 # ---------------------------------------------------------------------------
-OPTIMIZER = "muon"           # "muon" | "adamw"；muon 只作用隐藏层 2D 矩阵，
-                             # embedding / lm_head / RMSNorm / 标量恒为 AdamW
+# 三档（可选值真源 = clip_data.OPTIMIZERS，训练界面下拉与队列文件名共用）：
+#   "adamw"   全部 AdamW；
+#   "muon"    参杂：隐藏层 2D 矩阵 Muon，其余参数 AdamW（历史默认）；
+#   "allmuon" 全 Muon：所有 2D 矩阵 Muon，1D 参数仍 AdamW（矩阵正交化
+#             对向量无意义，见 muon.build_optimizers）。
+OPTIMIZER = "muon"
 MUON_MOMENTUM = 0.95
 MUON_NS_STEPS = 5
 ADAMW_LR = 3e-4
 MUON_LR = 2e-2
+
+# ---------------------------------------------------------------------------
+# 6b. CLIP 数据集文件夹 v1（2026-11-08）
+# ---------------------------------------------------------------------------
+# 唯一真源：契约见 service/train/clip_folder.py，常量放这里避免三处硬编码。
+# 对比训练不再「一次传两个文件」，而是强制上传一个按此格式组织的文件夹；
+# 解析出的 N 对真实配对同批做对称 InfoNCE，负样本来自批内其它配对。
+CLIP_FOLDER_FORMAT = "gargantua-clip-folder"
+CLIP_FOLDER_VERSION = 1
+CLIP_FOLDER_MIN_PAIRS = 2          # InfoNCE 至少 2 对才有批内负样本
+CLIP_FOLDER_MAX_BATCH = 64         # 与 server_train._validate_clip_batch_size 同界
+CLIP_FOLDER_DEFAULT_BATCH = 16
+CLIP_FOLDER_TEMPERATURE = 0.07
 
 # ---------------------------------------------------------------------------
 # 7. 运行环境
@@ -776,21 +1445,21 @@ DTYPE = "float32"            # 训练/推理默认 FP32（x86_64 mac 无 CUDA）
 # 模型前向输入 = 扁平 token_ids + 并行 step_ids + type_ids；
 # decoder 因果 = 步间因果 + 步内双向（无步内掩码）。
 #
-# 时间步结构（token-5 体系，2026-10-28 起，tokens/tok5.py）：
+# 时间步结构（token-6 体系，2026-11-05 起，tokens/tok6.py）：
 #   流中的每个时间步由字符 { } 包裹，步内多个元素由 | 分隔；元素形态
-#   见第 5b 节（t: 文本 / w: 音频 / v: 视觉）。文本每 token 独占一步；
-#   图片 = 一步（内部多 patch 元素）；音频每 533 采样 = 一个元素 = 一步；
-#   视频每帧 = 一步。KDA 循环状态递归 / 逻辑并行以时间步为原子。
-#   结构字符 { } | 本身不是 token，不占 token 位置、不进 loss、无嵌入。
+#   见第 5b 节（t: 文本 / w: 音频 / v: 视觉 / [ ] 扩展 / < > 工具调用）。
+#   文本每 token 独占一步；图片 = 一步（内部多 patch 元素）；音频每 533
+#   采样 = 一个元素 = 一步；视频每帧 = 一步。KDA 循环状态递归 / 逻辑
+#   并行以时间步为原子。结构字符 { } | [ ] < > 本身不是 token。
 #
-# 训练数据（2026-10-28 起）：.tokens 文件（token-5 位流，5 bit/字符）。
+# 训练数据（2026-11-05 起）：.tokens 文件（token-6 位流，6 bit/字符）。
 #   内容必须带 { } | 时间步结构；训练侧读取后按 Step 展开成「扁平
-#   token_ids + 并行 step_ids」。旧 tok-32 大端 uint32 流不再生成，
+#   token_ids + 并行 step_ids」。旧 tok-32 / token-5 位流不再生成，
 #   tok32 模块仅作为历史数据的读取/转换工具保留。
 #   Token 编辑器导出同一格式，训练与编辑器共用一套流。
 #
-# 标识（2026-10-25）：段类型用类型嵌入表达——user 段内所有 token 都加
-#   type_emb(TYPE_USER)，model 段都加 type_emb(TYPE_MODEL)，不分段首
-#   段尾。<user>/<user/>/<model>/<model/> 这类边界 token 是扩展系统级
-#   标记（token-5 写作 <1> / <2> / <3> / <4>），不进入共享 KV、不作为
-#   普通 token 参与 loss。
+# 标识（2026-10-25，2026-11-05 补 sys）：段类型用类型嵌入表达——
+#   user 段加 type_emb(TYPE_USER)、model 段加 type_emb(TYPE_MODEL)、
+#   sys 段（工具结果/系统提示）加 type_emb(TYPE_SYS)，不分段首尾。
+#   [user]/[user/]/[model]/[model/]/[sys]/[sys/] 这些边界 token 是
+#   扩展系统级标记（token-6 各占一个原子码位），不进共享 KV、不参与 loss。

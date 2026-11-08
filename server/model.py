@@ -888,7 +888,8 @@ class Gargantua(nn.Module):
                  hca_ratio: int | None = None,
                  vocab_size: int | None = None,
                  share_enc_dec: bool = spec.SHARE_ENC_DEC,
-                 d_model: int | None = None):
+                 d_model: int | None = None,
+                 momw: dict | None = None):
         super().__init__()
         # 2026-11-04：模型宽度建模可选（缺省 = spec.D_MODEL，旧目录行为不变）
         D = (spec.D_MODEL if d_model is None
@@ -942,6 +943,17 @@ class Gargantua(nn.Module):
         self.dec_final_norm = RMSNorm(D)
         # —— fast weight：全局 bank，enc/dec 共享 ——
         self.fast_weight = FastWeightBank(D)
+        # —— MoMW：可选无训练记忆阀门（2026-11-08，默认关闭）——
+        # 关闭时 self.momw = None（普通属性，不注册子模块）→ state_dict
+        # 与 v1 逐字一致；开启时构造的 MoMW 也是零参数零 buffer，池层共享
+        # 上面这个 fast_weight.layer 的权重引用，权重契约依旧不变。
+        # 旧模型目录的 config 没有 "momw" 字段，永远走关闭分支。
+        self.momw = None
+        if momw is not None and bool(momw.get("enabled", False)):
+            from momw import MoMW
+            # wte 只作为「代表性 token Embedding 均值」的锚点来源，是引用
+            # 不是参数；锚点在首次 forward 惰性计算（此时权重已 load 完）。
+            self.momw = MoMW(self.fast_weight.layer, momw, wte=self.wte)
         # 先初始化、后绑定：两侧独立各初始化一次，随机序列与 v1 逐字一致；
         # 绑定后 dec 侧原有的 Parameter 成为孤儿被回收，dec_blocks 里的
         # Block 实例仍保留自己的 is_decoder / MLA.causal / rec_state 语义。
@@ -962,6 +974,18 @@ class Gargantua(nn.Module):
         for enc_blk, dec_blk in zip(self.enc_blocks, self.dec_blocks):
             tie_module_parameters(dec_blk, enc_blk)
         tie_module_parameters(self.dec_final_norm, self.enc_final_norm)
+
+    def reset_memory(self) -> None:
+        """样本边界复位全部持久记忆（fast weight + 可选 MoMW）。
+
+        只清模块内部持有的状态，**不动外部 state 容器**：推理会话把跨轮
+        记忆放在 state["fw"] / state["momw"]，在这里 reset 掉就等于清空
+        会话记忆（2026-10-27 审计修复的结论，见 infer.generate 注释）。
+        所有训练/推理入口统一调这一个方法，避免新增记忆组件时漏掉复位。
+        """
+        self.fast_weight.reset()
+        if self.momw is not None:
+            self.momw.reset()
 
     @staticmethod
     def _init(m):
@@ -1010,6 +1034,11 @@ class Gargantua(nn.Module):
             if i == 0:   # fast weight：第一个 block 之后调用一次（先用后更新）
                 x = x + self.fast_weight(x, state=state)
                 blocks[-1] = x             # 提交块表示与实际流一致
+                # MoMW（可选）：与 fast weight 同址、并列残差。H_1 是已含
+                # fast weight 读出的主干流，未激活时原样返回 H_1。
+                if self.momw is not None:
+                    x = self.momw(x, state=state)
+                    blocks[-1] = x
         return self.enc_final_norm(x)
 
     # ---- decoder：读共享 KV，自回归（步间因果 + 步内 token 级因果）----
@@ -1026,6 +1055,11 @@ class Gargantua(nn.Module):
             if i == 0:   # fast weight：与 encoder 共享同一 bank，状态继续推进
                 x = x + self.fast_weight(x, state=state)
                 blocks[-1] = x
+                # MoMW：encoder 侧写过的池状态通过同一个 state 容器跨到
+                # decoder，语义与 fast weight 的 enc→dec 状态推进一致。
+                if self.momw is not None:
+                    x = self.momw(x, state=state)
+                    blocks[-1] = x
         return self.dec_final_norm(x)
 
     def build_views(self, vecs: torch.Tensor, step_ids: torch.Tensor):
@@ -1128,7 +1162,7 @@ class Gargantua(nn.Module):
         2026-10-20：入口重置 fast weight 状态——Gargantua 从不自行 reset，
         连续调用会跨样本泄漏持久记忆（实测 logits 差 20.19，已回归测试）。
         训练样本相互独立，状态不应跨 forward 推进。 """
-        self.fast_weight.reset()
+        self.reset_memory()
         emb_in = self.embed_text(input_ids, torch.full_like(input_ids, spec.TYPE_USER))
         enc_out = self.encode(emb_in, input_steps)
         # 共享 KV = encoder 输出 + decoder 已生成 token 的 embedding（类型=模型输出）
@@ -1220,7 +1254,7 @@ class Gargantua(nn.Module):
         """ 多模态教师强制前向（embedding 已装配）。与 forward_train 同构，
         区别仅在输入段/输出段直接使用给定嵌入（文本路径走 forward_train）。
         同样在入口重置 fast weight 状态（样本独立性，见 forward_train）。 """
-        self.fast_weight.reset()
+        self.reset_memory()
         enc_out = self.encode(emb_in, s_in)
         kv_vecs = torch.cat([enc_out, emb_dec], 1)
         kv_steps = torch.cat([s_in, s_dec], 1)

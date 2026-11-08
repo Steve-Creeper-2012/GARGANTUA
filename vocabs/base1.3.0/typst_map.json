@@ -1,0 +1,4133 @@
+{
+  "format": "gargantua-typst-map-v1",
+  "vocab_name": "base1.3.0",
+  "vocab_version": "1.3.0",
+  "source": "gargantua-typst-token-spec.md §3 + §2",
+  "generated_at": "2026-11-07T20:51:04Z",
+  "layout": {
+    "slot_count": 0,
+    "typst_begin": 12,
+    "typst_end": 240,
+    "typst_size": 228,
+    "head_size": 9845,
+    "draw_begin": 240,
+    "vocab_size": 80262,
+    "max_vocab_size": 100000
+  },
+  "rules": {
+    "pair": "每个构造占两个连续 ID：开在前、闭在后，close_id = open_id + 1",
+    "wrappers": "`{}|` = system；`[]` = border；`<>` = tools（core + typst / slot 用户自定义预留）；`内容:HEX` = 可见常规 token",
+    "empty": "empty=true 的构造仍保留显式空对 `<X></X>`（规范 §2）",
+    "attrs": "属性走 `<ATTR>…</ATTR>`，紧跟开标签；映射器聚合成具名参数",
+    "math": "MATH/MATHB 通道内不做内容转义，运算符/数字/标识符全 token 化",
+    "unicode_ext": "可见区末尾（code 之后）另有 `unicode_ext` 3537 个字符 / 31 个 Unicode 区块（base1.3.0 新增，regular）；散文子词用这些普通可见 token 承载，不属于本表，映射器按内容通道原样输出并做 §4.2 转义",
+    "id_shift": "派生词表带 N 个预留槽位时，本表所有 ID 与 typst_begin 一同 +N；用 /api/agent/spec 的 typst.begin 换算",
+    "token6": "typst 与 core/slot 同为 `<>` tool 元素：进 loss、有 KV、type_emb=TYPE_NONE"
+  },
+  "construct_count": 114,
+  "token_count": 228,
+  "constructs": [
+    {
+      "name": "DOC",
+      "section": "3.1",
+      "kind": "root",
+      "typst": "（文档根，可省略）",
+      "empty": false,
+      "attrs": [],
+      "note": "顶层包裹",
+      "open": {
+        "id": 12,
+        "hex": "C",
+        "token": "<DOC>"
+      },
+      "close": {
+        "id": 13,
+        "hex": "D",
+        "token": "</DOC>"
+      }
+    },
+    {
+      "name": "PAGESET",
+      "section": "3.1",
+      "kind": "page",
+      "typst": "set page(..)",
+      "empty": false,
+      "attrs": [
+        "margin",
+        "paper",
+        "columns"
+      ],
+      "note": "页边距/纸张/分栏",
+      "open": {
+        "id": 14,
+        "hex": "E",
+        "token": "<PAGESET>"
+      },
+      "close": {
+        "id": 15,
+        "hex": "F",
+        "token": "</PAGESET>"
+      }
+    },
+    {
+      "name": "TEXTSET",
+      "section": "3.1",
+      "kind": "page",
+      "typst": "set text(..)",
+      "empty": false,
+      "attrs": [
+        "font",
+        "size",
+        "lang",
+        "cjk"
+      ],
+      "note": "字体/字号/CJK",
+      "open": {
+        "id": 16,
+        "hex": "10",
+        "token": "<TEXTSET>"
+      },
+      "close": {
+        "id": 17,
+        "hex": "11",
+        "token": "</TEXTSET>"
+      }
+    },
+    {
+      "name": "PARSET",
+      "section": "3.1",
+      "kind": "page",
+      "typst": "set par(..)",
+      "empty": false,
+      "attrs": [
+        "spacing",
+        "justify",
+        "leading"
+      ],
+      "note": "段落间距/对齐",
+      "open": {
+        "id": 18,
+        "hex": "12",
+        "token": "<PARSET>"
+      },
+      "close": {
+        "id": 19,
+        "hex": "13",
+        "token": "</PARSET>"
+      }
+    },
+    {
+      "name": "DOCSET",
+      "section": "3.1",
+      "kind": "page",
+      "typst": "set document(..)",
+      "empty": false,
+      "attrs": [
+        "title",
+        "author"
+      ],
+      "note": "标题/作者",
+      "open": {
+        "id": 20,
+        "hex": "14",
+        "token": "<DOCSET>"
+      },
+      "close": {
+        "id": 21,
+        "hex": "15",
+        "token": "</DOCSET>"
+      }
+    },
+    {
+      "name": "HEADER",
+      "section": "3.1",
+      "kind": "page",
+      "typst": "page(header: ..)",
+      "empty": false,
+      "attrs": [],
+      "note": "页眉",
+      "open": {
+        "id": 22,
+        "hex": "16",
+        "token": "<HEADER>"
+      },
+      "close": {
+        "id": 23,
+        "hex": "17",
+        "token": "</HEADER>"
+      }
+    },
+    {
+      "name": "FOOTER",
+      "section": "3.1",
+      "kind": "page",
+      "typst": "page(footer: ..)",
+      "empty": false,
+      "attrs": [],
+      "note": "页脚",
+      "open": {
+        "id": 24,
+        "hex": "18",
+        "token": "<FOOTER>"
+      },
+      "close": {
+        "id": 25,
+        "hex": "19",
+        "token": "</FOOTER>"
+      }
+    },
+    {
+      "name": "BIB",
+      "section": "3.1",
+      "kind": "empty",
+      "typst": "bibliography(..)",
+      "empty": true,
+      "attrs": [
+        "path",
+        "style"
+      ],
+      "note": "参考文献 ∅",
+      "open": {
+        "id": 26,
+        "hex": "1A",
+        "token": "<BIB>"
+      },
+      "close": {
+        "id": 27,
+        "hex": "1B",
+        "token": "</BIB>"
+      }
+    },
+    {
+      "name": "OUTLINE",
+      "section": "3.1",
+      "kind": "empty",
+      "typst": "outline",
+      "empty": true,
+      "attrs": [
+        "title",
+        "depth"
+      ],
+      "note": "目录 ∅",
+      "open": {
+        "id": 28,
+        "hex": "1C",
+        "token": "<OUTLINE>"
+      },
+      "close": {
+        "id": 29,
+        "hex": "1D",
+        "token": "</OUTLINE>"
+      }
+    },
+    {
+      "name": "INCLUDE",
+      "section": "3.1",
+      "kind": "empty",
+      "typst": "include \"..\"",
+      "empty": true,
+      "attrs": [
+        "src"
+      ],
+      "note": "引入模块 ∅",
+      "open": {
+        "id": 30,
+        "hex": "1E",
+        "token": "<INCLUDE>"
+      },
+      "close": {
+        "id": 31,
+        "hex": "1F",
+        "token": "</INCLUDE>"
+      }
+    },
+    {
+      "name": "IMPORT",
+      "section": "3.1",
+      "kind": "page",
+      "typst": "import \"..\"",
+      "empty": false,
+      "attrs": [
+        "src"
+      ],
+      "note": "导入",
+      "open": {
+        "id": 32,
+        "hex": "20",
+        "token": "<IMPORT>"
+      },
+      "close": {
+        "id": 33,
+        "hex": "21",
+        "token": "</IMPORT>"
+      }
+    },
+    {
+      "name": "H1",
+      "section": "3.2",
+      "kind": "heading",
+      "typst": "= ",
+      "empty": false,
+      "attrs": [],
+      "note": "一级标题",
+      "open": {
+        "id": 34,
+        "hex": "22",
+        "token": "<H1>"
+      },
+      "close": {
+        "id": 35,
+        "hex": "23",
+        "token": "</H1>"
+      }
+    },
+    {
+      "name": "H2",
+      "section": "3.2",
+      "kind": "heading",
+      "typst": "== ",
+      "empty": false,
+      "attrs": [],
+      "note": "二级标题",
+      "open": {
+        "id": 36,
+        "hex": "24",
+        "token": "<H2>"
+      },
+      "close": {
+        "id": 37,
+        "hex": "25",
+        "token": "</H2>"
+      }
+    },
+    {
+      "name": "H3",
+      "section": "3.2",
+      "kind": "heading",
+      "typst": "=== ",
+      "empty": false,
+      "attrs": [],
+      "note": "三级标题",
+      "open": {
+        "id": 38,
+        "hex": "26",
+        "token": "<H3>"
+      },
+      "close": {
+        "id": 39,
+        "hex": "27",
+        "token": "</H3>"
+      }
+    },
+    {
+      "name": "H4",
+      "section": "3.2",
+      "kind": "heading",
+      "typst": "==== ",
+      "empty": false,
+      "attrs": [],
+      "note": "四级标题",
+      "open": {
+        "id": 40,
+        "hex": "28",
+        "token": "<H4>"
+      },
+      "close": {
+        "id": 41,
+        "hex": "29",
+        "token": "</H4>"
+      }
+    },
+    {
+      "name": "H5",
+      "section": "3.2",
+      "kind": "heading",
+      "typst": "===== ",
+      "empty": false,
+      "attrs": [],
+      "note": "五级标题",
+      "open": {
+        "id": 42,
+        "hex": "2A",
+        "token": "<H5>"
+      },
+      "close": {
+        "id": 43,
+        "hex": "2B",
+        "token": "</H5>"
+      }
+    },
+    {
+      "name": "H6",
+      "section": "3.2",
+      "kind": "heading",
+      "typst": "====== ",
+      "empty": false,
+      "attrs": [],
+      "note": "六级标题",
+      "open": {
+        "id": 44,
+        "hex": "2C",
+        "token": "<H6>"
+      },
+      "close": {
+        "id": 45,
+        "hex": "2D",
+        "token": "</H6>"
+      }
+    },
+    {
+      "name": "P",
+      "section": "3.2",
+      "kind": "block",
+      "typst": "段落（空行分隔）",
+      "empty": false,
+      "attrs": [],
+      "note": "显式段落",
+      "open": {
+        "id": 46,
+        "hex": "2E",
+        "token": "<P>"
+      },
+      "close": {
+        "id": 47,
+        "hex": "2F",
+        "token": "</P>"
+      }
+    },
+    {
+      "name": "QUOTE",
+      "section": "3.2",
+      "kind": "block",
+      "typst": "quote[..]",
+      "empty": false,
+      "attrs": [],
+      "note": "引用块",
+      "open": {
+        "id": 48,
+        "hex": "30",
+        "token": "<QUOTE>"
+      },
+      "close": {
+        "id": 49,
+        "hex": "31",
+        "token": "</QUOTE>"
+      }
+    },
+    {
+      "name": "BLOCK",
+      "section": "3.2",
+      "kind": "block",
+      "typst": "block(..)[..]",
+      "empty": false,
+      "attrs": [
+        "width",
+        "height",
+        "fill"
+      ],
+      "note": "通用块",
+      "open": {
+        "id": 50,
+        "hex": "32",
+        "token": "<BLOCK>"
+      },
+      "close": {
+        "id": 51,
+        "hex": "33",
+        "token": "</BLOCK>"
+      }
+    },
+    {
+      "name": "BOX",
+      "section": "3.2",
+      "kind": "block",
+      "typst": "box(..)[..]",
+      "empty": false,
+      "attrs": [
+        "width",
+        "height"
+      ],
+      "note": "行内块",
+      "open": {
+        "id": 52,
+        "hex": "34",
+        "token": "<BOX>"
+      },
+      "close": {
+        "id": 53,
+        "hex": "35",
+        "token": "</BOX>"
+      }
+    },
+    {
+      "name": "PAD",
+      "section": "3.2",
+      "kind": "block",
+      "typst": "pad(..)[..]",
+      "empty": false,
+      "attrs": [
+        "x",
+        "y",
+        "left",
+        "right",
+        "top",
+        "bottom"
+      ],
+      "note": "内边距",
+      "open": {
+        "id": 54,
+        "hex": "36",
+        "token": "<PAD>"
+      },
+      "close": {
+        "id": 55,
+        "hex": "37",
+        "token": "</PAD>"
+      }
+    },
+    {
+      "name": "COLUMNS",
+      "section": "3.2",
+      "kind": "block",
+      "typst": "columns(2)[..]",
+      "empty": false,
+      "attrs": [
+        "n"
+      ],
+      "note": "分栏",
+      "open": {
+        "id": 56,
+        "hex": "38",
+        "token": "<COLUMNS>"
+      },
+      "close": {
+        "id": 57,
+        "hex": "39",
+        "token": "</COLUMNS>"
+      }
+    },
+    {
+      "name": "GRID",
+      "section": "3.2",
+      "kind": "block",
+      "typst": "grid(..)",
+      "empty": false,
+      "attrs": [
+        "columns",
+        "rows",
+        "gutter"
+      ],
+      "note": "网格布局",
+      "open": {
+        "id": 58,
+        "hex": "3A",
+        "token": "<GRID>"
+      },
+      "close": {
+        "id": 59,
+        "hex": "3B",
+        "token": "</GRID>"
+      }
+    },
+    {
+      "name": "STACK",
+      "section": "3.2",
+      "kind": "block",
+      "typst": "stack(..)",
+      "empty": false,
+      "attrs": [
+        "dir",
+        "spacing"
+      ],
+      "note": "堆叠布局",
+      "open": {
+        "id": 60,
+        "hex": "3C",
+        "token": "<STACK>"
+      },
+      "close": {
+        "id": 61,
+        "hex": "3D",
+        "token": "</STACK>"
+      }
+    },
+    {
+      "name": "ALIGN",
+      "section": "3.2",
+      "kind": "block",
+      "typst": "align(center)[..]",
+      "empty": false,
+      "attrs": [
+        "mode"
+      ],
+      "note": "对齐",
+      "open": {
+        "id": 62,
+        "hex": "3E",
+        "token": "<ALIGN>"
+      },
+      "close": {
+        "id": 63,
+        "hex": "3F",
+        "token": "</ALIGN>"
+      }
+    },
+    {
+      "name": "PLACE",
+      "section": "3.2",
+      "kind": "block",
+      "typst": "place(..)[..]",
+      "empty": false,
+      "attrs": [
+        "dx",
+        "dy"
+      ],
+      "note": "绝对定位",
+      "open": {
+        "id": 64,
+        "hex": "40",
+        "token": "<PLACE>"
+      },
+      "close": {
+        "id": 65,
+        "hex": "41",
+        "token": "</PLACE>"
+      }
+    },
+    {
+      "name": "FIGURE",
+      "section": "3.2",
+      "kind": "block",
+      "typst": "figure(..)",
+      "empty": false,
+      "attrs": [
+        "caption"
+      ],
+      "note": "图/表浮动体",
+      "open": {
+        "id": 66,
+        "hex": "42",
+        "token": "<FIGURE>"
+      },
+      "close": {
+        "id": 67,
+        "hex": "43",
+        "token": "</FIGURE>"
+      }
+    },
+    {
+      "name": "CAPTION",
+      "section": "3.2",
+      "kind": "block",
+      "typst": "figure 的 caption",
+      "empty": false,
+      "attrs": [],
+      "note": "图注",
+      "open": {
+        "id": 68,
+        "hex": "44",
+        "token": "<CAPTION>"
+      },
+      "close": {
+        "id": 69,
+        "hex": "45",
+        "token": "</CAPTION>"
+      }
+    },
+    {
+      "name": "PARBREAK",
+      "section": "3.2",
+      "kind": "empty",
+      "typst": "parbreak",
+      "empty": true,
+      "attrs": [],
+      "note": "段落分隔 ∅",
+      "open": {
+        "id": 70,
+        "hex": "46",
+        "token": "<PARBREAK>"
+      },
+      "close": {
+        "id": 71,
+        "hex": "47",
+        "token": "</PARBREAK>"
+      }
+    },
+    {
+      "name": "LINEBREAK",
+      "section": "3.2",
+      "kind": "empty",
+      "typst": "linebreak",
+      "empty": true,
+      "attrs": [],
+      "note": "换行 ∅",
+      "open": {
+        "id": 72,
+        "hex": "48",
+        "token": "<LINEBREAK>"
+      },
+      "close": {
+        "id": 73,
+        "hex": "49",
+        "token": "</LINEBREAK>"
+      }
+    },
+    {
+      "name": "PAGEBREAK",
+      "section": "3.2",
+      "kind": "empty",
+      "typst": "pagebreak",
+      "empty": true,
+      "attrs": [],
+      "note": "分页 ∅",
+      "open": {
+        "id": 74,
+        "hex": "4A",
+        "token": "<PAGEBREAK>"
+      },
+      "close": {
+        "id": 75,
+        "hex": "4B",
+        "token": "</PAGEBREAK>"
+      }
+    },
+    {
+      "name": "SPACER",
+      "section": "3.2",
+      "kind": "empty",
+      "typst": "v(..) / h(..)",
+      "empty": true,
+      "attrs": [
+        "amount"
+      ],
+      "note": "间距 ∅",
+      "open": {
+        "id": 76,
+        "hex": "4C",
+        "token": "<SPACER>"
+      },
+      "close": {
+        "id": 77,
+        "hex": "4D",
+        "token": "</SPACER>"
+      }
+    },
+    {
+      "name": "B",
+      "section": "3.3",
+      "kind": "inline",
+      "typst": "*..*",
+      "empty": false,
+      "attrs": [],
+      "note": "加粗",
+      "open": {
+        "id": 78,
+        "hex": "4E",
+        "token": "<B>"
+      },
+      "close": {
+        "id": 79,
+        "hex": "4F",
+        "token": "</B>"
+      }
+    },
+    {
+      "name": "I",
+      "section": "3.3",
+      "kind": "inline",
+      "typst": "_.._",
+      "empty": false,
+      "attrs": [],
+      "note": "斜体",
+      "open": {
+        "id": 80,
+        "hex": "50",
+        "token": "<I>"
+      },
+      "close": {
+        "id": 81,
+        "hex": "51",
+        "token": "</I>"
+      }
+    },
+    {
+      "name": "CODE",
+      "section": "3.3",
+      "kind": "inline",
+      "typst": "行内代码反引号",
+      "empty": false,
+      "attrs": [],
+      "note": "行内代码",
+      "open": {
+        "id": 82,
+        "hex": "52",
+        "token": "<CODE>"
+      },
+      "close": {
+        "id": 83,
+        "hex": "53",
+        "token": "</CODE>"
+      }
+    },
+    {
+      "name": "LINK",
+      "section": "3.3",
+      "kind": "inline",
+      "typst": "link(\"..\")[..]",
+      "empty": false,
+      "attrs": [
+        "url"
+      ],
+      "note": "链接",
+      "open": {
+        "id": 84,
+        "hex": "54",
+        "token": "<LINK>"
+      },
+      "close": {
+        "id": 85,
+        "hex": "55",
+        "token": "</LINK>"
+      }
+    },
+    {
+      "name": "RAW",
+      "section": "3.3",
+      "kind": "inline",
+      "typst": "围栏原始块",
+      "empty": false,
+      "attrs": [
+        "lang"
+      ],
+      "note": "代码块（保留格式）",
+      "open": {
+        "id": 86,
+        "hex": "56",
+        "token": "<RAW>"
+      },
+      "close": {
+        "id": 87,
+        "hex": "57",
+        "token": "</RAW>"
+      }
+    },
+    {
+      "name": "LABEL",
+      "section": "3.3",
+      "kind": "inline",
+      "typst": "label 名",
+      "empty": false,
+      "attrs": [],
+      "note": "标签",
+      "open": {
+        "id": 88,
+        "hex": "58",
+        "token": "<LABEL>"
+      },
+      "close": {
+        "id": 89,
+        "hex": "59",
+        "token": "</LABEL>"
+      }
+    },
+    {
+      "name": "REF",
+      "section": "3.3",
+      "kind": "inline",
+      "typst": "@name",
+      "empty": false,
+      "attrs": [],
+      "note": "引用",
+      "open": {
+        "id": 90,
+        "hex": "5A",
+        "token": "<REF>"
+      },
+      "close": {
+        "id": 91,
+        "hex": "5B",
+        "token": "</REF>"
+      }
+    },
+    {
+      "name": "SYM",
+      "section": "3.3",
+      "kind": "empty",
+      "typst": "-> 等符号简写",
+      "empty": true,
+      "attrs": [
+        "name"
+      ],
+      "note": "符号 ∅",
+      "open": {
+        "id": 92,
+        "hex": "5C",
+        "token": "<SYM>"
+      },
+      "close": {
+        "id": 93,
+        "hex": "5D",
+        "token": "</SYM>"
+      }
+    },
+    {
+      "name": "COMMENT",
+      "section": "3.3",
+      "kind": "inline",
+      "typst": "/* .. */",
+      "empty": false,
+      "attrs": [],
+      "note": "注释（输出丢弃）",
+      "open": {
+        "id": 94,
+        "hex": "5E",
+        "token": "<COMMENT>"
+      },
+      "close": {
+        "id": 95,
+        "hex": "5F",
+        "token": "</COMMENT>"
+      }
+    },
+    {
+      "name": "UL",
+      "section": "3.4",
+      "kind": "list",
+      "typst": "list(..)[..]",
+      "empty": false,
+      "attrs": [],
+      "note": "无序列表",
+      "open": {
+        "id": 96,
+        "hex": "60",
+        "token": "<UL>"
+      },
+      "close": {
+        "id": 97,
+        "hex": "61",
+        "token": "</UL>"
+      }
+    },
+    {
+      "name": "OL",
+      "section": "3.4",
+      "kind": "list",
+      "typst": "enum(..)[..]",
+      "empty": false,
+      "attrs": [],
+      "note": "有序列表",
+      "open": {
+        "id": 98,
+        "hex": "62",
+        "token": "<OL>"
+      },
+      "close": {
+        "id": 99,
+        "hex": "63",
+        "token": "</OL>"
+      }
+    },
+    {
+      "name": "TERMS",
+      "section": "3.4",
+      "kind": "list",
+      "typst": "terms(..)[..]",
+      "empty": false,
+      "attrs": [],
+      "note": "术语列表",
+      "open": {
+        "id": 100,
+        "hex": "64",
+        "token": "<TERMS>"
+      },
+      "close": {
+        "id": 101,
+        "hex": "65",
+        "token": "</TERMS>"
+      }
+    },
+    {
+      "name": "LI",
+      "section": "3.4",
+      "kind": "list",
+      "typst": "列表项",
+      "empty": false,
+      "attrs": [],
+      "note": "UL/OL 子项",
+      "open": {
+        "id": 102,
+        "hex": "66",
+        "token": "<LI>"
+      },
+      "close": {
+        "id": 103,
+        "hex": "67",
+        "token": "</LI>"
+      }
+    },
+    {
+      "name": "TERM",
+      "section": "3.4",
+      "kind": "list",
+      "typst": "术语",
+      "empty": false,
+      "attrs": [],
+      "note": "TERMS 子项",
+      "open": {
+        "id": 104,
+        "hex": "68",
+        "token": "<TERM>"
+      },
+      "close": {
+        "id": 105,
+        "hex": "69",
+        "token": "</TERM>"
+      }
+    },
+    {
+      "name": "DESC",
+      "section": "3.4",
+      "kind": "list",
+      "typst": "描述",
+      "empty": false,
+      "attrs": [],
+      "note": "TERMS 子项",
+      "open": {
+        "id": 106,
+        "hex": "6A",
+        "token": "<DESC>"
+      },
+      "close": {
+        "id": 107,
+        "hex": "6B",
+        "token": "</DESC>"
+      }
+    },
+    {
+      "name": "TABLE",
+      "section": "3.5",
+      "kind": "table",
+      "typst": "#table(columns:.., ..)",
+      "empty": false,
+      "attrs": [
+        "columns"
+      ],
+      "note": "表格",
+      "open": {
+        "id": 108,
+        "hex": "6C",
+        "token": "<TABLE>"
+      },
+      "close": {
+        "id": 109,
+        "hex": "6D",
+        "token": "</TABLE>"
+      }
+    },
+    {
+      "name": "ROW",
+      "section": "3.5",
+      "kind": "table",
+      "typst": "一行",
+      "empty": false,
+      "attrs": [],
+      "note": "含若干 CELL",
+      "open": {
+        "id": 110,
+        "hex": "6E",
+        "token": "<ROW>"
+      },
+      "close": {
+        "id": 111,
+        "hex": "6F",
+        "token": "</ROW>"
+      }
+    },
+    {
+      "name": "CELL",
+      "section": "3.5",
+      "kind": "table",
+      "typst": "单元格内容",
+      "empty": false,
+      "attrs": [
+        "colspan",
+        "rowspan"
+      ],
+      "note": "单元格",
+      "open": {
+        "id": 112,
+        "hex": "70",
+        "token": "<CELL>"
+      },
+      "close": {
+        "id": 113,
+        "hex": "71",
+        "token": "</CELL>"
+      }
+    },
+    {
+      "name": "TH",
+      "section": "3.5",
+      "kind": "table",
+      "typst": "表头单元格",
+      "empty": false,
+      "attrs": [
+        "colspan"
+      ],
+      "note": "加粗表头",
+      "open": {
+        "id": 114,
+        "hex": "72",
+        "token": "<TH>"
+      },
+      "close": {
+        "id": 115,
+        "hex": "73",
+        "token": "</TH>"
+      }
+    },
+    {
+      "name": "MATH",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "$..$",
+      "empty": false,
+      "attrs": [],
+      "note": "行内数学",
+      "open": {
+        "id": 116,
+        "hex": "74",
+        "token": "<MATH>"
+      },
+      "close": {
+        "id": 117,
+        "hex": "75",
+        "token": "</MATH>"
+      }
+    },
+    {
+      "name": "MATHB",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "$ .. $",
+      "empty": false,
+      "attrs": [],
+      "note": "块级数学",
+      "open": {
+        "id": 118,
+        "hex": "76",
+        "token": "<MATHB>"
+      },
+      "close": {
+        "id": 119,
+        "hex": "77",
+        "token": "</MATHB>"
+      }
+    },
+    {
+      "name": "MSUB",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "_",
+      "empty": false,
+      "attrs": [],
+      "note": "下标",
+      "open": {
+        "id": 120,
+        "hex": "78",
+        "token": "<MSUB>"
+      },
+      "close": {
+        "id": 121,
+        "hex": "79",
+        "token": "</MSUB>"
+      }
+    },
+    {
+      "name": "MSUP",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "^",
+      "empty": false,
+      "attrs": [],
+      "note": "上标",
+      "open": {
+        "id": 122,
+        "hex": "7A",
+        "token": "<MSUP>"
+      },
+      "close": {
+        "id": 123,
+        "hex": "7B",
+        "token": "</MSUP>"
+      }
+    },
+    {
+      "name": "MFRAC",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "frac(..)",
+      "empty": false,
+      "attrs": [],
+      "note": "分数（含 NUM/DEN）",
+      "open": {
+        "id": 124,
+        "hex": "7C",
+        "token": "<MFRAC>"
+      },
+      "close": {
+        "id": 125,
+        "hex": "7D",
+        "token": "</MFRAC>"
+      }
+    },
+    {
+      "name": "NUM",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "分子",
+      "empty": false,
+      "attrs": [],
+      "note": "MFRAC 分子",
+      "open": {
+        "id": 126,
+        "hex": "7E",
+        "token": "<NUM>"
+      },
+      "close": {
+        "id": 127,
+        "hex": "7F",
+        "token": "</NUM>"
+      }
+    },
+    {
+      "name": "DEN",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "分母",
+      "empty": false,
+      "attrs": [],
+      "note": "MFRAC 分母",
+      "open": {
+        "id": 128,
+        "hex": "80",
+        "token": "<DEN>"
+      },
+      "close": {
+        "id": 129,
+        "hex": "81",
+        "token": "</DEN>"
+      }
+    },
+    {
+      "name": "MSQRT",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "sqrt(..)",
+      "empty": false,
+      "attrs": [],
+      "note": "平方根",
+      "open": {
+        "id": 130,
+        "hex": "82",
+        "token": "<MSQRT>"
+      },
+      "close": {
+        "id": 131,
+        "hex": "83",
+        "token": "</MSQRT>"
+      }
+    },
+    {
+      "name": "MROOT",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "root(..)",
+      "empty": false,
+      "attrs": [],
+      "note": "n 次根",
+      "open": {
+        "id": 132,
+        "hex": "84",
+        "token": "<MROOT>"
+      },
+      "close": {
+        "id": 133,
+        "hex": "85",
+        "token": "</MROOT>"
+      }
+    },
+    {
+      "name": "MSUM",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "sum",
+      "empty": false,
+      "attrs": [],
+      "note": "求和（含 MBELOW/MABOVE）",
+      "open": {
+        "id": 134,
+        "hex": "86",
+        "token": "<MSUM>"
+      },
+      "close": {
+        "id": 135,
+        "hex": "87",
+        "token": "</MSUM>"
+      }
+    },
+    {
+      "name": "MBELOW",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "下限",
+      "empty": false,
+      "attrs": [],
+      "note": "MSUM 下限",
+      "open": {
+        "id": 136,
+        "hex": "88",
+        "token": "<MBELOW>"
+      },
+      "close": {
+        "id": 137,
+        "hex": "89",
+        "token": "</MBELOW>"
+      }
+    },
+    {
+      "name": "MABOVE",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "上限",
+      "empty": false,
+      "attrs": [],
+      "note": "MSUM 上限",
+      "open": {
+        "id": 138,
+        "hex": "8A",
+        "token": "<MABOVE>"
+      },
+      "close": {
+        "id": 139,
+        "hex": "8B",
+        "token": "</MABOVE>"
+      }
+    },
+    {
+      "name": "MINT",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "integral",
+      "empty": false,
+      "attrs": [],
+      "note": "积分",
+      "open": {
+        "id": 140,
+        "hex": "8C",
+        "token": "<MINT>"
+      },
+      "close": {
+        "id": 141,
+        "hex": "8D",
+        "token": "</MINT>"
+      }
+    },
+    {
+      "name": "MLIM",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "lim",
+      "empty": false,
+      "attrs": [],
+      "note": "极限",
+      "open": {
+        "id": 142,
+        "hex": "8E",
+        "token": "<MLIM>"
+      },
+      "close": {
+        "id": 143,
+        "hex": "8F",
+        "token": "</MLIM>"
+      }
+    },
+    {
+      "name": "MMAT",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "mat(..)",
+      "empty": false,
+      "attrs": [],
+      "note": "矩阵（含 MROW）",
+      "open": {
+        "id": 144,
+        "hex": "90",
+        "token": "<MMAT>"
+      },
+      "close": {
+        "id": 145,
+        "hex": "91",
+        "token": "</MMAT>"
+      }
+    },
+    {
+      "name": "MROW",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "矩阵一行",
+      "empty": false,
+      "attrs": [],
+      "note": "MMAT 子项",
+      "open": {
+        "id": 146,
+        "hex": "92",
+        "token": "<MROW>"
+      },
+      "close": {
+        "id": 147,
+        "hex": "93",
+        "token": "</MROW>"
+      }
+    },
+    {
+      "name": "MCASE",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "cases(..)",
+      "empty": false,
+      "attrs": [],
+      "note": "分段",
+      "open": {
+        "id": 148,
+        "hex": "94",
+        "token": "<MCASE>"
+      },
+      "close": {
+        "id": 149,
+        "hex": "95",
+        "token": "</MCASE>"
+      }
+    },
+    {
+      "name": "MALIGN",
+      "section": "3.6",
+      "kind": "empty",
+      "typst": "&",
+      "empty": true,
+      "attrs": [],
+      "note": "对齐点 ∅",
+      "open": {
+        "id": 150,
+        "hex": "96",
+        "token": "<MALIGN>"
+      },
+      "close": {
+        "id": 151,
+        "hex": "97",
+        "token": "</MALIGN>"
+      }
+    },
+    {
+      "name": "MFUNC",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "sin(..)",
+      "empty": false,
+      "attrs": [
+        "name"
+      ],
+      "note": "数学函数",
+      "open": {
+        "id": 152,
+        "hex": "98",
+        "token": "<MFUNC>"
+      },
+      "close": {
+        "id": 153,
+        "hex": "99",
+        "token": "</MFUNC>"
+      }
+    },
+    {
+      "name": "MID",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "变量名",
+      "empty": false,
+      "attrs": [],
+      "note": "标识符",
+      "open": {
+        "id": 154,
+        "hex": "9A",
+        "token": "<MID>"
+      },
+      "close": {
+        "id": 155,
+        "hex": "9B",
+        "token": "</MID>"
+      }
+    },
+    {
+      "name": "MN",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "数字字面量",
+      "empty": false,
+      "attrs": [],
+      "note": "数字",
+      "open": {
+        "id": 156,
+        "hex": "9C",
+        "token": "<MN>"
+      },
+      "close": {
+        "id": 157,
+        "hex": "9D",
+        "token": "</MN>"
+      }
+    },
+    {
+      "name": "MOP",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "+ - * / = < > 等",
+      "empty": false,
+      "attrs": [],
+      "note": "运算符（允许集见规范）",
+      "open": {
+        "id": 158,
+        "hex": "9E",
+        "token": "<MOP>"
+      },
+      "close": {
+        "id": 159,
+        "hex": "9F",
+        "token": "</MOP>"
+      }
+    },
+    {
+      "name": "MTEXT",
+      "section": "3.6",
+      "kind": "math",
+      "typst": "数学中文本 \"..\"",
+      "empty": false,
+      "attrs": [],
+      "note": "数学中文本",
+      "open": {
+        "id": 160,
+        "hex": "A0",
+        "token": "<MTEXT>"
+      },
+      "close": {
+        "id": 161,
+        "hex": "A1",
+        "token": "</MTEXT>"
+      }
+    },
+    {
+      "name": "CODEBLOCK",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "#{ .. }",
+      "empty": false,
+      "attrs": [],
+      "note": "代码块",
+      "open": {
+        "id": 162,
+        "hex": "A2",
+        "token": "<CODEBLOCK>"
+      },
+      "close": {
+        "id": 163,
+        "hex": "A3",
+        "token": "</CODEBLOCK>"
+      }
+    },
+    {
+      "name": "CBLOCK",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "[..]",
+      "empty": false,
+      "attrs": [],
+      "note": "内容块",
+      "open": {
+        "id": 164,
+        "hex": "A4",
+        "token": "<CBLOCK>"
+      },
+      "close": {
+        "id": 165,
+        "hex": "A5",
+        "token": "</CBLOCK>"
+      }
+    },
+    {
+      "name": "SET",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "set text(..)",
+      "empty": false,
+      "attrs": [
+        "sel"
+      ],
+      "note": "设值规则",
+      "open": {
+        "id": 166,
+        "hex": "A6",
+        "token": "<SET>"
+      },
+      "close": {
+        "id": 167,
+        "hex": "A7",
+        "token": "</SET>"
+      }
+    },
+    {
+      "name": "SETIF",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "set text(..) if ..",
+      "empty": false,
+      "attrs": [
+        "sel",
+        "cond"
+      ],
+      "note": "条件设值",
+      "open": {
+        "id": 168,
+        "hex": "A8",
+        "token": "<SETIF>"
+      },
+      "close": {
+        "id": 169,
+        "hex": "A9",
+        "token": "</SETIF>"
+      }
+    },
+    {
+      "name": "SHOW",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "show heading: ..",
+      "empty": false,
+      "attrs": [
+        "sel"
+      ],
+      "note": "显示规则",
+      "open": {
+        "id": 170,
+        "hex": "AA",
+        "token": "<SHOW>"
+      },
+      "close": {
+        "id": 171,
+        "hex": "AB",
+        "token": "</SHOW>"
+      }
+    },
+    {
+      "name": "SHOWSET",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "show heading: set ..",
+      "empty": false,
+      "attrs": [
+        "sel"
+      ],
+      "note": "显示-设值",
+      "open": {
+        "id": 172,
+        "hex": "AC",
+        "token": "<SHOWSET>"
+      },
+      "close": {
+        "id": 173,
+        "hex": "AD",
+        "token": "</SHOWSET>"
+      }
+    },
+    {
+      "name": "SHOWFUNC",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "show raw: it => ..",
+      "empty": false,
+      "attrs": [
+        "sel"
+      ],
+      "note": "变换规则",
+      "open": {
+        "id": 174,
+        "hex": "AE",
+        "token": "<SHOWFUNC>"
+      },
+      "close": {
+        "id": 175,
+        "hex": "AF",
+        "token": "</SHOWFUNC>"
+      }
+    },
+    {
+      "name": "SHOWALL",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "show: template",
+      "empty": false,
+      "attrs": [],
+      "note": "全局套用",
+      "open": {
+        "id": 176,
+        "hex": "B0",
+        "token": "<SHOWALL>"
+      },
+      "close": {
+        "id": 177,
+        "hex": "B1",
+        "token": "</SHOWALL>"
+      }
+    },
+    {
+      "name": "SHOWTEXT",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "show \"badly\": ..",
+      "empty": false,
+      "attrs": [
+        "text"
+      ],
+      "note": "文本替换",
+      "open": {
+        "id": 178,
+        "hex": "B2",
+        "token": "<SHOWTEXT>"
+      },
+      "close": {
+        "id": 179,
+        "hex": "B3",
+        "token": "</SHOWTEXT>"
+      }
+    },
+    {
+      "name": "SHOWREGEX",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "show regex(..): ..",
+      "empty": false,
+      "attrs": [
+        "pat"
+      ],
+      "note": "正则选择",
+      "open": {
+        "id": 180,
+        "hex": "B4",
+        "token": "<SHOWREGEX>"
+      },
+      "close": {
+        "id": 181,
+        "hex": "B5",
+        "token": "</SHOWREGEX>"
+      }
+    },
+    {
+      "name": "CONTEXT",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "context ..",
+      "empty": false,
+      "attrs": [],
+      "note": "自省上下文",
+      "open": {
+        "id": 182,
+        "hex": "B6",
+        "token": "<CONTEXT>"
+      },
+      "close": {
+        "id": 183,
+        "hex": "B7",
+        "token": "</CONTEXT>"
+      }
+    },
+    {
+      "name": "LET",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "let x = ..",
+      "empty": false,
+      "attrs": [
+        "name"
+      ],
+      "note": "绑定",
+      "open": {
+        "id": 184,
+        "hex": "B8",
+        "token": "<LET>"
+      },
+      "close": {
+        "id": 185,
+        "hex": "B9",
+        "token": "</LET>"
+      }
+    },
+    {
+      "name": "DEF",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "let f(x) = ..",
+      "empty": false,
+      "attrs": [
+        "name"
+      ],
+      "note": "具名函数",
+      "open": {
+        "id": 186,
+        "hex": "BA",
+        "token": "<DEF>"
+      },
+      "close": {
+        "id": 187,
+        "hex": "BB",
+        "token": "</DEF>"
+      }
+    },
+    {
+      "name": "IF",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "if ..",
+      "empty": false,
+      "attrs": [],
+      "note": "条件",
+      "open": {
+        "id": 188,
+        "hex": "BC",
+        "token": "<IF>"
+      },
+      "close": {
+        "id": 189,
+        "hex": "BD",
+        "token": "</IF>"
+      }
+    },
+    {
+      "name": "ELIF",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "else if ..",
+      "empty": false,
+      "attrs": [
+        "cond"
+      ],
+      "note": "条件分支",
+      "open": {
+        "id": 190,
+        "hex": "BE",
+        "token": "<ELIF>"
+      },
+      "close": {
+        "id": 191,
+        "hex": "BF",
+        "token": "</ELIF>"
+      }
+    },
+    {
+      "name": "ELSE",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "else ..",
+      "empty": false,
+      "attrs": [],
+      "note": "条件分支",
+      "open": {
+        "id": 192,
+        "hex": "C0",
+        "token": "<ELSE>"
+      },
+      "close": {
+        "id": 193,
+        "hex": "C1",
+        "token": "</ELSE>"
+      }
+    },
+    {
+      "name": "FOR",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "for x in ..",
+      "empty": false,
+      "attrs": [
+        "var",
+        "in"
+      ],
+      "note": "循环",
+      "open": {
+        "id": 194,
+        "hex": "C2",
+        "token": "<FOR>"
+      },
+      "close": {
+        "id": 195,
+        "hex": "C3",
+        "token": "</FOR>"
+      }
+    },
+    {
+      "name": "WHILE",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "while ..",
+      "empty": false,
+      "attrs": [
+        "cond"
+      ],
+      "note": "循环",
+      "open": {
+        "id": 196,
+        "hex": "C4",
+        "token": "<WHILE>"
+      },
+      "close": {
+        "id": 197,
+        "hex": "C5",
+        "token": "</WHILE>"
+      }
+    },
+    {
+      "name": "RETURN",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "return ..",
+      "empty": false,
+      "attrs": [],
+      "note": "返回",
+      "open": {
+        "id": 198,
+        "hex": "C6",
+        "token": "<RETURN>"
+      },
+      "close": {
+        "id": 199,
+        "hex": "C7",
+        "token": "</RETURN>"
+      }
+    },
+    {
+      "name": "BREAK",
+      "section": "3.7",
+      "kind": "empty",
+      "typst": "break",
+      "empty": true,
+      "attrs": [],
+      "note": "循环控制 ∅",
+      "open": {
+        "id": 200,
+        "hex": "C8",
+        "token": "<BREAK>"
+      },
+      "close": {
+        "id": 201,
+        "hex": "C9",
+        "token": "</BREAK>"
+      }
+    },
+    {
+      "name": "CONTINUE",
+      "section": "3.7",
+      "kind": "empty",
+      "typst": "continue",
+      "empty": true,
+      "attrs": [],
+      "note": "循环控制 ∅",
+      "open": {
+        "id": 202,
+        "hex": "CA",
+        "token": "<CONTINUE>"
+      },
+      "close": {
+        "id": 203,
+        "hex": "CB",
+        "token": "</CONTINUE>"
+      }
+    },
+    {
+      "name": "CALL",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "#rect(..)[..]",
+      "empty": false,
+      "attrs": [
+        "name"
+      ],
+      "note": "通用函数调用",
+      "open": {
+        "id": 204,
+        "hex": "CC",
+        "token": "<CALL>"
+      },
+      "close": {
+        "id": 205,
+        "hex": "CD",
+        "token": "</CALL>"
+      }
+    },
+    {
+      "name": "ARG",
+      "section": "3.7",
+      "kind": "code",
+      "typst": "具名参数 k: v",
+      "empty": false,
+      "attrs": [
+        "name"
+      ],
+      "note": "CALL 参数",
+      "open": {
+        "id": 206,
+        "hex": "CE",
+        "token": "<ARG>"
+      },
+      "close": {
+        "id": 207,
+        "hex": "CF",
+        "token": "</ARG>"
+      }
+    },
+    {
+      "name": "STR",
+      "section": "3.8",
+      "kind": "value",
+      "typst": "\"hello\"",
+      "empty": false,
+      "attrs": [],
+      "note": "字符串",
+      "open": {
+        "id": 208,
+        "hex": "D0",
+        "token": "<STR>"
+      },
+      "close": {
+        "id": 209,
+        "hex": "D1",
+        "token": "</STR>"
+      }
+    },
+    {
+      "name": "INT",
+      "section": "3.8",
+      "kind": "value",
+      "typst": "10",
+      "empty": false,
+      "attrs": [],
+      "note": "整数",
+      "open": {
+        "id": 210,
+        "hex": "D2",
+        "token": "<INT>"
+      },
+      "close": {
+        "id": 211,
+        "hex": "D3",
+        "token": "</INT>"
+      }
+    },
+    {
+      "name": "FLOAT",
+      "section": "3.8",
+      "kind": "value",
+      "typst": "3.14",
+      "empty": false,
+      "attrs": [],
+      "note": "浮点",
+      "open": {
+        "id": 212,
+        "hex": "D4",
+        "token": "<FLOAT>"
+      },
+      "close": {
+        "id": 213,
+        "hex": "D5",
+        "token": "</FLOAT>"
+      }
+    },
+    {
+      "name": "BOOL",
+      "section": "3.8",
+      "kind": "value",
+      "typst": "true / false",
+      "empty": false,
+      "attrs": [],
+      "note": "布尔",
+      "open": {
+        "id": 214,
+        "hex": "D6",
+        "token": "<BOOL>"
+      },
+      "close": {
+        "id": 215,
+        "hex": "D7",
+        "token": "</BOOL>"
+      }
+    },
+    {
+      "name": "NONE",
+      "section": "3.8",
+      "kind": "empty",
+      "typst": "none",
+      "empty": true,
+      "attrs": [],
+      "note": "占位 ∅",
+      "open": {
+        "id": 216,
+        "hex": "D8",
+        "token": "<NONE>"
+      },
+      "close": {
+        "id": 217,
+        "hex": "D9",
+        "token": "</NONE>"
+      }
+    },
+    {
+      "name": "AUTO",
+      "section": "3.8",
+      "kind": "empty",
+      "typst": "auto",
+      "empty": true,
+      "attrs": [],
+      "note": "占位 ∅",
+      "open": {
+        "id": 218,
+        "hex": "DA",
+        "token": "<AUTO>"
+      },
+      "close": {
+        "id": 219,
+        "hex": "DB",
+        "token": "</AUTO>"
+      }
+    },
+    {
+      "name": "LEN",
+      "section": "3.8",
+      "kind": "value",
+      "typst": "2pt",
+      "empty": false,
+      "attrs": [],
+      "note": "长度",
+      "open": {
+        "id": 220,
+        "hex": "DC",
+        "token": "<LEN>"
+      },
+      "close": {
+        "id": 221,
+        "hex": "DD",
+        "token": "</LEN>"
+      }
+    },
+    {
+      "name": "ANG",
+      "section": "3.8",
+      "kind": "value",
+      "typst": "90deg",
+      "empty": false,
+      "attrs": [],
+      "note": "角度",
+      "open": {
+        "id": 222,
+        "hex": "DE",
+        "token": "<ANG>"
+      },
+      "close": {
+        "id": 223,
+        "hex": "DF",
+        "token": "</ANG>"
+      }
+    },
+    {
+      "name": "FRAC",
+      "section": "3.8",
+      "kind": "value",
+      "typst": "2fr",
+      "empty": false,
+      "attrs": [],
+      "note": "弹性比例",
+      "open": {
+        "id": 224,
+        "hex": "E0",
+        "token": "<FRAC>"
+      },
+      "close": {
+        "id": 225,
+        "hex": "E1",
+        "token": "</FRAC>"
+      }
+    },
+    {
+      "name": "RATIO",
+      "section": "3.8",
+      "kind": "value",
+      "typst": "50%",
+      "empty": false,
+      "attrs": [],
+      "note": "百分比",
+      "open": {
+        "id": 226,
+        "hex": "E2",
+        "token": "<RATIO>"
+      },
+      "close": {
+        "id": 227,
+        "hex": "E3",
+        "token": "</RATIO>"
+      }
+    },
+    {
+      "name": "ARR",
+      "section": "3.8",
+      "kind": "value",
+      "typst": "(..)",
+      "empty": false,
+      "attrs": [],
+      "note": "数组（含 ITEM）",
+      "open": {
+        "id": 228,
+        "hex": "E4",
+        "token": "<ARR>"
+      },
+      "close": {
+        "id": 229,
+        "hex": "E5",
+        "token": "</ARR>"
+      }
+    },
+    {
+      "name": "ITEM",
+      "section": "3.8",
+      "kind": "value",
+      "typst": "数组项",
+      "empty": false,
+      "attrs": [],
+      "note": "ARR 子项",
+      "open": {
+        "id": 230,
+        "hex": "E6",
+        "token": "<ITEM>"
+      },
+      "close": {
+        "id": 231,
+        "hex": "E7",
+        "token": "</ITEM>"
+      }
+    },
+    {
+      "name": "DICT",
+      "section": "3.8",
+      "kind": "value",
+      "typst": "(k: v)",
+      "empty": false,
+      "attrs": [],
+      "note": "字典（含 KV）",
+      "open": {
+        "id": 232,
+        "hex": "E8",
+        "token": "<DICT>"
+      },
+      "close": {
+        "id": 233,
+        "hex": "E9",
+        "token": "</DICT>"
+      }
+    },
+    {
+      "name": "KV",
+      "section": "3.8",
+      "kind": "value",
+      "typst": "k: v",
+      "empty": false,
+      "attrs": [
+        "k"
+      ],
+      "note": "DICT 子项",
+      "open": {
+        "id": 234,
+        "hex": "EA",
+        "token": "<KV>"
+      },
+      "close": {
+        "id": 235,
+        "hex": "EB",
+        "token": "</KV>"
+      }
+    },
+    {
+      "name": "CITE",
+      "section": "3.8",
+      "kind": "empty",
+      "typst": "cite(..)",
+      "empty": true,
+      "attrs": [
+        "key"
+      ],
+      "note": "引用 ∅",
+      "open": {
+        "id": 236,
+        "hex": "EC",
+        "token": "<CITE>"
+      },
+      "close": {
+        "id": 237,
+        "hex": "ED",
+        "token": "</CITE>"
+      }
+    },
+    {
+      "name": "ATTR",
+      "section": "2",
+      "kind": "meta",
+      "typst": "name=\"k\" value=\"v\"",
+      "empty": false,
+      "attrs": [
+        "name",
+        "value"
+      ],
+      "note": "通用属性，紧跟开标签，映射器聚合成具名参数",
+      "open": {
+        "id": 238,
+        "hex": "EE",
+        "token": "<ATTR>"
+      },
+      "close": {
+        "id": 239,
+        "hex": "EF",
+        "token": "</ATTR>"
+      }
+    }
+  ],
+  "tokens": [
+    {
+      "id": 12,
+      "hex": "C",
+      "token": "<DOC>",
+      "kind": "open",
+      "construct": "DOC",
+      "pair_id": 13
+    },
+    {
+      "id": 13,
+      "hex": "D",
+      "token": "</DOC>",
+      "kind": "close",
+      "construct": "DOC",
+      "pair_id": 12
+    },
+    {
+      "id": 14,
+      "hex": "E",
+      "token": "<PAGESET>",
+      "kind": "open",
+      "construct": "PAGESET",
+      "pair_id": 15
+    },
+    {
+      "id": 15,
+      "hex": "F",
+      "token": "</PAGESET>",
+      "kind": "close",
+      "construct": "PAGESET",
+      "pair_id": 14
+    },
+    {
+      "id": 16,
+      "hex": "10",
+      "token": "<TEXTSET>",
+      "kind": "open",
+      "construct": "TEXTSET",
+      "pair_id": 17
+    },
+    {
+      "id": 17,
+      "hex": "11",
+      "token": "</TEXTSET>",
+      "kind": "close",
+      "construct": "TEXTSET",
+      "pair_id": 16
+    },
+    {
+      "id": 18,
+      "hex": "12",
+      "token": "<PARSET>",
+      "kind": "open",
+      "construct": "PARSET",
+      "pair_id": 19
+    },
+    {
+      "id": 19,
+      "hex": "13",
+      "token": "</PARSET>",
+      "kind": "close",
+      "construct": "PARSET",
+      "pair_id": 18
+    },
+    {
+      "id": 20,
+      "hex": "14",
+      "token": "<DOCSET>",
+      "kind": "open",
+      "construct": "DOCSET",
+      "pair_id": 21
+    },
+    {
+      "id": 21,
+      "hex": "15",
+      "token": "</DOCSET>",
+      "kind": "close",
+      "construct": "DOCSET",
+      "pair_id": 20
+    },
+    {
+      "id": 22,
+      "hex": "16",
+      "token": "<HEADER>",
+      "kind": "open",
+      "construct": "HEADER",
+      "pair_id": 23
+    },
+    {
+      "id": 23,
+      "hex": "17",
+      "token": "</HEADER>",
+      "kind": "close",
+      "construct": "HEADER",
+      "pair_id": 22
+    },
+    {
+      "id": 24,
+      "hex": "18",
+      "token": "<FOOTER>",
+      "kind": "open",
+      "construct": "FOOTER",
+      "pair_id": 25
+    },
+    {
+      "id": 25,
+      "hex": "19",
+      "token": "</FOOTER>",
+      "kind": "close",
+      "construct": "FOOTER",
+      "pair_id": 24
+    },
+    {
+      "id": 26,
+      "hex": "1A",
+      "token": "<BIB>",
+      "kind": "open",
+      "construct": "BIB",
+      "pair_id": 27
+    },
+    {
+      "id": 27,
+      "hex": "1B",
+      "token": "</BIB>",
+      "kind": "close",
+      "construct": "BIB",
+      "pair_id": 26
+    },
+    {
+      "id": 28,
+      "hex": "1C",
+      "token": "<OUTLINE>",
+      "kind": "open",
+      "construct": "OUTLINE",
+      "pair_id": 29
+    },
+    {
+      "id": 29,
+      "hex": "1D",
+      "token": "</OUTLINE>",
+      "kind": "close",
+      "construct": "OUTLINE",
+      "pair_id": 28
+    },
+    {
+      "id": 30,
+      "hex": "1E",
+      "token": "<INCLUDE>",
+      "kind": "open",
+      "construct": "INCLUDE",
+      "pair_id": 31
+    },
+    {
+      "id": 31,
+      "hex": "1F",
+      "token": "</INCLUDE>",
+      "kind": "close",
+      "construct": "INCLUDE",
+      "pair_id": 30
+    },
+    {
+      "id": 32,
+      "hex": "20",
+      "token": "<IMPORT>",
+      "kind": "open",
+      "construct": "IMPORT",
+      "pair_id": 33
+    },
+    {
+      "id": 33,
+      "hex": "21",
+      "token": "</IMPORT>",
+      "kind": "close",
+      "construct": "IMPORT",
+      "pair_id": 32
+    },
+    {
+      "id": 34,
+      "hex": "22",
+      "token": "<H1>",
+      "kind": "open",
+      "construct": "H1",
+      "pair_id": 35
+    },
+    {
+      "id": 35,
+      "hex": "23",
+      "token": "</H1>",
+      "kind": "close",
+      "construct": "H1",
+      "pair_id": 34
+    },
+    {
+      "id": 36,
+      "hex": "24",
+      "token": "<H2>",
+      "kind": "open",
+      "construct": "H2",
+      "pair_id": 37
+    },
+    {
+      "id": 37,
+      "hex": "25",
+      "token": "</H2>",
+      "kind": "close",
+      "construct": "H2",
+      "pair_id": 36
+    },
+    {
+      "id": 38,
+      "hex": "26",
+      "token": "<H3>",
+      "kind": "open",
+      "construct": "H3",
+      "pair_id": 39
+    },
+    {
+      "id": 39,
+      "hex": "27",
+      "token": "</H3>",
+      "kind": "close",
+      "construct": "H3",
+      "pair_id": 38
+    },
+    {
+      "id": 40,
+      "hex": "28",
+      "token": "<H4>",
+      "kind": "open",
+      "construct": "H4",
+      "pair_id": 41
+    },
+    {
+      "id": 41,
+      "hex": "29",
+      "token": "</H4>",
+      "kind": "close",
+      "construct": "H4",
+      "pair_id": 40
+    },
+    {
+      "id": 42,
+      "hex": "2A",
+      "token": "<H5>",
+      "kind": "open",
+      "construct": "H5",
+      "pair_id": 43
+    },
+    {
+      "id": 43,
+      "hex": "2B",
+      "token": "</H5>",
+      "kind": "close",
+      "construct": "H5",
+      "pair_id": 42
+    },
+    {
+      "id": 44,
+      "hex": "2C",
+      "token": "<H6>",
+      "kind": "open",
+      "construct": "H6",
+      "pair_id": 45
+    },
+    {
+      "id": 45,
+      "hex": "2D",
+      "token": "</H6>",
+      "kind": "close",
+      "construct": "H6",
+      "pair_id": 44
+    },
+    {
+      "id": 46,
+      "hex": "2E",
+      "token": "<P>",
+      "kind": "open",
+      "construct": "P",
+      "pair_id": 47
+    },
+    {
+      "id": 47,
+      "hex": "2F",
+      "token": "</P>",
+      "kind": "close",
+      "construct": "P",
+      "pair_id": 46
+    },
+    {
+      "id": 48,
+      "hex": "30",
+      "token": "<QUOTE>",
+      "kind": "open",
+      "construct": "QUOTE",
+      "pair_id": 49
+    },
+    {
+      "id": 49,
+      "hex": "31",
+      "token": "</QUOTE>",
+      "kind": "close",
+      "construct": "QUOTE",
+      "pair_id": 48
+    },
+    {
+      "id": 50,
+      "hex": "32",
+      "token": "<BLOCK>",
+      "kind": "open",
+      "construct": "BLOCK",
+      "pair_id": 51
+    },
+    {
+      "id": 51,
+      "hex": "33",
+      "token": "</BLOCK>",
+      "kind": "close",
+      "construct": "BLOCK",
+      "pair_id": 50
+    },
+    {
+      "id": 52,
+      "hex": "34",
+      "token": "<BOX>",
+      "kind": "open",
+      "construct": "BOX",
+      "pair_id": 53
+    },
+    {
+      "id": 53,
+      "hex": "35",
+      "token": "</BOX>",
+      "kind": "close",
+      "construct": "BOX",
+      "pair_id": 52
+    },
+    {
+      "id": 54,
+      "hex": "36",
+      "token": "<PAD>",
+      "kind": "open",
+      "construct": "PAD",
+      "pair_id": 55
+    },
+    {
+      "id": 55,
+      "hex": "37",
+      "token": "</PAD>",
+      "kind": "close",
+      "construct": "PAD",
+      "pair_id": 54
+    },
+    {
+      "id": 56,
+      "hex": "38",
+      "token": "<COLUMNS>",
+      "kind": "open",
+      "construct": "COLUMNS",
+      "pair_id": 57
+    },
+    {
+      "id": 57,
+      "hex": "39",
+      "token": "</COLUMNS>",
+      "kind": "close",
+      "construct": "COLUMNS",
+      "pair_id": 56
+    },
+    {
+      "id": 58,
+      "hex": "3A",
+      "token": "<GRID>",
+      "kind": "open",
+      "construct": "GRID",
+      "pair_id": 59
+    },
+    {
+      "id": 59,
+      "hex": "3B",
+      "token": "</GRID>",
+      "kind": "close",
+      "construct": "GRID",
+      "pair_id": 58
+    },
+    {
+      "id": 60,
+      "hex": "3C",
+      "token": "<STACK>",
+      "kind": "open",
+      "construct": "STACK",
+      "pair_id": 61
+    },
+    {
+      "id": 61,
+      "hex": "3D",
+      "token": "</STACK>",
+      "kind": "close",
+      "construct": "STACK",
+      "pair_id": 60
+    },
+    {
+      "id": 62,
+      "hex": "3E",
+      "token": "<ALIGN>",
+      "kind": "open",
+      "construct": "ALIGN",
+      "pair_id": 63
+    },
+    {
+      "id": 63,
+      "hex": "3F",
+      "token": "</ALIGN>",
+      "kind": "close",
+      "construct": "ALIGN",
+      "pair_id": 62
+    },
+    {
+      "id": 64,
+      "hex": "40",
+      "token": "<PLACE>",
+      "kind": "open",
+      "construct": "PLACE",
+      "pair_id": 65
+    },
+    {
+      "id": 65,
+      "hex": "41",
+      "token": "</PLACE>",
+      "kind": "close",
+      "construct": "PLACE",
+      "pair_id": 64
+    },
+    {
+      "id": 66,
+      "hex": "42",
+      "token": "<FIGURE>",
+      "kind": "open",
+      "construct": "FIGURE",
+      "pair_id": 67
+    },
+    {
+      "id": 67,
+      "hex": "43",
+      "token": "</FIGURE>",
+      "kind": "close",
+      "construct": "FIGURE",
+      "pair_id": 66
+    },
+    {
+      "id": 68,
+      "hex": "44",
+      "token": "<CAPTION>",
+      "kind": "open",
+      "construct": "CAPTION",
+      "pair_id": 69
+    },
+    {
+      "id": 69,
+      "hex": "45",
+      "token": "</CAPTION>",
+      "kind": "close",
+      "construct": "CAPTION",
+      "pair_id": 68
+    },
+    {
+      "id": 70,
+      "hex": "46",
+      "token": "<PARBREAK>",
+      "kind": "open",
+      "construct": "PARBREAK",
+      "pair_id": 71
+    },
+    {
+      "id": 71,
+      "hex": "47",
+      "token": "</PARBREAK>",
+      "kind": "close",
+      "construct": "PARBREAK",
+      "pair_id": 70
+    },
+    {
+      "id": 72,
+      "hex": "48",
+      "token": "<LINEBREAK>",
+      "kind": "open",
+      "construct": "LINEBREAK",
+      "pair_id": 73
+    },
+    {
+      "id": 73,
+      "hex": "49",
+      "token": "</LINEBREAK>",
+      "kind": "close",
+      "construct": "LINEBREAK",
+      "pair_id": 72
+    },
+    {
+      "id": 74,
+      "hex": "4A",
+      "token": "<PAGEBREAK>",
+      "kind": "open",
+      "construct": "PAGEBREAK",
+      "pair_id": 75
+    },
+    {
+      "id": 75,
+      "hex": "4B",
+      "token": "</PAGEBREAK>",
+      "kind": "close",
+      "construct": "PAGEBREAK",
+      "pair_id": 74
+    },
+    {
+      "id": 76,
+      "hex": "4C",
+      "token": "<SPACER>",
+      "kind": "open",
+      "construct": "SPACER",
+      "pair_id": 77
+    },
+    {
+      "id": 77,
+      "hex": "4D",
+      "token": "</SPACER>",
+      "kind": "close",
+      "construct": "SPACER",
+      "pair_id": 76
+    },
+    {
+      "id": 78,
+      "hex": "4E",
+      "token": "<B>",
+      "kind": "open",
+      "construct": "B",
+      "pair_id": 79
+    },
+    {
+      "id": 79,
+      "hex": "4F",
+      "token": "</B>",
+      "kind": "close",
+      "construct": "B",
+      "pair_id": 78
+    },
+    {
+      "id": 80,
+      "hex": "50",
+      "token": "<I>",
+      "kind": "open",
+      "construct": "I",
+      "pair_id": 81
+    },
+    {
+      "id": 81,
+      "hex": "51",
+      "token": "</I>",
+      "kind": "close",
+      "construct": "I",
+      "pair_id": 80
+    },
+    {
+      "id": 82,
+      "hex": "52",
+      "token": "<CODE>",
+      "kind": "open",
+      "construct": "CODE",
+      "pair_id": 83
+    },
+    {
+      "id": 83,
+      "hex": "53",
+      "token": "</CODE>",
+      "kind": "close",
+      "construct": "CODE",
+      "pair_id": 82
+    },
+    {
+      "id": 84,
+      "hex": "54",
+      "token": "<LINK>",
+      "kind": "open",
+      "construct": "LINK",
+      "pair_id": 85
+    },
+    {
+      "id": 85,
+      "hex": "55",
+      "token": "</LINK>",
+      "kind": "close",
+      "construct": "LINK",
+      "pair_id": 84
+    },
+    {
+      "id": 86,
+      "hex": "56",
+      "token": "<RAW>",
+      "kind": "open",
+      "construct": "RAW",
+      "pair_id": 87
+    },
+    {
+      "id": 87,
+      "hex": "57",
+      "token": "</RAW>",
+      "kind": "close",
+      "construct": "RAW",
+      "pair_id": 86
+    },
+    {
+      "id": 88,
+      "hex": "58",
+      "token": "<LABEL>",
+      "kind": "open",
+      "construct": "LABEL",
+      "pair_id": 89
+    },
+    {
+      "id": 89,
+      "hex": "59",
+      "token": "</LABEL>",
+      "kind": "close",
+      "construct": "LABEL",
+      "pair_id": 88
+    },
+    {
+      "id": 90,
+      "hex": "5A",
+      "token": "<REF>",
+      "kind": "open",
+      "construct": "REF",
+      "pair_id": 91
+    },
+    {
+      "id": 91,
+      "hex": "5B",
+      "token": "</REF>",
+      "kind": "close",
+      "construct": "REF",
+      "pair_id": 90
+    },
+    {
+      "id": 92,
+      "hex": "5C",
+      "token": "<SYM>",
+      "kind": "open",
+      "construct": "SYM",
+      "pair_id": 93
+    },
+    {
+      "id": 93,
+      "hex": "5D",
+      "token": "</SYM>",
+      "kind": "close",
+      "construct": "SYM",
+      "pair_id": 92
+    },
+    {
+      "id": 94,
+      "hex": "5E",
+      "token": "<COMMENT>",
+      "kind": "open",
+      "construct": "COMMENT",
+      "pair_id": 95
+    },
+    {
+      "id": 95,
+      "hex": "5F",
+      "token": "</COMMENT>",
+      "kind": "close",
+      "construct": "COMMENT",
+      "pair_id": 94
+    },
+    {
+      "id": 96,
+      "hex": "60",
+      "token": "<UL>",
+      "kind": "open",
+      "construct": "UL",
+      "pair_id": 97
+    },
+    {
+      "id": 97,
+      "hex": "61",
+      "token": "</UL>",
+      "kind": "close",
+      "construct": "UL",
+      "pair_id": 96
+    },
+    {
+      "id": 98,
+      "hex": "62",
+      "token": "<OL>",
+      "kind": "open",
+      "construct": "OL",
+      "pair_id": 99
+    },
+    {
+      "id": 99,
+      "hex": "63",
+      "token": "</OL>",
+      "kind": "close",
+      "construct": "OL",
+      "pair_id": 98
+    },
+    {
+      "id": 100,
+      "hex": "64",
+      "token": "<TERMS>",
+      "kind": "open",
+      "construct": "TERMS",
+      "pair_id": 101
+    },
+    {
+      "id": 101,
+      "hex": "65",
+      "token": "</TERMS>",
+      "kind": "close",
+      "construct": "TERMS",
+      "pair_id": 100
+    },
+    {
+      "id": 102,
+      "hex": "66",
+      "token": "<LI>",
+      "kind": "open",
+      "construct": "LI",
+      "pair_id": 103
+    },
+    {
+      "id": 103,
+      "hex": "67",
+      "token": "</LI>",
+      "kind": "close",
+      "construct": "LI",
+      "pair_id": 102
+    },
+    {
+      "id": 104,
+      "hex": "68",
+      "token": "<TERM>",
+      "kind": "open",
+      "construct": "TERM",
+      "pair_id": 105
+    },
+    {
+      "id": 105,
+      "hex": "69",
+      "token": "</TERM>",
+      "kind": "close",
+      "construct": "TERM",
+      "pair_id": 104
+    },
+    {
+      "id": 106,
+      "hex": "6A",
+      "token": "<DESC>",
+      "kind": "open",
+      "construct": "DESC",
+      "pair_id": 107
+    },
+    {
+      "id": 107,
+      "hex": "6B",
+      "token": "</DESC>",
+      "kind": "close",
+      "construct": "DESC",
+      "pair_id": 106
+    },
+    {
+      "id": 108,
+      "hex": "6C",
+      "token": "<TABLE>",
+      "kind": "open",
+      "construct": "TABLE",
+      "pair_id": 109
+    },
+    {
+      "id": 109,
+      "hex": "6D",
+      "token": "</TABLE>",
+      "kind": "close",
+      "construct": "TABLE",
+      "pair_id": 108
+    },
+    {
+      "id": 110,
+      "hex": "6E",
+      "token": "<ROW>",
+      "kind": "open",
+      "construct": "ROW",
+      "pair_id": 111
+    },
+    {
+      "id": 111,
+      "hex": "6F",
+      "token": "</ROW>",
+      "kind": "close",
+      "construct": "ROW",
+      "pair_id": 110
+    },
+    {
+      "id": 112,
+      "hex": "70",
+      "token": "<CELL>",
+      "kind": "open",
+      "construct": "CELL",
+      "pair_id": 113
+    },
+    {
+      "id": 113,
+      "hex": "71",
+      "token": "</CELL>",
+      "kind": "close",
+      "construct": "CELL",
+      "pair_id": 112
+    },
+    {
+      "id": 114,
+      "hex": "72",
+      "token": "<TH>",
+      "kind": "open",
+      "construct": "TH",
+      "pair_id": 115
+    },
+    {
+      "id": 115,
+      "hex": "73",
+      "token": "</TH>",
+      "kind": "close",
+      "construct": "TH",
+      "pair_id": 114
+    },
+    {
+      "id": 116,
+      "hex": "74",
+      "token": "<MATH>",
+      "kind": "open",
+      "construct": "MATH",
+      "pair_id": 117
+    },
+    {
+      "id": 117,
+      "hex": "75",
+      "token": "</MATH>",
+      "kind": "close",
+      "construct": "MATH",
+      "pair_id": 116
+    },
+    {
+      "id": 118,
+      "hex": "76",
+      "token": "<MATHB>",
+      "kind": "open",
+      "construct": "MATHB",
+      "pair_id": 119
+    },
+    {
+      "id": 119,
+      "hex": "77",
+      "token": "</MATHB>",
+      "kind": "close",
+      "construct": "MATHB",
+      "pair_id": 118
+    },
+    {
+      "id": 120,
+      "hex": "78",
+      "token": "<MSUB>",
+      "kind": "open",
+      "construct": "MSUB",
+      "pair_id": 121
+    },
+    {
+      "id": 121,
+      "hex": "79",
+      "token": "</MSUB>",
+      "kind": "close",
+      "construct": "MSUB",
+      "pair_id": 120
+    },
+    {
+      "id": 122,
+      "hex": "7A",
+      "token": "<MSUP>",
+      "kind": "open",
+      "construct": "MSUP",
+      "pair_id": 123
+    },
+    {
+      "id": 123,
+      "hex": "7B",
+      "token": "</MSUP>",
+      "kind": "close",
+      "construct": "MSUP",
+      "pair_id": 122
+    },
+    {
+      "id": 124,
+      "hex": "7C",
+      "token": "<MFRAC>",
+      "kind": "open",
+      "construct": "MFRAC",
+      "pair_id": 125
+    },
+    {
+      "id": 125,
+      "hex": "7D",
+      "token": "</MFRAC>",
+      "kind": "close",
+      "construct": "MFRAC",
+      "pair_id": 124
+    },
+    {
+      "id": 126,
+      "hex": "7E",
+      "token": "<NUM>",
+      "kind": "open",
+      "construct": "NUM",
+      "pair_id": 127
+    },
+    {
+      "id": 127,
+      "hex": "7F",
+      "token": "</NUM>",
+      "kind": "close",
+      "construct": "NUM",
+      "pair_id": 126
+    },
+    {
+      "id": 128,
+      "hex": "80",
+      "token": "<DEN>",
+      "kind": "open",
+      "construct": "DEN",
+      "pair_id": 129
+    },
+    {
+      "id": 129,
+      "hex": "81",
+      "token": "</DEN>",
+      "kind": "close",
+      "construct": "DEN",
+      "pair_id": 128
+    },
+    {
+      "id": 130,
+      "hex": "82",
+      "token": "<MSQRT>",
+      "kind": "open",
+      "construct": "MSQRT",
+      "pair_id": 131
+    },
+    {
+      "id": 131,
+      "hex": "83",
+      "token": "</MSQRT>",
+      "kind": "close",
+      "construct": "MSQRT",
+      "pair_id": 130
+    },
+    {
+      "id": 132,
+      "hex": "84",
+      "token": "<MROOT>",
+      "kind": "open",
+      "construct": "MROOT",
+      "pair_id": 133
+    },
+    {
+      "id": 133,
+      "hex": "85",
+      "token": "</MROOT>",
+      "kind": "close",
+      "construct": "MROOT",
+      "pair_id": 132
+    },
+    {
+      "id": 134,
+      "hex": "86",
+      "token": "<MSUM>",
+      "kind": "open",
+      "construct": "MSUM",
+      "pair_id": 135
+    },
+    {
+      "id": 135,
+      "hex": "87",
+      "token": "</MSUM>",
+      "kind": "close",
+      "construct": "MSUM",
+      "pair_id": 134
+    },
+    {
+      "id": 136,
+      "hex": "88",
+      "token": "<MBELOW>",
+      "kind": "open",
+      "construct": "MBELOW",
+      "pair_id": 137
+    },
+    {
+      "id": 137,
+      "hex": "89",
+      "token": "</MBELOW>",
+      "kind": "close",
+      "construct": "MBELOW",
+      "pair_id": 136
+    },
+    {
+      "id": 138,
+      "hex": "8A",
+      "token": "<MABOVE>",
+      "kind": "open",
+      "construct": "MABOVE",
+      "pair_id": 139
+    },
+    {
+      "id": 139,
+      "hex": "8B",
+      "token": "</MABOVE>",
+      "kind": "close",
+      "construct": "MABOVE",
+      "pair_id": 138
+    },
+    {
+      "id": 140,
+      "hex": "8C",
+      "token": "<MINT>",
+      "kind": "open",
+      "construct": "MINT",
+      "pair_id": 141
+    },
+    {
+      "id": 141,
+      "hex": "8D",
+      "token": "</MINT>",
+      "kind": "close",
+      "construct": "MINT",
+      "pair_id": 140
+    },
+    {
+      "id": 142,
+      "hex": "8E",
+      "token": "<MLIM>",
+      "kind": "open",
+      "construct": "MLIM",
+      "pair_id": 143
+    },
+    {
+      "id": 143,
+      "hex": "8F",
+      "token": "</MLIM>",
+      "kind": "close",
+      "construct": "MLIM",
+      "pair_id": 142
+    },
+    {
+      "id": 144,
+      "hex": "90",
+      "token": "<MMAT>",
+      "kind": "open",
+      "construct": "MMAT",
+      "pair_id": 145
+    },
+    {
+      "id": 145,
+      "hex": "91",
+      "token": "</MMAT>",
+      "kind": "close",
+      "construct": "MMAT",
+      "pair_id": 144
+    },
+    {
+      "id": 146,
+      "hex": "92",
+      "token": "<MROW>",
+      "kind": "open",
+      "construct": "MROW",
+      "pair_id": 147
+    },
+    {
+      "id": 147,
+      "hex": "93",
+      "token": "</MROW>",
+      "kind": "close",
+      "construct": "MROW",
+      "pair_id": 146
+    },
+    {
+      "id": 148,
+      "hex": "94",
+      "token": "<MCASE>",
+      "kind": "open",
+      "construct": "MCASE",
+      "pair_id": 149
+    },
+    {
+      "id": 149,
+      "hex": "95",
+      "token": "</MCASE>",
+      "kind": "close",
+      "construct": "MCASE",
+      "pair_id": 148
+    },
+    {
+      "id": 150,
+      "hex": "96",
+      "token": "<MALIGN>",
+      "kind": "open",
+      "construct": "MALIGN",
+      "pair_id": 151
+    },
+    {
+      "id": 151,
+      "hex": "97",
+      "token": "</MALIGN>",
+      "kind": "close",
+      "construct": "MALIGN",
+      "pair_id": 150
+    },
+    {
+      "id": 152,
+      "hex": "98",
+      "token": "<MFUNC>",
+      "kind": "open",
+      "construct": "MFUNC",
+      "pair_id": 153
+    },
+    {
+      "id": 153,
+      "hex": "99",
+      "token": "</MFUNC>",
+      "kind": "close",
+      "construct": "MFUNC",
+      "pair_id": 152
+    },
+    {
+      "id": 154,
+      "hex": "9A",
+      "token": "<MID>",
+      "kind": "open",
+      "construct": "MID",
+      "pair_id": 155
+    },
+    {
+      "id": 155,
+      "hex": "9B",
+      "token": "</MID>",
+      "kind": "close",
+      "construct": "MID",
+      "pair_id": 154
+    },
+    {
+      "id": 156,
+      "hex": "9C",
+      "token": "<MN>",
+      "kind": "open",
+      "construct": "MN",
+      "pair_id": 157
+    },
+    {
+      "id": 157,
+      "hex": "9D",
+      "token": "</MN>",
+      "kind": "close",
+      "construct": "MN",
+      "pair_id": 156
+    },
+    {
+      "id": 158,
+      "hex": "9E",
+      "token": "<MOP>",
+      "kind": "open",
+      "construct": "MOP",
+      "pair_id": 159
+    },
+    {
+      "id": 159,
+      "hex": "9F",
+      "token": "</MOP>",
+      "kind": "close",
+      "construct": "MOP",
+      "pair_id": 158
+    },
+    {
+      "id": 160,
+      "hex": "A0",
+      "token": "<MTEXT>",
+      "kind": "open",
+      "construct": "MTEXT",
+      "pair_id": 161
+    },
+    {
+      "id": 161,
+      "hex": "A1",
+      "token": "</MTEXT>",
+      "kind": "close",
+      "construct": "MTEXT",
+      "pair_id": 160
+    },
+    {
+      "id": 162,
+      "hex": "A2",
+      "token": "<CODEBLOCK>",
+      "kind": "open",
+      "construct": "CODEBLOCK",
+      "pair_id": 163
+    },
+    {
+      "id": 163,
+      "hex": "A3",
+      "token": "</CODEBLOCK>",
+      "kind": "close",
+      "construct": "CODEBLOCK",
+      "pair_id": 162
+    },
+    {
+      "id": 164,
+      "hex": "A4",
+      "token": "<CBLOCK>",
+      "kind": "open",
+      "construct": "CBLOCK",
+      "pair_id": 165
+    },
+    {
+      "id": 165,
+      "hex": "A5",
+      "token": "</CBLOCK>",
+      "kind": "close",
+      "construct": "CBLOCK",
+      "pair_id": 164
+    },
+    {
+      "id": 166,
+      "hex": "A6",
+      "token": "<SET>",
+      "kind": "open",
+      "construct": "SET",
+      "pair_id": 167
+    },
+    {
+      "id": 167,
+      "hex": "A7",
+      "token": "</SET>",
+      "kind": "close",
+      "construct": "SET",
+      "pair_id": 166
+    },
+    {
+      "id": 168,
+      "hex": "A8",
+      "token": "<SETIF>",
+      "kind": "open",
+      "construct": "SETIF",
+      "pair_id": 169
+    },
+    {
+      "id": 169,
+      "hex": "A9",
+      "token": "</SETIF>",
+      "kind": "close",
+      "construct": "SETIF",
+      "pair_id": 168
+    },
+    {
+      "id": 170,
+      "hex": "AA",
+      "token": "<SHOW>",
+      "kind": "open",
+      "construct": "SHOW",
+      "pair_id": 171
+    },
+    {
+      "id": 171,
+      "hex": "AB",
+      "token": "</SHOW>",
+      "kind": "close",
+      "construct": "SHOW",
+      "pair_id": 170
+    },
+    {
+      "id": 172,
+      "hex": "AC",
+      "token": "<SHOWSET>",
+      "kind": "open",
+      "construct": "SHOWSET",
+      "pair_id": 173
+    },
+    {
+      "id": 173,
+      "hex": "AD",
+      "token": "</SHOWSET>",
+      "kind": "close",
+      "construct": "SHOWSET",
+      "pair_id": 172
+    },
+    {
+      "id": 174,
+      "hex": "AE",
+      "token": "<SHOWFUNC>",
+      "kind": "open",
+      "construct": "SHOWFUNC",
+      "pair_id": 175
+    },
+    {
+      "id": 175,
+      "hex": "AF",
+      "token": "</SHOWFUNC>",
+      "kind": "close",
+      "construct": "SHOWFUNC",
+      "pair_id": 174
+    },
+    {
+      "id": 176,
+      "hex": "B0",
+      "token": "<SHOWALL>",
+      "kind": "open",
+      "construct": "SHOWALL",
+      "pair_id": 177
+    },
+    {
+      "id": 177,
+      "hex": "B1",
+      "token": "</SHOWALL>",
+      "kind": "close",
+      "construct": "SHOWALL",
+      "pair_id": 176
+    },
+    {
+      "id": 178,
+      "hex": "B2",
+      "token": "<SHOWTEXT>",
+      "kind": "open",
+      "construct": "SHOWTEXT",
+      "pair_id": 179
+    },
+    {
+      "id": 179,
+      "hex": "B3",
+      "token": "</SHOWTEXT>",
+      "kind": "close",
+      "construct": "SHOWTEXT",
+      "pair_id": 178
+    },
+    {
+      "id": 180,
+      "hex": "B4",
+      "token": "<SHOWREGEX>",
+      "kind": "open",
+      "construct": "SHOWREGEX",
+      "pair_id": 181
+    },
+    {
+      "id": 181,
+      "hex": "B5",
+      "token": "</SHOWREGEX>",
+      "kind": "close",
+      "construct": "SHOWREGEX",
+      "pair_id": 180
+    },
+    {
+      "id": 182,
+      "hex": "B6",
+      "token": "<CONTEXT>",
+      "kind": "open",
+      "construct": "CONTEXT",
+      "pair_id": 183
+    },
+    {
+      "id": 183,
+      "hex": "B7",
+      "token": "</CONTEXT>",
+      "kind": "close",
+      "construct": "CONTEXT",
+      "pair_id": 182
+    },
+    {
+      "id": 184,
+      "hex": "B8",
+      "token": "<LET>",
+      "kind": "open",
+      "construct": "LET",
+      "pair_id": 185
+    },
+    {
+      "id": 185,
+      "hex": "B9",
+      "token": "</LET>",
+      "kind": "close",
+      "construct": "LET",
+      "pair_id": 184
+    },
+    {
+      "id": 186,
+      "hex": "BA",
+      "token": "<DEF>",
+      "kind": "open",
+      "construct": "DEF",
+      "pair_id": 187
+    },
+    {
+      "id": 187,
+      "hex": "BB",
+      "token": "</DEF>",
+      "kind": "close",
+      "construct": "DEF",
+      "pair_id": 186
+    },
+    {
+      "id": 188,
+      "hex": "BC",
+      "token": "<IF>",
+      "kind": "open",
+      "construct": "IF",
+      "pair_id": 189
+    },
+    {
+      "id": 189,
+      "hex": "BD",
+      "token": "</IF>",
+      "kind": "close",
+      "construct": "IF",
+      "pair_id": 188
+    },
+    {
+      "id": 190,
+      "hex": "BE",
+      "token": "<ELIF>",
+      "kind": "open",
+      "construct": "ELIF",
+      "pair_id": 191
+    },
+    {
+      "id": 191,
+      "hex": "BF",
+      "token": "</ELIF>",
+      "kind": "close",
+      "construct": "ELIF",
+      "pair_id": 190
+    },
+    {
+      "id": 192,
+      "hex": "C0",
+      "token": "<ELSE>",
+      "kind": "open",
+      "construct": "ELSE",
+      "pair_id": 193
+    },
+    {
+      "id": 193,
+      "hex": "C1",
+      "token": "</ELSE>",
+      "kind": "close",
+      "construct": "ELSE",
+      "pair_id": 192
+    },
+    {
+      "id": 194,
+      "hex": "C2",
+      "token": "<FOR>",
+      "kind": "open",
+      "construct": "FOR",
+      "pair_id": 195
+    },
+    {
+      "id": 195,
+      "hex": "C3",
+      "token": "</FOR>",
+      "kind": "close",
+      "construct": "FOR",
+      "pair_id": 194
+    },
+    {
+      "id": 196,
+      "hex": "C4",
+      "token": "<WHILE>",
+      "kind": "open",
+      "construct": "WHILE",
+      "pair_id": 197
+    },
+    {
+      "id": 197,
+      "hex": "C5",
+      "token": "</WHILE>",
+      "kind": "close",
+      "construct": "WHILE",
+      "pair_id": 196
+    },
+    {
+      "id": 198,
+      "hex": "C6",
+      "token": "<RETURN>",
+      "kind": "open",
+      "construct": "RETURN",
+      "pair_id": 199
+    },
+    {
+      "id": 199,
+      "hex": "C7",
+      "token": "</RETURN>",
+      "kind": "close",
+      "construct": "RETURN",
+      "pair_id": 198
+    },
+    {
+      "id": 200,
+      "hex": "C8",
+      "token": "<BREAK>",
+      "kind": "open",
+      "construct": "BREAK",
+      "pair_id": 201
+    },
+    {
+      "id": 201,
+      "hex": "C9",
+      "token": "</BREAK>",
+      "kind": "close",
+      "construct": "BREAK",
+      "pair_id": 200
+    },
+    {
+      "id": 202,
+      "hex": "CA",
+      "token": "<CONTINUE>",
+      "kind": "open",
+      "construct": "CONTINUE",
+      "pair_id": 203
+    },
+    {
+      "id": 203,
+      "hex": "CB",
+      "token": "</CONTINUE>",
+      "kind": "close",
+      "construct": "CONTINUE",
+      "pair_id": 202
+    },
+    {
+      "id": 204,
+      "hex": "CC",
+      "token": "<CALL>",
+      "kind": "open",
+      "construct": "CALL",
+      "pair_id": 205
+    },
+    {
+      "id": 205,
+      "hex": "CD",
+      "token": "</CALL>",
+      "kind": "close",
+      "construct": "CALL",
+      "pair_id": 204
+    },
+    {
+      "id": 206,
+      "hex": "CE",
+      "token": "<ARG>",
+      "kind": "open",
+      "construct": "ARG",
+      "pair_id": 207
+    },
+    {
+      "id": 207,
+      "hex": "CF",
+      "token": "</ARG>",
+      "kind": "close",
+      "construct": "ARG",
+      "pair_id": 206
+    },
+    {
+      "id": 208,
+      "hex": "D0",
+      "token": "<STR>",
+      "kind": "open",
+      "construct": "STR",
+      "pair_id": 209
+    },
+    {
+      "id": 209,
+      "hex": "D1",
+      "token": "</STR>",
+      "kind": "close",
+      "construct": "STR",
+      "pair_id": 208
+    },
+    {
+      "id": 210,
+      "hex": "D2",
+      "token": "<INT>",
+      "kind": "open",
+      "construct": "INT",
+      "pair_id": 211
+    },
+    {
+      "id": 211,
+      "hex": "D3",
+      "token": "</INT>",
+      "kind": "close",
+      "construct": "INT",
+      "pair_id": 210
+    },
+    {
+      "id": 212,
+      "hex": "D4",
+      "token": "<FLOAT>",
+      "kind": "open",
+      "construct": "FLOAT",
+      "pair_id": 213
+    },
+    {
+      "id": 213,
+      "hex": "D5",
+      "token": "</FLOAT>",
+      "kind": "close",
+      "construct": "FLOAT",
+      "pair_id": 212
+    },
+    {
+      "id": 214,
+      "hex": "D6",
+      "token": "<BOOL>",
+      "kind": "open",
+      "construct": "BOOL",
+      "pair_id": 215
+    },
+    {
+      "id": 215,
+      "hex": "D7",
+      "token": "</BOOL>",
+      "kind": "close",
+      "construct": "BOOL",
+      "pair_id": 214
+    },
+    {
+      "id": 216,
+      "hex": "D8",
+      "token": "<NONE>",
+      "kind": "open",
+      "construct": "NONE",
+      "pair_id": 217
+    },
+    {
+      "id": 217,
+      "hex": "D9",
+      "token": "</NONE>",
+      "kind": "close",
+      "construct": "NONE",
+      "pair_id": 216
+    },
+    {
+      "id": 218,
+      "hex": "DA",
+      "token": "<AUTO>",
+      "kind": "open",
+      "construct": "AUTO",
+      "pair_id": 219
+    },
+    {
+      "id": 219,
+      "hex": "DB",
+      "token": "</AUTO>",
+      "kind": "close",
+      "construct": "AUTO",
+      "pair_id": 218
+    },
+    {
+      "id": 220,
+      "hex": "DC",
+      "token": "<LEN>",
+      "kind": "open",
+      "construct": "LEN",
+      "pair_id": 221
+    },
+    {
+      "id": 221,
+      "hex": "DD",
+      "token": "</LEN>",
+      "kind": "close",
+      "construct": "LEN",
+      "pair_id": 220
+    },
+    {
+      "id": 222,
+      "hex": "DE",
+      "token": "<ANG>",
+      "kind": "open",
+      "construct": "ANG",
+      "pair_id": 223
+    },
+    {
+      "id": 223,
+      "hex": "DF",
+      "token": "</ANG>",
+      "kind": "close",
+      "construct": "ANG",
+      "pair_id": 222
+    },
+    {
+      "id": 224,
+      "hex": "E0",
+      "token": "<FRAC>",
+      "kind": "open",
+      "construct": "FRAC",
+      "pair_id": 225
+    },
+    {
+      "id": 225,
+      "hex": "E1",
+      "token": "</FRAC>",
+      "kind": "close",
+      "construct": "FRAC",
+      "pair_id": 224
+    },
+    {
+      "id": 226,
+      "hex": "E2",
+      "token": "<RATIO>",
+      "kind": "open",
+      "construct": "RATIO",
+      "pair_id": 227
+    },
+    {
+      "id": 227,
+      "hex": "E3",
+      "token": "</RATIO>",
+      "kind": "close",
+      "construct": "RATIO",
+      "pair_id": 226
+    },
+    {
+      "id": 228,
+      "hex": "E4",
+      "token": "<ARR>",
+      "kind": "open",
+      "construct": "ARR",
+      "pair_id": 229
+    },
+    {
+      "id": 229,
+      "hex": "E5",
+      "token": "</ARR>",
+      "kind": "close",
+      "construct": "ARR",
+      "pair_id": 228
+    },
+    {
+      "id": 230,
+      "hex": "E6",
+      "token": "<ITEM>",
+      "kind": "open",
+      "construct": "ITEM",
+      "pair_id": 231
+    },
+    {
+      "id": 231,
+      "hex": "E7",
+      "token": "</ITEM>",
+      "kind": "close",
+      "construct": "ITEM",
+      "pair_id": 230
+    },
+    {
+      "id": 232,
+      "hex": "E8",
+      "token": "<DICT>",
+      "kind": "open",
+      "construct": "DICT",
+      "pair_id": 233
+    },
+    {
+      "id": 233,
+      "hex": "E9",
+      "token": "</DICT>",
+      "kind": "close",
+      "construct": "DICT",
+      "pair_id": 232
+    },
+    {
+      "id": 234,
+      "hex": "EA",
+      "token": "<KV>",
+      "kind": "open",
+      "construct": "KV",
+      "pair_id": 235
+    },
+    {
+      "id": 235,
+      "hex": "EB",
+      "token": "</KV>",
+      "kind": "close",
+      "construct": "KV",
+      "pair_id": 234
+    },
+    {
+      "id": 236,
+      "hex": "EC",
+      "token": "<CITE>",
+      "kind": "open",
+      "construct": "CITE",
+      "pair_id": 237
+    },
+    {
+      "id": 237,
+      "hex": "ED",
+      "token": "</CITE>",
+      "kind": "close",
+      "construct": "CITE",
+      "pair_id": 236
+    },
+    {
+      "id": 238,
+      "hex": "EE",
+      "token": "<ATTR>",
+      "kind": "open",
+      "construct": "ATTR",
+      "pair_id": 239
+    },
+    {
+      "id": 239,
+      "hex": "EF",
+      "token": "</ATTR>",
+      "kind": "close",
+      "construct": "ATTR",
+      "pair_id": 238
+    }
+  ]
+}

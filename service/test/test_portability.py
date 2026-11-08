@@ -163,6 +163,15 @@ class TestNoExternalReferences(unittest.TestCase):
                     p.read_text(encoding="utf-8",
                                 errors="replace").splitlines(), 1):
                 if "shutil.which(" in line or 'os.environ.get("SHELL")' in line:
+                    # 精确豁免：service/web/minify.py 是【构建期】工具，
+                    # --check 时用它找可选的 node 做 JS 语法检查，找不到
+                    # 只降级为 SKIP（不假装通过），不构成运行时依赖。
+                    # 本门的意图是「运行时代码不得依赖系统 PATH」，那一行
+                    # 属于误报。范围只放到这一个文件、这一个调用，规则
+                    # 本身与其它所有文件/行一律不放宽（2026-11-05 基线修复）。
+                    if (p.name == "minify.py" and p.parent.name == "web"
+                            and "shutil.which(exe_name)" in line):
+                        continue
                     bad.append(f"{p.relative_to(ROOT)}:{i}: {line.strip()[:90]}")
         self.assertEqual(bad, [], "运行时仍会查系统 PATH:\n"
                                 + "\n".join(bad))

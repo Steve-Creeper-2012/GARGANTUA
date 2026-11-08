@@ -31,6 +31,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import spec
 import vocab_presets as vp
 from server_tokens import TokensApi
 
@@ -54,14 +55,14 @@ class VocabApiTest(unittest.TestCase):
         self.assertIn("vocabs", data)
         self.assertIn("max_vocab_size", data)
         names = {v["name"] for v in data["vocabs"]}
-        self.assertIn("base", names)
-        base = next(v for v in data["vocabs"] if v["name"] == "base")
+        self.assertIn(vp.BASE, names)
+        base = next(v for v in data["vocabs"] if v["name"] == vp.BASE)
         self.assertTrue(base["is_main"])
 
     def test_regions(self):
-        code, data = self.api.api_vocab_regions({"name": ["base"]})
+        code, data = self.api.api_vocab_regions({"name": [vp.BASE]})
         self.assertEqual(code, 200)
-        self.assertEqual(data["name"], "base")
+        self.assertEqual(data["name"], vp.BASE)
         self.assertGreater(len(data["regions"]), 0)
         self.assertEqual(data["vocab_size"],
                          data["visible_size"] + data["invisible_size"])
@@ -102,7 +103,7 @@ class VocabApiTest(unittest.TestCase):
             self.api.api_vocab_token({"action": "add", "name": "x"})
         with self.assertRaises(ValueError):
             self.api.api_vocab_token(
-                {"action": "bogus", "name": "base", "token": "x"})
+                {"action": "bogus", "name": vp.BASE, "token": "x"})
 
     # ---------------- .vfc 编辑器（文本模式）----------------
     def test_source_get_and_write(self):
@@ -128,11 +129,101 @@ class VocabApiTest(unittest.TestCase):
             self.api.api_vocab_source(
                 {"name": "srcp", "text": bad, "mode": "this"})
 
+    # ---------------- 按子区添加（2026-11-07）----------------
+    def test_region_add_policy_and_slot_roundtrip(self):
+        """下拉给全 16 个子区 + 策略；契约头锁定、slot 强制 <>、文本无要求。"""
+        vp.ensure_base()
+        vp.create_vocab("regp")
+        code, occ = self.api.api_vocab_regions({"name": ["regp"]})
+        self.assertEqual(code, 200)
+        self.assertEqual(len(occ["add_regions"]), len(spec.REGION_ORDER))
+        self.assertEqual(set(occ["add_policy_hints"]),
+                         {spec.POLICY_LOCKED, spec.POLICY_ANGLED,
+                          spec.POLICY_TEXT})
+        by_name = {r["region"]: r["add_policy"]
+                   for r in occ["add_regions"]}
+        self.assertEqual(by_name["system"], spec.POLICY_LOCKED)
+        self.assertEqual(by_name["slot"], spec.POLICY_ANGLED)
+        self.assertEqual(by_name["unicode_ext"], spec.POLICY_TEXT)
+
+        # 锁定 / 未知子区：后端也要拦，不能只靠前端 disabled
+        for bad in ("core", "boundary", "system", "typst", "draw", "nope"):
+            with self.assertRaises(ValueError):
+                self.api.api_vocab_token(
+                    {"action": "add", "name": "regp", "token": "x",
+                     "region": bad})
+
+        # slot：裸名自动补 <>，名字任意；头部长度与 config 同步 +1
+        code, r = self.api.api_vocab_token(
+            {"action": "add", "name": "regp", "token": "mood",
+             "region": "slot"})
+        self.assertEqual(code, 200)
+        self.assertEqual((r["token"], r["id"], r["region"]),
+                         ("<mood>", 12, "slot"))
+        v = vp.load_vocab("regp", fresh=True)
+        self.assertEqual((v.slot_count, v.head_size),
+                         (1, spec.HEAD_SIZE + 1))
+        self.assertEqual((v.token(12), v.region_of(12)), ("<mood>", "slot"))
+        occ2 = vp.vocab_occupancy("regp")
+        self.assertEqual(occ2["invisible_size"], spec.HEAD_SIZE + 1)
+        self.assertEqual(occ2["vocab_size"],
+                         occ2["visible_size"] + occ2["invisible_size"])
+
+        # 重名 / 非法形态一律拒绝
+        for bad in ("mood", "<DOC>", "[user]", "</H1>", "<caps>"):
+            with self.assertRaises(ValueError):
+                self.api.api_vocab_token(
+                    {"action": "add", "name": "regp", "token": bad,
+                     "region": "slot"})
+
+        # 文本子区：无格式要求
+        for tok, rg in (("zzz_region_plain", "unicode_ext"),
+                        ("<looks_like_tool>", "extra")):
+            code, r = self.api.api_vocab_token(
+                {"action": "add", "name": "regp", "token": tok,
+                 "region": rg})
+            self.assertEqual(code, 200)
+            self.assertEqual((r["token"], r["region"]), (tok, rg))
+
+        # slot token 可删，头部长度回落；旧 category 路径仍可用
+        code, _ = self.api.api_vocab_token(
+            {"action": "remove", "name": "regp", "token": "<mood>"})
+        self.assertEqual(code, 200)
+        v = vp.load_vocab("regp", fresh=True)
+        self.assertEqual((v.slot_count, v.head_size), (0, spec.HEAD_SIZE))
+        self.assertEqual(v.token(12), spec.TYPST_TOKENS[0])
+        code, r = self.api.api_vocab_token(
+            {"action": "add", "name": "regp", "token": "zzz_region_legacy",
+             "category": "regular"})
+        self.assertEqual(code, 200)
+        self.assertEqual(r["region"], "extra")
+
+    def test_empty_vocab_keeps_all_add_regions(self):
+        """空词表的 0 长度子区不能丢：否则第二次添加会落回契约头里。"""
+        vp.ensure_base()
+        vp.create_empty_vocab("emptyreg")
+        occ = vp.vocab_occupancy("emptyreg")
+        self.assertEqual(len(occ["add_regions"]), len(spec.REGION_ORDER))
+        for tok, rg in (("mood", "slot"), ("hello", "unicode_ext"),
+                        ("42", "digit")):
+            code, r = self.api.api_vocab_token(
+                {"action": "add", "name": "emptyreg", "token": tok,
+                 "region": rg})
+            self.assertEqual(code, 200)
+            self.assertEqual(r["region"], rg)
+        v = vp.load_vocab("emptyreg", fresh=True)
+        self.assertEqual((v.slot_count, v.head_size),
+                         (1, spec.HEAD_SIZE + 1))
+        self.assertEqual(v.token(12), "<mood>")
+        # digit 在 unicode_ext 之前，新 token 紧凑插到 digit 区末尾
+        self.assertEqual(v.token(v.head_size), "42")
+        self.assertEqual(len(v), spec.HEAD_SIZE + 3)
+
     # ---------------- fork / delete ----------------
     def test_fork_and_delete(self):
         vp.ensure_base()
         code, data = self.api.api_vocab_fork(
-            {"name": "base", "new_name": "api_fork"})
+            {"name": vp.BASE, "new_name": "api_fork"})
         self.assertEqual(code, 200)
         self.assertEqual(data["name"], "api_fork")
 
@@ -142,7 +233,7 @@ class VocabApiTest(unittest.TestCase):
 
         # main 不可删
         with self.assertRaises(ValueError):
-            self.api.api_vocab_delete({"name": "base"})
+            self.api.api_vocab_delete({"name": vp.BASE})
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import glob
 import json
+import math
 import os
 import re
 import shutil
@@ -446,6 +447,142 @@ def read_d_model(cfg: dict) -> int:
         return spec.D_MODEL
 
 
+# ---------------------------------------------------------------------------
+# MoMW 配置（2026-11-08）——创建入口与加载入口共用的唯一规则
+# ---------------------------------------------------------------------------
+# 与 d_model / share_enc_dec 一样：config.json 的 "momw" 是唯一开关，
+# 旧目录没这个字段 → spec.momw_default_config()（enabled=False），
+# Gargantua 根本不构造 MoMW 子模块，state_dict 与行为逐字不变。
+def _momw_int(v, name: str, lo: int, hi: int) -> int:
+    n = _ctx_int(v, name)          # 复用 ctx 的严格整数口径（拒 bool 等）
+    if not (lo <= n <= hi):
+        raise ValueError(f"momw.{name} 必须在 [{lo}, {hi}]: {n}")
+    return n
+
+
+def _momw_float(v, name: str, lo: float) -> float:
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        raise ValueError(f"momw.{name} 必须是数字: {v!r}")
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"momw.{name} 必须是数字: {v!r}")
+    if not math.isfinite(f) or f < lo:
+        raise ValueError(f"momw.{name} 必须是 ≥ {lo} 的有限数: {f}")
+    return f
+
+
+def validate_momw_config(v) -> dict:
+    """规范化 MoMW 配置（唯一规则，创建入口 / CLI / 测试共用）。
+
+    None / 缺失 → spec 默认（关闭）；bool 简写只切开关；dict 逐字段严格
+    校验（拒 bool 冒充整数、NaN/inf、越界、未知字段）。非法抛 ValueError，
+    HTTP 层映射 400 —— 与 validate_ctx_config 同一口径。
+
+    **B0 > threshold 是硬约束**，不是风格建议：新层零状态 ⇒ 语义分接近 0，
+    只有 bonus 能把它抬过 threshold；B0 ≤ threshold 时新层永远不会被召回，
+    动态扩展就成了纯浪费内存的无效扩容（规格里点名的「无训练扩展死锁」）。
+
+    2026-11-08 第二版：新增 6 个三阶段参数（expand_delta / gamma_k /
+    eigen_interval / load_lambda / anchor_sample / eigen_min_writes），
+    v1 的 10 个字段全部保留 → 旧 config.json 无需迁移即可通过校验。
+    """
+    cfg = spec.momw_default_config()
+    if v is None:
+        return cfg
+    if isinstance(v, bool):
+        cfg["enabled"] = v
+        return cfg
+    if not isinstance(v, dict):
+        raise ValueError(f"momw 必须是对象或布尔值: {type(v).__name__}")
+    unknown = set(v) - set(spec.MOMW_CONFIG_FIELDS)
+    if unknown:
+        raise ValueError(f"momw 未知字段: {', '.join(sorted(unknown))}")
+    e = v.get("enabled", cfg["enabled"])
+    if isinstance(e, bool):
+        cfg["enabled"] = e
+    elif isinstance(e, int) and e in (0, 1):
+        cfg["enabled"] = bool(e)
+    elif isinstance(e, str) and e.strip().lower() in ("true", "false"):
+        cfg["enabled"] = e.strip().lower() == "true"
+    else:
+        raise ValueError(f"momw.enabled 必须是布尔值: {e!r}")
+    for key, rng in (("N", spec.MOMW_TOP_N_RANGE),
+                     ("M", spec.MOMW_WINDOW_RANGE),
+                     ("initial_layers", spec.MOMW_INITIAL_LAYERS_RANGE),
+                     ("max_layers", spec.MOMW_MAX_LAYERS_RANGE),
+                     ("eigen_interval", spec.MOMW_EIGEN_INTERVAL_RANGE),
+                     ("anchor_sample", spec.MOMW_ANCHOR_SAMPLE_RANGE),
+                     ("eigen_min_writes",
+                      spec.MOMW_EIGEN_MIN_WRITES_RANGE)):
+        if key in v:
+            cfg[key] = _momw_int(v[key], key, *rng)
+    for key, lo in (("tau", spec.MOMW_TAU_MIN),
+                    ("threshold", spec.MOMW_POSITIVE_MIN),
+                    ("B0", spec.MOMW_POSITIVE_MIN),
+                    ("starve_threshold", spec.MOMW_POSITIVE_MIN),
+                    ("saturation_limit", spec.MOMW_POSITIVE_MIN),
+                    ("expand_delta", spec.MOMW_POSITIVE_MIN),
+                    ("gamma_k", spec.MOMW_GAMMA_K_MIN)):
+        if key in v:
+            cfg[key] = _momw_float(v[key], key, lo)
+    if "load_lambda" in v:
+        lam = _momw_float(v["load_lambda"], "load_lambda",
+                          spec.MOMW_POSITIVE_MIN)
+        if lam > spec.MOMW_LOAD_LAMBDA_MAX:
+            raise ValueError(
+                f"momw.load_lambda 必须 ≤ {spec.MOMW_LOAD_LAMBDA_MAX}："
+                "软均衡不能盖过语义打分")
+        cfg["load_lambda"] = lam
+    if cfg["initial_layers"] > cfg["max_layers"]:
+        raise ValueError(
+            f"momw.initial_layers({cfg['initial_layers']}) 不能超过 "
+            f"max_layers({cfg['max_layers']})")
+    if cfg["B0"] <= cfg["threshold"]:
+        raise ValueError(
+            f"momw.B0({cfg['B0']}) 必须 > threshold({cfg['threshold']})："
+            "否则新层的 bonus 跨不过阈值，零状态层永远不会被召回")
+    return cfg
+
+
+def read_momw_config(cfg: dict) -> dict:
+    """build_model 用：config 坏值只告警并按「关闭」处理，不让目录报废。
+
+    与 read_d_model / _block_count 的容错口径一致：单个字段写错不该让整个
+    模型目录无法加载；但必须把结论打出来，否则排障时不知道开关被谁关了。
+    """
+    v = cfg.get(spec.MOMW_CONFIG_KEY)
+    if v is None:
+        return spec.momw_default_config()
+    # v1 → v2 迁移：v1 的 threshold/B0 是「能量范数」量级（1.0 / 2.0），
+    # v2 改成余弦相似度（[-1,1]，0.2 / 0.6）。不迁移的话旧 config 会
+    # 静默变成「永远不激活」。
+    # 判定必须窄：余弦相似度恒 ≤ 1，所以只有 threshold ≥ 1 或 B0 ≥ 2
+    # 才可能是 v1 遗留。若用「缺 v2 字段」判定，新建的
+    # {"enabled": true} 会被误迁移，用户显式给的非法 B0 也会被悄悄覆盖
+    # 成默认值（校验被绕过，坏值变成假阳性通过）。
+    if isinstance(v, dict) and not any(
+            k in v for k in ("gamma_k", "eigen_interval", "load_lambda")):
+        def _numeric(x):
+            return isinstance(x, (int, float)) and not isinstance(x, bool)
+        legacy = ((_numeric(v.get("threshold")) and
+                   float(v["threshold"]) >= 1.0) or
+                  (_numeric(v.get("B0")) and float(v["B0"]) >= 2.0))
+        if legacy:
+            _warn("config.json momw 是 v1 配置（能量范数阈值），"
+                  "已迁移到 v2 余弦打分默认值")
+            v = dict(v)
+            v["threshold"] = spec.MOMW_THRESHOLD
+            v["B0"] = spec.MOMW_BONUS
+    try:
+        return validate_momw_config(v)
+    except ValueError as e:
+        _warn(f"config.json {spec.MOMW_CONFIG_KEY} 非法，按关闭处理: {e}")
+        out = spec.momw_default_config()
+        out["enabled"] = False
+        return out
+
+
 def normalize_shared_blocks(enc, dec, share: bool):
     """建模入口共用的 block 数归一化（server.py 与 init.py 都走这里）。
 
@@ -489,9 +626,13 @@ def build_model(model_dir: str):
         raise ValueError(
             f"共享权重模型的 config.json 要求 n_enc_blocks == n_dec_blocks"
             f"（读到 {n_enc} / {n_dec}）：配置与权重不匹配")
+    # 2026-11-08：MoMW 配置同样由 config.json 驱动；旧目录缺字段 →
+    # read_momw_config 返回 enabled=False，Gargantua 不构造子模块，
+    # state_dict 一个 key 都不变（strict load 不受影响）。
     m = Gargantua(n_enc_blocks=n_enc, n_dec_blocks=n_dec,
                   vocab_size=model_vocab_size(model_dir),
                   share_enc_dec=share, d_model=read_d_model(cfg),
+                  momw=read_momw_config(cfg),
                   **_ctx_from_cfg(cfg))
     sd = load_model_state_dict(model_dir)
     if sd:

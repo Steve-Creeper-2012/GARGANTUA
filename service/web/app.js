@@ -450,6 +450,7 @@ function switchPage(id) {
   $("vtab-bar").hidden = (id !== "vocab");
   $("infer-toolbar").hidden = (id !== "infer");
   $("prims-bar").hidden = (id !== "prims");
+  $("train-bar").hidden = (id !== "train");
   // 「关于」是**每页独立**的：同一颗按钮，切页换目标；没有文档的页就不出现。
   const doc = TOOL_DOCS.find(x => x.id === id);
   const aboutBtn = $("about-btn");
@@ -474,8 +475,9 @@ function switchPage(id) {
        {opacity: 1, transform: "none"}],
       {duration: 320, easing: "cubic-bezier(.22, .61, .36, 1)"});
   }
+  if (id === "settings") switchSetCat("appearance");  // 进设置页默认停在「外观」
   if (id === "models") { refreshModels(); refreshModelEstimate(); }
-  if (id === "train") refreshQueue();
+  if (id === "train") { refreshModels(); refreshTrainAll(); }
   if (id === "vocab") refreshVocab();
   if (id === "pdraw") pdrawInit();
   if (id === "prims") primsInit();
@@ -898,8 +900,8 @@ refreshStatus();
 /* ---------- 定制 token 时间步格式 ----------
    格式（GARGANTUA token stream .gts，以 {} 为时间步原子）：
      {} = 一个时间步；同一 {} 内多 token 以 | 分隔，无空格；
-     <...> = 特殊 token（<user>/<model>/<stop>/<caps>）；裸字符 = 可见 token。
-     特殊 token（<user>、<model> 等）各自独占一个时间步。
+     <...> = 特殊 token（[user]/[model]/<stop>/<caps>）；裸字符 = 可见 token。
+     特殊 token（[user]、[model] 等）各自独占一个时间步。
      视觉段：每一帧一个 {}，该 {} 内平铺该帧全部 patch token。
      独立音频：每 533 采样一个 {<wave:hex>}。
      绘图时间步：每个图元 = 一个 {}，内部 9 个 <id:...> token 平铺。
@@ -921,8 +923,8 @@ function b64ToBytes(b64) {
 const _IDHEX = n => Number(n).toString(16).toUpperCase();
 
 function stepsToToken5(steps, bound) {
-  const openTag = bound === "user" ? "<user>" : "<model>";   // <user> / <model>
-  const closeTag = bound === "user" ? "<user/>" : "<model/>";  // <user/> / <model/>
+  const openTag = bound === "user" ? "[user]" : "[model]";   // [user] / [model]
+  const closeTag = bound === "user" ? "[user/]" : "[model/]";  // [user/] / [model/]
   const parts = [openTag];
   for (const st of steps) {
     const ids = st.token_ids || [];
@@ -949,7 +951,7 @@ async function refreshModels() {
   try {
     const r = await api("/api/models");
     $("model-tbody").innerHTML = r.models.map(m =>
-      `<tr><td>${esc(m.name)} ${m.name === r.active ? '<span class="badge on">当前</span>' : ""}${m.share_enc_dec ? '<span class="badge">共享权重</span>' : ""}</td>
+      `<tr><td>${esc(m.name)} ${m.name === r.active ? '<span class="badge on">当前</span>' : ""}${m.share_enc_dec ? '<span class="badge">共享权重</span>' : ""}${m.momw ? '<span class="badge">MoMW</span>' : ""}</td>
        <td>${m.params ? (m.params/1e6).toFixed(1)+"M" : "—"}</td>
        <td class="right">
          <button class="act sec xs" data-load="${esc(m.name)}">加载</button>
@@ -961,11 +963,16 @@ async function refreshModels() {
     $("model-tbody").querySelectorAll("[data-del]").forEach(b => {
       b.onclick = () => deleteModel(b.dataset.del);
     });
+    /* 目标模型只列真实模型名：2026-11-07 起删掉「当前活动模型」这个
+       历史遗留的隐式选项——训练必须明确写到任务里是哪一个模型。
+       首次进入训练页默认选中已加载的那个，之后不再被刷新覆盖。 */
     const target = $("train-target");
     const cur = target.value;
-    target.innerHTML = '<option value="">当前活动模型</option>' +
-      r.models.map(m => `<option value="${esc(m.name)}">${esc(m.name)}</option>`).join("");
-    target.value = cur;
+    target.innerHTML = r.models.length
+      ? r.models.map(m => `<option value="${esc(m.name)}">${esc(m.name)}</option>`).join("")
+      : '<option value="">（还没有模型，请先到「模型」页创建）</option>';
+    if (cur && r.models.some(m => m.name === cur)) target.value = cur;
+    else if (r.active) target.value = r.active;
   } catch (e) {}
 }
 async function loadModel(name) {
@@ -1034,6 +1041,9 @@ function modelFormValues() {
     hca_ratio: intOrUndef($("model-hca-ratio").value),
     vocab: $("model-vocab").value || "base",
     dtype: $("model-dtype").value || "fp32",
+    // 2026-11-08：MoMW 可选记忆阀门。只传开关，其余超参由后端
+    // spec.momw_default_config() 给（前端不抄阈值常量）。
+    momw: {enabled: $("model-momw").value === "on"},
   };
 }
 
@@ -1137,87 +1147,575 @@ async function createModel(name, overwrite) {
 }
 wireRefreshSpin("model-refresh", refreshModels);
 
-/* ---------- 训练 ---------- */
-$("train-enqueue").onclick = async () => {
-  const file = $("train-file").files[0];
-  const msg = $("train-enqueue-msg");
-  if (!file) { msg.textContent = "请先选择 .tokens 训练数据文件"; return; }
+/* ===========================================================================
+   训练（2026-11-07 三视图大改；2026-11-08 按 steve 裁决修正 + 文件夹定案）
+   ---------------------------------------------------------------------------
+   顶栏右上角滑块切 tasks / logs / loss 三块满高视图。任务视图 = 左半整块
+   「创建 / 编辑训练任务」+ 右半上未完成队列、下已完成队列。
+     * 普通训练：只收 .tokens，可多选，每文件一个任务。
+     * 对比训练：强制定死「数据集文件夹格式 v1」，一个文件夹解析出 N 对
+       真实配对，同批做对称 InfoNCE（100% CLIP，负样本来自批内其它配对）。
+       格式说明一律从 /api/train/dataset/spec 读，前端不抄常量。
+   训练口径 = 一个文件固定 steps 步、每步随机采样一个窗口；loss 按样本/步
+   记录，曲线不分段。任务参数随任务存进服务端 sidecar，点击未完成项即可
+   回填编辑；进行中的任务只读。
+   =========================================================================== */
+const TRAIN = {
+  view: "tasks",
+  files: [],                       // 普通训练：File[]（可多选 .tokens）
+  folder: [],                      // 对比训练：{path, file}[]（整个文件夹）
+  datasetSpec: null,               // /api/train/dataset/spec 下发的格式说明
+  editing: null,                   // 正在编辑的未完成任务
+  queue: {pending: [], done: [], failed: [], running: null},
+  loss: {files: [], tab: ""},
+  tick: 0,
+};
+
+/* ---------- 三视图滑块 ---------- */
+function trainSetView(v) {
+  TRAIN.view = v;
+  ["tasks", "logs", "loss"].forEach(k => {
+    const el = $("train-view-" + k);
+    if (el) el.hidden = k !== v;
+    const b = document.querySelector(`#train-viewseg [data-v="${k}"]`);
+    if (b) b.classList.toggle("on", k === v);
+  });
+  hideOptTip();
+  if (v === "tasks") refreshQueue();
+  if (v === "logs") { refreshTrain(); refreshEvents(); }
+  if (v === "loss") refreshLoss();
+}
+$$("#train-viewseg button").forEach(b => {
+  b.onclick = () => trainSetView(b.dataset.v);
+});
+
+/* ---------- 上传框：点击 / 拖拽 / 文件 chip ---------- */
+function renderDzFiles(zone, files, onRemove) {
+  const box = zone.querySelector(".dz-files");
+  if (!box) return;
+  box.innerHTML = (files || []).map((f, i) =>
+    `<span class="dz-chip"><span class="nm" title="${esc(f.name)}">${esc(f.name)}</span>` +
+    `<span class="x" data-i="${i}" title="移除">×</span></span>`).join("");
+  box.querySelectorAll(".x").forEach(x => {
+    x.onclick = e => { e.stopPropagation(); onRemove(Number(x.dataset.i)); };
+  });
+}
+/* 只收 .tokens：accept 只是文件选择器的过滤提示，拖拽能绕过它，
+   所以在事件入口统一拦一次（服务端另有一份同名校验，不靠前端兜底）。 */
+function onlyTokens(files) {
+  const ok = files.filter(f => /\.tokens$/i.test(f.name || ""));
+  if (ok.length !== files.length) {
+    toast("训练数据只接受 .tokens 文件，已忽略其它文件", true);
+  }
+  return ok;
+}
+function setupDropZone(zone, opts) {
+  const input = zone.querySelector('input[type=file]');
+  if (!input) return;
+  const accept = fs => onlyTokens(opts.multiple ? fs : fs.slice(0, 1));
+  zone.onclick = e => {
+    if (e.target.closest(".x")) return;
+    input.click();
+  };
+  zone.onkeydown = e => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); }
+  };
+  input.onchange = () => {
+    opts.onFiles(accept(Array.from(input.files || [])));
+    input.value = "";
+  };
+  ["dragenter", "dragover"].forEach(ev => zone.addEventListener(ev, e => {
+    e.preventDefault(); e.stopPropagation();
+    zone.classList.add("dragging");
+  }));
+  ["dragleave", "drop"].forEach(ev => zone.addEventListener(ev, e => {
+    e.preventDefault(); e.stopPropagation();
+    zone.classList.remove("dragging");
+    if (ev === "drop") {
+      const fs = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
+      opts.onFiles(accept(fs));
+    }
+  }));
+}
+function renderLmFiles() {
+  renderDzFiles($("dz-lm"), TRAIN.files,
+                i => { TRAIN.files.splice(i, 1); renderLmFiles(); });
+}
+setupDropZone($("dz-lm"), {
+  multiple: true,
+  onFiles(fs) {
+    if (!fs.length) return;
+    TRAIN.files = TRAIN.files.concat(fs);
+    renderLmFiles();
+  },
+});
+
+/* ---------- 对比训练：数据集文件夹（格式 v1）----------
+   只允许一个文件夹。点击走 webkitdirectory（File.webkitRelativePath 带
+   根目录名）；拖拽走 webkitGetAsEntry 递归读目录，自己拼同样的相对路径。
+   服务端 clip_folder.parse 是唯一格式校验真源，前端只负责把文件带路径
+   送过去，不在这里判断对错。 */
+function folderRootName() {
+  const p = TRAIN.folder[0] && TRAIN.folder[0].path;
+  return p ? String(p).split("/")[0] : "";
+}
+function renderFolderInfo() {
+  const box = $("dz-folder-info");
+  if (!TRAIN.folder.length) {
+    box.innerHTML = '<span class="hint">未选择文件夹</span>';
+    return;
+  }
+  box.innerHTML =
+    `<span class="dz-chip"><span class="nm" title="${esc(folderRootName())}">` +
+    `${esc(folderRootName())}</span><span class="x" title="移除">×</span></span>` +
+    `<span class="hint">${TRAIN.folder.length} 个文件</span>`;
+  const x = box.querySelector(".x");
+  if (x) x.onclick = e => {
+    e.stopPropagation(); TRAIN.folder = []; renderFolderInfo();
+  };
+}
+async function readDirEntries(reader, prefix, out) {
+  for (;;) {
+    const batch = await new Promise(res => {
+      try { reader.readEntries(res, () => res([])); }
+      catch (e) { res([]); }
+    });
+    if (!batch.length) break;
+    for (const entry of batch) await readEntry(entry, prefix, out);
+  }
+}
+async function readEntry(entry, prefix, out) {
+  if (entry.isFile) {
+    const file = await new Promise(res => {
+      try { entry.file(res, () => res(null)); }
+      catch (e) { res(null); }
+    });
+    if (file) out.push({path: prefix + entry.name, file});
+  } else if (entry.isDirectory) {
+    await readDirEntries(entry.createReader(), prefix + entry.name + "/", out);
+  }
+}
+async function folderFromDrop(dt) {
+  const items = Array.from((dt && dt.items) || []);
+  const entries = items.map(it => (it.webkitGetAsEntry
+                                   ? it.webkitGetAsEntry() : null))
+                       .filter(Boolean);
+  const out = [];
+  for (const e of entries) await readEntry(e, "", out);
+  return out;
+}
+function setupFolderZone() {
+  const zone = $("dz-folder"), input = $("train-folder-input");
+  zone.onclick = e => { if (!e.target.closest(".x")) input.click(); };
+  zone.onkeydown = e => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); }
+  };
+  input.onchange = () => {
+    TRAIN.folder = Array.from(input.files || []).map(f => ({
+      path: f.webkitRelativePath || f.name, file: f,
+    }));
+    input.value = "";
+    renderFolderInfo();
+  };
+  ["dragenter", "dragover"].forEach(ev => zone.addEventListener(ev, e => {
+    e.preventDefault(); e.stopPropagation();
+    zone.classList.add("dragging");
+  }));
+  ["dragleave", "drop"].forEach(ev => zone.addEventListener(ev, e => {
+    e.preventDefault(); e.stopPropagation();
+    zone.classList.remove("dragging");
+    if (ev !== "drop") return;
+    folderFromDrop(e.dataTransfer).then(fs => {
+      if (!fs.length) {
+        toast("没能读到文件夹内容，请改用「点击选择文件夹」", true);
+        return;
+      }
+      TRAIN.folder = fs;
+      renderFolderInfo();
+    });
+  }));
+  renderFolderInfo();
+}
+async function loadDatasetSpec() {
+  if (TRAIN.datasetSpec) { renderDatasetSpec(TRAIN.datasetSpec); return; }
   try {
-    const r = await api("/api/train/enqueue", {
-      tokens_b64: await fileToB64(file),
-      optimizer: $("train-mode").value,
-    }, {timeout: API_UPLOAD_TIMEOUT_MS});
-    msg.textContent = `已入队 ${r.queued[0]}（${r.n_tokens} tokens / ` +
-      `${r.n_steps} 时间步）`;
+    TRAIN.datasetSpec = await api("/api/train/dataset/spec");
+    renderDatasetSpec(TRAIN.datasetSpec);
+  } catch (e) {
+    $("train-folder-spec").innerHTML =
+      `<span class="hint">格式说明加载失败: ${esc(e.message)}</span>`;
+  }
+}
+function renderDatasetSpec(s) {
+  const tree = (s.tree || []).join("\n");
+  const man = JSON.stringify(s.manifest || {}, null, 2);
+  const rules = (s.rules || []).map(r => `<li>${esc(r)}</li>`).join("");
+  $("train-folder-spec").innerHTML =
+    `<div class="fs-title">数据集文件夹格式 v${esc(s.version)} · 至少 ` +
+    `${esc(s.min_pairs)} 对真实配对</div>` +
+    `<pre>${esc(tree)}</pre>` +
+    `<div class="fs-title">dataset.json 示例</div><pre>${esc(man)}</pre>` +
+    `<ul>${rules}</ul>` +
+    `<div class="fs-note">格式标识 ${esc(s.format)} · 默认批大小 ` +
+    `${esc(s.default_batch)} · 默认温度 ${esc(s.default_temperature)}</div>`;
+}
+setupFolderZone();
+loadDatasetSpec();
+
+/* ---------- 训练方式（普通 / 对比）----------
+   队列任务级 mode 由 enqueue 写入队列项；start 故意不传 mode，服务端
+   按队列文件名逐任务分流（传了会让 start 变成死 UI）。 */
+function syncTrainType() {
+  const mode = $("train-type").value;
+  const isFolder = (mode === "clip");
+  const editing = !!TRAIN.editing;
+  $("train-data-lm").hidden = editing || isFolder;
+  $("train-data-folder").hidden = editing || !isFolder;
+  const ed = $("train-edit-data");
+  ed.hidden = !editing;
+  if (editing) {
+    ed.textContent = "训练数据已入队：" +
+      (TRAIN.editing.label || TRAIN.editing.name) +
+      "（" + ((TRAIN.editing.size || 0) / 1024).toFixed(1) +
+      " KB），不可替换；要换数据请删除任务后重建。";
+  }
+  // 批大小由 dataset.json 决定，不由表单决定；旧格式输入恒隐藏
+  // （元素保留是终端 CLI 的静态对拍锚点）。
+  $("clip-batch-field").style.display = "none";
+  $("train-mode-hint").textContent = isFolder
+    ? "一个数据集文件夹 → N 对真实配对 → 同批做对称 InfoNCE，负样本来自批内其它配对（100% CLIP）；a/b 两段模态任意组合。"
+    : "一次上传 = 一条 token 流；每步随机取一个窗口，在因果掩码下逐 token 预测下一个 token、算 loss、梯度下降。";
+  $$("#train-type-seg button").forEach(b => {
+    b.classList.toggle("on", b.dataset.v === mode);
+    b.disabled = !!TRAIN.editing;           // 编辑任务时不许改训练方式
+    b.style.opacity = TRAIN.editing ? ".55" : "";
+  });
+  $("train-data-hint").textContent = editing
+    ? "编辑模式 · 只读"
+    : isFolder
+      ? "只允许一个文件夹 · 强制格式 v1（结构见下方）"
+      : "只接受 .tokens；可同时上传多个，每个文件 = 一个训练任务";
+}
+$$("#train-type-seg button").forEach(b => {
+  b.onclick = () => {
+    if (TRAIN.editing) { toast("编辑任务时不能改训练方式，请删除后重建", true); return; }
+    $("train-type").value = b.dataset.v;
+    syncTrainType();
+  };
+});
+$("train-type").onchange = syncTrainType;   /* 绑定切换事件 */
+syncTrainType();                            /* 首帧按默认 lm 初始化一次 */
+
+/* ---------- 优化器旁的「关于」按钮：悬停显示参杂方式 ---------- */
+function hideOptTip() {
+  const tip = $("train-opt-tip");
+  if (tip) tip.classList.remove("show");
+}
+function showOptTip() {
+  const btn = $("train-opt-about"), tip = $("train-opt-tip");
+  if (!btn || !tip) return;
+  const r = btn.getBoundingClientRect();
+  const w = 340;
+  tip.style.left = Math.max(12, Math.min(window.innerWidth - w - 12,
+                                        r.left - 150)) + "px";
+  tip.style.top = Math.max(12, Math.min(window.innerHeight - 210,
+                                       r.bottom + 10)) + "px";
+  tip.classList.add("show");
+}
+$("train-opt-about").onmouseenter = showOptTip;
+$("train-opt-about").onmouseleave = hideOptTip;
+$("train-opt-about").onfocus = showOptTip;
+$("train-opt-about").onblur = hideOptTip;
+
+/* ---------- 创建 / 编辑任务 ---------- */
+function trainFormValues() {
+  return {
+    optimizer: $("train-mode").value,
+    target: $("train-target").value,
+    // 一个文件固定训练多少步（每步随机采样一个窗口），≥1
+    steps: clampNum($("train-steps").value, 1, 1e6, 20),
+    // & ~1：强制为偶数（block_size 会二分给 enc/dec，奇数令前向崩溃）
+    block_size: clampNum($("train-block").value, 2, 1024, 32) & ~1,
+    clip_batch_size: clampNum($("train-clip-batch").value, 2, 64, 4),
+  };
+}
+function resetTrainForm() {
+  TRAIN.editing = null;
+  TRAIN.folder = [];
+  $("train-form-title").textContent = "创建训练任务";
+  $("train-enqueue").textContent = "提交训练任务";
+  $("train-form-reset").hidden = true;
+  $("train-file").value = "";
+  renderFolderInfo();
+  syncTrainType();
+}
+$("train-form-reset").onclick = () => {
+  resetTrainForm();
+  $("train-enqueue-msg").textContent = "已取消编辑";
+  renderPending();
+};
+$("train-enqueue").onclick = async () => {
+  const msg = $("train-enqueue-msg");
+  const vals = trainFormValues();
+  if (TRAIN.editing) {
+    msg.textContent = "保存中…";
+    try {
+      await api("/api/train/task/update",
+                Object.assign({name: TRAIN.editing.name}, vals));
+      msg.textContent = "已保存";
+      resetTrainForm();
+      refreshQueue(); refreshEvents();
+    } catch (e) { msg.textContent = "错误: " + e.message; }
+    return;
+  }
+  const isFolder = ($("train-type").value === "clip");
+  if (isFolder && !TRAIN.folder.length) {
+    msg.textContent = "对比训练请先选择数据集文件夹（格式 v1，见下方说明）";
+    return;
+  }
+  if (!isFolder && !TRAIN.files.length) {
+    msg.textContent = "请先选择或拖入 .tokens 训练文件"; return;
+  }
+  msg.textContent = "上传中…";
+  try {
+    /* 训练方式（lm / clip）：每个队列任务各自的 mode，决定入队文件的类型 */
+    const payload = {mode: $("train-type").value};
+    if (isFolder) {
+      const files = [];
+      for (const it of TRAIN.folder) {
+        files.push({path: it.path, data_b64: await fileToB64(it.file)});
+      }
+      payload.dataset = {files};
+    } else {
+      const files = [];
+      for (const f of TRAIN.files) {
+        files.push({name: f.name, data_b64: await fileToB64(f)});
+      }
+      payload.files = files;
+    }
+    const r = await api("/api/train/enqueue", Object.assign(payload, vals),
+                        {timeout: API_UPLOAD_TIMEOUT_MS});
+    msg.textContent = isFolder
+      ? `数据集「${r.dataset}」：${r.n_pairs} 对真实配对已入队` +
+        `（批大小 ${r.batch_size}，CLIP 批内负样本）`
+      : `已入队 ${r.queued.length} 个任务（${r.n_tokens} tokens）`;
+    TRAIN.files = [];
+    TRAIN.folder = [];
+    renderLmFiles(); renderFolderInfo();
     $("train-file").value = "";
-    refreshQueue(); refreshStatus();
+    refreshQueue(); refreshStatus(); refreshEvents();
   } catch (e) { msg.textContent = "错误: " + e.message; }
 };
+
+function fillFormFromTask(it) {
+  $("train-type").value = (it.mode === "pair" || it.mode === "clip")
+    ? "clip" : "lm";
+  $("train-mode").value = it.optimizer || "muon";
+  if (it.target) $("train-target").value = it.target;
+  // 旧 sidecar 里可能残留 steps=0（token 级时代的「自动全量」），
+  // 回退到固定步数的默认值，避免 0 步被钳成 1 步。
+  $("train-steps").value = Math.max(1, Number(it.steps) || 20);
+  $("train-block").value = it.block_size || 32;
+  $("train-clip-batch").value = it.clip_batch_size || 4;
+  syncTrainType();
+}
+function editTask(it) {
+  if (it.running) {
+    toast("正在进行的任务不能编辑，请先停止训练", true); return;
+  }
+  TRAIN.editing = it;
+  $("train-form-title").textContent = "编辑任务";
+  $("train-enqueue").textContent = "保存修改";
+  $("train-form-reset").hidden = false;
+  $("train-enqueue-msg").textContent = "训练方式不可改；其余参数可编辑";
+  fillFormFromTask(it);
+  renderPending();
+  trainSetView("tasks");
+}
+
+/* ---------- 任务队列：未完成 / 已完成 / 失败 ---------- */
+function taskMetaLine(it) {
+  const bits = [it.mode || "lm", it.optimizer || "?"];
+  if (it.target) bits.push("→ " + it.target);
+  bits.push(Math.max(1, Number(it.steps) || 20) + " steps");
+  if (it.n_elements) bits.push(it.n_elements + " tokens");
+  return bits.join(" · ");
+}
+function renderPending() {
+  const el = $("train-queue"), items = TRAIN.queue.pending;
+  $("train-pending-count").textContent = items.length + " 项";
+  if (!items.length) { el.innerHTML = '<span class="hint">队列为空</span>'; return; }
+  el.innerHTML = items.map(it => {
+    const on = TRAIN.editing && TRAIN.editing.name === it.name ? " on" : "";
+    return `<div class="train-item${on}" data-name="${esc(it.name)}" title="${esc(it.name)}">
+      <div class="ti-main"><div class="ti-name">${esc(it.label || it.name)}</div>
+        <div class="ti-meta">${esc(taskMetaLine(it))} · ${esc(it.name)}</div></div>
+      ${it.running ? '<span class="badge on">进行中</span>' : ""}
+      <button class="act danger xs" data-del="${esc(it.name)}">删除</button></div>`;
+  }).join("");
+  el.querySelectorAll(".train-item").forEach(row => {
+    row.onclick = e => {
+      if (e.target.closest("[data-del]")) return;
+      const it = items.find(x => x.name === row.dataset.name);
+      if (it) editTask(it);
+    };
+  });
+  el.querySelectorAll("[data-del]").forEach(b => {
+    b.onclick = e => { e.stopPropagation(); deleteQueue(b.dataset.del, "queue"); };
+  });
+}
+/* 已完成 / 失败任务只读：左侧整块是创建与编辑表单，不展示已完成详情。 */
+function renderDone() {
+  const el = $("train-done-list");
+  const done = TRAIN.queue.done || [], failed = TRAIN.queue.failed || [];
+  const items = done.concat(failed.map(x => Object.assign({}, x, {where: "failed"})));
+  $("train-done-count").textContent = items.length + " 项";
+  if (!items.length) { el.innerHTML = '<span class="hint">暂无已完成任务</span>'; return; }
+  el.innerHTML = items.map(it =>
+    `<div class="train-item ro" data-name="${esc(it.name)}" title="${esc(it.name)}">
+      <div class="ti-main"><div class="ti-name">${esc(it.label || it.name)}</div>
+        <div class="ti-meta">${esc(taskMetaLine(it))} · ${esc(it.name)}</div></div>
+      ${it.where === "failed" ? '<span class="badge">失败</span>' : ""}
+      <button class="act danger xs" data-del="${esc(it.name)}" data-where="${esc(it.where || "done")}">删除</button></div>`
+  ).join("");
+  el.querySelectorAll("[data-del]").forEach(b => {
+    b.onclick = e => {
+      e.stopPropagation();
+      deleteQueue(b.dataset.del, b.dataset.where || "done");
+    };
+  });
+}
 async function refreshQueue() {
   try {
     const r = await api("/api/train/queue");
-    const el = $("train-queue");
-    if (!r.items.length) { el.innerHTML = '<span class="hint">队列为空</span>'; return; }
-    el.innerHTML = r.items.map(it =>
-      `<div class="queue-item"><span class="name" title="${esc(it.name)}">${esc(it.name)}
-        <span class="hint">（${esc(it.optimizer || "?")}）</span></span>
-       <button class="act danger xs" data-del="${esc(it.name)}">删除</button></div>`
-    ).join("");
-    el.querySelectorAll("[data-del]").forEach(b => {
-      b.onclick = () => deleteQueue(b.dataset.del);
-    });
-  } catch (e) { $("train-queue").textContent = "错误: " + e.message; }
+    TRAIN.queue = {
+      pending: r.pending || r.items || [],
+      done: r.done || [], failed: r.failed || [],
+      running: r.running || null,
+    };
+    renderPending(); renderDone();
+  } catch (e) {
+    $("train-queue").innerHTML = `<span class="hint">错误: ${esc(e.message)}</span>`;
+  }
 }
-async function deleteQueue(name) {
-  try { await api("/api/train/delete", {name}); refreshQueue(); refreshStatus(); }
-  catch (e) { toast(e.message, true); }
+async function deleteQueue(name, where) {
+  try {
+    await api("/api/train/delete", {name, where: where || "queue"});
+    if (TRAIN.editing && TRAIN.editing.name === name) resetTrainForm();
+    refreshQueue(); refreshStatus(); refreshEvents();
+  } catch (e) { toast(e.message, true); }
 }
 wireRefreshSpin("queue-refresh", refreshQueue);
 $("train-start").onclick = async () => {
   try {
-    const r = await api("/api/train/start", {
-      steps: clampNum($("train-steps").value, 1, 1e6, 20),
-      // & ~1：强制为偶数（block_size 会二分给 enc/dec，奇数令前向崩溃）
-      block_size: clampNum($("train-block").value, 4, 1024, 32) & ~1,
-      optimizer: $("train-mode").value,
-      target: $("train-target").value});
+    // 目标模型以「队首任务」为准：任务级参数优先，表单值只作兜底。
+    // 一轮训练里模型不能热切换（训练服务会 409），所以同一轮请用同一
+    // 目标模型；编辑别的任务时改的是它自己的 sidecar，不影响队首。
+    const first = TRAIN.queue.pending[0];
+    const vals = trainFormValues();
+    vals.target = (first && first.target) || vals.target;
+    const r = await api("/api/train/start", vals);
     $("train-state").textContent = r.started ? "已启动" : "已在运行中";
+    refreshEvents();
+    setTimeout(refreshQueue, 600);
   } catch (e) { $("train-state").textContent = "错误: " + e.message; }
 };
 $("train-stop").onclick = async () => {
   try { await api("/api/train/stop", {});
-        $("train-state").textContent = "停止请求已发送"; }
+        $("train-state").textContent = "停止请求已发送";
+        refreshEvents(); }
   catch (e) { $("train-state").textContent = "错误: " + e.message; }
 };
 
-/* Loss 曲线：每步 = 单个样本的独立 loss，逐点折线，悬停显示数值 */
-function drawLoss(tail) {
+/* ---------- 训练日志 + 事件 ---------- */
+async function refreshEvents() {
+  try {
+    const r = await api("/api/train/events");
+    const evs = (r.events || []).slice().reverse();
+    $("train-events-count").textContent = evs.length + " 条";
+    $("train-events").innerHTML = evs.length
+      ? evs.map(e => `<div class="ev"><span class="t">${esc(e.time || "")}</span>` +
+          `<span class="k">${esc(e.kind || "")}</span>` +
+          `<span class="x">${esc(e.text || "")}</span></div>`).join("")
+      : '<span class="hint">暂无事件</span>';
+  } catch (e) {}
+}
+$("train-log-refresh").onclick = () => { refreshTrain(); refreshEvents(); };
+
+/* ---------- loss 曲线：一个文件一个标签页（横轴按训练 step） ---------- */
+function renderLossTabs() {
+  const box = $("loss-tabs"), files = TRAIN.loss.files;
+  if (!files.length) { box.innerHTML = '<span class="hint">暂无 loss 数据</span>'; return; }
+  box.innerHTML = files.map(f =>
+    `<button class="loss-tab${f.name === TRAIN.loss.tab ? " on" : ""}" ` +
+    `data-name="${esc(f.name)}" title="${esc(f.name)}">${esc(f.name)} ` +
+    `<span class="hint">(${f.n})</span></button>`).join("");
+  box.querySelectorAll(".loss-tab").forEach(b => {
+    b.onclick = () => {
+      TRAIN.loss.tab = b.dataset.name;
+      const cur = files.find(f => f.name === TRAIN.loss.tab);
+      renderLossTabs(); drawLoss(cur ? cur.points : []);
+    };
+  });
+}
+async function refreshLoss() {
+  try {
+    const r = await api("/api/train/loss");
+    TRAIN.loss.files = r.files || [];
+    if (!TRAIN.loss.files.some(f => f.name === TRAIN.loss.tab)) {
+      TRAIN.loss.tab = TRAIN.loss.files.length ? TRAIN.loss.files[0].name : "";
+    }
+    renderLossTabs();
+    const cur = TRAIN.loss.files.find(f => f.name === TRAIN.loss.tab);
+    drawLoss(cur ? cur.points : []);
+    $("train-loss-summary").textContent =
+      `${TRAIN.loss.files.length} 个文件 · ${r.total || 0} 个点`;
+  } catch (e) {
+    $("train-loss-summary").textContent = "错误: " + e.message;
+  }
+}
+$("train-loss-refresh").onclick = refreshLoss;
+
+/* 每个点 = 一个样本窗口的独立 loss（原先「一个文件固定 steps 步」的口径）。
+   横轴按训练步序铺开，点与点之间不做平均；不再按 token 段画竖线分段。 */
+function drawLoss(points) {
   const cv = $("loss-canvas"), ctx = cv.getContext("2d");
+  const box = cv.parentElement.getBoundingClientRect();
+  const W = Math.max(320, Math.floor(box.width));
+  const H = Math.max(180, Math.floor(box.height));
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
   const cs = getComputedStyle(document.documentElement);
   const cFg2 = cs.getPropertyValue("--fg2").trim() || "#98a2b3";
   const cTrack = cs.getPropertyValue("--track").trim() || "#242b35";
   const cAcc = cs.getPropertyValue("--accent").trim() || "#4c8dff";
-  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.clearRect(0, 0, W, H);
   ctx.fillStyle = cFg2; ctx.font = "12px ui-monospace, monospace";
-  if (!tail.length) { ctx.fillText("暂无 loss 数据", 20, 30); cv._pts = null; return; }
-  const losses = tail.map(r => r.loss);
+  const pts = (points || []).filter(p => Number.isFinite(Number(p.loss)));
+  if (!pts.length) { ctx.fillText("暂无 loss 数据", 20, 30); cv._pts = null; return; }
+  const losses = pts.map(p => Number(p.loss));
   const lo = Math.min(...losses), hi = Math.max(...losses);
-  const pad = 40, W = cv.width - pad * 2, H = cv.height - pad * 2;
-  ctx.strokeStyle = cTrack; ctx.strokeRect(pad, pad, W, H);
-  ctx.fillText(hi.toFixed(3), 4, pad + 4); ctx.fillText(lo.toFixed(3), 4, pad + H);
-  ctx.fillText("step " + tail[0].step + " → " + tail[tail.length - 1].step,
-               pad, cv.height - 10);
-  const pts = tail.map((r, i) => {
-    const x = pad + (tail.length === 1 ? W / 2 : i / (tail.length - 1) * W);
-    const y = pad + H - (hi === lo ? H / 2 : (r.loss - lo) / (hi - lo) * H);
-    return {x, y, step: r.step, loss: r.loss, file: r.file || ""};
-  });
-  cv._pts = pts;
-  ctx.strokeStyle = cAcc; ctx.lineWidth = 1.2; ctx.beginPath();
-  pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+  const yPad = (hi - lo) * 0.12 || 0.1;
+  const yLo = lo - yPad, yHi = hi + yPad;
+  const pad = 46, PW = W - pad * 2, PH = H - pad * 2;
+  const px = i => pad + (pts.length === 1 ? PW / 2 : i / (pts.length - 1) * PW);
+  const py = v => pad + PH - (v - yLo) / (yHi - yLo) * PH;
+  ctx.strokeStyle = cTrack; ctx.lineWidth = 1;
+  ctx.strokeRect(pad, pad, PW, PH);
+  ctx.fillStyle = cFg2;
+  ctx.fillText(yHi.toFixed(3), 4, pad + 4);
+  ctx.fillText(yLo.toFixed(3), 4, pad + PH);
+  ctx.fillText(`step ${pts[0].step} → ${pts[pts.length - 1].step}`,
+               pad, H - 12);
+  const mapped = pts.map((p, i) => ({
+    x: px(i), y: py(Number(p.loss)),
+    step: p.step, loss: Number(p.loss), file: p.file || "",
+  }));
+  cv._pts = mapped;
+  ctx.strokeStyle = cAcc; ctx.lineWidth = 1.4; ctx.beginPath();
+  mapped.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
   ctx.stroke();
   ctx.fillStyle = cAcc;
-  pts.forEach(p => { ctx.beginPath(); ctx.arc(p.x, p.y, 2, 0, 7); ctx.fill(); });
+  mapped.forEach(p => { ctx.beginPath(); ctx.arc(p.x, p.y, 2.2, 0, 7); ctx.fill(); });
 }
 $("loss-canvas").onmousemove = e => {
   const cv = e.currentTarget, pts = cv._pts;
@@ -1235,17 +1733,216 @@ $("loss-canvas").onmousemove = e => {
                (best.file ? `\n样本: ${best.file}` : "");
   }
 };
+window.addEventListener("resize", () => {
+  if (TRAIN.view === "loss") {
+    const cur = TRAIN.loss.files.find(f => f.name === TRAIN.loss.tab);
+    drawLoss(cur ? cur.points : []);
+  }
+});
+
+/* ---------- 状态轮询 ---------- */
 async function refreshTrain() {
+  // 不在训练页就完全不发请求（老机器省一轮 2s 轮询）；切回训练页时
+  // switchPage 会主动调 refreshTrainAll() 补一次。
+  if (document.documentElement.getAttribute("data-page") !== "train") return;
   try {
     const s = await api("/api/train/status");
-    drawLoss(s.loss_tail || []);
     $("train-log").textContent = (s.log_tail || []).slice(-200).join("\n") || "—";
-    $("train-state").textContent =
-      (s.running ? "运行中 step=" + s.step : "空闲 step=" + s.step)
-      + (s.optimizer ? " · " + s.optimizer : "");
+    const state = (s.running ? "运行中" : "空闲") + " step=" + s.step +
+      (s.optimizer ? " · " + s.optimizer : "");
+    $("train-state").textContent = state;
+    $("train-log-state").textContent = state;
   } catch (e) {}
+  TRAIN.tick++;
+  // 低频补充：每 3 轮（约 6s）刷一次事件 / 曲线 / 队列，避免 2s 轮询
+  // 把老机器压满
+  if (TRAIN.tick % 3 === 0) {
+    if (TRAIN.view === "loss") refreshLoss();
+    if (TRAIN.view === "tasks") refreshQueue();
+    if (TRAIN.view === "logs") refreshEvents();
+  }
+}
+function refreshTrainAll() {
+  refreshQueue(); refreshTrain(); refreshEvents(); refreshLoss();
 }
 setInterval(refreshTrain, 2000);
+
+/* ===========================================================================
+   会话管理器 SESSIONS（顶栏会话 tab + 设置页历史共用一份状态）
+   ---------------------------------------------------------------------------
+   会话内容一律走后端 /api/session/*；localStorage 只记「上次打开的 tab」一个 id
+   （gargantua.session.current），不缓存任何消息，避免多端/刷新后读到脏数据。
+   =========================================================================== */
+const SESSION_KEY = "gargantua.session.current";
+/* ctx.session.config 用 camelCase，session schema 用 snake_case，映射只此一处 */
+const SESSION_CFG_FIELDS = {
+  maxNew: "max_new", temperature: "temperature", topP: "top_p",
+  kvEnabled: "kv_enabled", model: "model", plugin: "plugin",
+};
+const SESSIONS = {
+  list: [],        // /api/sessions 的摘要数组
+  current: null,   // 完整 session（/api/session/get）
+  id: "",          // 当前会话 id
+
+  _remember(id) {
+    try { localStorage.setItem(SESSION_KEY, id || ""); } catch (e) {}
+  },
+  _remembered() {
+    try { return localStorage.getItem(SESSION_KEY) || ""; } catch (e) { return ""; }
+  },
+  _defaultPlugin() {
+    try { return (BUILTIN_PLUGINS[0] && BUILTIN_PLUGINS[0].id) || "tokens"; }
+    catch (e) { return "tokens"; }   // 常量尚未初始化时也不炸
+  },
+
+  async load() {
+    try {
+      this.list = (await api("/api/sessions")).sessions || [];
+    } catch (e) {
+      toast("读取会话列表失败: " + e.message, true);
+      this.list = [];
+    }
+    if (!this.list.length) { await this.create(); return; }
+    const want = this._remembered();
+    const hit = this.list.find(s => s.id === want) || this.list[0];
+    await this.open(hit.id);
+  },
+
+  async open(id) {
+    let s;
+    try {
+      s = (await api("/api/session/get?id=" + encodeURIComponent(id))).session;
+    } catch (e) {
+      toast("打开会话失败: " + e.message, true);
+      return;
+    }
+    if (!s) return;
+    this.current = s;
+    this.id = s.id;
+    this._remember(s.id);
+    this.applySessionToUI();
+    this.renderConvTabs();
+    /* 切会话：卸载旧插件 → 按会话插件设置选择器 → 强制重挂。
+       重挂后 makePluginCtx 会把 current.messages 交给新插件。 */
+    unmountInferPlugin();
+    const pid = s.plugin || this._defaultPlugin();
+    setSelectedPluginId(pid);
+    const sel = $("plugin-select");
+    if (sel) sel.value = pid;
+    mountInferPlugin(true);
+  },
+
+  /* 打开 / 切换会话时用 current 回填开发者选项的三个采样框与 KV 开关 */
+  applySessionToUI() {
+    const c = this.current;
+    if (!c) return;
+    const kv = $("dev-kv-enable");
+    if (kv) kv.setAttribute("aria-checked", c.kv_enabled ? "true" : "false");
+    const put = (id, v) => { const el = $(id); if (el && v != null) el.value = v; };
+    put("infer-maxnew", c.max_new);
+    put("infer-temp", c.temperature);
+    put("infer-topp", c.top_p);
+  },
+
+  async create() {
+    const body = {
+      title: "新会话",
+      plugin: this._defaultPlugin(),
+      model: (this.current && this.current.model) || "",
+      kv_enabled: true,
+      max_new: 32, temperature: 0.8, top_p: 0.95,
+    };
+    let s;
+    try { s = (await api("/api/session/create", body)).session; }
+    catch (e) { toast("创建会话失败: " + e.message, true); return; }
+    if (!s) return;
+    try { this.list = (await api("/api/sessions")).sessions || []; } catch (e) {}
+    await this.open(s.id);
+  },
+
+  /* 只从 tab 列表移除并切到相邻会话，不删磁盘（磁盘删除走设置页历史） */
+  close(id) {
+    const i = this.list.findIndex(s => s.id === id);
+    if (i < 0) return;
+    this.list.splice(i, 1);
+    if (id === this.id) {
+      const next = this.list[Math.min(i, this.list.length - 1)];
+      if (next) this.open(next.id);
+      else this.create();
+    } else {
+      this.renderConvTabs();
+    }
+  },
+
+  async savePatch(patch) {
+    if (!this.current) return;
+    Object.assign(this.current, patch);       // 本地先落地，UI 不等网络
+    try {
+      const r = await api("/api/session/save", {id: this.id, patch});
+      /* 不用响应整体覆盖 current：本地可能有尚未落盘的 append 消息，
+         覆盖会丢；响应只用来对齐 tab 摘要。 */
+      const hit = this.list.find(s => s.id === this.id);
+      if (hit && r && r.session) Object.assign(hit, r.session);
+      this.renderConvTabs();
+    } catch (e) {
+      toast("保存会话失败: " + e.message, true);
+    }
+  },
+
+  /* 本地即时 push（UI 不阻塞），后端 append 失败只提示、不回滚 */
+  appendMessage(role, tokenIds) {
+    const c = this.current;
+    if (!c) return;
+    const msg = {role, token_ids: Array.isArray(tokenIds) ? tokenIds.slice() : [],
+                 ts: Date.now() / 1000};
+    if (!Array.isArray(c.messages)) c.messages = [];
+    c.messages.push(msg);
+    api("/api/session/append", {id: this.id, role, token_ids: msg.token_ids})
+      .catch(e => toast("追加消息失败: " + e.message, true));
+  },
+
+  renderConvTabs() {
+    const box = $("conv-tabs");
+    if (!box) return;
+    box.innerHTML = "";
+    for (const s of this.list) {
+      const tab = document.createElement("div");
+      tab.className = "conv-tab" + (s.id === this.id ? " on" : "");
+      tab.dataset.id = s.id;
+      tab.title = s.title || "未命名会话";
+      const nm = document.createElement("span");
+      nm.className = "conv-tab-name";
+      nm.textContent = s.title || "未命名会话";
+      const cl = document.createElement("button");
+      cl.className = "conv-tab-close";
+      cl.type = "button";
+      cl.textContent = "✕";
+      cl.title = "关闭标签（不删除会话）";
+      cl.onclick = e => { e.stopPropagation(); this.close(s.id); };
+      tab.onclick = () => { if (s.id !== this.id) this.open(s.id); };
+      tab.append(nm, cl);
+      box.appendChild(tab);
+    }
+    // 标签多到需要横向滚动时，重建后把当前选中项滚回可视区：
+    // 否则点第 12 个标签 → innerHTML 清空 → scrollLeft 归零 → 选中的标签
+    // 跑到视野外，看起来像「点了没反应」。
+    const on = box.querySelector(".conv-tab.on");
+    if (on) {
+      const b = box.getBoundingClientRect();
+      const t = on.getBoundingClientRect();
+      if (t.left < b.left) box.scrollLeft -= (b.left - t.left) + 2;
+      else if (t.right > b.right) box.scrollLeft += (t.right - b.right) + 2;
+    }
+  },
+};
+
+/* 顶栏：新建 / 跳设置页历史分类 */
+if ($("conv-add")) $("conv-add").onclick = () => SESSIONS.create();
+if ($("conv-history")) $("conv-history").onclick = () => {
+  switchPage("settings");
+  switchSetCat("history");
+  refreshHistory();
+};
 
 /* ===========================================================================
    推理：显示插件宿主（2026-11-04）
@@ -1259,11 +1956,17 @@ setInterval(refreshTrain, 2000);
    插件协议见 service/web/plugins/README.md——它只连 /api/infer 与
    /api/infer/stream 两个端点，其余（DOM、输入解析、展示方式）完全自理。
    =========================================================================== */
-/* 内置插件只注册「token 对话」一个。base 词表插件仍在开发中，按需求
-   「不显示」——不注册、不出现在选择器里；开发计划写在 plugins/README.md。
+/* 内置插件：Infer-Plug v1.0.0（新一代「正常文字交互」，默认）与 token 对话
+   （旧转换器格式对话，保留给要看原始 token 的场景）。base 词表的正常文字
+   交互已由 Infer-Plug 实现并注册，不再是「开发中 / 不显示」。
    其它显示器由开发者用「开发者选项 → 显示插件 → 导入插件…」从本地 .js
    导入，服务端落到 service/web/plugins/ 并在 /api/plugin/list 登记。 */
 const BUILTIN_PLUGINS = [
+  {id: "infer-plug", name: "Infer-Plug v1.0.0", entry: "plugins/infer-plug.js",
+   css: "plugins/infer-plug.css",
+   desc: "正常文字对话：输入框里文字与文件胶囊在同一行无缝内联，支持 + 上传 / " +
+         "拖放、流式文字与工具徽标、DRAW 图元画布预览 + 可拖拽时间轴；" +
+         "Enter 不发送，只能点「发送」。"},
   {id: "tokens", name: "token 对话", entry: "plugins/tokens.js",
    css: "plugins/tokens.css",
    desc: "微信式多轮对话：右边是你的输入、左边是模型输出，上下文逐轮保留；" +
@@ -1282,6 +1985,8 @@ function pluginById(id) {
 function selectedPluginId() {
   let id = null;
   try { id = localStorage.getItem(PLUGIN_KEY); } catch (e) {}
+  // 没存过选择 → 用新一代默认插件；已存过的一律尊重用户选择（不覆盖）。
+  if (!id) return "infer-plug";
   return pluginById(id).id;
 }
 function setSelectedPluginId(id) {
@@ -1296,6 +2001,104 @@ function setSelectedPluginId(id) {
    否则 513..2048 这一档永远用不上（/api/status 也会下发同一个值）。 */
 const INFER_MAX_NEW = 2048;
 const INFER_WALL_MS = 10 * 60 * 1000;   // 整轮流式的墙钟上限
+
+/* 阶段状态：全局只记「上一次通知过的 phase」，避免 stream 轮询与 stats
+   兜底互相重复通知。cb 缺省时转给当前插件 ctx 里登记的 onPhase。 */
+let PHASE_LAST = "";
+let INFER_ACTIVE = false;
+function notifyPluginPhase(phase, cb) {
+  if (!phase || phase === PHASE_LAST) return;
+  PHASE_LAST = phase;
+  // 宿主状态条同步（幂等：done 的回落计时器会被后一次调用清掉重设）
+  try { if (typeof renderInferStatus === "function") renderInferStatus(phase); }
+  catch (e) {}
+  const fn = cb || (PLUGIN_CUR && PLUGIN_CUR.ctx && PLUGIN_CUR.ctx._phaseCb);
+  if (typeof fn === "function") { try { fn(phase); } catch (e) {} }
+}
+
+/* ===========================================================================
+   推理页状态条（宿主拥有 · 2026-11-05）
+   ---------------------------------------------------------------------------
+   顶部那一条（实时状态 + TTFT / tok/s / tokens / 上下文 / model）原本由
+   默认插件 tokens.js 自建 .tk-head。steve 定案「归到系统」：换插件也不会
+   整条消失或各画一套。现在 DOM 在 #infer-statusbar（index_source.html），
+   由宿主渲染；插件只管对话流 + 输入区。
+
+   宿主在 ctx.api.infer 里把 handlers 包一层：自己统计指标 + 消费 phase，
+   同时把插件的回调【原样转发】，一个都不吞。这样导入的第三方插件即使
+   完全不知道状态条的存在，也能看到统一的常驻状态。
+   =========================================================================== */
+const INFER_PHASE_TEXT = {
+  idle: "空闲", loading: "加载中", encoding: "encoding",
+  decoding: "decoding", done: "已完成", error: "出错", cancel: "已取消",
+};
+let STATUS_IDLE_TIMER = null;
+
+function renderInferStatus(phase) {
+  const box = $("infer-status"), text = $("infer-status-text");
+  const p = Object.prototype.hasOwnProperty.call(INFER_PHASE_TEXT, phase)
+    ? phase : "idle";
+  if (box) box.dataset.phase = p;
+  if (text) text.textContent = INFER_PHASE_TEXT[p];
+  clearTimeout(STATUS_IDLE_TIMER);
+  STATUS_IDLE_TIMER = null;
+  // 「已完成」停留 2 秒回落空闲，避免一直亮着
+  if (p === "done") {
+    STATUS_IDLE_TIMER = setTimeout(() => renderInferStatus("idle"), 2000);
+  }
+}
+
+function statusFmtMs(ms) {
+  if (ms == null || !Number.isFinite(Number(ms))) return "—";
+  const n = Number(ms);
+  return n < 1000 ? `${Math.round(n)} ms` : `${(n / 1000).toFixed(2)} s`;
+}
+
+function updateInferMetrics(patch) {
+  const set = (id, v) => {
+    if (v === undefined) return;
+    const el = $(id);
+    if (el) el.textContent = String(v);
+  };
+  if ("ttft" in patch)
+    set("im-ttft", patch.ttft == null ? "—" : statusFmtMs(patch.ttft));
+  if ("tps" in patch)
+    set("im-tps", patch.tps == null ? "—" : Number(patch.tps).toFixed(2));
+  if ("count" in patch) set("im-count", patch.count);
+  if ("ctx" in patch) set("im-ctx", patch.ctx);
+  if ("model" in patch) set("im-model", patch.model || "未加载");
+}
+
+/** 每轮推理一份宿主 handlers；返回包装后的对象交给 inferStream。 */
+function wrapHostInferHandlers(h) {
+  const s = {count: 0, tFirst: null, tLast: null};
+  const call = (k, ...args) => {
+    const fn = h && h[k];
+    if (typeof fn === "function") { try { fn(...args); } catch (e) {} }
+  };
+  return {
+    onStart(info) {
+      s.count = 0; s.tFirst = s.tLast = null;
+      updateInferMetrics({ttft: null, tps: null, count: 0});
+      renderInferStatus("loading");
+      call("onStart", info);
+    },
+    onPhase(p) { renderInferStatus(p); call("onPhase", p); },
+    onToken(tk, n) {
+      s.count += 1;
+      // t_ms 是服务端「收到请求 → 产出该 token」的墙钟毫秒，含模型加载
+      const t = tk && typeof tk.t_ms === "number" ? tk.t_ms : null;
+      if (t != null) { if (s.tFirst == null) s.tFirst = t; s.tLast = t; }
+      const tps = (s.tFirst != null && s.tLast != null &&
+                   s.count > 1 && s.tLast > s.tFirst)
+        ? (s.count - 1) / ((s.tLast - s.tFirst) / 1000) : null;
+      updateInferMetrics({count: s.count, ttft: s.tFirst, tps});
+      call("onToken", tk, n);
+    },
+    onDone(result, sum) { renderInferStatus("done"); call("onDone", result, sum); },
+    onError(err) { renderInferStatus("error"); call("onError", err); },
+  };
+}
 
 /* 流式推理客户端：POST 起任务 → 按 from 游标增量拉 token。
    为什么不用长连接：server 是纯标准库 http.server，一条连接一个线程，
@@ -1314,6 +2117,10 @@ async function inferStream(req, h, signal) {
     max_new_tokens: clampNum(req.maxNew, 1, INFER_MAX_NEW, 32),
     temperature: clampNum(req.temperature, 0.05, 5, 0.8),
     top_p: clampNum(req.topP, 0.01, 1, 0.95),
+    // 会话上下文一律随请求带上（插件经 ctx.api.infer 也会先补这两个字段）
+    session_id: req.session_id != null ? req.session_id : SESSIONS.id,
+    kv_enabled: req.kv_enabled != null ? req.kv_enabled
+      : !!(SESSIONS.current && SESSIONS.current.kv_enabled),
   };
   if (Array.isArray(req.tokenIds) && req.tokenIds.length) {
     body.token_ids = req.tokenIds;
@@ -1322,44 +2129,58 @@ async function inferStream(req, h, signal) {
   } else {
     throw new Error("需要 tokenIds 或 prompt");
   }
+  // 附件通道：/api/infer 支持 media:[{kind,b64,filename}]，插件透传。
+  if (Array.isArray(req.media) && req.media.length) body.media = req.media;
   const r = await api("/api/infer", body, {signal});
   const sid = r.task_id;
   if (h.onStart) h.onStart({taskId: sid});
+  INFER_ACTIVE = true;
   const t0 = Date.now();
   let from = 0;
   let fails = 0;
-  for (;;) {
-    if (aborted()) throw new Error("已取消");
-    if (Date.now() - t0 > INFER_WALL_MS) {
-      throw new Error(`推理超时（${Math.round(INFER_WALL_MS / 1000)}s）`);
-    }
-    let s;
-    try {
-      s = await api(
-        `/api/infer/stream?task_id=${encodeURIComponent(sid)}&from=${from}`,
-        undefined, {timeout: 120000, signal});
-      fails = 0;
-    } catch (e) {
+  try {
+    for (;;) {
       if (aborted()) throw new Error("已取消");
-      if (++fails <= 3) {                 // 瞬时失败：退避重试，不整轮报废
-        await new Promise(res => setTimeout(res, 250 * fails));
-        continue;
+      if (Date.now() - t0 > INFER_WALL_MS) {
+        throw new Error(`推理超时（${Math.round(INFER_WALL_MS / 1000)}s）`);
       }
-      throw e;
+      let s;
+      try {
+        s = await api(
+          `/api/infer/stream?task_id=${encodeURIComponent(sid)}&from=${from}`,
+          undefined, {timeout: 120000, signal});
+        fails = 0;
+      } catch (e) {
+        if (aborted()) throw new Error("已取消");
+        if (++fails <= 3) {                 // 瞬时失败：退避重试，不整轮报废
+          await new Promise(res => setTimeout(res, 250 * fails));
+          continue;
+        }
+        throw e;
+      }
+      // 后端 phase 变化时转发给插件（去重由 notifyPluginPhase 统一做）
+      if (s.phase) notifyPluginPhase(s.phase, h.onPhase);
+      const got = s.tokens || [];
+      for (const tk of got) {
+        from += 1;
+        if (h.onToken) h.onToken(tk, from);
+      }
+      // 服务端的 next 是权威游标（慢轮询/丢帧时靠它对齐，不靠本地累加）
+      if (typeof s.next === "number") from = s.next;
+      if (s.status === "done") {
+        notifyPluginPhase("done", h.onPhase);   // 收尾通知一次 done
+        if (h.onDone) h.onDone(s.result || {}, s);
+        break;
+      }
+      if (s.status === "error") {
+        notifyPluginPhase("error", h.onPhase);
+        if (h.onError) h.onError(new Error(s.error || "推理失败"));
+        break;
+      }
+      await new Promise(res => setTimeout(res, 90));
     }
-    const got = s.tokens || [];
-    for (const tk of got) {
-      from += 1;
-      if (h.onToken) h.onToken(tk, from);
-    }
-    // 服务端的 next 是权威游标（慢轮询/丢帧时靠它对齐，不靠本地累加）
-    if (typeof s.next === "number") from = s.next;
-    if (s.status === "done") { if (h.onDone) h.onDone(s.result || {}, s); break; }
-    if (s.status === "error") {
-      if (h.onError) h.onError(new Error(s.error || "推理失败"));
-      break;
-    }
-    await new Promise(res => setTimeout(res, 90));
+  } finally {
+    INFER_ACTIVE = false;
   }
 }
 
@@ -1370,15 +2191,53 @@ function makePluginCtx(meta, host, signal) {
     plugin: {id: meta.id, name: meta.name},
     signal,                       // 插件可自选监听：异步回调别碰已卸载的 DOM
     api: {
-      infer: (req, h) => inferStream(req, h, signal),
+      /* 记录本轮 onPhase 供 stats 兜底转发；req 自动补会话字段 */
+      infer: (req, h) => {
+        const r = Object.assign({}, req || {});
+        if (r.session_id == null) r.session_id = SESSIONS.id;
+        if (r.kv_enabled == null)
+          r.kv_enabled = !!(SESSIONS.current && SESSIONS.current.kv_enabled);
+        if (h && typeof h.onPhase === "function") ctx._phaseCb = h.onPhase;
+        // 宿主状态条：包一层 handlers，自己统计指标 + 消费 phase，插件回调
+        // 由 wrapHostInferHandlers 原样转发（一个都不吞）。
+        return inferStream(r, wrapHostInferHandlers(h), signal).catch(e => {
+          // 取消 / 异常也反映到状态条；错误继续抛给插件，不改原有语义
+          renderInferStatus(e && e.message === "已取消" ? "cancel" : "error");
+          throw e;
+        });
+      },
       reset: () => api("/api/infer/reset", {}),
       stats: () => api("/api/infer/stats"),
       status: () => api("/api/status"),
       models: () => api("/api/models"),
       loadModel: (name) => api("/api/model/load", {name}),
+      clearFw: () => api("/api/infer/clear_fw", {session_id: SESSIONS.id}),
+      preload: (name) => api("/api/model/preload", {name}),
+      unloadModel: (name) => api("/api/model/unload", {name}),
+      selectModel: (name) => api("/api/model/select", {name}),
       toast: (msg, bad) => toast(msg, bad),
       confirm: (title, body) => modalOpen(title, body, "确定", true),
       fmtBytes,
+      // ---- Infer-Plug：/api/agent/* 契约（见 plugins/README.md）----
+      agentSpec: () => api("/api/agent/spec"),
+      encodeText: (text) => api("/api/agent/encode", {text}),
+      decodeIds: (ids) => api("/api/agent/decode", {ids}),
+      uploadFile: (file) => new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onload = () => {
+          const b64 = String(fr.result || "").replace(/^data:[^;]*;base64,/, "");
+          api("/api/agent/file", {filename: file.name, b64},
+              {timeout: API_UPLOAD_TIMEOUT_MS}).then(resolve).catch(reject);
+        };
+        fr.onerror = () => reject(new Error("读取文件失败：" + file.name));
+        fr.readAsDataURL(file);
+      }),
+      tools: () => api("/api/agent/tools"),
+      runTool: (name, args) => api("/api/agent/tool", {name, args}),
+      // 工具结果 → [sys] 结果文本 [sys/] 的 token ID 序列（1.3.0 无嵌套），
+      // 供插件把结果自动喂回模型（agent 闭环）
+      toolResult: (name, result) =>
+        api("/api/agent/tool_result", {name, result}),
     },
     /* 每个插件一份命名空间，互不污染；值走 JSON，读不到就用默认 */
     config: {
@@ -1395,10 +2254,31 @@ function makePluginCtx(meta, host, signal) {
         } catch (e) {}
       },
     },
+    /* per-session 层（新增）：读当前会话字段，set 同时 savePatch 落盘。
+       与上面按插件隔离的 ctx.config 并存，互不影响。 */
+    session: {
+      get id() { return SESSIONS.id; },
+      get messages() { return (SESSIONS.current && SESSIONS.current.messages) || []; },
+      config: {
+        get(k, d) {
+          const c = SESSIONS.current;
+          if (!c) return d;
+          const f = SESSION_CFG_FIELDS[k] || k;
+          return c[f] === undefined ? d : c[f];
+        },
+        set(k, v) {
+          const f = SESSION_CFG_FIELDS[k] || k;
+          if (SESSIONS.current) SESSIONS.current[f] = v;
+          SESSIONS.savePatch({[f]: v});
+        },
+      },
+      append(role, tokenIds) { return SESSIONS.appendMessage(role, tokenIds); },
+    },
     onCleanup(fn) { if (typeof fn === "function") cleanups.push(fn); },
   };
   ctx._cleanup = () => {
     cleanups.splice(0).forEach(fn => { try { fn(); } catch (e) {} });
+    ctx._phaseCb = null;           // 卸载后 stats 兜底不再转给死实例
   };
   return ctx;
 }
@@ -1408,11 +2288,29 @@ function makePluginCtx(meta, host, signal) {
    不碰插件内部状态。两个滑块在 init 时各挂一次监听，切换/重挂插件后也
    靠挂载末尾的调用补同步。 */
 function syncSamplingToPlugin() {
-  if (PLUGIN_CUR && PLUGIN_CUR.ctx) {
-    const t = parseFloat($("infer-temp").value);
-    const p = parseFloat($("infer-topp").value);
-    if (Number.isFinite(t)) PLUGIN_CUR.ctx.config.set("temperature", t);
-    if (Number.isFinite(p)) PLUGIN_CUR.ctx.config.set("topP", p);
+  const tEl = $("infer-temp"), pEl = $("infer-topp"), mEl = $("infer-maxnew");
+  const t = tEl ? parseFloat(tEl.value) : NaN;
+  const p = pEl ? parseFloat(pEl.value) : NaN;
+  const mn = mEl ? parseFloat(mEl.value) : NaN;
+  const patch = {};
+  if (Number.isFinite(t)) patch.temperature = t;
+  if (Number.isFinite(p)) patch.top_p = p;
+  if (Number.isFinite(mn)) patch.max_new = mn;
+  if (!PLUGIN_CUR || !PLUGIN_CUR.ctx) {
+    // 插件没挂载时参数改动也要落盘（不依赖 ctx 存在）
+    if (Object.keys(patch).length) SESSIONS.savePatch(patch);
+    return;
+  }
+  // 按插件隔离的命名空间（保留原有语义）
+  const c = PLUGIN_CUR.ctx.config;
+  if (Number.isFinite(t)) c.set("temperature", t);
+  if (Number.isFinite(p)) c.set("topP", p);
+  // per-session 层：三个采样参数写进当前会话（config.set 内部会 savePatch）
+  const sc = PLUGIN_CUR.ctx.session && PLUGIN_CUR.ctx.session.config;
+  if (sc) {
+    if (Number.isFinite(t)) sc.set("temperature", t);
+    if (Number.isFinite(p)) sc.set("topP", p);
+    if (Number.isFinite(mn)) sc.set("maxNew", mn);
   }
 }
 
@@ -1507,16 +2405,24 @@ function renderCtxMeters(s) {
   const cu = Math.max(0, Math.min(n - full, comp));
   meterSet("ctx-full-bar", "ctx-full-val", fu, full);
   meterSet("ctx-comp-bar", "ctx-comp-val", cu, comp);
-  const kv = $("ctx-kv-val");
-  if (kv) {
-    kv.textContent = n
-      ? (s.kv_bytes ? `${fmtBytes(s.kv_bytes)} · ` : "") + `${n} tok`
-      : "—";
-    kv.title = n
-      ? `共享 KV 序列：${n} 步 × d_model ${s.d_model} × ${
-          s.kv_bytes && n ? Math.round(s.kv_bytes / n / Math.max(1, s.d_model)) : 0
-        } 字节`
-      : "尚未推理（KV 为空）";
+  /* #ctx-kv-val 已由 #kv-mem-val / #kv-pct-bar / #kv-pct-val 取代（D 已删该 DOM） */
+  /* KV 内存 / 占用百分比（后端 /api/infer/stats 新增 kv_pct / kv_capacity_bytes） */
+  const kvMem = $("kv-mem-val");
+  if (kvMem) {
+    const used = s.kv_bytes, cap = s.kv_capacity_bytes;
+    kvMem.textContent = (used != null ? fmtBytes(used) : "—") +
+      (cap != null ? " / " + fmtBytes(cap) : "");
+  }
+  let pct = Number(s.kv_pct);
+  if (!Number.isFinite(pct)) pct = 0;
+  if (pct > 0 && pct <= 1) pct *= 100;      // 兼容 0..1 比例与 0..100 百分数
+  pct = Math.max(0, Math.min(100, pct));
+  const pctVal = $("kv-pct-val"), pctBar = $("kv-pct-bar");
+  if (pctVal) pctVal.textContent = pct.toFixed(1) + "%";
+  if (pctBar) {
+    pctBar.style.width = pct.toFixed(2) + "%";
+    pctBar.classList.toggle("warn", pct >= 75 && pct < 98);
+    pctBar.classList.toggle("full", pct >= 98);
   }
 }
 
@@ -1648,14 +2554,72 @@ function renderFastWeight(s) {
   }
 }
 
+/* ---------- MoMW 三阶段记忆阀门面板（2026-11-08） ----------
+   数据来自 /api/infer/stats 的 momw 字段（宿主 1.2s 轮询，不额外起定时器）。
+   模型未启用 MoMW 时 momw=null：指标显示「—」，面板给出开启指引并禁用按钮。 */
+function renderMoMW(s) {
+  const badge = $("momw-state"), sum = $("momw-summary"),
+        box = $("momw-layers"), metric = $("im-momw");
+  const silentBtn = $("momw-silent"), clearBtn = $("momw-clear");
+  if (!badge || !sum || !box || !metric) return;
+  if (!s || !s.enabled) {
+    metric.textContent = "—";
+    badge.textContent = "未启用";
+    badge.className = "badge";
+    sum.textContent = "当前模型未启用 MoMW；可在「模型 → 创建新模型」勾选开启。";
+    box.innerHTML = "";
+    if (silentBtn) silentBtn.disabled = true;
+    if (clearBtn) clearBtn.disabled = true;
+    return;
+  }
+  const layers = s.layers || [], cfg = s.config || {};
+  const active = (s.last_indices || []).length;
+  metric.textContent = `${layers.length} 层 / ${active} 激活`;
+  badge.textContent = s.silent ? "静默" : "运行中";
+  badge.className = "badge" + (s.silent ? "" : " on");
+  sum.textContent = `步数 ${s.steps} · 扩展 ${s.expansions} 次 · ` +
+    `N=${cfg.N} · τ=${cfg.tau} · 阈值 ${cfg.threshold}`;
+  box.innerHTML = layers.map((l, i) => {
+    const g = Math.max(0, Math.min(100, Math.round((l.gamma || 0) * 100)));
+    const sc = (s.last_scores || [])[i];
+    const ca = ((s.last_cos_anchor || [])[i] || 0).toFixed(3);
+    const ce = ((s.last_cos_state || [])[i] || 0).toFixed(3);
+    return `<div class="row" style="align-items:center;gap:6px;margin:3px 0;font-size:11px"
+         title="锚点余弦 ${ca} · 状态余弦 ${ce} · 路由分 ${sc == null ? "—" : Number(sc).toFixed(3)}">
+      <span class="badge ${l.active ? "on" : ""}">${esc(l.type)}</span>
+      <span class="hint" style="min-width:18px">#${i}</span>
+      <span style="flex:1;height:5px;border-radius:3px;background:var(--fill-2);overflow:hidden;display:block">
+        <span style="display:block;height:100%;width:${g}%;background:var(--accent)"></span>
+      </span>
+      <span class="hint">γ ${Number(l.gamma || 0).toFixed(2)}</span>
+      <span class="hint">写 ${l.writes}</span>
+      <span class="hint">‖S‖ ${Number(l.norm || 0).toFixed(1)}</span>
+    </div>`;
+  }).join("") || '<div class="hint">暂无记忆层</div>';
+  if (silentBtn) {
+    silentBtn.disabled = false;
+    silentBtn.setAttribute("aria-pressed", s.silent ? "true" : "false");
+    silentBtn.textContent = s.silent ? "静默中（点此恢复）" : "静默激活";
+  }
+  if (clearBtn) clearBtn.disabled = false;
+}
+
 async function refreshInferStats() {
   try {
     const s = await api("/api/infer/stats");
     renderCtxMeters(s);
     renderFastWeight(s);
+    renderMoMW(s.momw);
     if (s.fw_writes && s.fw_writes.length) {
       FW_WRITES.length = 0;
       FW_WRITES.push(...s.fw_writes.slice(-96));
+    }
+    /* 阶段兜底：没有活跃流式任务、后端也报 streaming=false 时给插件一个
+       done→idle（去重，避免每帧重复通知）；stream 轮询的 phase 是主路径。 */
+    if (!INFER_ACTIVE && !s.streaming) {
+      const busy = PHASE_LAST === "loading" || PHASE_LAST === "encoding" ||
+                   PHASE_LAST === "decoding";
+      notifyPluginPhase(busy ? "done" : "idle");
     }
   } catch (e) {}
 }
@@ -1812,19 +2776,7 @@ function bindPluginImport() {
   };
 }
 
-$("infer-clear").onclick = async () => {
-  if (PLUGIN_CUR && PLUGIN_CUR.instance && PLUGIN_CUR.instance.reset) {
-    try { PLUGIN_CUR.instance.reset(); } catch (e) {}
-  }
-  try {
-    // 后端：杀掉 infer 服务进程 → 释放持久 fast weight + KV 上下文
-    await api("/api/infer/reset", {});
-    toast("已清空会话；infer 服务已终止，下次推理重新加载模型");
-    refreshInferStats();
-  } catch (e) {
-    toast("后端重置失败: " + e.message, true);
-  }
-};
+/* 顶栏清空按钮已移除：清空上下文改由开发者选项的清空 fast weight 按钮处理 */
 /* 右侧边栏：左侧边栏的镜像（状态挂在 <html data-dev> 上）。
    开合动画与左栏共用 --dur-side / --dur-tail / --move-ease：width 与
    clip-path 同相，只有用户点击时挂 .right-anim（首帧恢复直接落位）。
@@ -1864,21 +2816,62 @@ async function refreshModelPop() {
   if (!list) return;
   try {
     const r = await api("/api/models");
-    list.innerHTML = r.models.map(m =>
-      `<div class="model-pop-row${m.name === r.active ? " on" : ""}" data-load="${esc(m.name)}">
-         <span class="nm">${esc(m.name)}<span class="sub">${m.name === r.active ? "当前活动" : "点此加载"} · `
-      + `${m.params ? (m.params / 1e6).toFixed(1) + "M" : "—"}</span></span>
-         <button class="act sec xs del" data-del="${esc(m.name)}" title="删除模型">删除</button>
-       </div>`).join("")
-      || `<div class="hint">还没有模型，去「模型」页创建一个</div>`;
-    list.querySelectorAll("[data-load]").forEach(row => {
+    const models = r.models || [], active = r.active || "";
+    list.innerHTML = models.map(m => {
+      const loaded = !!m.loaded;
+      const on = m.name === active ? " on" : "";
+      const sub = m.name === active ? "当前选中" : (loaded ? "已加载" : "未加载");
+      const params = m.params ? (m.params / 1e6).toFixed(1) + "M" : "—";
+      return `<div class="model-pop-row${on}" data-name="${esc(m.name)}">
+        <span class="nm">${esc(m.name)} <span class="params">${params}</span>
+          <span class="sub">${sub}</span></span>
+        <button class="act sec xs model-load${loaded ? " loaded" : ""}"
+                data-name="${esc(m.name)}" data-loaded="${loaded ? "1" : "0"}">${
+          loaded ? "移出内存" : "加载"}</button>
+        <button class="act sec xs del" data-del="${esc(m.name)}" title="删除模型">删除</button>
+      </div>`;
+    }).join("") || `<div class="hint">还没有模型，去「模型」页创建一个</div>`;
+
+    /* 点行（不点按钮）→ 只选中：改高亮 + 会话 model，不加载权重 */
+    list.querySelectorAll(".model-pop-row").forEach(row => {
       row.onclick = async e => {
-        if (e.target.closest("[data-del]")) return;   // 点删除不触发加载
-        await loadModel(row.dataset.load);
-        $("model-pop").hidden = true;
-        await refreshModelPop();
+        if (e.target.closest("button")) return;
+        const name = row.dataset.name;
+        try {
+          await api("/api/model/select", {name});
+          list.querySelectorAll(".model-pop-row").forEach(x =>
+            x.classList.toggle("on", x === row));
+          if (SESSIONS.current) SESSIONS.current.model = name;
+          SESSIONS.savePatch({model: name});
+          toast(`已选中「${name}」`);
+        } catch (err) { toast("选择模型失败: " + err.message, true); }
       };
     });
+
+    /* 加载 / 移出内存：preload / unload → 刷新列表 + toast；期间禁用按钮 */
+    list.querySelectorAll(".model-load").forEach(b => {
+      b.onclick = async e => {
+        e.stopPropagation();
+        const name = b.dataset.name, loaded = b.dataset.loaded === "1";
+        b.disabled = true; b.textContent = "加载中…";
+        try {
+          if (loaded) {
+            await api("/api/model/unload", {name});
+            toast(`已把「${name}」移出内存`);
+          } else {
+            await api("/api/model/preload", {name});
+            toast(`已加载「${name}」`);
+          }
+          await refreshModelPop();
+        } catch (err) {
+          b.disabled = false;
+          b.textContent = loaded ? "移出内存" : "加载";
+          toast((loaded ? "移出" : "加载") + "失败: " + err.message, true);
+        }
+      };
+    });
+
+    /* 删除按钮：保留原有 deleteModel 行为 */
     list.querySelectorAll("[data-del]").forEach(b => {
       b.onclick = e => {
         e.stopPropagation();
@@ -1889,6 +2882,55 @@ async function refreshModelPop() {
     list.innerHTML = `<div class="hint">获取模型失败: ${esc(e.message)}</div>`;
   }
 }
+/* 开发者选项：KV 开关（aria-checked 表状态）/ 清空 fast weight */
+if ($("dev-kv-enable")) $("dev-kv-enable").onclick = () => {
+  const b = $("dev-kv-enable");
+  const on = b.getAttribute("aria-checked") !== "true";
+  b.setAttribute("aria-checked", on ? "true" : "false");
+  if (SESSIONS.current) SESSIONS.current.kv_enabled = on;
+  SESSIONS.savePatch({kv_enabled: on});
+  toast(on ? "已开启 KV 缓存" : "已关闭 KV 缓存：关闭后每轮重发完整上下文");
+};
+if ($("fw-clear")) $("fw-clear").onclick = async () => {
+  try {
+    if (PLUGIN_CUR && PLUGIN_CUR.ctx && PLUGIN_CUR.ctx.api)
+      await PLUGIN_CUR.ctx.api.clearFw();
+    else
+      await api("/api/infer/clear_fw", {session_id: SESSIONS.id});
+    refreshInferStats();
+    toast("已清空 fast weight / KV 上下文");
+  } catch (e) { toast("清空失败: " + e.message, true); }
+};
+
+/* MoMW 记忆阀门：常驻指标点击开合浮层；clear / silent 走后端会话级控制，
+   用返回的快照立即重绘，不必等下一次 1.2s 轮询。 */
+if ($("momw-open")) $("momw-open").onclick = () => {
+  const p = $("momw-panel");
+  if (p) p.hidden = !p.hidden;
+};
+if ($("momw-close")) $("momw-close").onclick = () => {
+  const p = $("momw-panel");
+  if (p) p.hidden = true;
+};
+if ($("momw-clear")) $("momw-clear").onclick = async () => {
+  try {
+    const r = await api("/api/momw/control",
+                        {session_id: SESSIONS.id, action: "clear"});
+    if (r.momw) renderMoMW(r.momw);
+    toast("已清空 MoMW 记忆池（状态从零重建）");
+  } catch (e) { toast("清空失败: " + e.message, true); }
+};
+if ($("momw-silent")) $("momw-silent").onclick = async () => {
+  const btn = $("momw-silent");
+  const on = btn.getAttribute("aria-pressed") !== "true";
+  try {
+    const r = await api("/api/momw/control",
+                        {session_id: SESSIONS.id, action: "silent", value: on});
+    if (r.momw) renderMoMW(r.momw);
+    toast(on ? "MoMW 已静默：仍写入记忆，但不注入输出" : "MoMW 已恢复注入");
+  } catch (e) { toast("切换失败: " + e.message, true); }
+};
+
 /* 点击工具栏之外关闭模型弹窗 */
 document.addEventListener("click", e => {
   const pop = $("model-pop"), btn = $("infer-model-btn");
@@ -2016,10 +3058,10 @@ $("video-encode").onclick = async () => {
 /* ---------- Token 编辑器 ----------
    调色板：扩展系统 token（<0>..<5>，也可直接写名字）+ 结构字符。 */
 const TOKEN_PALETTE = [
-  {label:"<user>",    insert:"<user>"},
-  {label:"<user/>",   insert:"<user/>"},
-  {label:"<model>",   insert:"<model>"},
-  {label:"<model/>",  insert:"<model/>"},
+  {label:"[user]",    insert:"[user]"},
+  {label:"[user/]",   insert:"[user/]"},
+  {label:"[model]",   insert:"[model]"},
+  {label:"[model/]",  insert:"[model/]"},
   {label:"<stop>",    insert:"<stop>"},
   {label:"<caps>",    insert:"<caps>"},
   {label:"时间步 {",  insert:"{"},
@@ -2079,6 +3121,38 @@ $("json-export").onclick = async () => {
     msg.textContent = `已导出 ${r.n_tokens} tokens / ${r.n_steps} 时间步`;
   } catch (e) { msg.textContent = "错误: " + e.message; }
 };
+
+/* 导入 .tokens：File → ArrayBuffer → base64 → /api/tokens/decode。
+   后端返回的 display 就是编辑器接受的 {text: …} 格式，直接落进编辑器。 */
+if ($("json-import") && $("json-import-file")) {
+  $("json-import").onclick = () => $("json-import-file").click();
+  $("json-import-file").addEventListener("change", async e => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!f) return;
+    const msg = $("json-msg");
+    if (f.size > 64 * 1024 * 1024) {
+      msg.textContent = "错误: 文件过大（上限 64MB）";
+      return;
+    }
+    msg.textContent = "导入中…";
+    try {
+      const bytes = new Uint8Array(await f.arrayBuffer());
+      let bin = "";
+      for (let i = 0; i < bytes.length; i += 0x8000)
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      const body = {tokens_b64: btoa(bin), vocab: $("json-vocab").value};
+      const r = await api("/api/tokens/decode", body,
+                          {timeout: API_UPLOAD_TIMEOUT_MS});
+      $("json-editor").textContent = r.display || "";
+      const n = r.n_tokens != null ? r.n_tokens : "?";
+      const m = r.n_steps != null ? r.n_steps : "?";
+      msg.textContent = `已导入 ${n} tokens / ${m} 时间步`;
+    } catch (err) {
+      msg.textContent = "错误: " + err.message;
+    }
+  });
+}
 
 /* =========================================================================
    图元编辑器：手动摆图元 → 实时 SVG + 实时 token 流
@@ -2825,6 +3899,7 @@ function vocabClearPanes() {
   VOCAB.info = null;
   renderVocabRegions([]);
   drawVocabBar(null);
+  vocabRenderAddRegions(null);
   $("vocab-bar-note").textContent = "";
   $("vsrc-text").value = "";
   $("vsrc-msg").textContent = "";
@@ -2843,6 +3918,7 @@ async function vocabLoadActive() {
     VOCAB.info = r;
     drawVocabBar(r);
     renderVocabRegions(r.regions || []);
+    vocabRenderAddRegions(r);
     const ct = r.category_totals || {}, m = vocabMeta(name);
     $("vocab-bar-note").textContent =
       `${name}　容量 ${r.vocab_size}` +
@@ -2854,6 +3930,7 @@ async function vocabLoadActive() {
     VOCAB.info = null;
     drawVocabBar(null);
     renderVocabRegions([]);
+    vocabRenderAddRegions(null);
     $("vocab-bar-note").textContent = "分区信息获取失败: " + e.message;
   }
   if (VOCAB.mode === "text") await vocabLoadSource(name, false);
@@ -2901,10 +3978,62 @@ function renderVocabRegions(regions) {
       `<td class="samples">${samples || '<span class="hint">—</span>'}</td></tr>`;
   }).join("");
 }
-/* 大类下拉写死两档：.vfc 的文件格式只有「引号包裹=可显示 / 尖括号包裹=不可显示」
-   两种形态，正好对应 regular / special。fallback（可显示的单字母）与 system
-   （{ } | 架构契约头）是派生的、不是用户可选的，所以不按分区推导。
-   注意：分区表里的 regions[].category 仍是 four-category 语义，照实渲染即可。 */
+/* ---------- 「添加到哪个子区」下拉 ----------
+   子区清单、添加策略（locked / angled / text）与提示文案全部由
+   /api/vocab/regions 下发，唯一真源是后端 spec.py；前端只做「值 → 文本
+   归一化」与展示，不抄任何子区名或规则常量。
+   分区表里的 regions[].category 仍是 four-category 语义，照实渲染即可。 */
+function vocabAddData() {
+  const r = VOCAB.info;
+  if (!r) return null;
+  const list = Array.isArray(r.add_regions) ? r.add_regions
+    : (r.regions || []).map(x => Object.assign({present: true}, x));
+  return {list, hints: r.add_policy_hints || {}};
+}
+function vocabRenderAddRegions(info) {
+  const sel = $("vtok-region"), hint = $("vtok-hint");
+  if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = "";
+  if (!info) {
+    sel.innerHTML = '<option value="">（未打开词表）</option>';
+    sel.disabled = true;
+    if (hint) hint.textContent = "";
+    return;
+  }
+  sel.disabled = false;
+  const d = vocabAddData() || {list: [], hints: {}};
+  d.list.forEach(rg => {
+    const op = document.createElement("option");
+    op.value = rg.region;
+    const p = rg.add_policy || "locked";
+    const tag = p === "locked" ? "不可改" : p === "angled" ? "<名字>" : "文本";
+    op.textContent = `${rg.region}　[${tag}]` +
+      (rg.present === false ? "（新区）" : "");
+    op.dataset.policy = p;
+    if (p === "locked") op.disabled = true;
+    sel.appendChild(op);
+  });
+  // 还原上次选择；若已锁定 / 不存在，优先落回 extra（默认追加区）
+  const usable = [...sel.options].filter(o => !o.disabled);
+  if (usable.some(o => o.value === prev)) sel.value = prev;
+  else sel.value = (usable.find(o => o.value === "extra") || usable[0] || {}).value || "";
+  vocabAddHint();
+}
+function vocabAddPolicy() {
+  const op = $("vtok-region").selectedOptions[0];
+  return op ? (op.dataset.policy || "locked") : "locked";
+}
+function vocabAddHint() {
+  const sel = $("vtok-region"), hint = $("vtok-hint");
+  if (!sel || !hint) return;
+  const op = sel.selectedOptions[0];
+  if (!op) { hint.textContent = ""; return; }
+  const d = vocabAddData();
+  const p = vocabAddPolicy();
+  hint.textContent = `${op.value}　${(d && d.hints[p]) || ""}`;
+}
+$("vtok-region").addEventListener("change", vocabAddHint);
 
 /* ---------- 第 2 块：两个模式 + 写入目标 ---------- */
 async function vocabSetMode(m) {
@@ -2976,10 +4105,33 @@ async function vocabDoFork(name, newName) {
 
 /* 模式一：表单式（添加 / 删除 / 查询） */
 async function vocabTokenAction(action) {
-  const token = $("vtok-token").value;
+  let token = $("vtok-token").value;
   const msg = $("vtok-msg");
   if (!token) { msg.textContent = "请输入 token 文本"; return; }
   if (!VOCAB.active) { toast("请先打开一个词表标签页", true); return; }
+  const region = $("vtok-region").value;
+  const policy = vocabAddPolicy();
+  if (action === "add") {
+    // 强制格式由所选子区决定；前端先归一/拦截，后端 spec 会再校验一次
+    if (!region || policy === "locked") {
+      msg.textContent = "该子区不可添加：架构契约头被 spec 冻结，请选择 slot 或任一文本子区";
+      return;
+    }
+    if (policy === "angled") {
+      if (token.startsWith("<") || token.startsWith("[")) {
+        if (!(token.startsWith("<") && token.endsWith(">"))) {
+          msg.textContent = "slot 强制 <名字> 包裹：尖括号必须成对，也不能用方括号";
+          return;
+        }
+      } else {
+        token = `<${token}>`;            // 裸名自动补包裹
+      }
+      if (!/^<[A-Za-z_][A-Za-z0-9_./:-]*>$/.test(token)) {
+        msg.textContent = `slot 强制 <名字> 包裹：${token} 的名字不合法`;
+        return;
+      }
+    }
+  }
   // 查询是只读的：不写词表，也就不必过 Fork 闸门
   const tgt = action === "query"
     ? {name: VOCAB.active, mode: "this", new_name: null}
@@ -2990,9 +4142,10 @@ async function vocabTokenAction(action) {
     let name = tgt.name;
     if (tgt.mode === "fork") name = await vocabDoFork(tgt.name, tgt.new_name);
     const r = await api("/api/vocab/token",
-      {name, action, token, category: $("vtok-cat").value});
+      {name, action, token, region});
     if (action === "add")
-      msg.textContent = `已添加 ${r.token} → #${r.id}（${r.category || "—"}）；`
+      msg.textContent = `已添加 ${r.token} → #${r.id}`
+        + `（${r.region || "—"} / ${r.category || "—"}）；`
         + `词表容量 ${r.vocab_size}`;
     else if (action === "remove")
       msg.textContent = `已删除 ${r.token}（原 #${r.id}）；词表容量 ${r.vocab_size}`;
@@ -3156,6 +4309,22 @@ const HK_DEFAULTS = {
   toggleSidebar: "Mod+B",
   prevTool: "Alt+[",
   nextTool: "Alt+]",
+  /* 14 个页面直达：10 个给默认（Alt+数字，彼此不冲突，也不碰
+     Mod+B / Alt+[ / Alt+]），其余留空表示「未绑定」，用户可自行录制。 */
+  gotoHome: "Alt+1",
+  gotoModels: "Alt+2",
+  gotoVocab: "Alt+3",
+  gotoTrain: "Alt+4",
+  gotoInfer: "Alt+5",
+  gotoText: "Alt+6",
+  gotoAudio: "Alt+7",
+  gotoImage: "Alt+8",
+  gotoVideo: "Alt+9",
+  gotoPrims: "Alt+0",
+  gotoJson: "",
+  gotoPdraw: "",
+  gotoTerm: "",
+  gotoSettings: "",
 };
 const TOOL_PAGES = ["text", "audio", "image", "video", "prims",
                     "json", "pdraw"];
@@ -3173,6 +4342,20 @@ const HK_ACTIONS = {
   toggleSidebar: () => toggleSidebar(),
   prevTool: () => cycleTool(-1),
   nextTool: () => cycleTool(1),
+  gotoHome: () => switchPage("home"),
+  gotoInfer: () => switchPage("infer"),
+  gotoModels: () => switchPage("models"),
+  gotoTrain: () => switchPage("train"),
+  gotoText: () => switchPage("text"),
+  gotoAudio: () => switchPage("audio"),
+  gotoImage: () => switchPage("image"),
+  gotoVideo: () => switchPage("video"),
+  gotoPrims: () => switchPage("prims"),
+  gotoJson: () => switchPage("json"),
+  gotoPdraw: () => switchPage("pdraw"),
+  gotoVocab: () => switchPage("vocab"),
+  gotoTerm: () => switchPage("term"),
+  gotoSettings: () => switchPage("settings"),
 };
 function loadHotkeys() {
   try {
@@ -3231,7 +4414,8 @@ function comboLabel(combo) {
   return parts.map(m => names[m] || m).concat(key).join(" ");
 }
 function renderHotkeys() {
-  Object.keys(HK_DEFAULTS).forEach(a => {
+  // 动态遍历运行时绑定表的全部 key（新增的 goto* 标签也一并渲染）
+  Object.keys(HOTKEYS).forEach(a => {
     const label = $("hk-label-" + a);
     if (!label) return;
     label.textContent = comboLabel(HOTKEYS[a]);
@@ -4047,16 +5231,31 @@ const TOOL_DOCS = [
         <li><b>宿主给什么</b>：一块满高容器 <code>root</code>，加
         <code>ctx.api</code>、<code>ctx.config</code>（按插件隔离的
         localStorage）、<code>ctx.signal</code>（卸载时中止异步回调）。</li>
-        <li><b>当前唯一可用插件</b>：<b>token 对话</b>——微信式多轮对话，右边是
-        你的输入、左边是模型输出，上下文逐轮保留；每个 token 以转换器格式
-        <code>{text: B46A}</code>（大写十六进制、自界定）或特殊 token
-        名字（<code>&lt;caps&gt;</code> / <code>&lt;user&gt;</code> /
-        <code>&lt;model&gt;</code> / <code>&lt;stop&gt;</code>…）呈现，顶部实时
+        <li><b>内置插件</b>：<b>Infer-Plug v1.0.0</b>（默认）用正常文字交互、
+        内联文件胶囊与图元画布预览；另有 <b>token 对话</b>——微信式多轮对话，
+        每个 token 以转换器格式 <code>{text: B46A}</code>（大写十六进制、自界定）
+        或特殊 token 名字（<code>&lt;caps&gt;</code> / <code>[user]</code> /
+        <code>[model]</code> / <code>&lt;stop&gt;</code>…）呈现，顶部实时
         给出 <b>TTFT</b> 与 <b>tok/s</b>。<b>Enter 不发送（防误触）</b>，只能点
         「发送」。输入只接受 token 格式（十六进制 ID、<code>{t:…}</code> /
         <code>{text: …}</code>、固定名字的特殊 token），不解析自然语言。</li>
-        <li><b>base 词表插件</b>：开发中，按约定<b>不注册、不显示</b>。
-        协议与它未来要用的接口已经写完，见 <code>plugins/README.md</code>。</li>
+        <li><b>契约</b>：base1.3.0 词表（token-6）。契约头 = <b>六段</b>：
+        <code>core 3</code>（<code>&lt;caps&gt;</code>/<code>&lt;stop&gt;</code>/
+        <code>&lt;draw:end&gt;</code>，单开一类）+ <code>boundary 6</code>
+        （<code>[user]</code> 等 <code>[]</code> 边界）+ <code>system 3</code>
+        + <b>N 个用户自定义槽位</b> <code>&lt;s0&gt;…&lt;sN-1&gt;</code>
+        （<b>N 由词表 config 的 slot_count 决定，spec 不钉死</b>；默认编号命名，
+        名字也可自定义成任意不重名的 <code>&lt;名字&gt;</code>——词表页选
+        slot 子区即可增删；语义自己定义、执行先全不接）
+        + <code>typst 228</code>（114 个 Typst
+        语法构造 × 显式开/闭对，与 core 同类、挂 TYPE_NONE，插在 slot 后、draw 前）
+        + <code>draw 9605</code>。
+        <b>base 零预留</b>（N=0 → HEAD_SIZE 9845、DRAW_BEGIN 240）；要槽位跑
+        <code>service/tokens/gen_vocab.py --name NAME --slots N</code>。
+        可见区末尾另有 1.3.0 追加的 <code>unicode_ext</code> 3537 字 / 31 区块，
+        全表 vocab_size 80262；1.3.0 又是一次 ID 整体位移（+228），旧存档不可读。
+        全表见 <code>plugins/AGENT_TOKENS.md</code>，插件契约详见
+        <code>plugins/README.md</code>。</li>
         <li><b>切换 / 导入</b>：右侧开发者选项 → 显示插件。选择会记住；
         「导入插件…」可选一个本地 <code>.js</code>（可附同名 <code>.css</code>），
         服务端落到 <code>service/web/plugins/</code> 并登记，导入后可直接在
@@ -4494,6 +5693,277 @@ window.addEventListener("scroll", ev => {
 }, true);
 window.addEventListener("resize", closeAllCsel);
 
+/* ===========================================================================
+   设置页：分类路由 / 历史对话 / 环境与依赖
+   =========================================================================== */
+function switchSetCat(cat) {
+  ["appearance", "hotkeys", "history", "env"].forEach(c => {
+    const nav = document.querySelector(
+      `#set-nav .set-nav-item[data-cat="${c}"]`);
+    if (nav) nav.classList.toggle("on", c === cat);
+    const pane = $("set-pane-" + c);
+    if (pane) {
+      pane.hidden = (c !== cat);
+      pane.classList.toggle("on", c === cat);   // 兼容 .on / hidden 两种 CSS 约定
+    }
+  });
+  if (cat === "history") refreshHistory();
+  if (cat === "env") refreshEnvPane();
+}
+$$("#set-nav .set-nav-item").forEach(item => {
+  item.onclick = () => switchSetCat(item.dataset.cat);
+});
+
+/* ---------------- 历史对话 ---------------- */
+let HIST_SEL = null;      // 当前选中的会话 id
+let HIST_CACHE = null;    // 最近一次详情 session（切换显示插件时复用）
+
+function histTime(v) {
+  if (v == null || v === "") return "—";
+  const d = new Date(typeof v === "number" ? (v < 1e12 ? v * 1000 : v) : v);
+  return isNaN(d.getTime()) ? String(v) : d.toLocaleString();
+}
+/* token id → {text: HEX} / <名字>。本地实现，不 import 插件内部代码。 */
+function histTokenText(ids) {
+  if (!Array.isArray(ids) || !ids.length) return "（空）";
+  return ids.map(id => {
+    if (typeof id === "string" && /^<.*>$/.test(id)) return id;   // <caps> 等名字
+    const n = Number(id);
+    return Number.isFinite(n) ? "{text: " + _IDHEX(n) + "}" : String(id);
+  }).join("");
+}
+function histMsgCount(s) {
+  if (s.n_messages != null) return s.n_messages;
+  if (s.message_count != null) return s.message_count;
+  return Array.isArray(s.messages) ? s.messages.length : 0;
+}
+function fillHistPluginSelect() {
+  const sel = $("hist-plugin");
+  if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = PLUGINS.filter(p => !p.status).map(p =>
+    `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("");
+  if (prev) sel.value = prev;
+}
+
+async function refreshHistory() {
+  const box = $("hist-list");
+  if (!box) return;
+  fillHistPluginSelect();          // 导入插件注册后刷新历史时补齐选项
+  try {
+    const arr = (await api("/api/sessions")).sessions || [];
+    box.innerHTML = arr.map(s =>
+      `<div class="hist-item${s.id === HIST_SEL ? " on" : ""}" data-id="${esc(s.id)}">
+         <div class="hist-t">${esc(s.title || "未命名会话")}</div>
+         <div class="hist-meta">${histMsgCount(s)} 条 · ${
+           esc(histTime(s.updated || s.created))} · ${esc(s.plugin || "")} · ${
+           esc(s.model || "")}</div>
+       </div>`).join("") || `<div class="hint">暂无历史会话</div>`;
+    box.querySelectorAll(".hist-item").forEach(it => {
+      it.onclick = () => openHistoryDetail(it.dataset.id);
+    });
+  } catch (e) {
+    box.innerHTML = `<div class="hint">读取失败: ${esc(e.message)}</div>`;
+  }
+}
+
+async function openHistoryDetail(id) {
+  HIST_SEL = id;
+  $$("#hist-list .hist-item").forEach(x =>
+    x.classList.toggle("on", x.dataset.id === id));
+  const content = $("hist-content");
+  if (content) content.textContent = "读取中…";
+  try {
+    const s = (await api("/api/session/get?id=" + encodeURIComponent(id))).session;
+    if (!s) throw new Error("会话不存在");
+    HIST_CACHE = s;
+    const sel = $("hist-plugin");
+    if (sel && s.plugin) sel.value = s.plugin;   // 默认设成该会话的 plugin
+    renderHistoryDetail(s);
+  } catch (e) {
+    if (content) content.textContent = "读取失败: " + e.message;
+  }
+}
+
+function renderHistoryDetail(s) {
+  const detail = $("hist-detail"), content = $("hist-content");
+  const sel = $("hist-plugin");
+  const pname = sel ? (sel.selectedOptions && sel.selectedOptions[0]
+    ? sel.selectedOptions[0].textContent : sel.value) : "—";
+  if (detail) {
+    /* 只增删自己加的 .hist-meta，绝不清空 detail：#hist-content 可能是它的子节点 */
+    const old = detail.querySelector(":scope > .hist-meta");
+    if (old) old.remove();
+    const m = document.createElement("div");
+    m.className = "hist-meta";
+    m.textContent = `${s.title || "未命名会话"} · ${s.id} · ` +
+      `${histTime(s.created)} → ${histTime(s.updated)} · ` +
+      `插件 ${s.plugin || "—"} · 模型 ${s.model || "—"} · 按「${pname}」显示`;
+    detail.appendChild(m);
+  }
+  if (content) {
+    const msgs = Array.isArray(s.messages) ? s.messages : [];
+    content.innerHTML = msgs.map(m => {
+      const me = m.role === "me";
+      return `<div class="hist-msg ${me ? "me" : "bot"}">
+        <div class="hist-who">${me ? "我" : "模型"} <span class="hist-ts">${
+          esc(histTime(m.ts))}</span></div>
+        <div class="hist-tok">${esc(histTokenText(m.token_ids))}</div>
+      </div>`;
+    }).join("") || `<div class="hint">暂无消息</div>`;
+  }
+}
+
+if ($("hist-plugin")) $("hist-plugin").addEventListener("change", () => {
+  if (HIST_CACHE) renderHistoryDetail(HIST_CACHE);
+});
+if ($("set-hist-refresh")) $("set-hist-refresh").onclick = refreshHistory;
+if ($("hist-open")) $("hist-open").onclick = async () => {
+  if (!HIST_SEL) { toast("请先选择一个会话", true); return; }
+  switchPage("infer");
+  await SESSIONS.open(HIST_SEL);
+};
+if ($("hist-delete")) $("hist-delete").onclick = async () => {
+  if (!HIST_SEL) { toast("请先选择一个会话", true); return; }
+  const ok = await uiConfirm(`确定删除会话「${HIST_SEL}」？此操作不可恢复。`);
+  if (!ok) return;
+  const id = HIST_SEL;
+  try {
+    await api("/api/session/delete", {id});
+    toast("已删除会话");
+    HIST_SEL = null; HIST_CACHE = null;
+    SESSIONS.list = (await api("/api/sessions")).sessions || [];
+    if (SESSIONS.id === id) {                  // 删的是当前会话 → 切到相邻
+      const next = SESSIONS.list[0];
+      if (next) await SESSIONS.open(next.id);
+      else await SESSIONS.create();
+    } else {
+      SESSIONS.renderConvTabs();
+    }
+    const d = $("hist-detail");
+    if (d) { const old = d.querySelector(":scope > .hist-meta"); if (old) old.remove(); }
+    const c = $("hist-content");
+    if (c) c.textContent = "";
+    refreshHistory();
+  } catch (e) { toast("删除失败: " + e.message, true); }
+};
+
+/* ---------------- 环境与依赖（设置页 env pane） ---------------- */
+async function refreshEnvPane() {
+  const msg = $("set-env-msg");
+  if (msg) msg.textContent = "读取中…";
+  try {
+    const [dr, br] = await Promise.all([
+      api("/api/env/deps"), api("/api/env/binaries")]);
+    renderEnvDeps(dr.deps || []);
+    renderEnvBins(br.binaries || []);
+    if (msg) msg.textContent = "";
+  } catch (e) {
+    if (msg) msg.textContent = "读取失败: " + e.message;
+  }
+}
+function envBadge(ok, okText, badText) {
+  return ok ? `<span class="badge on">${okText}</span>`
+            : `<span class="badge">${badText}</span>`;
+}
+function renderEnvDeps(deps) {
+  const box = $("env-dep-list");
+  if (!box) return;
+  box.innerHTML = (deps || []).map(d => {
+    const name = d.name || d.id || "—";
+    const ver = d.version || "—";
+    const ok = !!(d.ok || d.installed || d.status === "ok" ||
+                  d.status === "installed" || d.status === "satisfied");
+    const req = d.required ? `<span class="badge">必需</span>` : "";
+    return `<div class="env-row" data-name="${esc(name)}">
+      <span class="env-nm">${esc(name)} <span class="env-ver">${esc(ver)}</span></span>
+      ${envBadge(ok, "已安装", "未安装")}${req}
+      <span class="env-acts">
+        <button class="act sec xs env-install" data-name="${esc(name)}">${
+          ok ? "更新" : "安装"}</button>
+        <button class="act sec xs del env-remove" data-name="${esc(name)}">删除</button>
+      </span>
+    </div>`;
+  }).join("") || `<div class="hint">暂无依赖</div>`;
+  /* 事件委托：innerHTML 重绘不会丢绑定 */
+  box.onclick = e => {
+    const ins = e.target.closest(".env-install");
+    const rm = e.target.closest(".env-remove");
+    if (ins) envInstall(ins.dataset.name);
+    else if (rm) envRemove(rm.dataset.name);
+  };
+}
+function renderEnvBins(bins) {
+  const box = $("env-bin-list");
+  if (!box) return;
+  box.innerHTML = (bins || []).map(b => {
+    const name = b.name || "—", path = b.path || "—", ver = b.version || "—";
+    const ok = !!(b.satisfied || b.ok);
+    const req = b.required ? `<span class="badge">必需</span>` : "";
+    return `<div class="env-row">
+      <span class="env-nm">${esc(name)} <span class="env-ver">${esc(ver)}</span></span>
+      <span class="env-path">${esc(path)}</span>
+      ${envBadge(ok, "满足", "缺失")}${req}
+    </div>`;
+  }).join("") || `<div class="hint">暂无系统依赖</div>`;
+}
+
+/* 版本选择：自绘菜单（modal 内一组按钮），不弹原生 select 弹层 */
+async function envPickVersion(name) {
+  let versions = [];
+  try {
+    const r = await api("/api/env/versions?name=" + encodeURIComponent(name));
+    versions = r.versions || r.list || [];
+  } catch (e) {
+    const m = $("set-env-msg");
+    if (m) m.textContent = "读取版本失败: " + e.message;
+    return null;
+  }
+  if (!versions.length) return "";    // 后端没给版本列表 → 装默认版本
+  const html = `<div class="ver-menu">` + versions.map(v =>
+    `<button type="button" class="ver-opt" data-v="${esc(String(v))}">${
+      esc(String(v))}</button>`).join("") + `</div>`;
+  const p = modalOpenHTML(`选择「${name}」的版本`, html, "取消", false, false);
+  $("modal-body").querySelectorAll(".ver-opt").forEach(b => {
+    b.onclick = () => modalClose(b.dataset.v);
+  });
+  const v = await p;
+  return typeof v === "string" ? v : null;    // 确定 / 遮罩 / Esc → 取消
+}
+async function envInstall(name) {
+  const msg = $("set-env-msg");
+  const v = await envPickVersion(name);
+  if (v === null) return;
+  if (msg) msg.textContent = `正在安装「${name}」${v ? " " + v : ""}…`;
+  try {
+    const body = {name};
+    if (v) body.version = v;
+    const r = await api("/api/env/install", body);
+    await pollTask(r.task_id, {onTick: t => {
+      if (msg && t && t.message) msg.textContent = t.message;
+    }});
+    if (msg) msg.textContent = `「${name}」安装完成`;
+    await refreshEnvPane();
+  } catch (e) {
+    if (msg) msg.textContent = "安装失败: " + e.message;
+  }
+}
+async function envRemove(name) {
+  const ok = await uiConfirm(`确定移除依赖「${name}」？`);
+  if (!ok) return;
+  const msg = $("set-env-msg");
+  if (msg) msg.textContent = `正在移除「${name}」…`;
+  try {
+    const r = await api("/api/env/remove", {name});
+    await pollTask(r.task_id);
+    if (msg) msg.textContent = `「${name}」已移除`;
+    await refreshEnvPane();
+  } catch (e) {
+    if (msg) msg.textContent = "移除失败: " + e.message;
+  }
+}
+if ($("set-env-refresh")) $("set-env-refresh").onclick = refreshEnvPane;
+
 $$("select").forEach(enhanceSelect);
 /* 运行时动态插入的 <select>（例如图元编辑器 pdrawForm 用 innerHTML 造的
    `data-f="shape"`）也必须自绘。只增强一次的话，那个下拉会漏回系统原生
@@ -4509,8 +5979,38 @@ fillPluginSelect();
 bindPluginImport();
 refreshPluginRegistry();            // 异步拉导入插件清单，回来后重绘选择器
 
-// 采样参数滑块：任何改动都实时推到当前插件配置（切换插件后挂载末尾也会补一次）
-["infer-temp", "infer-topp"].forEach(id => {
+// 采样参数：任何改动都实时推到当前插件配置与 per-session 会话（后者会 savePatch）
+["infer-temp", "infer-topp", "infer-maxnew"].forEach(id => {
   const elx = $(id);
   if (elx) elx.addEventListener("input", syncSamplingToPlugin);
 });
+
+/* 启动：DOM 与插件注册完成后拉会话列表、恢复上次 tab；会话打开会按
+   current.plugin 重挂插件，首次进入推理页时插件已带着 current.messages 就位。 */
+fillHistPluginSelect();
+switchSetCat("appearance");
+/* 用户手动切换插件也写回当前会话（程序赋值 sel.value 不触发 change） */
+if ($("plugin-select")) $("plugin-select").addEventListener("change", () => {
+  if (SESSIONS.current) SESSIONS.savePatch({plugin: $("plugin-select").value});
+});
+SESSIONS.load();
+
+/* 状态条的「上下文 / model」不随 token 流走，低频独立刷新。
+   - 上下文 = 当前会话所有消息 token_ids 的总长（完整对话累计），与
+     「本轮发给服务端的长度」无关：KV 开启时请求里往往只有增量 ids。
+   - model = /api/status 的活动模型名；选中/换模型后 2 秒内跟上。
+   只在推理页激活时跑，别的页面不打 /api/status。 */
+function refreshStatusbarContext() {
+  const page = $("p-infer");
+  if (!page || !page.classList.contains("active")) return;
+  try {
+    const msgs = (SESSIONS.current && SESSIONS.current.messages) || [];
+    let n = 0;
+    for (const m of msgs) n += (m.token_ids || []).length;
+    updateInferMetrics({ctx: n});
+  } catch (e) {}
+  api("/api/status").then(st => updateInferMetrics({model: st.model || "未加载"}))
+    .catch(() => {});
+}
+setInterval(refreshStatusbarContext, 2000);
+refreshStatusbarContext();

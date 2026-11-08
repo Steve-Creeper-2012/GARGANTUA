@@ -15,7 +15,8 @@
 # 词表不变量（由 tokens/vfc.py 与 tokens/vocab.py 强制）：
 #   - ID 严格连续 0..N-1，**不允许空位**（空位也要占一个 embedding 行）
 #   - token 文本全表唯一
-#   - 前 HEAD_SIZE 个 ID 是架构契约头（special/system/draw），不可删改
+#   - 前 HEAD_SIZE 个 ID 是架构契约头（core/boundary/system/slot/
+#     typst/draw 六段），不可删改
 #
 # 安全：所有路径拼接都先过 vocab_dir() 的名字校验 + realpath 前缀校验，
 # 防止 HTTP 入参 name / new_name 穿越写出到任意 vocab.vfc。
@@ -41,7 +42,9 @@ VOCAB_CONFIG_NAME = spec.VOCAB_CONFIG_NAME
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VOCABS_DIR = PROJECT_ROOT / "vocabs"
-BASE = "base"
+# 2026-11-05：基础词表带版本号。旧 vocabs/base/ 已删除，ID 布局不兼容，
+# 不做向后兼容（下次再做兼容层）。名字唯一真源在 spec。
+BASE = spec.BASE_VOCAB_NAME
 VOCAB_FOLDER_FORMAT = "gargantua-vocab-folder-v1"
 
 GLOBAL_VOCAB_DIR = PROJECT_ROOT / "service" / "tokens"
@@ -89,6 +92,11 @@ def _valid_name(name) -> str | None:
         return "词表名过长（>64）"
     if name in (".", ".."):
         return "非法名称"
+    # 基础词表带版本号（spec.BASE_VOCAB_NAME，当前 base1.3.0）——唯一允许
+    # 带点号的名字，且是系统常量、不含路径分隔符，不可能被拿来穿越。
+    # 其它带点号的名字（a.b / bad.name）仍一律拒绝，保持路径防护强度。
+    if name == BASE:
+        return None
     for ch in name:
         if not (ch.isascii() and (ch.isalnum() or ch in "_-")):
             return "词表名只能含字母/数字/下划线/连字符"
@@ -246,6 +254,10 @@ def save_vocab_config(name: str, v: Vocab) -> None:
     cfg["regions"] = [{"region": r["region"], "category": r["category"],
                        "size": r["size"]} for r in v.regions]
     cfg["vocab_size"] = len(v)
+    # slot 段增删会改变头部长度：不写回这两个字段，下次加载会拿旧的
+    # head_size 判 is_invisible / draw_begin，整张词表ID语义就错位了。
+    cfg["head_size"] = v.head_size
+    cfg["slot_count"] = v.slot_count
     write_config(name, cfg)
 
 
@@ -360,13 +372,17 @@ def ensure_base() -> None:
     write_config(BASE, {
         "name": BASE,
         "format": VOCAB_FOLDER_FORMAT,
+        "vocab_version": spec.VOCAB_VERSION,
+        "token_encoding": spec.TOKEN_ENCODING,
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "source": None,
-        "description": "基础词表（系统预设，不可直接编辑）",
+        "description": f"基础词表 {BASE}（系统预设，不可直接编辑）",
         "is_main": True,
         "regions": regions,
         "vocab_size": len(entries),
         "head_size": spec.HEAD_SIZE,
+        # 预留槽位数由 config 决定（base 恒为 0）；spec 不钉死这个数字。
+        "slot_count": spec.SLOT_COUNT,
     })
     _HEAD_OK = True
 
@@ -458,7 +474,7 @@ def create_vocab(name: str, source: str = BASE) -> dict:
 
 
 def create_empty_vocab(name: str) -> dict:
-    """创建一张「空词表」：只含架构契约头（special/system/draw），
+    """创建一张「空词表」：只含架构契约头（六段，含 typst），
     不含任何用户 token。满足 .vfc 的全部不变量（ID 连续 0..HEAD_SIZE-1、
     头契约完整），用户可在其上从零增删。base 不可被空词表覆盖。
 
@@ -479,13 +495,23 @@ def create_empty_vocab(name: str) -> dict:
         d.mkdir(parents=True, exist_ok=True)
         entries = vfc.head_entries()
         vfc.write_vfc(str(vocab_vfc_path(name)), entries)
+        # 六段契约头逐个列出（名字与 spec.HEAD_REGION_ORDER 对齐）；再补上
+        # 全部可见子区的 0 长度占位——这样「添加到哪个子区」下拉在空词表上
+        # 同样能列出全部 16 个子区，加第一个文本 token 就有明确落点。
+        head_sizes = {
+            "core": spec.CORE_SIZE, "boundary": spec.BOUNDARY_SIZE,
+            "system": spec.SYSTEM_SIZE, "slot": spec.SLOT_SIZE,
+            "typst": spec.TYPST_SIZE, "draw": spec.MODAL_SIZE,
+        }
         regions = [
-            {"region": "special", "category": "special",
-             "size": spec.SPECIAL_SIZE},
-            {"region": "system", "category": "system",
-             "size": spec.SYSTEM_SIZE},
-            {"region": "draw", "category": "special",
-             "size": spec.MODAL_SIZE},
+            {"region": r,
+             "category": ("system" if r == "system" else "special"),
+             "size": head_sizes[r]}
+            for r in spec.HEAD_REGION_ORDER
+        ]
+        regions += [
+            {"region": r, "category": spec.REGION_CATEGORY[r], "size": 0}
+            for r in spec.VISIBLE_REGION_ORDER
         ]
         if sum(r["size"] for r in regions) != len(entries):
             regions = [{"region": "visible", "category": "regular",
@@ -618,16 +644,22 @@ def _require_editable(name: str) -> None:
             "出去的其它词表与已建模型。请先 Fork 出一份再编辑。")
 
 
-def add_token_to(name: str, text: str, category: str = "regular") -> dict:
-    """给词表加一个 token（紧凑插入指定子区末尾，不留空位）。"""
+def add_token_to(name: str, text: str, category: str = "regular",
+                 region: str | None = None) -> dict:
+    """给词表加一个 token（紧凑插入指定子区末尾，不留空位）。
+
+    region 给定 → 走 spec.REGION_ADD_POLICY（子区策略 + 文本强制格式）；
+    region 缺省 → 兼容老调用的两档 category（regular / special）。
+    """
     ensure_base()
     _require_editable(name)
     with _LOCK:
         v = load_vocab(name, fresh=True)   # 写路径：实例会被就地变异
-        tid = v.add_token(text, category)
+        tid = v.add_token(text, category, region=region)
         save_vocab_config(name, v)
-    return {"vocab": name, "token": text, "category": category, "id": tid,
-            "vocab_size": len(v)}
+    return {"vocab": name, "token": v.token(tid),
+            "category": v.category_of(tid), "region": v.region_of(tid),
+            "id": tid, "vocab_size": len(v)}
 
 
 def remove_token_from(name: str, text: str) -> dict:
@@ -712,10 +744,29 @@ def vocab_occupancy(name: str) -> dict:
             samples.append(t if len(t) <= 16 else t[:15] + "…")
             if len(samples) >= 4:
                 break
-        regions.append({**r, "samples": samples})
+        # 添加策略跟着 spec 的唯一真源下发，前端不抄子区名/规则；
+        # 未知子区（旧 config 里的 "special" / "visible"）按锁定处理最安全。
+        regions.append({**r, "samples": samples,
+                        "add_policy": spec.REGION_ADD_POLICY.get(
+                            r["region"], spec.POLICY_LOCKED)})
+    # 「添加到哪个子区」下拉的数据源：始终给全 16 个规范子区，哪怕这份
+    # 词表当前没有该区（空词表的末尾 0 长度区会被 _build_regions 折叠掉）。
+    # 旧 config 里的非规范区（"special" / "visible"）补在末尾并按锁定处理。
+    present = {r["region"] for r in regions}
+    add_regions = [
+        {"region": r, "add_policy": spec.REGION_ADD_POLICY[r],
+         "present": r in present}
+        for r in spec.REGION_ORDER
+    ] + [{"region": r["region"], "add_policy": spec.POLICY_LOCKED,
+          "present": True}
+         for r in regions if r["region"] not in spec.REGION_ORDER]
+    # 用该词表自己的 head_size，而不是全局 spec.HEAD_SIZE：slot 段增删会
+    # 让派生词表的头部变长/变短，用全局常量会把「可见/不可见」算错。
     return {"name": name, "vocab_size": n,
-            "visible_size": max(n - spec.HEAD_SIZE, 0),
-            "invisible_size": min(n, spec.HEAD_SIZE),
+            "visible_size": max(n - v.head_size, 0),
+            "invisible_size": min(n, v.head_size),
             "is_main": name == BASE,
             "regions": regions,
+            "add_regions": add_regions,
+            "add_policy_hints": dict(spec.ADD_POLICY_HINTS),
             "category_totals": v.category_totals()}

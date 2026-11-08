@@ -1,8 +1,8 @@
 # ===========================================================================
 # GARGANTUA v1 — test_infer_archive.py：推理存档的 user/model 段边界包裹
 # ---------------------------------------------------------------------------
-# 验证 generate() 把「用户输入」包成 <user>…<user/>、「模型输出」包成
-# <model>…<model/> 写进 .tokens 存档（与训练 .tokens 同一套边界约定）。
+# 验证 generate() 把「用户输入」包成 [user]…[user/]、「模型输出」包成
+# [model]…[model/] 写进 .tokens 存档（与训练 .tokens 同一套边界约定）。
 # 同时覆盖媒体步（视觉 patch）经 from_steps → add_items 落盘的路径。
 #
 # 这是 steve 2026-11-05 拍板的需求：存档里必须能看出谁是谁，而不是扁平
@@ -27,7 +27,7 @@ import tempfile
 import unittest
 
 import spec
-from tokens import tok5
+from tokens import tok6
 from tokens.vocab import Vocab
 from infer import IdArchive
 
@@ -64,7 +64,7 @@ class TestInferArchiveWrapping(unittest.TestCase):
 
         files = [f for f in os.listdir(root) if f.endswith(".tokens")]
         self.assertEqual(len(files), 1, files)
-        items = tok5.read_file(os.path.join(root, files[0]))
+        items = tok6.read_file(os.path.join(root, files[0]))
 
         ext_ids = [it["id"] for it in items if it.get("kind") == "ext"]
         text_ids = []
@@ -74,16 +74,16 @@ class TestInferArchiveWrapping(unittest.TestCase):
                     if e.get("kind") == "text":
                         text_ids.append(e["id"])
 
-        # 四个边界按 <user> <user/> <model> <model/> 顺序出现
+        # 四个边界按 [user] [user/] [model] [model/] 顺序出现
         self.assertEqual(
             ext_ids,
             [spec.USER_ID, spec.USER_END_ID, spec.MODEL_ID, spec.MODEL_END_ID],
             "边界 token 顺序或数量不对")
         # 内容 token 全部落盘、顺序正确（prompt 在前、生成为后）
         self.assertEqual(text_ids, prompt_ids + out_ids)
-        # 边界 id 必须能被前端映射成名（<user>/<user/>/<model>/<model/>）
+        # 边界 id 必须能被前端映射成名（[user]/[user/]/[model]/[model/]）
         for i in ext_ids:
-            self.assertIn(i, spec.T5_BOUND_ID_TO_NAME,
+            self.assertIn(i, spec.T6_BOUND_ID_TO_NAME,
                           "边界 id 没有对应名字，前端渲染会丢结构")
 
     def test_media_step_also_archived(self):
@@ -98,7 +98,7 @@ class TestInferArchiveWrapping(unittest.TestCase):
         root = self._tmp_root()
         arc = IdArchive("", root)
         arc.add([spec.USER_ID])
-        arc.add_items(tok5.from_steps(media_steps))
+        arc.add_items(tok6.from_steps(media_steps))
         arc.add(prompt_ids)
         arc.add([spec.USER_END_ID])
         arc.add([spec.MODEL_ID])
@@ -108,7 +108,7 @@ class TestInferArchiveWrapping(unittest.TestCase):
 
         files = [f for f in os.listdir(root) if f.endswith(".tokens")]
         self.assertEqual(len(files), 1)
-        items = tok5.read_file(os.path.join(root, files[0]))
+        items = tok6.read_file(os.path.join(root, files[0]))
 
         # 媒体步应呈现为一个含 visual 元素的 step
         n_visual = sum(
@@ -122,7 +122,7 @@ class TestInferArchiveWrapping(unittest.TestCase):
             [spec.USER_ID, spec.USER_END_ID, spec.MODEL_ID, spec.MODEL_END_ID])
 
     def test_empty_generation_still_closes_boundaries(self):
-        """无生成时也要写一对空 <model>…<model/>，保持存档结构完整。"""
+        """无生成时也要写一对空 [model]…[model/]，保持存档结构完整。"""
         prompt_ids = _visible_ids(2)
         root = self._tmp_root()
         arc = IdArchive("", root)
@@ -134,7 +134,7 @@ class TestInferArchiveWrapping(unittest.TestCase):
         arc.close(n_prompt=len(prompt_ids), n_generated=0)
 
         files = [f for f in os.listdir(root) if f.endswith(".tokens")]
-        items = tok5.read_file(os.path.join(root, files[0]))
+        items = tok6.read_file(os.path.join(root, files[0]))
         ext_ids = [it["id"] for it in items if it.get("kind") == "ext"]
         # 即使无生成，<model> 与 <model/> 也必须成对出现
         self.assertIn(spec.MODEL_ID, ext_ids)

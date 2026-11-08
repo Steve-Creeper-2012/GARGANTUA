@@ -56,25 +56,42 @@ class HeadContractTest(unittest.TestCase):
 
     def test_head_size_matches_spec(self):
         self.assertEqual(_H, spec.HEAD_SIZE)
-        self.assertEqual(_H, 6 + 3 + spec.DRAW_VOCAB_SIZE)
+        # 2026-11-05：头 = special + system + agent + draw 四段
+        # 2026-11-07（base1.3.0）：slot 与 draw 之间新增 typst 段（228）
+        self.assertEqual(_H, spec.SPECIAL_SIZE + spec.SYSTEM_SIZE
+                         + spec.AGENT_SIZE + spec.TYPST_SIZE
+                         + spec.DRAW_VOCAB_SIZE)
         self.assertEqual(len(_HEAD), _H)
 
     def test_head_ids_are_dense(self):
         self.assertEqual([e[0] for e in _HEAD], list(range(_H)))
 
     def test_head_names_come_from_spec(self):
-        # 不可显示条目的 text 自带尖括号，与 spec / vocab.json 的拼写一致
-        self.assertEqual([e[1] for e in _HEAD[:6]], list(spec.SPECIAL_TOKENS))
-        self.assertEqual([e[1] for e in _HEAD[6:9]], spec.SYSTEM_CHARS)
-        # DRAW 区第 0 段是画布声明定界符（2026-11-01：<x> <x/> <y> <y/>），
-        # 其后 x/y 字段是「名字 = 像素号」的 <x0>… / <y0>…
-        self.assertEqual(_HEAD[9][1], spec.DRAW_CANVAS_OPEN_X)
-        self.assertEqual(_HEAD[9 + 1][1], spec.DRAW_CANVAS_CLOSE_X)
-        self.assertEqual(_HEAD[9 + 2][1], spec.DRAW_CANVAS_OPEN_Y)
-        self.assertEqual(_HEAD[9 + spec.DRAW_CANVAS_BINS - 1][1],
+        # 不可显示条目的 text 自带包裹（<> 工具 / [] 边界），与 spec 一致
+        self.assertEqual(
+            [e[1] for e in _HEAD[:spec.SPECIAL_SIZE]],
+            list(spec.SPECIAL_TOKENS))
+        self.assertEqual(
+            [e[1] for e in _HEAD[spec.SYSTEM_BEGIN:
+                                 spec.SYSTEM_BEGIN + spec.SYSTEM_SIZE]],
+            spec.SYSTEM_CHARS)
+        self.assertEqual(
+            [e[1] for e in _HEAD[spec.AGENT_BEGIN:spec.AGENT_END]],
+            list(spec.AGENT_TOKENS))
+        b = spec.DRAW_BEGIN
+        # DRAW 区第 0 段是画布声明定界符（<x> <x/> <y> <y/>），其后是
+        # x/y 字段「名字 = 像素号」的 <x0>… / <y0>…
+        self.assertEqual(_HEAD[b][1], spec.DRAW_CANVAS_OPEN_X)
+        self.assertEqual(_HEAD[b + 1][1], spec.DRAW_CANVAS_CLOSE_X)
+        self.assertEqual(_HEAD[b + 2][1], spec.DRAW_CANVAS_OPEN_Y)
+        self.assertEqual(_HEAD[b + spec.DRAW_CANVAS_BINS - 1][1],
                          spec.DRAW_CANVAS_CLOSE_Y)
-        self.assertEqual(_HEAD[9 + spec.DRAW_CANVAS_BINS][1], "<x0>")
+        self.assertEqual(_HEAD[b + spec.DRAW_CANVAS_BINS][1], "<x0>")
         self.assertEqual(_HEAD[_H - 1][1], "<draw:special:2>")
+        # 边界改用 [] 包裹，<> 留给工具调用
+        self.assertEqual(_HEAD[spec.USER_ID][1], "[user]")
+        self.assertEqual(_HEAD[spec.SYS_ID][1], "[sys]")
+        self.assertEqual(_HEAD[spec.DRAW_END_ID][1], "<draw:end>")
 
     def test_common_english_words_do_not_collide_with_head(self):
         """stop / model / user / caps 也是收录的英文单词，不能与头部撞文本。
@@ -89,25 +106,64 @@ class HeadContractTest(unittest.TestCase):
                              (_H, word, True))
 
     def test_head_visibility(self):
-        # special / draw 不可显示；system（{ } |）不是合法标识符，只能落引号
-        self.assertEqual([e[2] for e in _HEAD[:6]], [False] * 6)
-        self.assertEqual([e[2] for e in _HEAD[6:9]], [True] * 3)
-        self.assertEqual([e[2] for e in _HEAD[9:]], [False] * (_H - 9))
+        # special / agent / draw 不可显示；system（{ } |）不是合法标识符，
+        # 只能落引号。2026-11-05 起 agent 区也是头的一部分。
+        self.assertEqual(
+            [e[2] for e in _HEAD[:spec.SPECIAL_SIZE]],
+            [False] * spec.SPECIAL_SIZE)
+        self.assertEqual(
+            [e[2] for e in _HEAD[spec.SYSTEM_BEGIN:
+                                 spec.SYSTEM_BEGIN + spec.SYSTEM_SIZE]],
+            [True] * spec.SYSTEM_SIZE)
+        self.assertEqual(
+            [e[2] for e in _HEAD[spec.SYSTEM_BEGIN + spec.SYSTEM_SIZE:]],
+            [False] * (_H - spec.SYSTEM_BEGIN - spec.SYSTEM_SIZE))
 
     def test_head_roundtrip_and_validates(self):
         text = vfc.dumps_vfc(_HEAD)
         self.assertEqual(vfc.parse_vfc(text), _HEAD)
         self.assertEqual(vfc.validate_vfc(text), [])
 
+    def test_typst_closed_tag_roundtrip(self):
+        """base1.3.0：Typst 闭标签 </H1> 名字带前导 '/'，vfc 正则已放宽。
+
+        回归点：旧 _ANGLED_* 正则不允许前导 '/'，会把 </H1> 当成非法名字。
+        契约头本就含 114 对开/闭结构 token，这里单独验证闭标签能原样写出、
+        解析、校验通过、并幂等往返。
+        """
+        text = vfc.dumps_vfc(_HEAD)
+        self.assertIn("</H1>:", text)
+        parsed = vfc.parse_vfc(text)
+        self.assertEqual(parsed, _HEAD)
+        self.assertEqual(vfc.validate_vfc(text), [])
+        self.assertEqual(vfc.dumps_vfc(parsed), text)
+        closed = [e for e in parsed if e[1] == "</H1>"]
+        self.assertEqual(len(closed), 1)
+        tid, tok, visible = closed[0]
+        self.assertEqual(tid, spec.TYPST_CLOSE_ID["H1"])
+        self.assertEqual(tok, "</H1>")
+        self.assertFalse(visible)
+
     def test_head_text_is_on_its_own_line(self):
         lines = vfc.dumps_vfc(_HEAD).split(NL)
         self.assertEqual(lines[0], vfc.MAGIC)
         self.assertEqual(lines[1], "<caps>:0")
-        self.assertEqual(lines[7], '"{":6')
-        # ID 9-12：画布声明定界符；ID 13：x 字段第一个像素 token
-        self.assertEqual(lines[10], "<x>:9")
-        self.assertEqual(lines[13], "<y/>:C")
-        self.assertEqual(lines[14], f"<x0>:{13:X}")
+        self.assertEqual(lines[1 + spec.USER_ID],
+                         f"[user]:{spec.USER_ID:X}")
+        self.assertEqual(lines[1 + spec.SYS_ID], f"[sys]:{spec.SYS_ID:X}")
+        self.assertEqual(lines[1 + spec.SYSTEM_BEGIN],
+                         f'"{{":{spec.SYSTEM_BEGIN:X}')
+        # slot 段数量由 config 决定（base 零预留时该位置就是 draw 首个
+        # token）；从 head_entries() 取名字，避免把某个具体布局钉死。
+        _slot0 = spec.AGENT_BEGIN
+        self.assertEqual(lines[1 + _slot0],
+                         f"{_HEAD[_slot0][1]}:{_slot0:X}")
+        b = spec.DRAW_BEGIN
+        self.assertEqual(lines[1 + b], f"<x>:{b:X}")
+        self.assertEqual(lines[1 + b + 3],
+                         f"<y/>:{b + 3:X}")
+        self.assertEqual(lines[1 + b + spec.DRAW_CANVAS_BINS],
+                         f"<x0>:{b + spec.DRAW_CANVAS_BINS:X}")
         last = _H - 1
         self.assertEqual(lines[1 + last], f"<draw:special:2>:{last:X}")
 
@@ -502,6 +558,68 @@ class FileIoTest(unittest.TestCase):
         p.write_text(vfc.MAGIC + NL + "oops" + NL, encoding="utf-8")
         with self.assertRaises(vfc.VfcError):
             vfc.read_vfc(str(p))
+
+
+class SlotNameContractTest(unittest.TestCase):
+    """2026-11-07：slot 段名字自定义（<名字>，不重名即可），形态仍强制。
+
+    段长靠「第一个 Typst 结构 token」自描述；typst / draw / core /
+    boundary / system 五段照旧逐字冻结，不因这次放宽而松动。
+    """
+
+    def _head_with(self, names):
+        head = list(vfc.head_entries(len(names)))
+        prefix = spec.CORE_SIZE + spec.BOUNDARY_SIZE + spec.SYSTEM_SIZE
+        for i, (text, visible) in enumerate(names):
+            head[prefix + i] = (prefix + i, text, visible)
+        return head
+
+    def test_numbered_slots_still_inferred(self):
+        head = vfc.head_entries(4)
+        self.assertEqual(vfc.infer_slot_count(head), 4)
+        self.assertEqual(vfc.infer_slot_count(vfc.head_entries()), 0)
+
+    def test_arbitrary_slot_names_accepted(self):
+        head = self._head_with([("<mood>", False), ("<my_tool:1>", False),
+                                ("<k>", False)])
+        entries = head + [(len(head) + i, t, True)
+                          for i, t in enumerate(["x", "y"])]
+        text = vfc.dumps_vfc(entries)
+        self.assertEqual(vfc.validate_vfc(text), [])
+        self.assertEqual(vfc.infer_slot_count(vfc.parse_vfc(text)), 3)
+        self.assertTrue(vfc.slot_text_ok("<mood>"))
+
+    def test_bad_slot_forms_rejected(self):
+        for bad in ("[mood]", "</mood>", "mood"):
+            head = self._head_with([(bad, bad == "mood")])
+            text = vfc.dumps_vfc(head + [(len(head), "x", True)])
+            errs = vfc.validate_vfc(text)
+            self.assertTrue(errs, f"{bad!r} 不该通过")
+            self.assertIn("slot 段", errs[0]["message"])
+        # 含空白 / 空名这类连 _dump_entry 都写不出的形态，入口就得挡住
+        for bad in ("<bad name>", "<>", "</>"):
+            self.assertFalse(vfc.slot_text_ok(bad))
+
+    def test_visible_slot_entry_rejected(self):
+        head = self._head_with([("<mood>", True)])
+        errs = vfc.validate_vfc(vfc.dumps_vfc(
+            head + [(len(head), "x", True)]))
+        self.assertTrue(errs)
+
+    def test_add_policy_single_source(self):
+        """16 个子区 = 6 段契约头 + 10 个可见区，策略只来自 spec。"""
+        self.assertEqual(set(spec.REGION_ADD_POLICY),
+                         set(spec.REGION_ORDER))
+        self.assertEqual(len(spec.REGION_ORDER), 16)
+        for r in spec.REGION_LOCKED:
+            self.assertEqual(spec.REGION_ADD_POLICY[r], spec.POLICY_LOCKED)
+            with self.assertRaises(ValueError):
+                spec.check_add_region(r)
+        self.assertEqual(spec.check_add_region("slot"), spec.POLICY_ANGLED)
+        for r in spec.VISIBLE_REGION_ORDER:
+            self.assertEqual(spec.check_add_region(r), spec.POLICY_TEXT)
+        with self.assertRaises(ValueError):
+            spec.check_add_region("nope")
 
 
 if __name__ == "__main__":

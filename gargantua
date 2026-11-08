@@ -1,0 +1,10 @@
+#!/bin/sh
+# GARGANTUA v1 — 终端接口启动器（POSIX sh，macOS / Linux）
+# 只用项目内 venv 的 Python，绝不回退系统解释器；路径全部由脚本自身位置推导。
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+PY="$ROOT/environment/venv/bin/python"
+if [ ! -x "$PY" ]; then
+  echo "请先运行 ./启动.sh 完成环境初始化"
+  exit 1
+fi
+exec "$PY" "$ROOT/service/cli/gargantua.py" "$@"

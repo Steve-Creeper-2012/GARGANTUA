@@ -46,7 +46,7 @@ SUITES = [
     ("test_model", "service.test.test_model", 1800, "unittest"),
     ("test_codecs", "service.test.test_codecs", 900, "unittest"),
     ("test_tokens", "service.test.test_tokens", 900, "unittest"),
-    ("test_tok5", "service.test.test_tok5", 300, "unittest"),
+    ("test_tok6", "service.test.test_tok6", 300, "unittest"),
     ("test_multimodal", "service.test.test_multimodal", 900, "unittest"),
     ("test_precision", "service.test.test_precision", 600, "unittest"),
     ("test_vocab_presets", "service.test.test_vocab_presets", 600, "unittest"),
@@ -78,6 +78,24 @@ SUITES = [
     ("test_plugins", "service.test.test_plugins", 120, "unittest"),
     # 2026-11-05 推理存档 user/model 段边界包裹往返（不起服务，秒级）
     ("test_infer_archive", "service.test.test_infer_archive", 600, "unittest"),
+    # 2026-11-05 推理界面大改：会话持久化 / 状态条归属 / 模型加载拆分 /
+    # 前后端 id 契约 / fw 分辨率 / 环境管理（不起服务，秒级）
+    ("test_ui_sessions_20261105",
+     "service.test.test_ui_sessions_20261105", 300, "unittest"),
+    # 2026-11-05 Infer-Plug v1.0.0 后端：工具调用 token 白名单 / 安全校验 /
+    # agent API 往返（不起服务，秒级）
+    ("test_agent_20261105",
+     "service.test.test_agent_20261105", 180, "unittest"),
+    # 2026-11-06 对比训练（CLIP）+ 全项目终端接口：配对格式 / 损失 /
+    # 端到端队列训练 / GUI 端点全覆盖 / 离线转换与队列管理 / 前端接线
+    ("test_contrastive_cli_20261106",
+     "service.test.test_contrastive_cli_20261106", 900, "unittest"),
+    # 2026-11-07 base1.3.0：typst 契约头 + unicode_ext 扩表 / 表格 / 派生对拍
+    ("test_typst_20261107", "service.test.test_typst_20261107", 300,
+     "unittest"),
+    # 2026-11-08 MoMW 无训练记忆阀门：state_dict 零新增 key / 单一出口 /
+    # bonus 破死锁 / 未召回不遗忘 / 动态扩展 / config roundtrip（轻量）
+    ("test_momw", "service.test.test_momw", 600, "unittest"),
     ("verify_formats", "service/test/verify_formats.py", 600, "script"),
 ]
 

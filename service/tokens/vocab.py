@@ -84,18 +84,25 @@ def _read_sibling_config(vfc_path: Path) -> dict:
 def _bracket(name: str) -> str:
     """不可显示条目的**裸名** → 词表里的文本形态 '<name>'。
 
-    .vfc 文件里尖括号是**语法分隔符**，不属于名字本身（`<stop>:5` 的名字
-    是 `stop`）；而进程内 id_to_token 沿用历史形态 `<stop>`，dectok /
-    gts / tok5 都按这个整词查表。两者在加载/落盘的边界上互转。
+    .vfc 文件里包裹符是**语法分隔符**，不属于名字本身；而进程内
+    id_to_token 保存整词形态，dectok / gts / tok6 都按这个整词查表。
+    两者在加载/落盘的边界上互转。
+
+    2026-11-05：边界 token 改用 [] 包裹（[user] / [sys]），<> 留给
+    工具调用。已经带任一包裹的名字原样返回，不再二次加括号。
     """
-    if len(name) >= 2 and name.startswith("<") and name.endswith(">"):
+    if len(name) >= 2 and (
+            (name.startswith("<") and name.endswith(">"))
+            or (name.startswith("[") and name.endswith("]"))):
         return name
     return f"<{name}>"
 
 
 def _unbracket(text: str) -> str:
-    """'<name>' → 裸名 'name'（落盘用）。非尖括号形态原样返回。"""
-    if len(text) >= 2 and text.startswith("<") and text.endswith(">"):
+    """'<name>' / '[name]' → 裸名 'name'（落盘用）。非包裹形态原样返回。"""
+    if len(text) >= 2 and (
+            (text.startswith("<") and text.endswith(">"))
+            or (text.startswith("[") and text.endswith("]"))):
         return text[1:-1]
     return text
 
@@ -108,17 +115,23 @@ def _unbracket(text: str) -> str:
 _HEAD_DRIFT_HINT = (
     "　【怎么修】spec.py 与词表版本不一致：① 先重启 server（spec 是 import "
     "期常量，老进程里还是旧布局）；② 仍报错说明词表文件是旧 spec 建的，用 "
-    "python service/tokens/build_vocab.py 重建全局词表，再删掉 vocabs/base "
-    "让 ensure_base() 重新派生。")
+    "python service/tokens/build_vocab.py 重建全局词表，再删掉 "
+    f"vocabs/{spec.BASE_VOCAB_NAME} 让 ensure_base() 重新派生。")
 
 
 def validate_head(entries, source: str = "vocab.vfc") -> None:
     """校验架构契约头（不变量 I2）。
 
-    头 = special + system + draw 三段，名字与顺序由 spec 冻结；头内不允许
-    任何空位，所以第 k 个条目的 ID 必须恰好等于 k。
+    头 = core + boundary + system + slot + typst + draw 六段，名字与顺序
+    由 spec 冻结；头内不允许任何空位，所以第 k 个条目的 ID 必须恰好等于 k。
+
+    2026-11-07 起唯一例外是 slot 段：**名字**由使用者自定义（`<mood>` /
+    `<mytool>` 都行，只要不重名），只校验 `<名字>` 形态与不可显示；段长
+    仍由 vfc.infer_slot_count() 自描述。与 vfc._check_head 保持同一口径。
     """
-    head = vfc.head_entries()
+    slot_n = vfc.infer_slot_count(entries)
+    head = vfc.head_entries(slot_n)
+    slot_begin = spec.CORE_SIZE + spec.BOUNDARY_SIZE + spec.SYSTEM_SIZE
     if len(entries) < len(head):
         raise ValueError(
             f"{source}: 词表只有 {len(entries)} 条，短于架构契约头 "
@@ -127,8 +140,19 @@ def validate_head(entries, source: str = "vocab.vfc") -> None:
             f"{_HEAD_DRIFT_HINT}")
     for k, (hid, htext, hvis) in enumerate(head):
         got = entries[k]
+        if got[0] != hid:
+            raise ValueError(
+                f"{source}: 架构契约头第 {k} 项应为 id={hid}，"
+                f"实际为 id={got[0]}。{_HEAD_DRIFT_HINT}")
+        if slot_begin <= k < slot_begin + slot_n:
+            if bool(got[2]) or not vfc.slot_text_ok(got[1]):
+                raise ValueError(
+                    f"{source}: slot 段第 {k - slot_begin + 1} 项必须是 "
+                    f"<名字> 形态的不可显示工具名（名字自定义、不允许前导 "
+                    f"'/' 或方括号），实际为 {got[1]!r}。{_HEAD_DRIFT_HINT}")
+            continue
         # 两侧都用裸名比较：文件侧是裸名，内存侧可能是 '<name>' 形态
-        if got[0] != hid or _unbracket(got[1]) != _unbracket(htext) \
+        if _unbracket(got[1]) != _unbracket(htext) \
                 or bool(got[2]) != bool(hvis):
             raise ValueError(
                 f"{source}: 架构契约头第 {k} 项应为 "
@@ -137,17 +161,51 @@ def validate_head(entries, source: str = "vocab.vfc") -> None:
                 f"visible={bool(got[2])}。{_HEAD_DRIFT_HINT}")
 
 
+def resolve_region_add(text: str, region: str) -> tuple:
+    """「添加到哪个子区」→ (归一化后的 token 文本, category)。
+
+    策略唯一真源 = spec.check_add_region / REGION_ADD_POLICY：
+      angled（slot）  裸名自动补 <>；已是 <> 时校验名字；[] / 未闭合 /
+                      前导 '/' 一律拒绝（形态强制）。
+      text（可见区）  文本无格式要求，非空即可。
+    返回 category 决定 .vfc 的 visible 标记：slot → special，可见区 →
+    regular（fallback 仍由「可显示的单个 a–z 字母」在 __init__ 自动派生）。
+    """
+    if not isinstance(text, str) or not text:
+        raise ValueError("token 文本必须是非空字符串")
+    policy = spec.check_add_region(region)
+    if policy == spec.POLICY_ANGLED:
+        if text.startswith("<") or text.startswith("["):
+            if not (text.startswith("<") and text.endswith(">")):
+                raise ValueError(
+                    f"子区 {region!r} 强制 <名字> 包裹：{text!r} 的尖括号"
+                    f"必须成对，且不能用方括号（boundary 专属形态）")
+        else:
+            text = f"<{text}>"          # 自动补包裹
+        if not vfc.slot_text_ok(text):
+            raise ValueError(
+                f"子区 {region!r} 强制 <名字> 包裹：{text!r} 的名字必须是"
+                f"[A-Za-z_][A-Za-z0-9_./:-]*，不允许空白、前导 '/' 或"
+                f"方括号包裹")
+        return text, CAT_SPECIAL
+    return text, CAT_REGULAR
+
+
 class Vocab:
     """词表视图：连续 ID 空间 0..N-1，每个 ID 恰好一个 token。
 
     布局：
-        [0, HEAD_SIZE)            架构契约头（special + system + draw）
+        [0, HEAD_SIZE)            架构契约头（core/boundary/system/
+                                  slot/typst/draw 六段）
                                   名字与顺序由 spec 冻结，所有词表一致
         [HEAD_SIZE, vocab_size)   可见区，按 config["regions"] 连续排布
 
-    两种 token 形态（.vfc 文件里就是引号包裹 vs 尖括号包裹）：
+    两种 token 形态（.vfc 文件里就是引号包裹 vs 标记包裹）：
         可显示   → 引号包裹   走 enctok 查表；单字母 a–z 兼作 fallback 兜底
-        不可显示 → 尖括号包裹  <stop>/<caps>/{ }| 这类标记，不参与文本编码
+        不可显示 → <> 包裹    <caps>/<stop>/<draw:end> 等 core 单标记、
+                              <s0>…<s127> 编号槽位、<cx:0> 等 draw token
+                 → [] 包裹    [user]/[model]/[sys] 等 6 个 boundary 段边界
+        两者都不参与文本编码；{ } | 是 system 区，按 ID 判定。
     """
 
     def __init__(self, entries, path=None, name=None, config=None):
@@ -175,17 +233,29 @@ class Vocab:
 
         self._entries = [(k, t, bool(v)) for k, (_i, t, v) in enumerate(flat)]
         self.id_to_token: list[str] = [t for _i, t, _v in self._entries]
+        # 每份词表的预留槽位数可能不同（spec 不定死，config 决定）。
+        # **正文是唯一事实源**：slot 段增删后 head_size 会变，config 里的
+        # 只是缓存——两者不一致（例如手工改过 .vfc、或写入链路中途失败）
+        # 时一律以从正文推断的值为准，避免 is_invisible / draw_begin 错位。
+        self.slot_count = vfc.infer_slot_count(self._entries)
+        derived_head = spec.head_layout(self.slot_count)["head_size"]
+        cfg_head = self.config.get("head_size")
+        self.head_size = (int(cfg_head) if isinstance(cfg_head, int)
+                          and not isinstance(cfg_head, bool)
+                          and cfg_head == derived_head
+                          else derived_head)
+        self.draw_begin = self.head_size - spec.MODAL_SIZE
         # 不可显示 ID 集合：**头部以上**用尖括号包裹的那些。
-        # [0, HEAD_SIZE) 整段都是架构契约头，恒为不可显示，不靠这个集合判断
+        # [0, head_size) 整段都是架构契约头，恒为不可显示，不靠这个集合判断
         # （见 is_invisible 的注释）。
         self._invisible_above_head = frozenset(
-            i for i, _t, v in self._entries if not v and i >= spec.HEAD_SIZE)
+            i for i, _t, v in self._entries if not v and i >= self.head_size)
         self.invisible_ids = frozenset(i for i, _t, v in self._entries
                                        if not v)
 
         # 四个类别映射。system 区单独拎出来：`{` `}` `|` 在文件里是引号
         # 形态（visible=True），但绝不能进 regular_ids——否则文本里的 "{"
-        # 会被编码成结构 token（ID 6），token-5 流当场破结构。它们按 ID
+        # 会被编码成结构 token（ID 6），token-6 流当场破结构。它们按 ID
         # 区间判定，与包裹形态无关。
         self.regular_ids: dict[str, int] = {}
         self.fallback_ids: dict[str, int] = {}
@@ -263,13 +333,14 @@ class Vocab:
     def global_vocab(cls) -> "Vocab":
         """全局基础词表：service/tokens/{vocab.vfc, config.json}。
 
-        目录名是 "tokens"，不是词表名；对外统一叫 base（= 系统预设名）。
+        目录名是 "tokens"，不是词表名；对外统一用 spec.BASE_VOCAB_NAME
+        （2026-11-07 起 = "base1.3.0"，与系统预设目录名一致）。
         """
         if not GLOBAL_VOCAB_VFC.is_file():
             raise RuntimeError(
                 f"{GLOBAL_VOCAB_VFC} 不存在，请先运行 "
                 f"python tokens/build_vocab.py")
-        return cls.load(GLOBAL_VOCAB_VFC, name="base")
+        return cls.load(GLOBAL_VOCAB_VFC, name=spec.BASE_VOCAB_NAME)
 
     # ------------------------------------------------------------------
     # 分区（前端词表页「分区」表的数据源）
@@ -294,16 +365,19 @@ class Vocab:
         out = []
         if not sizes:
             # 无分区元数据（旧文件）：整段可见区当一个区
-            n_vis = n - spec.HEAD_SIZE
+            n_vis = n - self.head_size
             out.append({"region": "visible", "category": CAT_REGULAR,
-                        "begin": spec.HEAD_SIZE, "size": max(n_vis, 0),
+                        "begin": self.head_size, "size": max(n_vis, 0),
                         "used": max(n_vis, 0)})
             return out
         begin = 0
         for r in sizes:
-            if begin >= n:
-                break
             size = max(int(r.get("size", 0)), 0)
+            # 正文已经排完之后，config 里剩下的 0 长度子区仍要保留：
+            # 空词表 / 派生词表靠它们声明「还有这些可添加的子区」，
+            # 一旦丢掉，下一次 add_token 就找不到目标子区而回退到头部。
+            if begin >= n and size > 0:
+                break
             end = min(begin + size, n)
             used = end - begin
             out.append({"region": r.get("region", "?"),
@@ -354,7 +428,7 @@ class Vocab:
         标识符、无法写成 `<{>`，所以文件里是引号形态。它们靠 ID 落在
         SYSTEM 区被正确归类，不受影响。
         """
-        return idx < spec.HEAD_SIZE or idx in self._invisible_above_head
+        return idx < self.head_size or idx in self._invisible_above_head
 
     def category_of(self, idx: int) -> str:
         """ID → 大类（regular / fallback / special / system）。"""
@@ -377,41 +451,59 @@ class Vocab:
         return self.fallback_ids.get(text)
 
     def name_of(self, idx: int) -> str | None:
-        """不可显示 token 的 ID → 名字（如 <stop> → "stop"）；可显示返回 None。"""
+        """不可显示 token 的 ID → 裸名（如 <stop> / [user] → "stop"/"user"）。"""
         if not self.is_invisible(idx):
             return None
-        t = self.id_to_token[idx]
-        return t[1:-1] if t.startswith("<") and t.endswith(">") else t
+        return _unbracket(self.id_to_token[idx])
 
     def id_of(self, name: str) -> int | None:
-        """名字（如 "stop" 或 "<stop>"）→ 不可显示 token 的 ID；查不到 None。"""
-        cand = name if name.startswith("<") else f"<{name}>"
-        tid = self.special_ids.get(cand)
-        if tid is None:
-            tid = self.system_ids.get(cand)
-        if tid is not None:
-            return tid
-        # system 区的 { } | 文本不带尖括号
-        return self.system_ids.get(name)
+        """名字（"stop" / "<stop>" / "[user]"）→ 不可显示 token 的 ID。
+
+        2026-11-05：边界 token 是方括号形态，所以 <name> 与 [name] 两种
+        包裹都要试；裸名按「工具/特殊」与「边界」两处都查一遍。
+        """
+        cands = [name]
+        if name.startswith("<") or name.startswith("["):
+            cands.append(_unbracket(name))
+        else:
+            cands.extend((f"<{name}>", f"[{name}]"))
+        for cand in cands:
+            tid = self.special_ids.get(cand)
+            if tid is None:
+                tid = self.system_ids.get(cand)
+            if tid is not None:
+                return tid
+        return None
 
     # ------------------------------------------------------------------
     # 增删（紧凑化：删除后其后 ID 整体前移，绝不留下空位）
     # ----------------------------------------------------------------------
-    def add_token(self, text: str, category: str = CAT_REGULAR) -> int:
+    def add_token(self, text: str, category: str = CAT_REGULAR,
+                  region: str | None = None) -> int:
         """追加一个 token，返回新 ID。
 
-        - category 只能是 regular（可显示）或 special（不可显示）；
-          fallback / system 由词表自动判定：单字母 a–z 兼作 fallback，
-          system 属架构契约头、不接受用户添加。
+        两种调用方式：
+          - region 给定（词表页表单）：按 spec.REGION_ADD_POLICY 校验子区、
+            归一化文本、推导 category，并插入**该子区**末尾；
+          - region 缺省（旧调用 / 测试）：沿用两档 category（regular /
+            special），插入 config["append_region"] 指定的子区末尾。
+
+        - 契约头里 core/boundary/system/typst/draw 锁定不可添加；slot 可
+          添加自定义 <名字>，会让其后所有 ID 平移 1（head_size / slot_count
+          同步 +1）；可见文本子区文本无格式要求。
         - 文本非空、不得使用 `<reserved:` 前缀、全表查重。
-        - 新 token 插入 config["append_region"] 指定的可见子区末尾，
-          其后所有 ID 自动前移/后移，保证连续。
+        - 插入后所有 ID 重新连续编号，config 的 regions/head_size/
+          slot_count 同步刷新。
         """
-        if category not in (CAT_REGULAR, CAT_SPECIAL):
-            raise ValueError(
-                f"category 必须是 {CAT_REGULAR}/{CAT_SPECIAL}: {category!r}")
-        if not isinstance(text, str) or not text:
-            raise ValueError("token 文本必须是非空字符串")
+        if region is not None:
+            text, category = resolve_region_add(text, region)
+        else:
+            if category not in (CAT_REGULAR, CAT_SPECIAL):
+                raise ValueError(
+                    f"category 必须是 {CAT_REGULAR}/{CAT_SPECIAL}: "
+                    f"{category!r}")
+            if not isinstance(text, str) or not text:
+                raise ValueError("token 文本必须是非空字符串")
         if text.startswith("<reserved:"):
             # 旧契约的软删占位符形态（<reserved:N>）。新契约没有占位符
             # 概念（占位即空位，空位违反对齐不变量 I1），且这种名字会让
@@ -426,10 +518,10 @@ class Vocab:
                 f"（ID {self.token_to_id[text]}，"
                 f"类别 {self.category_of(self.token_to_id[text])}）")
 
-        region = (self.config.get("append_region")
-                  or DEFAULT_APPEND_REGION)
+        target_region = (region or self.config.get("append_region")
+                         or DEFAULT_APPEND_REGION)
         entries = list(self._entries)
-        pos = self._insert_position(entries, region)
+        pos = self._insert_position(entries, target_region)
         entries.insert(pos, (pos, text, category == CAT_REGULAR))
         # 插入点之后的所有 ID 必须整体后移 1：entries 是按位置存的，
         # 直接 insert 会让「新条目」和「原 pos 处条目」撞同一个 ID，出现
@@ -443,13 +535,19 @@ class Vocab:
         sizes = [dict(r) for r in (cfg.get("regions") or [])]
         found = False
         for r in sizes:
-            if r.get("region") == region:
+            if r.get("region") == target_region:
                 r["size"] = int(r.get("size", 0)) + 1
                 found = True
                 break
         if not found and sizes:
             sizes[-1]["size"] = int(sizes[-1].get("size", 0)) + 1
         cfg["regions"] = sizes
+        # slot 段增删会平移 typst / draw / 整个可见区 → 头部长度必须跟着
+        # 正文重算（正文是唯一事实源）。不写进 cfg 的话 __init__ 会沿用
+        # 旧的 head_size，is_invisible / draw_begin 全错位。
+        new_slots = vfc.infer_slot_count(entries)
+        cfg["slot_count"] = new_slots
+        cfg["head_size"] = spec.head_layout(new_slots)["head_size"]
         fresh = Vocab(entries, path=self._path, name=self.name, config=cfg)
         self.__dict__.update(fresh.__dict__)
         self._persist()
@@ -458,8 +556,13 @@ class Vocab:
     def _insert_position(self, entries, region: str) -> int:
         """返回新 token 应插入的下标：指定 region 的末尾。
 
-        没有该 region 时：插到最后一个**可见**条目之后（保持不可显示头
-        与其后的可见区各自成段），全空则插到末尾。"""
+        没有该 region 时追加到**正文末尾**：绝不能停在前 head_size 个
+        位置——那会把已有追加项往后挤、让原 ID 漂移，旧调用
+        `add_token(text, category)` 的「追加到末尾」语义就断了（实测
+        test_services 的 alpha/beta 被挤到 head_size+1/+2）。
+        也绝不能用「最后一个可见条目」：system 区的 { } | 是可见条目，
+        会算出 ID 12 这种落在契约头里的下标，插进去当场破坏架构契约头。
+        entries 连续编号保证 len(entries) >= head_size，max 只是防御。"""
         sizes = self.config.get("regions") or []
         begin = 0
         for r in sizes:
@@ -467,22 +570,22 @@ class Vocab:
             if r.get("region") == region:
                 return begin + size
             begin += size
-        # 兜底：最后一个可显示条目之后
-        last_vis = max((i for i, _t, v in entries if v), default=-1)
-        return last_vis + 1
+        return max(self.head_size, len(entries))
 
     def remove_token(self, text: str) -> int:
         """删除一个 token 并紧凑化，返回被删 token 的原 ID。
 
-        不可显示头（special/system/draw）是架构契约，**禁止删除**。
+        架构契约头（core/boundary/system/typst/draw）**禁止删除**；唯一
+        例外是 slot 段——它的名字是使用者自定义的，加了就得能删，否则
+        误加一次只能靠文本编辑器手改。删除同样会让其后 ID 整体前移。
         """
         tid = self.token_to_id.get(text)
         if tid is None:
             raise ValueError(f"token 未收录于词表: {text!r}")
-        if tid < spec.HEAD_SIZE:
+        if tid < self.head_size and self.region_of(tid) != "slot":
             raise ValueError(
                 f"不可删除架构契约头内的 token: {text!r}（ID {tid} < "
-                f"HEAD_SIZE {spec.HEAD_SIZE}）")
+                f"head_size {self.head_size}）；只有 slot 段可删")
         entries = [e for e in self._entries if int(e[0]) != tid]
         # 同步收缩该 token 所属子区的 size（其余区的 begin 自动跟随）
         cfg = dict(self.config)
@@ -495,8 +598,11 @@ class Vocab:
                 break
             begin += size
         cfg["regions"] = sizes
-        fresh = Vocab([(i, t, v) for i, (_o, t, v) in enumerate(entries)],
-                      path=self._path, name=self.name, config=cfg)
+        dense = [(i, t, v) for i, (_o, t, v) in enumerate(entries)]
+        new_slots = vfc.infer_slot_count(dense)
+        cfg["slot_count"] = new_slots
+        cfg["head_size"] = spec.head_layout(new_slots)["head_size"]
+        fresh = Vocab(dense, path=self._path, name=self.name, config=cfg)
         self.__dict__.update(fresh.__dict__)
         self._persist()
         return tid

@@ -96,18 +96,19 @@ def node_check(js: str) -> bool:
         return None
     tmp_dir = os.path.join(root, "data", "tmp")
     os.makedirs(tmp_dir, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
-                                     encoding="utf-8", dir=tmp_dir) as f:
+    # 2026-11-08：固定复用同一个文件、**不 unlink**。此前每次 mkstemp +
+    # os.unlink，在全量回归里会被宿主的批量删除守卫拦下
+    # （SAFE_DELETE_BULK_CONFIRM_REQUIRED），minify --check 因此误报非零退出。
+    # data/tmp 是项目约定的运行时目录（.gitignore 已排除），留一个固定文件
+    # 没有副作用；minify 是单实例构建工具，不存在并发写竞争。
+    path = os.path.join(tmp_dir, ".js-syntax-check.js")
+    with open(path, "w", encoding="utf-8") as f:
         f.write(js)
-        path = f.name
-    try:
-        r = subprocess.run([node, "--check", path],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            print("[verify] JS 语法错误:", (r.stderr or "")[:400])
-        return r.returncode == 0
-    finally:
-        os.unlink(path)
+    r = subprocess.run([node, "--check", path],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print("[verify] JS 语法错误:", (r.stderr or "")[:400])
+    return r.returncode == 0
 
 
 def verify(src_text: str, dst_text: str, css_text: str, js_text: str) -> bool:

@@ -79,9 +79,14 @@ class VocabLayoutTest(unittest.TestCase):
         # <pad> 已删除（2026-10-24，steve 拍板）
         self.assertNotIn("<pad>", spec.SPECIAL_TOKENS)
         self.assertFalse(hasattr(spec, "PAD_ID"))
+        # 1.2.0：core 三个机制单标记提到最前单开一类，其余是 []
+        # boundary 段边界（spec.SPECIAL_TOKENS 是两段的兼容别名）。
         self.assertEqual(spec.SPECIAL_TOKENS,
-                         ["<caps>", "<user>", "<user/>",
-                          "<model>", "<model/>", "<stop>"])
+                         ["<caps>", "<stop>", "<draw:end>",
+                          "[user]", "[user/]", "[model]", "[model/]",
+                          "[sys]", "[sys/]"])
+        self.assertEqual(spec.SPECIAL_TOKENS,
+                         spec.CORE_TOKENS + spec.BOUNDARY_TOKENS)
         for i, tok in enumerate(spec.SPECIAL_TOKENS):
             self.assertEqual(self.t[i], tok)
         self.assertEqual(self.t[spec.STOP_ID], spec.STOP_TOKEN)
@@ -260,10 +265,25 @@ class BuildIdempotentTest(unittest.TestCase):
         self.assertEqual(t1, t2)
         # 新契约：分区按内容收紧，不再预留空位——全表没有 reserved
         self.assertFalse(any(x.startswith("<reserved:") for x in t1))
-        # 3 个词恰好占满 english 区（各 1 行），紧跟着就是 fallback 字母
+        # 3 个词恰好占满 english 区（各 1 行），紧跟着是 fallback 字母；
+        # 2026-11-06（base1.1.0）起 fallback 后面还追加了 code 区，
+        # 2026-11-07（base1.3.0）起 code 之后又追加了 unicode_ext 区，
+        # 所以不再断言「末尾 26 个是字母」，改为按分区表定位这几段。
         self.assertIn("hello", t1)
         self.assertIn("don't", t1)
-        self.assertEqual(t1[-26:], list(spec.FALLBACK_LETTERS))
+        _e, regions, _a = build_entries(words)
+        fb = next(r for r in regions if r["region"] == "fallback")
+        code = next(r for r in regions if r["region"] == "code")
+        ue = next(r for r in regions if r["region"] == "unicode_ext")
+        self.assertEqual(regions[-1]["region"], "unicode_ext")
+        self.assertEqual(ue["size"], 3537)
+        fb_begin = sum(r["size"] for r in regions
+                       [:regions.index(fb)])
+        self.assertEqual(t1[fb_begin:fb_begin + fb["size"]],
+                         list(spec.FALLBACK_LETTERS))
+        self.assertGreater(code["size"], 300)
+        self.assertEqual(fb_begin + fb["size"] + code["size"] + ue["size"],
+                         len(t1))
         # 头部契约原样保留（DRAW 区第一段是画布声明定界符）
         self.assertEqual(t1[spec.DRAW_BEGIN], "<x>")
         self.assertEqual(t1[spec.DRAW_BEGIN + spec.DRAW_CANVAS_BINS],
@@ -686,7 +706,7 @@ class GtsAndTokensetTest(unittest.TestCase):
         self.assertEqual(timestep.count_steps(ids), 5)
         steps = timestep.unwrap(ids)
         self.assertEqual(len(steps), 5)
-        self.assertEqual(steps[0], [spec.SPECIAL_TOKENS.index("<user>")])
+        self.assertEqual(steps[0], [spec.SPECIAL_TOKENS.index("[user]")])
         # 导出二进制再读回，ID 完全一致
         data = tok32.encode_ids(ids)
         self.assertEqual(tok32.decode_ids(data), ids)
@@ -703,12 +723,12 @@ class GtsAndTokensetTest(unittest.TestCase):
             gts.parse_gts("{\U00020000}")     # 扩展 B 未收录
 
     def test_tokenset_read_stream(self):
-        from tokens import tokenset, tok5
-        items = [{"kind": "ext", "id": 1}, tok5.step(tok5.text(50994)),
+        from tokens import tokenset, tok6
+        items = [{"kind": "ext", "id": 1}, tok6.step(tok6.text(50994)),
                  {"kind": "ext", "id": 2}]
         tmp = tempfile.NamedTemporaryFile(suffix=".tokens", delete=False)
         try:
-            tmp.write(tok5.dumps(items))
+            tmp.write(tok6.dumps(items))
             tmp.close()
             flat, steps = tokenset.read_stream(tmp.name)
             # read_stream 只返回 token（{} 与结构字符由 step_ids 承载）；
@@ -722,7 +742,7 @@ class GtsAndTokensetTest(unittest.TestCase):
         from tokens import tokenset
         tmp = tempfile.NamedTemporaryFile(suffix=".tokens", delete=False)
         try:
-            tmp.write(b"\x00\x01\x02")        # 不是 token-5 位流
+            tmp.write(b"\x00\x01\x02")        # 不是 token-6 位流
             tmp.close()
             with self.assertRaises(tokenset.TokensetError):
                 tokenset.read_stream(tmp.name)

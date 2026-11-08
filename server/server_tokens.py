@@ -1,5 +1,5 @@
 # ===========================================================================
-# GARGANTUA v1 — server_tokens.py：token-5 离散 token API
+# GARGANTUA v1 — server_tokens.py：token-6 离散 token API
 # ---------------------------------------------------------------------------
 # 从 server.py 拆出。这里只回答「文本 ↔ token 流」与「添加 token」，
 # 不碰模型、不碰训练、不碰 HTTP 框架。App 以 mixin 方式继承本类：
@@ -7,13 +7,13 @@
 #     class App(TrainApi, CodecApi, TokensApi): ...
 #
 # 端点：
-#   POST /api/tokens/encode  文本 → token-5 流（.tokens 二进制 b64 / 可读文本）
-#   POST /api/tokens/decode  token-5 流 → 可读文本（{text: 00001} …）
+#   POST /api/tokens/encode  文本 → token-6 流（.tokens 二进制 b64 / 可读文本）
+#   POST /api/tokens/decode  token-6 流 → 可读文本（{text: 00001} …）
 #   POST /api/tokens/export  Token 编辑器文本（{t:}/{text:} …）→ .tokens b64
 #   GET  /api/vocab/*        词表文件夹 API（list/regions/query/source，
 #                            见下方 TokensApi 的方法注释）
 #
-# 格式（spec 第 5b 节）：27 个单字符 + 4 个原子绑定 token（码 0-30）、5 bit/字符；{ } 包裹时间步，| 分隔
+# 格式（spec 第 5b 节）：27 个单字符 + 4 个原子绑定 token（码 0-30）、6 bit/字符；{ } 包裹时间步，| 分隔
 # 步内元素；{t:<id>} 文本、{w:<hex>} 音频、{v:<hex>x:..y:..} 视觉、
 # <id> 扩展系统 token。结构字符本身不是 token。
 #
@@ -22,7 +22,7 @@
 import base64
 
 import spec
-from tokens import enctok, tok5
+from tokens import enctok, tok6
 from tokens.vocab import CAT_REGULAR, CATEGORIES, get_vocab
 
 
@@ -46,14 +46,25 @@ def resolve_vocab_query(query):
 def _norm_cat(cat) -> str:
     """归一化类别：.vfc 只有「引号 / 尖括号」两种形态 → regular / special。
 
-    fallback 不是用户可选的——可显示且是单个 a–z 字母时自动兼作 fallback；
-    system 属架构契约头，不接受用户添加。"""
+    2026-11-07 起这条只是**旧调用的兼容路径**：词表页表单已改为按子区
+    （region）添加。fallback 不是用户可选的——可显示且是单个 a–z 字母时
+    自动兼作 fallback；system 属架构契约头，不接受用户添加。"""
     c = cat or CAT_REGULAR
     if c == "fallback":
         return CAT_REGULAR
     if c not in (CAT_REGULAR, "special"):
         raise ValueError(f"category 必须是 regular/special: {cat!r}")
     return c
+
+
+def _norm_region(region) -> str:
+    """归一化「添加到哪个子区」：未知子区 / 契约头锁定子区一律 400。
+
+    策略唯一真源在 spec.check_add_region；后端再拦一次，防止绕过前端。"""
+    if not isinstance(region, str) or not region:
+        raise ValueError("缺少 region（请选择添加到的子区）")
+    spec.check_add_region(region)
+    return region
 
 
 def _body_vocab(body):
@@ -75,12 +86,12 @@ MAX_DECODE_TOKENS = 100_000    # 单次解码元素数上限
 
 def _name_of(v):
     """扩展系统 token 的 ID → 名字（<stop> 等）；可见区返回 None。"""
-    return tok5.vocab_name_of(v)
+    return tok6.vocab_name_of(v)
 
 
 def _id_of(v):
     """名字（"<stop>" 等）→ 扩展系统 token 的 ID；查不到返回 None。"""
-    return tok5.vocab_id_of(v)
+    return tok6.vocab_id_of(v)
 
 
 class TokensApi:
@@ -103,14 +114,14 @@ class TokensApi:
             raise ValueError(f"format 必须是 tokens_b64/display: {fmt!r}")
         v = _body_vocab(body)
         ids, skipped = enctok.encode_text(text, vocab=v)
-        items = [tok5.step(tok5.text(i)) for i in ids]
+        items = [tok6.step(tok6.text(i)) for i in ids]
         out = {"n_tokens": len(ids), "n_steps": len(items),
                "skipped": skipped, "vocab": v.name}
         if fmt == "display":
-            out["display"] = tok5.to_display(items, name_of=_name_of(v))
+            out["display"] = tok6.to_display(items, name_of=_name_of(v))
         else:
             out["tokens_b64"] = base64.b64encode(
-                tok5.dumps(items)).decode()
+                tok6.dumps(items)).decode()
         return 200, out
 
     # ---------------- token 流 → 可读形式 ----------------
@@ -130,9 +141,9 @@ class TokensApi:
                     f"数据过大: {len(data)} 字节（元素数上限 "
                     f"{MAX_DECODE_TOKENS}）")
             try:
-                items = tok5.loads(data)
-            except tok5.Tok5Error as e:
-                raise ValueError(f"不是合法的 token-5 .tokens: {e}")
+                items = tok6.loads(data)
+            except tok6.Tok6Error as e:
+                raise ValueError(f"不是合法的 token-6 .tokens: {e}")
         elif "ids" in body:
             ids = body["ids"]
             if not isinstance(ids, list) or any(
@@ -143,8 +154,8 @@ class TokensApi:
                 raise ValueError(
                     f"token 数超限: {len(ids)} > {MAX_DECODE_TOKENS}")
             try:
-                items = [tok5.step(tok5.text(i)) for i in ids]
-            except tok5.Tok5Error as e:
+                items = [tok6.step(tok6.text(i)) for i in ids]
+            except tok6.Tok6Error as e:
                 raise ValueError(str(e))
         else:
             raise ValueError("缺少 tokens_b64 / ids")
@@ -152,14 +163,14 @@ class TokensApi:
         if n_el > MAX_DECODE_TOKENS:
             raise ValueError(
                 f"元素数超限: {n_el} > {MAX_DECODE_TOKENS}")
-        return 200, {"display": tok5.to_display(items, name_of=_name_of(v)),
+        return 200, {"display": tok6.to_display(items, name_of=_name_of(v)),
                      "n_tokens": n_el,
                      "n_steps": sum(1 for it in items
                                     if it["kind"] == "step")}
 
     # ---------------- Token 编辑器 → .tokens 导出 ----------------
     def api_tokens_export(self, body):
-        """把编辑器里的 token-5 文本解析成流，返回 .tokens 二进制。
+        """把编辑器里的 token-6 文本解析成流，返回 .tokens 二进制。
 
         结构非法（括号不配对 / 载荷长度不符 / 未收录字符）→ 400，
         不产出坏文件。同时接受紧凑形式 {t:00001} 与显示形式 {text: 00001}。
@@ -174,8 +185,8 @@ class TokensApi:
                 f"text 过长: {len(text)} > {MAX_ENCODE_CHARS} 字符")
         v = _body_vocab(body)
         try:
-            items = tok5.parse_display(text, id_of=_id_of(v))
-        except tok5.Tok5Error as e:
+            items = tok6.parse_display(text, id_of=_id_of(v))
+        except tok6.Tok6Error as e:
             raise ValueError(str(e))
         if not items:
             raise ValueError(
@@ -184,7 +195,7 @@ class TokensApi:
         if n_el > MAX_DECODE_TOKENS:
             raise ValueError(f"元素数超限: {n_el} > {MAX_DECODE_TOKENS}")
         return 200, {
-            "tokens_b64": base64.b64encode(tok5.dumps(items)).decode(),
+            "tokens_b64": base64.b64encode(tok6.dumps(items)).decode(),
             "n_tokens": n_el,
             "n_steps": sum(1 for it in items if it["kind"] == "step"),
         }
@@ -239,6 +250,10 @@ class TokensApi:
         if action == "query":
             return 200, query_token(name, token)
         if action == "add":
+            # 新表单按子区添加；不带 region 的旧调用继续走两档 category。
+            if body.get("region") is not None:
+                return 200, add_token_to(
+                    name, token, region=_norm_region(body.get("region")))
             return 200, add_token_to(name, token,
                                      _norm_cat(body.get("category")))
         return 200, remove_token_from(name, token)

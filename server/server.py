@@ -62,15 +62,19 @@ import boot
 boot.bootstrap()
 import spec
 from common import (MAX_BLOCKS, MAX_NEW_TOKENS, MAX_PROMPT_TOKENS,
-                    model_init_lock, normalize_shared_blocks,
-                    valid_model_name, validate_ctx_config)
+                    model_exists, model_init_lock, normalize_shared_blocks,
+                    valid_model_name, validate_ctx_config,
+                    validate_momw_config)
 from server_env import ROOT, check_environment, kill_proc
 from server_models import (ConflictError, ModelManager, TaskPool,
                            step_to_json)
+from server_sessions import SessionStore
 from server_media import (MAX_IMAGE_DIM, MAX_PATCHES_TOTAL, b64_to_pil,
                           decode_audio_any, extract_video_audio,
                           extract_video_frames, size_guard_pil)
 from server_codecs import CodecApi
+from server_agent import AgentApi
+import agent_tools
 from server_monitor import MonitorApi
 from server_prims import PrimsApi
 from server_train import TrainApi
@@ -102,8 +106,9 @@ MAX_MEDIA_BYTES = 64 * 1024 * 1024
 _PLUGIN_DIR = os.path.join(WEB_DIR, "plugins")
 _PLUGIN_REGISTRY = os.path.join(_PLUGIN_DIR, "_imported.json")
 _PLUGIN_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
-_PLUGIN_RESERVED = {"tokens", "base", "_imported"}
-_PLUGIN_BUILTIN_FILES = {"tokens.js", "tokens.css", "README.md"}
+_PLUGIN_RESERVED = {"tokens", "base", "_imported", "infer-plug"}
+_PLUGIN_BUILTIN_FILES = {"tokens.js", "tokens.css", "README.md",
+                         "infer-plug.js", "infer-plug.css"}
 
 
 def _plugin_check_id(pid):
@@ -298,7 +303,7 @@ class _TrainStatusProxy:
 # ---------------------------------------------------------------------------
 # 应用装配：注册表 + 任务池 + 服务监督器 + 三个 API mixin
 # ---------------------------------------------------------------------------
-class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
+class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi, AgentApi):
     def __init__(self, model_dir, data_dir, log_path, idle_timeout=300):
         self.mgr = ModelManager(model_dir)
         self.pool = TaskPool()
@@ -319,6 +324,8 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
         self._streams = {}
         self._streams_lock = threading.Lock()
         self._streams_max = 32
+        # 会话持久化：一会话一 JSON（见 server_sessions.py）
+        self.sessions = SessionStore()
 
     def apply_model_vocab(self) -> None:
         """活动模型的词表覆盖（每模型可有自己的 vocab.txt，2026-10-24）。
@@ -411,21 +418,37 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
             # 图元 token 布局：唯一构造处在 draw_layout_payload()（test_pdraw_js
             # 也用它对拍，保证测试与线上同表）
             "draw_layout": draw_layout_payload(),
+            # MoMW 可选记忆阀门的默认配置（唯一真源 spec，前端不抄常量）；
+            # 零新增参数，启用与否都不改变参数量预估。
+            "momw": spec.momw_default_config(),
+            # Infer-Plug v1.0.0：词表版本 / 编码 / 基础词表名（前端不抄常量）
+            "agent": {
+                "vocab_version": spec.VOCAB_VERSION,
+                "token_encoding": spec.TOKEN_ENCODING,
+                "base_vocab_name": spec.BASE_VOCAB_NAME,
+            },
         }
 
     def api_models(self):
-        return {"models": self.mgr.list_models(), "active": self.mgr.name}
+        with self.mgr.lock:
+            loaded, active = self.mgr.loaded, self.mgr.name
+        models = self.mgr.list_models()
+        for m in models:
+            m["loaded"] = (m["name"] == loaded)
+        return {"models": models, "active": active, "loaded": loaded}
 
     def api_model_estimate(self, body):
         """建模前的参数量 / 存储占用预估（不建模型、不碰 torch）。
 
         入参与 /api/model/init 同源：d_model / n_enc_blocks / n_dec_blocks /
-        share_enc_dec / csa_ratio / hca_ratio / vocab / dtype。校验也走同一套
-        规则（spec.check_d_model、normalize_shared_blocks、validate_ctx_config），
-        避免「预估能过、真建报 400」的两套口径。
+        share_enc_dec / csa_ratio / hca_ratio / vocab / dtype / momw。校验也走
+        同一套规则（spec.check_d_model、normalize_shared_blocks、
+        validate_ctx_config、validate_momw_config），避免「预估能过、真建报
+        400」的两套口径。MoMW 零新增参数，只校验不影响参数量。
         """
         from param_estimate import estimate
         from vocab_presets import BASE, list_vocabs
+        validate_momw_config(body.get("momw"))   # 只校验，零新增参数
 
         d_model = None
         if body.get("d_model") is not None:
@@ -525,6 +548,9 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
                 validate_dtype(body["dtype"])
             except ValueError as e:
                 raise ValueError(f"dtype: {e}")
+        # 2026-11-08：MoMW 配置提前校验（非法 → 400，不提交失败任务）。
+        # 规范化后整份下发，init 子进程不再解释默认值。
+        momw_cfg = validate_momw_config(body.get("momw"))
 
         def work():
             # 建模是罕见的重活（默认 4+6 blocks ≈ 527M 参数、2.1GB
@@ -545,6 +571,11 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
                 argv += ["--vocab", str(body["vocab"])]
             if body.get("dtype"):
                 argv += ["--dtype", str(body["dtype"])]
+            # MoMW：只在请求显式带 momw 时下发——旧请求连 argv 都不多一个
+            # 参数，init 也就不会往 config.json 写这个键。
+            if body.get("momw") is not None:
+                argv += ["--momw", json.dumps(
+                    momw_cfg, ensure_ascii=False, separators=(",", ":"))]
             # ctx 已在本进程校验过，原样下发（服务端不再解释默认值）
             argv += ["--ctx-full", str(ctx["ctx_full"]),
                      "--ctx-compress", str(ctx["ctx_compress"]),
@@ -751,6 +782,16 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
             raise ValueError(f"temperature 必须在 [1e-5, 100]: {temperature}")
         if not (0 < top_p <= 1):
             raise ValueError(f"top_p 必须在 (0, 1]: {top_p}")
+        # 2026-11-05：会话 / KV 透传给 infer 服务（流式与非流式都要带），
+        # 类型不对一律 400，不静默默认。
+        session_id = body.get("session_id")
+        if session_id is None:
+            session_id = "default"
+        elif not isinstance(session_id, str):
+            raise ValueError("session_id 必须是字符串")
+        kv_enabled = True
+        if "kv_enabled" in body and body["kv_enabled"] is not None:
+            kv_enabled = self._bool_arg(body["kv_enabled"], "kv_enabled")
         archive_dir = os.path.join(os.path.dirname(self.log_path),
                                    "infer_archive")
 
@@ -759,7 +800,8 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
                 model_dir=model_dir, prompt=prompt, token_ids=token_ids,
                 media=clean_media, max_new=max_new,
                 temperature=temperature, top_p=top_p,
-                archive_dir=archive_dir)
+                archive_dir=archive_dir,
+                session_id=session_id, kv_enabled=kv_enabled)
 
         def work():
             # 推理服务按需拉起（首次含建模加载，之后复用；空闲自行退出）。
@@ -772,14 +814,16 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
                 prompt=prompt, token_ids=token_ids, max_new=max_new,
                 temperature=temperature, top_p=top_p,
                 media=clean_media,
-                archive_dir=archive_dir)
+                archive_dir=archive_dir,
+                session_id=session_id, kv_enabled=kv_enabled)
 
         tid = self.pool.submit(work)
         return 202, {"task_id": tid}
 
     # ---------------- 流式推理（2026-11-04） ----------------
     def _start_infer_stream(self, *, model_dir, prompt, token_ids, media,
-                            max_new, temperature, top_p, archive_dir):
+                            max_new, temperature, top_p, archive_dir,
+                            session_id="default", kv_enabled=True):
         """起一条流式推理，立刻返回 stream_id；token 边产边进缓冲区。
 
         为什么不复用 TaskPool 的结果：任务池只有「跑完/失败」两种状态，
@@ -790,7 +834,8 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
         sid = uuid.uuid4().hex
         buf = {"tokens": [], "done": False, "error": None, "result": None,
                "t0": time.time(), "ttft_ms": None, "stats": None,
-               "kv_steps": 0, "fw": None, "writes": []}
+               "kv_steps": 0, "fw": None, "writes": [], "phase": "idle",
+               "momw": None}
         with self._streams_lock:
             # 无 done 可淘汰时按 t0 淘汰最旧（含 running），保证不超 _streams_max
             while len(self._streams) >= self._streams_max:
@@ -812,10 +857,18 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
                     media=media, max_new=max_new,
                     temperature=temperature, top_p=top_p,
                     archive_dir=archive_dir, stream=True,
+                    session_id=session_id, kv_enabled=kv_enabled,
                     # 墙钟起点：让首 token 的 t_ms / TTFT 从「收到请求」算，
                     # 含模型加载与排队，而不是从 generate() 内部算。
                     t0_wall=buf["t0"])
                 for frame in gen:
+                    # 阶段事件帧 {"ok":True,"phase":...} 既无 partial 也无
+                    # result：必须先判 phase 并 continue，否则下面的
+                    # buf["result"]=frame.get("result") 会把它覆盖成 None。
+                    ph = frame.get("phase")
+                    if isinstance(ph, str):
+                        buf["phase"] = ph
+                        continue
                     part = frame.get("partial")
                     if part is not None:
                         # 最新 fast weight 快照 / 写入幅度 / KV 步数单独进 buf：
@@ -831,10 +884,18 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
                                 del buf["writes"][:-spec.FW_WRITE_HISTORY]
                         if part.get("kv_steps") is not None:
                             buf["kv_steps"] = part["kv_steps"]
+                        # MoMW 面板快照只保留最新一份（与 fw 同口径）
+                        if part.get("momw") is not None:
+                            buf["momw"] = part["momw"]
                         # token 字典里把 fw 置 None（保留键以符合「可能为 null」
                         # 协议），否则最多 2048 个 token 各带一份 24×24 矩阵吃穿内存
                         tok = dict(part)
                         tok["fw"] = None
+                        tok["momw"] = None
+                        # Infer-Plug v1.0.0：给每个 token 补 char / tool 元数据
+                        meta = agent_tools.token_meta(tok.get("id"))
+                        tok["char"] = meta["char"]
+                        tok["tool"] = meta["tool"]
                         buf["tokens"].append(tok)
                         if buf["ttft_ms"] is None:
                             buf["ttft_ms"] = part.get("t_ms")
@@ -842,6 +903,7 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
                     buf["result"] = frame.get("result")
             except Exception as e:
                 buf["error"] = str(e)
+                buf["phase"] = "error"
             finally:
                 # 显式关闭：否则句柄锁要等 GC 才释放，下一次推理会一直等
                 if gen is not None:
@@ -850,6 +912,8 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
                     except Exception:
                         pass
                 buf["done"] = True
+                if buf["error"] is None:
+                    buf["phase"] = "done"
                 buf["t1"] = time.time()
 
         self.pool.submit(work)
@@ -871,12 +935,19 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
             if buf is None:
                 raise ValueError(f"流不存在或已过期: {sid}")
             toks = buf["tokens"][frm:]
+            result = buf["result"] if buf["done"] else None
+            if buf["done"] and isinstance(result, dict):
+                # 浅拷贝：不修改 buf 里的原对象，避免每次轮询重复计算/污染
+                result = dict(result)
+                result["tool_calls"] = agent_tools.detect_tool_calls(
+                    result.get("token_ids") or [])
             out = {"status": ("error" if buf["error"] else
                               "done" if buf["done"] else "running"),
                    "tokens": toks, "next": frm + len(toks),
                    "ttft_ms": buf["ttft_ms"],
                    "error": buf["error"],
-                   "result": buf["result"] if buf["done"] else None}
+                   "result": result,
+                   "phase": buf["phase"]}
             if buf["done"]:
                 out["elapsed_ms"] = int((buf.get("t1", time.time())
                                          - buf["t0"]) * 1000)
@@ -884,13 +955,19 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
                 out["elapsed_ms"] = int((time.time() - buf["t0"]) * 1000)
         return 200, out
 
-    def api_infer_stats(self):
+    def api_infer_stats(self, query=None):
         """推理侧实时状态：上下文占用 / KV cache / fast weight 可视化。
 
         生成期 stream() 持有句柄锁，query() 拿不到锁会立刻返回 None，所以
         优先读本地流缓冲（每帧 partial 已把 fw/writes/kv_steps 写进 buf）；
         只有一条流都没有时才回退到 query 取上一轮非流式统计。
+
+        2026-11-05：KV 内存占用/百分比从本端点出（前端 renderCtxMeters 每
+        1.2s 轮询，stream 的 result.stats 只在单轮结束拿到一次，撑不起常驻
+        面板）。生成期不 query，用流缓冲按 infer.py 的同一公式精确展开。
         """
+        # 可选 session_id：透传给 op stats / 标记当前会话；缺省保持旧行为
+        sid = (query.get("session_id") or [""])[0] if query else ""
         cfg = self.mgr.ctx or {"ctx_full": spec.CTX_FULL,
                                "ctx_compress": spec.CTX_COMPRESS}
         model_cfg = {}
@@ -913,12 +990,18 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
                         "kv_steps": buf["kv_steps"],
                         "n_generated": len(buf["tokens"]),
                         "ttft_ms": buf["ttft_ms"],
-                        "streaming": not buf["done"]}
+                        "streaming": not buf["done"],
+                        # .get 而非 []：缓冲结构是公开契约，旧版本/手工构造
+                        # 的 buf 没有 momw 键，直接索引会 KeyError（实测被
+                        # test_plugins 的两个 stats 用例打出来）。
+                        "momw": buf.get("momw")}
 
         st = {}
         if snap is None:
             # 没有任何流缓冲：取上一轮非流式推理留下的统计（超时 2s，不阻塞）
-            st = self.supervisor.query("infer", "stats", timeout=2) or {}
+            qargs = {"session_id": sid} if sid else {}
+            st = self.supervisor.query("infer", "stats", timeout=2,
+                                       **qargs) or {}
             streaming = False
             fw = st.get("fw")
             fw_writes = st.get("fw_writes") or []
@@ -926,6 +1009,7 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
             n_generated = int(st.get("n_generated") or 0)
             ttft_ms = st.get("ttft_ms")
             tps = st.get("tps") or 0
+            momw_stats = st.get("momw")
         else:
             streaming = snap["streaming"]
             # 用 buf 的实时值覆盖统计（生成中每收到一个 partial 都在更新）
@@ -934,24 +1018,57 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
             kv_steps = snap["kv_steps"]
             n_generated = snap["n_generated"]
             ttft_ms = snap["ttft_ms"]
+            momw_stats = snap["momw"]
             # 粗略 tps：只有首 token 时间 ttft_ms 可用，无首 token 时记 0
             tps = (round(n_generated * 1000.0 / ttft_ms, 2)
                    if ttft_ms else 0)
+
+        # ctx / d_model：返回字段与生成期公式共用同一取值，避免两处口径不一
+        ctx_full = int(st.get("ctx_full") or cfg.get("ctx_full")
+                       or spec.CTX_FULL)
+        ctx_compress = int(st.get("ctx_compress") or cfg.get("ctx_compress")
+                           or spec.CTX_COMPRESS)
+        d_model = int(st.get("d_model") or model_cfg.get("d_model")
+                      or spec.D_MODEL)
+        ctx_total = ctx_full + ctx_compress
+
+        if snap is None:
+            # 非生成期：op stats 已返回会话 stats（kv_pct /
+            # kv_capacity_bytes / kv_bytes / sessions），白名单放行，不重算
+            kv_bytes = int(st.get("kv_bytes") or 0)
+            kv_pct = st.get("kv_pct") if st.get("kv_pct") is not None else 0.0
+            kv_capacity_bytes = st.get("kv_capacity_bytes") or 0
+            session_id = sid or st.get("session_id")
+            sessions = st.get("sessions") or []
+        else:
+            # 生成期精确展开（不是估算）：infer.py 的 kv_vecs 形状恒为
+            # [1, n_steps, d_model]，meta.kv_bytes = kv_vecs.numel() *
+            # element_size() = n_steps*d_model*4；meta.kv_capacity_bytes =
+            # ctx_total*d_model*4；kv_pct = 100*n_steps/ctx_total。
+            # buf["kv_steps"] 是每个 partial 实时更新的 n_steps，代入同一
+            # 公式即为精确值，无需 query（生成期也拿不到句柄锁）。
+            kv_steps = int(kv_steps or 0)
+            kv_bytes = kv_steps * d_model * 4
+            kv_capacity_bytes = ctx_total * d_model * 4
+            kv_pct = (round(100 * kv_steps / ctx_total, 1)
+                      if ctx_total else 0.0)
+            session_id = sid or None
+            sessions = []       # 生成期不 query，拿不到会话列表
 
         return {
             "active": self.mgr.name,
             # 有流缓冲时 st 为空，不能再拿 st["loaded"] 判断；直接查句柄表
             "running": self.supervisor.running("infer") or streaming,
             "streaming": streaming,
-            "ctx_full": int(st.get("ctx_full") or cfg.get("ctx_full")
-                            or spec.CTX_FULL),
-            "ctx_compress": int(st.get("ctx_compress")
-                                or cfg.get("ctx_compress")
-                                or spec.CTX_COMPRESS),
+            "ctx_full": ctx_full,
+            "ctx_compress": ctx_compress,
             "kv_steps": int(kv_steps),
-            "kv_bytes": int(st.get("kv_bytes") or 0),
-            "d_model": int(st.get("d_model") or model_cfg.get("d_model")
-                           or spec.D_MODEL),
+            "kv_bytes": kv_bytes,
+            "kv_pct": kv_pct,
+            "kv_capacity_bytes": kv_capacity_bytes,
+            "session_id": session_id,
+            "sessions": sessions,
+            "d_model": d_model,
             "vocab_size": int(st.get("vocab_size")
                               or model_cfg.get("vocab_size") or 0),
             "n_generated": int(n_generated),
@@ -961,7 +1078,258 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi):
             "fw_writes": fw_writes,
             "fw_bins": spec.FW_VIZ_BINS,
             "fw_write_history": spec.FW_WRITE_HISTORY,
+            # 2026-11-08：三阶段 MoMW 记忆阀门面板（未启用时为 null）
+            "momw": momw_stats,
         }
+
+    # ---------------- 会话持久化 / 模型加载-选中拆分 / 环境管理 ----------
+    # 2026-11-05：会话落盘（server_sessions.SessionStore）+ 把「活动选中」
+    # (mgr.name) 与「权重已加载进 infer 进程」(mgr.loaded) 拆开 +
+    # env_manager（成员 C 新建，本文件只 import + 转发，未就绪一律 503）。
+
+    # -- 会话字段规范化（create / save 共用） --
+    def _session_fields(self, body):
+        """把会话业务字段做严格类型校验，只返回出现过的键。"""
+        out = {}
+        for k in ("title", "plugin", "model"):
+            if body.get(k) is not None:
+                if not isinstance(body[k], str):
+                    raise ValueError(f"{k} 必须是字符串")
+                out[k] = body[k]
+        if body.get("kv_enabled") is not None:
+            out["kv_enabled"] = self._bool_arg(
+                body.get("kv_enabled"), "kv_enabled")
+        if body.get("max_new") is not None:
+            out["max_new"] = self._clamp_int(
+                body.get("max_new"), 1, MAX_NEW_TOKENS, "max_new")
+        if body.get("temperature") is not None:
+            v = num_param(body, "temperature", 0.8, float)
+            if not (1e-5 <= v <= 100):
+                raise ValueError(f"temperature 必须在 [1e-5, 100]: {v}")
+            out["temperature"] = v
+        if body.get("top_p") is not None:
+            v = num_param(body, "top_p", 0.95, float)
+            if not (0 < v <= 1):
+                raise ValueError(f"top_p 必须在 (0, 1]: {v}")
+            out["top_p"] = v
+        return out
+
+    # -- 会话存储（GET） --
+    def api_sessions(self):
+        return 200, {"sessions": self.sessions.list()}
+
+    def api_session_get(self, query):
+        sid = (query.get("id") or [""])[0]
+        if not sid:
+            raise ValueError("缺少 id")
+        sess = self.sessions.get(sid)
+        if sess is None:
+            return 404, {"error": f"会话不存在: {sid}"}
+        return 200, {"session": sess}
+
+    # -- 会话存储（POST） --
+    def api_session_create(self, body):
+        return {"session": self.sessions.create(self._session_fields(body))}
+
+    def api_session_save(self, body):
+        sid = body.get("id")
+        if not isinstance(sid, str) or not sid:
+            raise ValueError("缺少 id")
+        patch = body.get("patch")
+        if not isinstance(patch, dict):
+            raise ValueError("patch 必须是对象")
+        fields = self._session_fields(patch)
+        if "messages" in patch:               # messages 允许整体覆盖
+            fields["messages"] = patch["messages"]
+        return {"session": self.sessions.save(sid, fields)}
+
+    def api_session_append(self, body):
+        sid = body.get("id")
+        if not isinstance(sid, str) or not sid:
+            raise ValueError("缺少 id")
+        role = body.get("role")
+        if not isinstance(role, str):
+            raise ValueError("role 必须是字符串")
+        token_ids = body.get("token_ids")
+        if not isinstance(token_ids, list):
+            raise ValueError("token_ids 必须是数组")
+        return {"session": self.sessions.append(sid, role, token_ids)}
+
+    def api_session_delete(self, body):
+        sid = body.get("id")
+        if not isinstance(sid, str) or not sid:
+            raise ValueError("缺少 id")
+        self.sessions.delete(sid)
+        # 尽力通知 infer 丢弃该会话的 KV / fast weight：服务没起、op 尚未
+        # 实现、调用失败都无妨——删除会话文件本身已经完成。
+        try:
+            self.supervisor.call("infer", "drop_session", session_id=sid)
+        except Exception:
+            pass
+        return {"ok": True}
+
+    # -- infer 清理通知（POST） --
+    def api_infer_clear_fw(self, body):
+        session_id = body.get("session_id")
+        if session_id is None:
+            session_id = "default"
+        elif not isinstance(session_id, str):
+            raise ValueError("session_id 必须是字符串")
+        # 同样是尽力而为的清理通知：infer 未运行时本就没有状态可清，
+        # 保证始终按契约返回 {"ok": true}。
+        try:
+            self.supervisor.call("infer", "clear_fw",
+                                 session_id=session_id)
+        except Exception:
+            pass
+        return {"ok": True}
+
+    def api_momw_control(self, body):
+        """会话级 MoMW 控制：clear / silent（2026-11-08 三阶段版）。
+
+        action 走白名单，不把任意 op 透传给子进程。infer 未运行时按
+        「成功但无状态」处理（与 clear_fw 同口径），前端不会卡在报错；
+        返回的 momw 快照供前端立即重绘，不必等下一次 1.2s 轮询。
+        """
+        session_id = body.get("session_id") or "default"
+        if not isinstance(session_id, str):
+            raise ValueError("session_id 必须是字符串")
+        action = body.get("action")
+        if action not in ("clear", "silent"):
+            raise ValueError("action 必须是 clear 或 silent")
+        value = body.get("value", True)
+        if not isinstance(value, bool):
+            raise ValueError("value 必须是布尔值")
+        try:
+            res = self.supervisor.call(
+                "infer", "momw_control", session_id=session_id,
+                action=action, value=value) or {}
+            return {"ok": True, "momw": res.get("momw"),
+                    "silent": bool(res.get("silent", False))}
+        except Exception:
+            return {"ok": True, "momw": None, "silent": False}
+
+    # -- 模型「加载 / 卸载 / 选中」拆分（POST） --
+    def api_model_preload(self, body):
+        name = body.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("缺少 name")
+        bad = valid_model_name(name)
+        if bad:
+            raise ValueError(bad)
+        d = os.path.join(self.mgr.model_dir, name)
+        if not model_exists(d):
+            raise FileNotFoundError(f"模型不存在: {name}")
+        # 让 infer 进程把权重读进去；成功后才登记 loaded（失败不登记）。
+        # preload_only=True：infer 侧已加载同一 model_dir 时跳过重载，省掉
+        # 重建模型实例的开销与潜在中断（load 强制重载只清 state["model"]/
+        # dir/stats，会话 KV/fw 仍保留；见 infer._serve_handle 的 load 分支）。
+        self.supervisor.call("infer", "load", timeout=600,
+                             model_dir=os.path.abspath(d),
+                             preload_only=True)
+        with self.mgr.lock:
+            self.mgr.loaded = name
+        return {"ok": True, "name": name, "loaded": name}
+
+    def api_model_unload(self, body):
+        name = body.get("name")
+        if name is not None and not isinstance(name, str):
+            raise ValueError("name 必须是字符串")
+        self.supervisor.call("infer", "unload", timeout=600)
+        with self.mgr.lock:
+            self.mgr.loaded = None
+        return {"ok": True, "loaded": None}
+
+    def api_model_select(self, body):
+        """选中活动模型（不加载权重）：复用 api_model_load 的全部登记逻辑。
+
+        名字/路径校验 → 训练互斥 → 【先验证并切换词表】→ 状态锁内
+        mgr.load()（只读 config.json，更新 name / params / ctx，本来就不读
+        权重）。这正是「选中」的语义；把权重读进内存是 /api/model/preload
+        的独立职责。
+
+        2026-11-05 集成修复：初版只写 mgr.name、不切词表、不更新 params/ctx，
+        会绕过 api_model_load:622-629 的 M7 审计修复——换模型后
+        /api/tokens/* 与 infer 子进程仍按旧词表编解码，/api/status 也报
+        上一个模型的上下文。那不是「不加载权重」的必要代价，必须复用。
+        """
+        _code, res = self.api_model_load(body)
+        return {"ok": True, "active": res.get("model")}
+
+    # -- 环境管理（GET，转发给成员 C 的 env_manager） --
+    # env_manager 对非法入参抛 ValueError（未知依赖名等）：显式转成 400
+    # {error}，不依赖 do_GET 的外层兜底，保证 {error} + HTTP 约定稳定。
+    def api_env_deps(self):
+        try:
+            import env_manager
+            deps = env_manager.list_deps()
+        except ImportError:
+            return 503, {"error": "环境管理模块尚未就绪"}
+        except ValueError as e:
+            return 400, {"error": str(e)}
+        return 200, {"deps": deps}
+
+    def api_env_binaries(self):
+        try:
+            import env_manager
+            binaries = env_manager.scan_binaries()
+        except ImportError:
+            return 503, {"error": "环境管理模块尚未就绪"}
+        except ValueError as e:
+            return 400, {"error": str(e)}
+        return 200, {"binaries": binaries}
+
+    def api_env_versions(self, query):
+        name = (query.get("name") or [""])[0]
+        if not name:
+            raise ValueError("缺少 name")
+        try:
+            import env_manager
+            result = env_manager.available_versions(name)
+        except ImportError:
+            return 503, {"error": "环境管理模块尚未就绪"}
+        except ValueError as e:
+            return 400, {"error": str(e)}
+        return 200, result
+
+    # -- 环境管理（POST，TaskPool 异步） --
+    def api_env_install(self, body):
+        name = body.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("缺少 name")
+        version = body.get("version")
+        if version is not None and not isinstance(version, str):
+            raise ValueError("version 必须是字符串")
+        try:
+            import env_manager
+        except ImportError:
+            return 503, {"error": "环境管理模块尚未就绪"}
+
+        # 入参错误（未知依赖名等 ValueError）在异步任务里由 TaskPool 记为
+        # status=error + error 返回，不在此预校验：避免把 env_manager 的
+        # name/removable 校验规则复制进 server 层（铁律「只 import + 转发」）。
+        def work():
+            return env_manager.install(name, version)
+
+        tid = self.pool.submit(work)
+        return 202, {"task_id": tid}
+
+    def api_env_remove(self, body):
+        name = body.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("缺少 name")
+        try:
+            import env_manager
+        except ImportError:
+            return 503, {"error": "环境管理模块尚未就绪"}
+
+        # 同上：must 组 / 未知依赖的 ValueError 由 TaskPool 以 status=error
+        # 透出，不在此做同步预校验（不复制 env_manager 的 removable 规则）。
+        def work():
+            return env_manager.remove(name)
+
+        tid = self.pool.submit(work)
+        return 202, {"task_id": tid}
 
     # ---------------- system / vocab ----------------
     # 模块名 → 发行包名（importlib.metadata 认的是后者，PIL 装在 pillow 里）
@@ -1324,6 +1692,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(app.api_status())
             elif path == "/api/models":
                 self._send_json(app.api_models())
+            elif path == "/api/sessions":
+                _code, obj = app.api_sessions()
+                self._send_json(obj, _code)
+            elif path == "/api/session/get":
+                _code, obj = app.api_session_get(query)
+                self._send_json(obj, _code)
+            elif path == "/api/env/deps":
+                _code, obj = app.api_env_deps()
+                self._send_json(obj, _code)
+            elif path == "/api/env/binaries":
+                _code, obj = app.api_env_binaries()
+                self._send_json(obj, _code)
+            elif path == "/api/env/versions":
+                _code, obj = app.api_env_versions(query)
+                self._send_json(obj, _code)
             elif path.startswith("/api/task/"):
                 tid = path.rsplit("/", 1)[-1]
                 t = app.pool.get(tid)
@@ -1336,6 +1719,12 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/train/queue":
                 _code, obj = app.api_train_queue()
                 self._send_json(obj, _code)
+            elif path == "/api/train/events":
+                self._send_json(app.api_train_events())
+            elif path == "/api/train/loss":
+                self._send_json(app.api_train_loss())
+            elif path == "/api/train/dataset/spec":
+                self._send_json(app.api_train_dataset_spec())
             elif path == "/api/system":
                 _code, obj = app.api_system()
                 self._send_json(obj, _code)
@@ -1367,12 +1756,16 @@ class Handler(BaseHTTPRequestHandler):
                 # 某个 pip 依赖在镜像上的全部版本（用户挑版本用）
                 self._send_json(app.api_system_versions(query)[1])
             elif path == "/api/infer/stats":
-                self._send_json(app.api_infer_stats())
+                self._send_json(app.api_infer_stats(query))
             elif path == "/api/infer/stream":
                 _code, obj = app.api_infer_stream(query)
                 self._send_json(obj, _code)
             elif path == "/api/plugin/list":
                 self._send_json(app.api_plugin_list())
+            elif path == "/api/agent/spec":
+                self._send_json(app.api_agent_spec())
+            elif path == "/api/agent/tools":
+                self._send_json(app.api_agent_tools())
             elif path == "/api/vocab":
                 _code, obj = app.api_vocab(query)
                 self._send_json(obj, _code)
@@ -1415,11 +1808,17 @@ class Handler(BaseHTTPRequestHandler):
             "/api/train/start": app.api_train_start,
             "/api/train/stop": app.api_train_stop,
             "/api/train/delete": app.api_train_delete,
+            "/api/train/task/update": app.api_train_task_update,
             "/api/codec/image": app.api_codec_image,
             "/api/codec/frames": app.api_codec_frames,
             "/api/codec/audio": app.api_codec_audio,
             "/api/codec/draw": app.api_codec_draw,
             "/api/codec/text": app.api_codec_text,
+            "/api/agent/encode": app.api_agent_encode,
+            "/api/agent/decode": app.api_agent_decode,
+            "/api/agent/file": app.api_agent_file,
+            "/api/agent/tool": app.api_agent_tool,
+            "/api/agent/tool_result": app.api_agent_tool_result,
             "/api/codec/video": app.api_codec_video,
             "/api/codec/image2prims": app.api_codec_image2prims,
             "/api/tokens/encode": app.api_tokens_encode,
@@ -1443,6 +1842,17 @@ class Handler(BaseHTTPRequestHandler):
             "/api/prims/job/create": app.api_prims_job_create,
             "/api/prims/job/update": app.api_prims_job_update,
             "/api/prims/job/delete": app.api_prims_job_delete,
+            "/api/session/create": app.api_session_create,
+            "/api/session/save": app.api_session_save,
+            "/api/session/append": app.api_session_append,
+            "/api/session/delete": app.api_session_delete,
+            "/api/infer/clear_fw": app.api_infer_clear_fw,
+            "/api/momw/control": app.api_momw_control,
+            "/api/model/preload": app.api_model_preload,
+            "/api/model/unload": app.api_model_unload,
+            "/api/model/select": app.api_model_select,
+            "/api/env/install": app.api_env_install,
+            "/api/env/remove": app.api_env_remove,
         }
         fn = routes.get(path)
         if fn is None:

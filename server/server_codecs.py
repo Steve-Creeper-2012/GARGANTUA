@@ -16,7 +16,7 @@ import tempfile
 
 import spec
 from paths import project_tmp_dir
-from tokens import audio_codec, draw_codec, image_codec, tok5
+from tokens import audio_codec, draw_codec, image_codec, tok6
 from prims.image_to_primitives import image_to_primitives
 from server_media import (MAX_AUDIO_TOKENS, MAX_PATCHES_TOTAL, b64_to_pil,
                           decode_audio_any, extract_video_audio,
@@ -32,7 +32,7 @@ MAX_PRIMITIVES = 1000
 
 
 def token5_text(steps, vocab=None) -> str:
-    """Steps → token-5 可读文本（{text: 00001} / {wave: HEX} / {visual: …}）。
+    """Steps → token-6 可读文本（{text: 00001} / {wave: HEX} / {visual: …}）。
 
     前端不再自己拼格式：hex 载荷（2132 / 10240 字符）在 JS 里拼既慢又容易
     和 Python 侧的位序不一致，统一由后端给出唯一真相。
@@ -42,8 +42,8 @@ def token5_text(steps, vocab=None) -> str:
     """
     from tokens.vocab import get_vocab
     v = vocab if vocab is not None else get_vocab()
-    items = tok5.from_steps(steps, vocab=v)
-    return tok5.to_display(items, name_of=tok5.vocab_name_of(v))
+    items = tok6.from_steps(steps, vocab=v)
+    return tok6.to_display(items, name_of=tok6.vocab_name_of(v))
 
 
 def codec_vocab(body):
@@ -315,22 +315,22 @@ class CodecApi:
                     "time_step": [step_to_json(vstep)] +
                                  [step_to_json(a) for a in asteps]
                 })
-                # token-5：一帧 = 一个 {}，里面先铺 patch 再铺音元
-                els = [tok5.visual(p["vec"], p["x"], p["y"])
+                # token-6：一帧 = 一个 {}，里面先铺 patch 再铺音元
+                els = [tok6.visual(p["vec"], p["x"], p["y"])
                        for p in vstep["meta"].get("patches") or []]
                 for a in asteps:
                     if (a["meta"].get("n") or 0) >= spec.AUDIO_SAMPLES_PER_TOKEN:
-                        els.append(tok5.wave(a["meta"]["samples"]))
+                        els.append(tok6.wave(a["meta"]["samples"]))
                 if els:
-                    frames_token5.append(tok5.step(els))
+                    frames_token5.append(tok6.step(els))
             return 200, {
                 "n_frames": len(frames),
                 "n_audio_tokens": len(audio_steps),
                 "total_patches": total_patches,
                 "audio_truncated": audio_truncated,
                 "steps": combined,
-                "token5": tok5.to_display(
-                    frames_token5, name_of=tok5.vocab_name_of(v)),
+                "token5": tok6.to_display(
+                    frames_token5, name_of=tok6.vocab_name_of(v)),
                 "vocab": v.name,
             }
         finally:
