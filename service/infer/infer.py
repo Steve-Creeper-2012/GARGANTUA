@@ -684,6 +684,18 @@ def generate(m, prompt: str | None = None, max_new: int = 32,
             session["kv_enabled"] = kv_enabled
             session["fw_writes"] = (list(session.get("fw_writes") or [])
                                     + writes)[-spec.FW_WRITE_HISTORY:]
+        # 2026-11-08：MoMW 快照落盘——一个「写入批次」（本轮生成）之后存一次，
+        # 不在 token 关键路径上。先 flush 异步写者，保证快照与内存状态一致；
+        # 落盘走 models/NAME/momw_state/，不进 weights/config 契约。
+        mo = getattr(m, "momw", None)
+        if session_mode and mo is not None:
+            try:
+                mo.flush(state)
+                if model_dir:
+                    mo.save_state(model_dir, state,
+                                  extra={"session_id": session_id})
+            except Exception as e:
+                print(f"[infer] momw 快照保存失败: {e}", file=sys.stderr)
         return out_steps, archive.rel_path(), meta
     finally:
         archive.close(
@@ -970,6 +982,14 @@ def _serve_handle(req: dict, state: dict, sessions: dict, emit=None) -> dict:
                 _release_session(old)
             return {"id": rid, "ok": True, "result": {"dropped": True}}
         if op == "unload":
+            # 2026-11-08：卸载前先停掉 MoMW 的异步写者线程（reset 会 close
+            # 旧池的 writer），否则反复切模型会累积线程。
+            old_m = state.get("model")
+            if getattr(old_m, "momw", None) is not None:
+                try:
+                    old_m.momw.reset()
+                except Exception:
+                    pass
             state["model"] = None
             state["dir"] = None
             state["stats"] = None

@@ -2577,15 +2577,23 @@ function renderMoMW(s) {
   metric.textContent = `${layers.length} 层 / ${active} 激活`;
   badge.textContent = s.silent ? "静默" : "运行中";
   badge.className = "badge" + (s.silent ? "" : " on");
+  const tmode = s.threshold_mode === "quantile" ? "分位自适应"
+              : (s.threshold_mode === "cold" ? "冷启动" : "固定");
+  const thr = Number(s.threshold == null ? cfg.threshold : s.threshold);
+  const gate = Number(s.fw_gate == null ? 1 : s.fw_gate);
+  const src = s.anchor_source === "text" ? "文本锚点"
+            : (s.anchor_source === "provider" ? "注入锚点" : "采样锚点");
   sum.textContent = `步数 ${s.steps} · 扩展 ${s.expansions} 次 · ` +
-    `N=${cfg.N} · τ=${cfg.tau} · 阈值 ${cfg.threshold}`;
+    `阈值 ${thr.toFixed(3)}（${tmode}）· 门控 ${gate.toFixed(2)} · ` +
+    (s.queue_pending ? `待写 ${s.queue_pending} · ` : "") +
+    `${src} · N=${cfg.N} · τ=${cfg.tau}`;
   box.innerHTML = layers.map((l, i) => {
     const g = Math.max(0, Math.min(100, Math.round((l.gamma || 0) * 100)));
     const sc = (s.last_scores || [])[i];
     const ca = ((s.last_cos_anchor || [])[i] || 0).toFixed(3);
     const ce = ((s.last_cos_state || [])[i] || 0).toFixed(3);
     return `<div class="row" style="align-items:center;gap:6px;margin:3px 0;font-size:11px"
-         title="锚点余弦 ${ca} · 状态余弦 ${ce} · 路由分 ${sc == null ? "—" : Number(sc).toFixed(3)}">
+         title="锚点余弦 ${ca} · 状态余弦 ${ce} · 路由分 ${sc == null ? "—" : Number(sc).toFixed(3)} · Oja ${l.oja_steps || 0} 步 · 增长 ${Number(l.growth || 0).toFixed(2)}">
       <span class="badge ${l.active ? "on" : ""}">${esc(l.type)}</span>
       <span class="hint" style="min-width:18px">#${i}</span>
       <span style="flex:1;height:5px;border-radius:3px;background:var(--fill-2);overflow:hidden;display:block">

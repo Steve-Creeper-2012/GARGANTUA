@@ -889,7 +889,8 @@ class Gargantua(nn.Module):
                  vocab_size: int | None = None,
                  share_enc_dec: bool = spec.SHARE_ENC_DEC,
                  d_model: int | None = None,
-                 momw: dict | None = None):
+                 momw: dict | None = None,
+                 vocab_dir: str | None = None):
         super().__init__()
         # 2026-11-04：模型宽度建模可选（缺省 = spec.D_MODEL，旧目录行为不变）
         D = (spec.D_MODEL if d_model is None
@@ -951,9 +952,12 @@ class Gargantua(nn.Module):
         self.momw = None
         if momw is not None and bool(momw.get("enabled", False)):
             from momw import MoMW
-            # wte 只作为「代表性 token Embedding 均值」的锚点来源，是引用
-            # 不是参数；锚点在首次 forward 惰性计算（此时权重已 load 完）。
-            self.momw = MoMW(self.fast_weight.layer, momw, wte=self.wte)
+            # wte / vocab_dir 只作为锚点来源，是引用不是参数；锚点在首次
+            # forward 惰性计算（此时权重已 load 完）。vocab_dir 指向**模型
+            # 自己的词表副本**，用它编码类别代表文本 → 不依赖硬编码 token
+            # ID（版本升级时全局 ID 会整体位移）。
+            self.momw = MoMW(self.fast_weight.layer, momw, wte=self.wte,
+                             vocab_dir=vocab_dir)
         # 先初始化、后绑定：两侧独立各初始化一次，随机序列与 v1 逐字一致；
         # 绑定后 dec 侧原有的 Parameter 成为孤儿被回收，dec_blocks 里的
         # Block 实例仍保留自己的 is_decoder / MLA.causal / rec_state 语义。
@@ -1032,12 +1036,17 @@ class Gargantua(nn.Module):
             x, blocks = blk(x, (None, None, None), (None, None, None),
                             x_step_ids=step_ids, blocks=blocks)
             if i == 0:   # fast weight：第一个 block 之后调用一次（先用后更新）
-                x = x + self.fast_weight(x, state=state)
+                fw_out = self.fast_weight(x, state=state)
+                x = x + fw_out
                 blocks[-1] = x             # 提交块表示与实际流一致
                 # MoMW（可选）：与 fast weight 同址、并列残差。H_1 是已含
                 # fast weight 读出的主干流，未激活时原样返回 H_1。
+                # fast weight 读出能量（相对主干）走 cost-aware 门控：
+                # 能量高时收缩 ΔH，避免两次记忆读出同时拉高范数。
                 if self.momw is not None:
-                    x = self.momw(x, state=state)
+                    e = float(fw_out.detach().float().norm()
+                              / (x.detach().float().norm() + 1e-6))
+                    x = self.momw(x, state=state, fw_energy=e)
                     blocks[-1] = x
         return self.enc_final_norm(x)
 
@@ -1053,12 +1062,15 @@ class Gargantua(nn.Module):
             x, blocks = blk(x, kv_hca, kv_csa, x_step_ids=step_ids,
                             blocks=blocks, rec_state=state)
             if i == 0:   # fast weight：与 encoder 共享同一 bank，状态继续推进
-                x = x + self.fast_weight(x, state=state)
+                fw_out = self.fast_weight(x, state=state)
+                x = x + fw_out
                 blocks[-1] = x
                 # MoMW：encoder 侧写过的池状态通过同一个 state 容器跨到
                 # decoder，语义与 fast weight 的 enc→dec 状态推进一致。
                 if self.momw is not None:
-                    x = self.momw(x, state=state)
+                    e = float(fw_out.detach().float().norm()
+                              / (x.detach().float().norm() + 1e-6))
+                    x = self.momw(x, state=state, fw_energy=e)
                     blocks[-1] = x
         return self.dec_final_norm(x)
 

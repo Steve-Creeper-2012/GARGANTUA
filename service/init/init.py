@@ -47,7 +47,7 @@ import boot
 boot.bootstrap()
 import spec
 from common import (MAX_BLOCKS, model_exists, model_init_lock,
-                    normalize_shared_blocks, save_checkpoint,
+                    model_vocab_dir, normalize_shared_blocks, save_checkpoint,
                     valid_model_name, validate_ctx_config,
                     validate_momw_config)
 from model import Gargantua
@@ -138,6 +138,8 @@ def _run(args) -> dict:
                       share_enc_dec=args.share_enc_dec,
                       d_model=dm,
                       momw=momw_cfg,
+                      # 词表已在上面复制进 models/NAME/vocab/，锚点文本用它编码
+                      vocab_dir=model_vocab_dir(d),
                       vocab_size=vocab_size, **ctx)
         # parameters() 由 PyTorch 去重——共享模型的 n 只算一份参数
         n = sum(p.numel() for p in m.parameters())

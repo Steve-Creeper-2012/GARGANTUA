@@ -1147,9 +1147,43 @@ MOMW_LOAD_LAMBDA = 0.05           # 同类层软均衡强度
 MOMW_ANCHOR_SAMPLE = 32           # 每类锚点采样的代表性 token 行数
 MOMW_EIGEN_MIN_WRITES = 4         # E_i 至少积累几次写入才可被继承为 P_new
 
+# ---- v3（2026-11-08 第三版：数据驱动阈值 / Oja / 持久化 / 门控 / 异步写）----
+# 阈值分位数：规格给的「p=10%」是「低尾定义边界」口径（≈90% 准入）。
+# MoMW 的语义是「有相关记忆才介入」，所以取保守侧：p=0.9 ⇒ 只让历史
+# 分数最高的约 10% 的输入跨过阈值。p 是**分位位置，不是激活率**。
+MOMW_THRESHOLD_MODE = "fixed"     # "fixed" | "quantile"
+MOMW_QUANTILE_P = 0.9             # 历史分数分位位置（1-p ≈ 准入比例）
+MOMW_QUANTILE_WINDOW = 64         # 打分历史窗口 W（步）
+# 相对量替代绝对值：‖S‖ > ratio × 同类层范数中位数 → 判过载。
+# 绝对 saturation_limit / expand_delta 降级为兜底（0 = 不启用绝对判定）。
+MOMW_SATURATION_RATIO = 1.5
+MOMW_GROWTH_RATIO = 0.5
+MOMW_OJA_ETA = 0.02               # Oja 在线主方向跟踪学习率
+MOMW_FW_GATE_C = 2.0              # cost-aware 门控强度（0 = 关闭）
+MOMW_ASYNC_WRITE = False          # 单写者队列异步写（默认同步）
+MOMW_PERSIST = True               # 启用时把池快照落 models/NAME/momw_state/
+MOMW_QUANTILE_MIN_SAMPLES = 8     # 历史不足时退回固定 threshold
+MOMW_QUANTILE_RANGE = (0.01, 0.99)
+MOMW_QUANTILE_WINDOW_RANGE = (4, 4096)
+MOMW_RATIO_MIN = 1.0              # saturation_ratio > 1 才有意义
+MOMW_OJA_ETA_RANGE = (1e-4, 1.0)
+MOMW_FW_GATE_C_RANGE = (0.0, 50.0)
+
 # 锚点类别（MW 层类型）。同类层之间才做软均衡；类型名会下发前端展示。
 MOMW_ANCHOR_GROUPS = ("general", "error", "code", "math")
 MOMW_ANCHOR_SEED = 0x4D4F4D57     # "MOMW"：确定性采样，禁用全局随机状态
+
+# 类别代表性文本（v3）：由调用方用**模型自己的词表副本**编码成 token id，
+# 再取 wte 均值作为锚点。用模型词表而不是全局词表，就绕开了「版本升级时
+# ID 整体位移」的问题——锚点不依赖任何硬编码 ID。编码失败时逐级降级：
+# 文本 → 代表性 token 采样 → 确定性随机单位向量。
+MOMW_ANCHOR_TEXTS = {
+    "general": ("hello", "the quick brown fox", "this is a note"),
+    "error": ("Traceback (most recent call last)", "SyntaxError",
+              "failed to parse the input"),
+    "code": ("def main():", "return None", "for i in range(10)"),
+    "math": ("1 + 2 = 3", "0.5 * 4", "the sum is"),
+}
 
 # 合法范围（HTTP / CLI 校验用；非法值一律拒绝而非静默钳制）
 MOMW_TOP_N_RANGE = (1, 16)
@@ -1170,7 +1204,11 @@ MOMW_CONFIG_FIELDS = ("enabled", "N", "tau", "threshold", "M", "B0",
                       "starve_threshold", "saturation_limit",
                       "initial_layers", "max_layers", "expand_delta",
                       "gamma_k", "eigen_interval", "load_lambda",
-                      "anchor_sample", "eigen_min_writes")
+                      "anchor_sample", "eigen_min_writes",
+                      "threshold_mode", "quantile_p", "quantile_window",
+                      "saturation_ratio", "growth_ratio", "oja_eta",
+                      "fw_gate_c", "async_write", "persist")
+MOMW_THRESHOLD_MODES = ("fixed", "quantile")
 
 
 def momw_default_config() -> dict:
@@ -1195,6 +1233,15 @@ def momw_default_config() -> dict:
         "load_lambda": MOMW_LOAD_LAMBDA,
         "anchor_sample": MOMW_ANCHOR_SAMPLE,
         "eigen_min_writes": MOMW_EIGEN_MIN_WRITES,
+        "threshold_mode": MOMW_THRESHOLD_MODE,
+        "quantile_p": MOMW_QUANTILE_P,
+        "quantile_window": MOMW_QUANTILE_WINDOW,
+        "saturation_ratio": MOMW_SATURATION_RATIO,
+        "growth_ratio": MOMW_GROWTH_RATIO,
+        "oja_eta": MOMW_OJA_ETA,
+        "fw_gate_c": MOMW_FW_GATE_C,
+        "async_write": MOMW_ASYNC_WRITE,
+        "persist": MOMW_PERSIST,
     }
 
 # ---------------------------------------------------------------------------

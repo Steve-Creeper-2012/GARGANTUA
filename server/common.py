@@ -460,6 +460,16 @@ def _momw_int(v, name: str, lo: int, hi: int) -> int:
     return n
 
 
+def _momw_bool(v, name: str) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str) and v.strip().lower() in ("true", "false"):
+        return v.strip().lower() == "true"
+    raise ValueError(f"momw.{name} 必须是布尔值: {v!r}")
+
+
 def _momw_float(v, name: str, lo: float) -> float:
     if isinstance(v, bool) or not isinstance(v, (int, float, str)):
         raise ValueError(f"momw.{name} 必须是数字: {v!r}")
@@ -534,6 +544,50 @@ def validate_momw_config(v) -> dict:
                 f"momw.load_lambda 必须 ≤ {spec.MOMW_LOAD_LAMBDA_MAX}："
                 "软均衡不能盖过语义打分")
         cfg["load_lambda"] = lam
+    # ---- v3：数据驱动阈值 / Oja / 门控 / 异步 / 持久化 ----
+    if "threshold_mode" in v:
+        mode = v["threshold_mode"]
+        if not isinstance(mode, str) or \
+                mode.strip().lower() not in spec.MOMW_THRESHOLD_MODES:
+            raise ValueError(
+                f"momw.threshold_mode 必须是 "
+                f"{' / '.join(spec.MOMW_THRESHOLD_MODES)}: {mode!r}")
+        cfg["threshold_mode"] = mode.strip().lower()
+    if "quantile_window" in v:
+        cfg["quantile_window"] = _momw_int(
+            v["quantile_window"], "quantile_window",
+            *spec.MOMW_QUANTILE_WINDOW_RANGE)
+    if "quantile_p" in v:
+        p = _momw_float(v["quantile_p"], "quantile_p",
+                        spec.MOMW_QUANTILE_RANGE[0])
+        if p > spec.MOMW_QUANTILE_RANGE[1]:
+            raise ValueError(
+                f"momw.quantile_p 必须 ≤ {spec.MOMW_QUANTILE_RANGE[1]}")
+        cfg["quantile_p"] = p
+    if "saturation_ratio" in v:
+        r = _momw_float(v["saturation_ratio"], "saturation_ratio",
+                        spec.MOMW_RATIO_MIN)
+        cfg["saturation_ratio"] = r
+    if "growth_ratio" in v:
+        cfg["growth_ratio"] = _momw_float(
+            v["growth_ratio"], "growth_ratio", spec.MOMW_POSITIVE_MIN)
+    if "oja_eta" in v:
+        eta = _momw_float(v["oja_eta"], "oja_eta",
+                          spec.MOMW_OJA_ETA_RANGE[0])
+        if eta > spec.MOMW_OJA_ETA_RANGE[1]:
+            raise ValueError(
+                f"momw.oja_eta 必须 ≤ {spec.MOMW_OJA_ETA_RANGE[1]}")
+        cfg["oja_eta"] = eta
+    if "fw_gate_c" in v:
+        g = _momw_float(v["fw_gate_c"], "fw_gate_c",
+                        spec.MOMW_FW_GATE_C_RANGE[0])
+        if g > spec.MOMW_FW_GATE_C_RANGE[1]:
+            raise ValueError(
+                f"momw.fw_gate_c 必须 ≤ {spec.MOMW_FW_GATE_C_RANGE[1]}")
+        cfg["fw_gate_c"] = g
+    for key in ("async_write", "persist"):
+        if key in v:
+            cfg[key] = _momw_bool(v[key], key)
     if cfg["initial_layers"] > cfg["max_layers"]:
         raise ValueError(
             f"momw.initial_layers({cfg['initial_layers']}) 不能超过 "
@@ -633,6 +687,9 @@ def build_model(model_dir: str):
                   vocab_size=model_vocab_size(model_dir),
                   share_enc_dec=share, d_model=read_d_model(cfg),
                   momw=read_momw_config(cfg),
+                  # 锚点用模型自己的词表副本编码类别代表文本（不依赖硬编码
+                  # token ID；版本升级时全局 ID 位移也不影响）
+                  vocab_dir=model_vocab_dir(model_dir),
                   **_ctx_from_cfg(cfg))
     sd = load_model_state_dict(model_dir)
     if sd:
@@ -663,6 +720,13 @@ def build_model(model_dir: str):
         # hasattr 是为了兼容测试里替换掉的替身模型。
         if share and hasattr(m, "retie_shared_weights"):
             m.retie_shared_weights()
+    # 2026-11-08：MoMW 池快照（独立子目录，不进 weights/config 契约）。
+    # 有就按快照重建，没有/损坏就从零开始——它本来就是可重建的运行时数据。
+    if getattr(m, "momw", None) is not None:
+        try:
+            m.momw.load_state(model_dir)
+        except Exception as e:
+            _warn(f"momw_state 恢复失败，按零状态启动: {e}")
     return m
 
 
