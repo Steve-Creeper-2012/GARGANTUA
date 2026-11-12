@@ -979,17 +979,34 @@ class Gargantua(nn.Module):
             tie_module_parameters(dec_blk, enc_blk)
         tie_module_parameters(self.dec_final_norm, self.enc_final_norm)
 
+    def _somn_module(self):
+        """SOMN（v4-somn，可选、默认关闭）。
+
+        管理器只存在普通字典 ``_rt['somn']['module']`` 里，不在模块树中 →
+        state_dict 与旧目录逐字一致。未 attach 时返回 None，主干零开销。
+        """
+        rt = getattr(self, "_rt", None)
+        if not isinstance(rt, dict):
+            return None
+        slot = rt.get("somn")
+        return slot.get("module") if isinstance(slot, dict) else None
+
     def reset_memory(self) -> None:
-        """样本边界复位全部持久记忆（fast weight + 可选 MoMW）。
+        """样本边界复位全部持久记忆（fast weight + 可选 MoMW + 可选 SOMN）。
 
         只清模块内部持有的状态，**不动外部 state 容器**：推理会话把跨轮
         记忆放在 state["fw"] / state["momw"]，在这里 reset 掉就等于清空
         会话记忆（2026-10-27 审计修复的结论，见 infer.generate 注释）。
         所有训练/推理入口统一调这一个方法，避免新增记忆组件时漏掉复位。
+        SOMN 显式设 persist_across_samples=True 时跳过复位（跨样本自组织
+        实验用），默认仍遵循样本边界契约。
         """
         self.fast_weight.reset()
         if self.momw is not None:
             self.momw.reset()
+        somn_mgr = self._somn_module()
+        if somn_mgr is not None and not somn_mgr.persist_across_samples:
+            somn_mgr.reset()
 
     @staticmethod
     def _init(m):
@@ -1048,6 +1065,12 @@ class Gargantua(nn.Module):
                               / (x.detach().float().norm() + 1e-6))
                     x = self.momw(x, state=state, fw_energy=e)
                     blocks[-1] = x
+                # SOMN（v4-somn，可选）：与 fast weight / MoMW 同址并列残差，
+                # 默认关闭时 _somn_module() 为 None，数值逐字不变。
+                somn_mgr = self._somn_module()
+                if somn_mgr is not None:
+                    x = somn_mgr(x)
+                    blocks[-1] = x
         return self.enc_final_norm(x)
 
     # ---- decoder：读共享 KV，自回归（步间因果 + 步内 token 级因果）----
@@ -1071,6 +1094,12 @@ class Gargantua(nn.Module):
                     e = float(fw_out.detach().float().norm()
                               / (x.detach().float().norm() + 1e-6))
                     x = self.momw(x, state=state, fw_energy=e)
+                    blocks[-1] = x
+                # SOMN：encoder 侧推进过的层池经同一管理器跨到 decoder，
+                # 与 fast weight 的 enc→dec 状态推进语义一致。
+                somn_mgr = self._somn_module()
+                if somn_mgr is not None:
+                    x = somn_mgr(x)
                     blocks[-1] = x
         return self.dec_final_norm(x)
 
