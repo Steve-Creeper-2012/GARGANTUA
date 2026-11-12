@@ -96,6 +96,8 @@ SUITES = [
     # 2026-11-08 MoMW 无训练记忆阀门：state_dict 零新增 key / 单一出口 /
     # bonus 破死锁 / 未召回不遗忘 / 动态扩展 / config roundtrip（轻量）
     ("test_momw", "service.test.test_momw", 600, "unittest"),
+    # 2026-11-11 v4-somn：SVD 无损拆分 / 冷启动 / 分裂 / Elbow / 零污染（轻量）
+    ("test_somn", "service.test.test_somn", 600, "unittest"),
     ("verify_formats", "service/test/verify_formats.py", 600, "script"),
 ]
 
