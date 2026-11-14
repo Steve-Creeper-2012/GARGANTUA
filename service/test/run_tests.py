@@ -98,6 +98,10 @@ SUITES = [
     ("test_momw", "service.test.test_momw", 600, "unittest"),
     # 2026-11-11 v4-somn：SVD 无损拆分 / 冷启动 / 分裂 / Elbow / 零污染（轻量）
     ("test_somn", "service.test.test_somn", 600, "unittest"),
+    # 2026-11-13 manifold/Muon 落地：谱诊断零侵入 / 秩 1 分组修正 /
+    # 复位统一 / Stiefel·DGram retraction / config 契约（77 项，轻量）
+    ("test_manifold_20261113", "service.test.test_manifold_20261113", 900,
+     "unittest"),
     ("verify_formats", "service/test/verify_formats.py", 600, "script"),
 ]
 

@@ -303,6 +303,9 @@ class MLAAttention(nn.Module):
         self.w_uk = nn.Linear(spec.MLA_KV_LORA_RANK, inner, bias=False)
         self.w_uv = nn.Linear(spec.MLA_V_LORA_RANK, inner, bias=False)
         self.w_o = nn.Linear(inner, d_model, bias=False)
+        # 诊断探针（阶段 2）：普通属性，绝不注册为 Module/Parameter/buffer，
+        # 不进 state_dict；默认 None 时 forward 仅多一次 `is not None` 判断。
+        self.diag_probe = None
 
     def forward(self, x: torch.Tensor, kv: torch.Tensor,
                 kv_step_ids: Optional[torch.Tensor] = None,
@@ -345,6 +348,8 @@ class MLAAttention(nn.Module):
                 & (kv_pos.unsqueeze(1) <= x_pos.unsqueeze(2))
             mask = past | within                             # [B,Tq,Tk]
             attn = attn.masked_fill(~mask.unsqueeze(1), float('-inf'))
+        if self.diag_probe is not None:
+            self.diag_probe(attn.detach())
         out = torch.einsum('bhqk,bhkd->bhqd', attn.softmax(-1), v)
         out = out.transpose(1, 2).reshape(B, Tq, self.H * self.dh)
         return self.w_o(out)
@@ -1000,6 +1005,13 @@ class Gargantua(nn.Module):
         所有训练/推理入口统一调这一个方法，避免新增记忆组件时漏掉复位。
         SOMN 显式设 persist_across_samples=True 时跳过复位（跨样本自组织
         实验用），默认仍遵循样本边界契约。
+
+        2026-11-13 交叉审计修复：各组件的 reset() 现在还要清空自己的
+        last_* 观测缓存（MoMWRouter.last_raw/last_scores/last_cos_*/
+        last_gamma、EnergyElbowRouter.last_base_scores/last_boosted_scores）。
+        这些缓存过去不随 pool/层池重建而消失，reset 后读 stats() 仍拿到
+        上一个样本的分数。清理下沉到各组件 reset()，本方法保持「只调度、
+        不复制清理逻辑」的单一真源。
         """
         self.fast_weight.reset()
         if self.momw is not None:
@@ -1305,18 +1317,79 @@ class Gargantua(nn.Module):
 
 
 # ===========================================================================
-# 参数分组（优化器契约：Muon 只管隐藏层 2D 矩阵；embedding / lm_head /
-# RMSNorm / 标量 / 卷积恒为 AdamW）
+# 参数分组（优化器契约：Muon 只管隐藏层 2D 满秩矩阵；embedding / lm_head /
+# RMSNorm / 标量 / 卷积 / 残差投影恒为 AdamW）
+#
+# 阶段 1 修正（2026-11-13，Manifold Muon 前置）：
+#   旧实现用散落的内联黑名单，把 wte/lm_head/coord/type_emb/pos_emb 之外
+#   的一切 2D 矩阵都塞进 Muon，于是 Block 的 attn_res_proj / mlp_res_proj
+#   （nn.Linear(D,1) → weight [1,D]）这种秩 1 的 2D 矩阵也被送进
+#   newton_schulz5。
+#   —— 为什么 rank-1 2D 矩阵不能进 Muon：NS5 做的是矩阵正交化（把更新投影
+#   到半正交 UVᵀ）。[1,D] / [D,1] 的外积只有一个有效方向，正交化退化成把
+#   该方向归一化，既无多方向去相关的意义，又会被 Muon 的 RMS 对齐
+#   `* sqrt(max(shape))` 放大到与满秩矩阵同量级，破坏残差门投影的标度稳定。
+#   —— 为什么用「显式集合」而不是散落的内联黑名单：把所有恒归 AdamW 的
+#   名字片段集中成一个可审计的常量，新增 embedding / 投影时只需改一处；
+#   再叠加一条不依赖命名的形状兜底（min(shape) < 2），任何形状的退化 2D
+#   矩阵都不会漏进 Muon。
 # ===========================================================================
+
+# 显式枚举：命中任一片段即恒归 AdamW（与形状无关）。
+_ADAMW_NAME_PARTS = (
+    "wte", "lm_head", "coord", "type_emb", "pos_emb",
+    "attn_res_proj", "mlp_res_proj",
+)
+
+
+def _classify_param(name: str, p: torch.Tensor):
+    """分组判据单一真源。返回 (to_adamw: bool, is_rank1_2d: bool)。
+
+    to_adamw     —— 该参数应归 AdamW；否则（2D 满秩且不在排除集合）归 Muon。
+    is_rank1_2d  —— 是否为被形状兜底拦下的秩 1 2D 矩阵（供报告使用）。
+    """
+    is_2d = p.ndim == 2
+    named_adamw = any(part in name for part in _ADAMW_NAME_PARTS)
+    # 不依赖命名的通用保护：任何 min(dim) < 2 的 2D 矩阵都是秩 1 退化矩阵。
+    rank1_2d = is_2d and min(p.shape) < 2
+    to_adamw = (not is_2d) or named_adamw or rank1_2d
+    return to_adamw, rank1_2d
+
+
 def param_groups_for_optimizers(model: Gargantua) -> Dict[str, List[torch.Tensor]]:
+    """返回 {"muon": [...], "adamw": [...]}，两组互不重叠且覆盖全部可训练参数。
+
+    契约不变：训练循环 / build_optimizers 依赖这两个键与参数对象身份。
+    """
     muon, adamw = [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if (p.ndim == 2 and "wte" not in name and "lm_head" not in name
-                and "coord" not in name and "type_emb" not in name
-                and "pos_emb" not in name):
-            muon.append(p)
-        else:
-            adamw.append(p)
+        to_adamw, _ = _classify_param(name, p)
+        (adamw if to_adamw else muon).append(p)
     return {"muon": muon, "adamw": adamw}
+
+
+def param_group_report(model: Gargantua) -> dict:
+    """分组审计（自检 / 测试用）。键：
+      muon / adamw / total     —— 数量（int）；
+      rank1_excluded           —— 被形状兜底拦下的 [1,D]/[D,1] 投影名字（list）；
+      muon_names / adamw_names —— 各组的参数名字（list）。
+    与 param_groups_for_optimizers 共用 _classify_param，判据不会漂移。
+    """
+    muon_names, adamw_names, rank1_excluded = [], [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        to_adamw, is_rank1 = _classify_param(name, p)
+        if is_rank1:
+            rank1_excluded.append(name)
+        (adamw_names if to_adamw else muon_names).append(name)
+    return {
+        "muon": len(muon_names),
+        "adamw": len(adamw_names),
+        "total": len(muon_names) + len(adamw_names),
+        "rank1_excluded": rank1_excluded,
+        "muon_names": muon_names,
+        "adamw_names": adamw_names,
+    }
