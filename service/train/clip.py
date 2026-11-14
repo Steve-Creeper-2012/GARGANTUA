@@ -10,7 +10,7 @@
 #     且加载侧是 strict，附加子模块会改变键集合、破坏所有既有模型/推理。
 #   * head 单独存成模型目录下的 contrast_head.pt；save_checkpoint 只回收
 #     weights/*.safetensors，不会碰这个文件。
-#   * 每个 segment 编码前都 reset fast weight：状态跨调用持久，不重置会
+#   * 每个 segment 编码前都 reset 全部持久记忆：状态跨调用持久，不重置会
 #     跨样本 / 跨段泄漏（与 forward_train 入口 reset 同一口径）。
 # 本模块只依赖 torch / os / math，不引入任何项目内或第三方依赖。
 # ===========================================================================
@@ -140,7 +140,7 @@ def clip_loss(m, head, pairs):
 
 def run_clip_step(m, head, pairs, model_opts, head_opt, max_grad_norm=1.0):
     """一步：清梯度 → backward → 全局裁剪（m + head）→ 所有 optimizer.step
-    → reset fast weight。返回 (loss.detach(), stats)。"""
+    → reset 全部持久记忆。返回 (loss.detach(), stats)。"""
     for o in model_opts:
         o.zero_grad(set_to_none=True)
     head_opt.zero_grad(set_to_none=True)
@@ -151,7 +151,7 @@ def run_clip_step(m, head, pairs, model_opts, head_opt, max_grad_norm=1.0):
     for o in model_opts:
         o.step()
     head_opt.step()
-    m.fast_weight.reset()
+    m.reset_memory()
     return loss.detach(), stats
 
 

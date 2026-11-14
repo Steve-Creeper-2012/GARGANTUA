@@ -92,7 +92,7 @@ def main(argv=None):
     ap.add_argument("--text", action="store_true",
                     help="输出表面文本（默认只展开 { } |，其余为十六进制 ID）")
     ap.add_argument("--vocab", default=None,
-                    help="用指定的 vocab.txt（或含它的模型目录）解码；"
+                    help="用指定的 .vfc 文件 / 词表目录 / 模型目录（读 vocab/）解码；"
                          "缺省用全局词表")
     args = ap.parse_args(argv)
 

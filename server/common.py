@@ -86,10 +86,10 @@ _DISCRETE_EMBED_KEY_PREFIXES = ("wte.",)
 _CONTINUOUS_EMBED_KEY_PREFIXES = ("visual_proj.", "visual_coord_x.",
                                   "visual_coord_y.", "audio_proj.")
 
-# 每模型词表文件（2026-10-24，steve：每个模型可以有不同的 vocab 词表）。
-# 契约，自定义词表不占用）；不允许重复（反查歧义）。没有 vocab.txt 的
-# 模型用全局词表 service/tokens/vocab.json。
-# 2026-10-27：文件格式升级为 v2（显式 ID + JSON 转义），详见下方
+# 每模型词表目录（2026-10-30 起）：models/NAME/vocab/{vocab.vfc, config.json}，
+# 建模时从 vocabs/<name>/ 整目录复制，模型之间互不牵连；没有该目录才回落到
+# 全局词表 service/tokens/{vocab.vfc, config.json}。
+# 见 tokens/vfc.py 的 .vfc 契约（一行一个 token，ID 严格连续 0..N-1）。
 
 # 推理 API/CLI 层硬上限：CPU 上单步是全序列重解码，2048 已是宽松保护值。
 # 定义在 common（server 与服务进程共用），避免 server 为拿一个常量去
@@ -588,6 +588,14 @@ def validate_momw_config(v) -> dict:
     for key in ("async_write", "persist"):
         if key in v:
             cfg[key] = _momw_bool(v[key], key)
+    if "persist_dtype" in v:
+        d = v["persist_dtype"]
+        if not isinstance(d, str) or \
+                d.strip().lower() not in spec.MOMW_PERSIST_DTYPES:
+            raise ValueError(
+                f"momw.persist_dtype 必须是 "
+                f"{' / '.join(spec.MOMW_PERSIST_DTYPES)}: {d!r}")
+        cfg["persist_dtype"] = d.strip().lower()
     if cfg["initial_layers"] > cfg["max_layers"]:
         raise ValueError(
             f"momw.initial_layers({cfg['initial_layers']}) 不能超过 "
@@ -633,6 +641,119 @@ def read_momw_config(cfg: dict) -> dict:
     except ValueError as e:
         _warn(f"config.json {spec.MOMW_CONFIG_KEY} 非法，按关闭处理: {e}")
         out = spec.momw_default_config()
+        out["enabled"] = False
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Manifold Muon 配置（阶段 2）——与 MoMW 同款「缺字段即关闭」契约
+# ---------------------------------------------------------------------------
+# config.json 里 "manifold_muon" 是唯一开关。旧目录没这个字段 →
+# spec.manifold_default_config()（enabled=False）；坏值只告警并按关闭处理，
+# 绝不让单个目录报废。配置是普通 Python 属性，不进 state_dict，
+# strict load 与三个 safetensors 契约逐字不变。
+_MANIFOLD_MODES = ("stiefel", "dgram", "none")
+
+
+def _manifold_bool(v, key: str) -> bool:
+    # 只认真 bool：0/1/"false" 一律拒绝（bool("false") is True 的坑）。
+    if not isinstance(v, bool):
+        raise ValueError(
+            f"manifold_muon.{key} 必须是布尔值(bool)，拒绝 0/1/字符串: {v!r}")
+    return v
+
+
+def _manifold_number(v, key: str) -> float:
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ValueError(f"manifold_muon.{key} 必须是数字: {v!r}")
+    f = float(v)
+    if not math.isfinite(f):
+        raise ValueError(f"manifold_muon.{key} 必须是有限数: {v!r}")
+    return f
+
+
+def _manifold_int(v, key: str, lo: int, hi: int = None) -> int:
+    # 严格整数：拒 bool / float（含 20.0）/ 字符串，避免类型悄悄漂移。
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise ValueError(f"manifold_muon.{key} 必须是整数: {v!r}")
+    if v < lo or (hi is not None and v > hi):
+        if hi is not None:
+            raise ValueError(f"manifold_muon.{key} 必须在 [{lo}, {hi}]: {v}")
+        raise ValueError(f"manifold_muon.{key} 必须 ≥ {lo}: {v}")
+    return v
+
+
+def validate_manifold_config(v) -> dict:
+    """规范化 Manifold Muon 配置（唯一规则，创建入口 / CLI / 测试共用）。
+
+    - 缺的键用 spec.manifold_default_config() 补齐（用户可能只写 enabled）；
+    - 已知键逐字段严格校验，非法抛 ValueError（说明键 / 收到值 / 期望）；
+    - 未知键原样保留（不覆盖任何默认键，也不参与校验），保证 config 往返
+      不丢用户字段；绝不 cfg.update(v) 整体灌入，避免坏值绕过校验；
+    - 返回补齐后的新 dict，绝不修改入参。
+    """
+    cfg = spec.manifold_default_config()
+    if not isinstance(v, dict):
+        raise ValueError(
+            f"manifold_muon 必须是对象(dict): {type(v).__name__}")
+    if "enabled" in v:
+        cfg["enabled"] = _manifold_bool(v["enabled"], "enabled")
+    for key in ("attention", "mlp"):
+        if key in v:
+            mode = v[key]
+            if not isinstance(mode, str) or mode not in _MANIFOLD_MODES:
+                raise ValueError(
+                    f"manifold_muon.{key} 必须是 "
+                    f"{'/'.join(_MANIFOLD_MODES)}: {mode!r}")
+            cfg[key] = mode
+    if "K" in v:
+        cfg["K"] = _manifold_int(v["K"], "K", 0, 1000)
+    if "ns_steps" in v:
+        cfg["ns_steps"] = _manifold_int(v["ns_steps"], "ns_steps", 1)
+    if "max_matrices" in v:
+        cfg["max_matrices"] = _manifold_int(
+            v["max_matrices"], "max_matrices", 0)
+    if "alpha" in v:
+        a = _manifold_number(v["alpha"], "alpha")
+        if a <= 0:
+            raise ValueError(f"manifold_muon.alpha 必须 > 0: {a!r}")
+        cfg["alpha"] = a
+    if "lr" in v:
+        lr = _manifold_number(v["lr"], "lr")
+        if lr <= 0:
+            raise ValueError(f"manifold_muon.lr 必须 > 0: {lr!r}")
+        cfg["lr"] = lr
+    if "momentum" in v:
+        mom = _manifold_number(v["momentum"], "momentum")
+        if not (0 <= mom < 1):
+            raise ValueError(
+                f"manifold_muon.momentum 必须在 [0, 1): {mom!r}")
+        cfg["momentum"] = mom
+    for key in ("exclude_kda", "exact_msign"):
+        if key in v:
+            cfg[key] = _manifold_bool(v[key], key)
+    # 未知键原样保留：不同名，不会覆盖任何默认键；也不参与上面的校验。
+    known = set(cfg)
+    for key in v:
+        if key not in known:
+            cfg[key] = v[key]
+    return cfg
+
+
+def read_manifold_config(cfg: dict) -> dict:
+    """build_model 用：config 坏值只告警并按「关闭」处理，不让目录报废。
+
+    与 read_momw_config 完全同款容错口径：缺字段 → spec 默认（关闭）；
+    非法 ValueError → _warn 后返回 enabled=False 的默认。
+    """
+    v = cfg.get(spec.MANIFOLD_CONFIG_KEY)
+    if v is None:
+        return spec.manifold_default_config()
+    try:
+        return validate_manifold_config(v)
+    except ValueError as e:
+        _warn(f"config.json {spec.MANIFOLD_CONFIG_KEY} 非法，按关闭处理: {e}")
+        out = spec.manifold_default_config()
         out["enabled"] = False
         return out
 
@@ -727,6 +848,10 @@ def build_model(model_dir: str):
             m.momw.load_state(model_dir)
         except Exception as e:
             _warn(f"momw_state 恢复失败，按零状态启动: {e}")
+    # Manifold Muon 配置是普通 Python 属性，不是 nn.Module / Parameter /
+    # buffer —— 不进 state_dict，strict load 与三个 safetensors 契约不变。
+    # 旧目录缺字段时 read_manifold_config 返回 enabled=False。
+    m.manifold_config = read_manifold_config(cfg)
     return m
 
 

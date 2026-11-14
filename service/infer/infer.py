@@ -1054,7 +1054,7 @@ def serve(idle_timeout: int = 300) -> int:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", help="模型目录（含 model.safetensors）")
+    ap.add_argument("--model", help="模型目录（config.json + weights/ + vocab/）")
     ap.add_argument("--prompt")
     ap.add_argument("--max-new-tokens", type=int, default=32)
     ap.add_argument("--temperature", type=float, default=0.8)

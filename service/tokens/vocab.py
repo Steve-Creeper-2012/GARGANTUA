@@ -3,9 +3,10 @@
 # ---------------------------------------------------------------------------
 # 【2026-10-30 词表契约重构】
 #
-# 单一格式：.vfc（定义在 tokens/vfc.py）。所有词表——全局 base、
-# vocabs/<name>/、models/<NAME>/vocab/ —— 都用它，不再有两套表示法
-# （旧的 vocab.json / vocab.txt 走兼容读取 + 就地迁移）。
+# 单一格式：.vfc（定义在 tokens/vfc.py）。所有词表——全局 base
+# （service/tokens/vocab.vfc + config.json）、vocabs/<name>/、
+# models/<NAME>/vocab/ —— 都用它；旧的 vocab.json / vocab.txt 仅保留
+# 兼容读取 + 就地迁移，不再是任何入口的产出格式。
 #
 # 核心不变量（构造 Vocab 时强制，任何一条不满足即拒绝加载）：
 #   I1 连续性：ID 恰好是 0..N-1，一个空位都不留。
@@ -658,8 +659,8 @@ def clear_model_vocab() -> None:
 
 def set_vocab_source(path: str) -> None:
     """CLI 便捷入口（enctok/dectok --vocab）：
-    path 是目录 → 用它的 vocab/vocab.vfc（或旧 vocab.txt）；
-    是文件 → 直接当 .vfc 加载。"""
+    path 是目录 → 用它的 vocab/ 子目录（模型目录）或目录下的 .vfc
+    （旧 vocab.txt 走兼容迁移）；是文件 → 直接当 .vfc 加载。"""
     p = Path(path)
     if p.is_dir():
         set_model_vocab(str(p))

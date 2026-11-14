@@ -13,9 +13,11 @@
 #   GET  /api/vocab/*        词表文件夹 API（list/regions/query/source，
 #                            见下方 TokensApi 的方法注释）
 #
-# 格式（spec 第 5b 节）：27 个单字符 + 4 个原子绑定 token（码 0-30）、6 bit/字符；{ } 包裹时间步，| 分隔
-# 步内元素；{t:<id>} 文本、{w:<hex>} 音频、{v:<hex>x:..y:..} 视觉、
-# <id> 扩展系统 token。结构字符本身不是 token。
+# 格式（spec 第 5b 节 / token-6）：29 个单字符 + 6 个原子边界 token
+# （码 29-34）、6 bit/字符，码 63 终止；{ } 包裹时间步，| 分隔步内元素；
+# {t:<id>} 文本、{w:<hex>} 音频、{v:<hex>x:..y:..} 视觉、
+# [id]/[名字] 边界与扩展、<id>/<名字> core / slot / typst 工具元素。
+# 结构字符本身不是 token。
 #
 # HTTP 错误契约：非法入参一律抛 ValueError（→ 400）。
 # ===========================================================================
@@ -95,7 +97,7 @@ def _id_of(v):
 
 
 class TokensApi:
-    """ /api/tokens/* 与 /api/vocab/add 全部端点。 """
+    """ /api/tokens/* 与 /api/vocab/* 全部端点。 """
 
     # ---------------- 文本 → token 流 ----------------
     def api_tokens_encode(self, body):
@@ -257,6 +259,21 @@ class TokensApi:
             return 200, add_token_to(name, token,
                                      _norm_cat(body.get("category")))
         return 200, remove_token_from(name, token)
+
+    def api_vocab_add(self, body):
+        """兼容别名：POST /api/vocab/add → /api/vocab/token（action=add）。
+
+        README 早期把「添加词表 token」写成 /api/vocab/add；现行唯一实现是
+        /api/vocab/token 的 action=add。这里不复制任何逻辑，只补上旧名，
+        让文档声明的端点真实可用，同时保持单一实现。
+        """
+        payload = dict(body) if isinstance(body, dict) else {}
+        action = payload.get("action", "add")
+        if action != "add":
+            raise ValueError(
+                f"/api/vocab/add 只对应 action=add: {action!r}")
+        payload["action"] = "add"
+        return self.api_vocab_token(payload)
 
     def api_vocab_source(self, body):
         """模式二：把编辑器里的 .vfc 全文校验后写回。

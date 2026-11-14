@@ -8,6 +8,10 @@
 
 > 状态：**评估稿 v2，决策已定，未实施。** 范围/计数已确认，待拍板"是否配套多语种语料"后落地。
 > 配套数据：`data/corpus/coverage_audit.json`（缺口审计）、`data/corpus/vocab_expansion_eval.json`（精确计数）。
+>
+> 2026-11-12 项目整理：本文件由项目根移入 `docs/`（历史稿归档区，见
+> [docs/README.md](./README.md)）。现行口径以根 [`README.md`](../README.md)
+> 的「base1.3.0 vocabulary」一节为准，本稿不再随代码更新。
 
 ## 1. 背景与动机
 

@@ -60,9 +60,10 @@ Thumbs.db
 .workbuddy/
 .workbuddy-ai/
 
-# 各 service 的产物目录（2026-11-03 契约）：除了 README 之外都是本地产物
-service/*/output/*
-!service/*/output/README.md
+# 各 service 的产物目录（2026-11-03 契约，2026-11-12 合并说明后简化）：
+# 整个目录都是本地产物，由服务运行时 os.makedirs 自行重建；约定统一写在
+# service/README.md，不再在每个 output/ 里放一份逐字相同的 README。
+service/*/output/
 
 # 显示插件注册表 + 导入的插件文件都是用户本地数据，不进仓库。
 # 内置 tokens.* / infer-plug.* / README.md 是代码，保持跟踪。

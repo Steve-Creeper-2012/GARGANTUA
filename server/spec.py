@@ -1162,6 +1162,13 @@ MOMW_OJA_ETA = 0.02               # Oja 在线主方向跟踪学习率
 MOMW_FW_GATE_C = 2.0              # cost-aware 门控强度（0 = 关闭）
 MOMW_ASYNC_WRITE = False          # 单写者队列异步写（默认同步）
 MOMW_PERSIST = True               # 启用时把池快照落 models/NAME/momw_state/
+# 快照落盘精度：fp16 让 8 层池的 tensors.safetensors 从 ~4MB 降到 ~2MB，
+# 对长期记忆方向几乎无损（锚点/E/状态本来就是 no_grad 的近似跟踪量）。
+# 计算时仍按模型自身 dtype 恢复，落盘精度只影响磁盘与重启后的舍入误差。
+MOMW_PERSIST_DTYPE = "fp32"
+MOMW_PERSIST_DTYPES = ("fp32", "fp16", "bf16")
+MOMW_PERSIST_DTYPE_MAP = {"fp32": "float32", "fp16": "float16",
+                          "bf16": "bfloat16"}
 MOMW_QUANTILE_MIN_SAMPLES = 8     # 历史不足时退回固定 threshold
 MOMW_QUANTILE_RANGE = (0.01, 0.99)
 MOMW_QUANTILE_WINDOW_RANGE = (4, 4096)
@@ -1207,7 +1214,8 @@ MOMW_CONFIG_FIELDS = ("enabled", "N", "tau", "threshold", "M", "B0",
                       "anchor_sample", "eigen_min_writes",
                       "threshold_mode", "quantile_p", "quantile_window",
                       "saturation_ratio", "growth_ratio", "oja_eta",
-                      "fw_gate_c", "async_write", "persist")
+                      "fw_gate_c", "async_write", "persist",
+                      "persist_dtype")
 MOMW_THRESHOLD_MODES = ("fixed", "quantile")
 
 
@@ -1242,6 +1250,7 @@ def momw_default_config() -> dict:
         "fw_gate_c": MOMW_FW_GATE_C,
         "async_write": MOMW_ASYNC_WRITE,
         "persist": MOMW_PERSIST,
+        "persist_dtype": MOMW_PERSIST_DTYPE,
     }
 
 # ---------------------------------------------------------------------------
@@ -1387,6 +1396,43 @@ MUON_MOMENTUM = 0.95
 MUON_NS_STEPS = 5
 ADAMW_LR = 3e-4
 MUON_LR = 2e-2
+
+# ---------------------------------------------------------------------------
+# 6a. 阶段 2 Manifold Muon（可选，默认关闭）——与 MoMW 同款 config 契约
+# ---------------------------------------------------------------------------
+# config.json 有 "manifold_muon" 字段才启用；缺字段 / 坏值一律按关闭处理。
+# 不新增任何 nn.Parameter / buffer / state_dict key——配置只是普通 Python
+# 属性，旧模型目录 strict load 照常可读。键名是唯一真源，别在别处抄字符串。
+MANIFOLD_CONFIG_KEY = "manifold_muon"
+MANIFOLD_ENABLED_DEFAULT = False
+MANIFOLD_K = 20
+MANIFOLD_ALPHA = 0.1
+MANIFOLD_EXACT_MSIGN = False
+MANIFOLD_EXCLUDE_KDA = True
+MANIFOLD_MAX_MATRICES = 0
+
+
+def manifold_default_config() -> dict:
+    """Manifold Muon 默认配置（唯一真源）。enabled=False 时其余只是备用值。
+
+    前端 / CLI / muon-dev 都从这份 dict 派生，避免把数字抄到三处。
+    lr / momentum / ns_steps 复用优化器常量，K / alpha / exclude_kda /
+    max_matrices / exact_msign 复用上面的新常量；键名与值由测试逐字依赖。
+    """
+    return {
+        "enabled": MANIFOLD_ENABLED_DEFAULT,
+        "attention": "stiefel",        # stiefel | dgram | none
+        "mlp": "dgram",                # stiefel | dgram | none
+        "K": MANIFOLD_K,
+        "alpha": MANIFOLD_ALPHA,
+        "lr": MUON_LR,
+        "momentum": MUON_MOMENTUM,
+        "ns_steps": MUON_NS_STEPS,
+        "exclude_kda": MANIFOLD_EXCLUDE_KDA,
+        "max_matrices": MANIFOLD_MAX_MATRICES,
+        "exact_msign": MANIFOLD_EXACT_MSIGN,
+    }
+
 
 # ---------------------------------------------------------------------------
 # 6b. CLIP 数据集文件夹 v1（2026-11-08）

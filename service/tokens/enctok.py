@@ -18,7 +18,7 @@
 #      编码（< caps u s > ...），可无损还原。
 #
 # 输出：十六进制文本（8 位/token 拼接）或 .tokens 二进制文件
-#       （大端 uint32 流，4 字节/token，解释器见 tokens/tok32.py）。
+#       （token-6 位流，解释器见 tokens/tok6.py；tok32.py 只作历史格式读取）。
 #
 # 用法：
 #   python tokens/enctok.py "Hello World"
@@ -64,8 +64,8 @@ def _emit_word(word: str, v):
     """[A-Za-z]+ 连续段 → (token ID 列表, 未收录字符列表)。
 
     整词命中 → 直接出（首字母大写加 <caps> 标记）；未命中逐字母拼写
-    （fallback 区）。扁平词表（models/NAME/vocab.txt）没有 fallback
-    字母——拼不出的字母跳过并报告，而不是 KeyError 崩掉整次编码。
+    （fallback 区）。缺 fallback 的自定义词表（models/NAME/vocab/ 或
+    vocabs/<name>/）拼不出的字母跳过并报告，而不是 KeyError 崩掉整次编码。
     <caps> 标记只在「至少还有一个字母能映射」时保留，避免给纯垃圾
     输入打光头标记。"""
     # 2026-11-06（base1.1.0）：大小写敏感的代码 token（None / True /
@@ -182,7 +182,7 @@ def encode_text_ids(text: str) -> list:
 # CLI
 # ---------------------------------------------------------------------------
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="enctok：文本 → tok-32 token 流")
+    ap = argparse.ArgumentParser(description="enctok：文本 → token-6 ID 流 / .tokens")
     src = ap.add_mutually_exclusive_group()
     src.add_argument("text", nargs="?", default=None, help="输入文本")
     src.add_argument("--file", default=None, help="输入文本文件（UTF-8）")
@@ -190,7 +190,7 @@ def main(argv=None):
                     help="输出文件：.tokens 为二进制，否则为十六进制文本；"
                          "缺省打印十六进制到 stdout")
     ap.add_argument("--vocab", default=None,
-                    help="用指定的 vocab.txt（或含它的模型目录）编码；"
+                    help="用指定的 .vfc 文件 / 词表目录 / 模型目录（读 vocab/）编码；"
                          "缺省用全局词表")
     args = ap.parse_args(argv)
 

@@ -24,16 +24,26 @@
 from __future__ import annotations
 
 import codecs
-import fcntl
 import os
-import pty
 import re
 import shutil
 import signal
 import subprocess
-import termios
 import threading
 import time
+
+# 跨平台（2026-11-12）：fcntl / pty / termios 只有 POSIX 提供，Windows 上
+# 无条件 import 会让整个 server 在启动阶段 ImportError 崩掉。这里做能力探测，
+# server 照常启动，只有「打开内置终端」这一个功能在 Windows 上降级为明确的
+# 400 提示（TermError），由用户改用系统终端 / gargantua.bat。
+try:
+    import fcntl
+    import pty
+    import termios
+    PTY_AVAILABLE = True
+except ImportError:                     # pragma: no cover - Windows
+    fcntl = pty = termios = None       # type: ignore[assignment]
+    PTY_AVAILABLE = False
 
 MAX_LINES = 3000           # 保留的滚动行数（超出从头部丢）
 POLL_TAIL_LINES = 800      # 每次 poll 最多回多少行（约 100KB 量级）
@@ -152,6 +162,8 @@ def _child_session_setup() -> None:
     TIOCSCTTY 之后 /dev/tty 指向这块 PTY，sudo 能正常读密码、终端驱动
     也能把 Ctrl-C 变成前台进程组的 SIGINT。
     """
+    if not PTY_AVAILABLE:
+        return
     os.setsid()
     try:
         # fd 0 此时已经是 slave（Popen 在 preexec_fn 之前完成 dup2）
@@ -184,6 +196,10 @@ class TermSession:
     def start(self) -> None:
         if self._alive:
             return
+        if not PTY_AVAILABLE:
+            raise TermError(
+                "内置终端依赖 POSIX PTY，当前系统不支持；"
+                "请用系统终端运行 gargantua.bat / 启动.bat")
         # 2026-11-04：shell 也走项目内优先（paths.shell_binary），不再直接
         # 继承 SHELL 环境变量或裸查系统 PATH。
         from paths import shell_binary
@@ -229,7 +245,7 @@ class TermSession:
     def close(self) -> None:
         self._alive = False
         try:
-            if self._proc and self._proc.poll() is None:
+            if self._proc and PTY_AVAILABLE and self._proc.poll() is None:
                 os.killpg(os.getpgid(self._proc.pid), signal.SIGHUP)
         except Exception:
             pass
@@ -323,6 +339,8 @@ class TermSession:
 
     def _signal_foreground(self, sig: int) -> bool:
         """给前台进程组发信号（Ctrl-C 的兜底路径）。"""
+        if not PTY_AVAILABLE:
+            return False
         pgid = self._foreground_pgid()
         if pgid is None and self._proc is not None:
             try:
@@ -355,7 +373,10 @@ class TermSession:
         只杀前台作业，不杀 shell 本身；前台恰好是 shell（空闲态）时
         等同于结束整个会话，前端会提示重开。
         """
-        if not self._signal_foreground(signal.SIGKILL):
+        # Windows 没有 SIGKILL；该分支实际只在 POSIX 会话里可达，这里仍做
+        # 一次能力兜底，保证任何平台都不会因属性缺失抛 AttributeError。
+        hard_kill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        if not self._signal_foreground(hard_kill):
             raise TermError("没有可结束的前台进程")
 
     def clear(self) -> None:
