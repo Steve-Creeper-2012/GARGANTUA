@@ -1,20 +1,20 @@
 # ===========================================================================
 # GARGANTUA v1 — clip_data.py：CLIP 对比训练的配对样本契约
 # ---------------------------------------------------------------------------
-# 2026-11-06 新增（对比训练功能）。本模块是「配对 .tokens 文件」格式的
-# 唯一事实来源，被三处共用：server/server_train.py（入队校验）、
-# service/train/clip.py + auto_train.py（训练）、service/cli/（终端转换）。
+# 本模块是「配对 .tokens 文件」格式与队列文件名元数据的唯一事实来源，
+# 被四处共用：server/server_train.py（入队校验）、service/train/clip_folder.py
+# （数据集文件夹 v1 解析）、service/train/clip.py + auto_train.py（训练）、
+# service/cli/（终端转换）。
 #
 # 契约：
 #   * 训练输入一律是 token-6 `.tokens` 位流（tok6.loads 可解析），不收
 #     JSON / JSONL / 原始图片音频文件。
-#   * 一个 CLIP 配对文件 = 两段连续的 Step：
-#       - 文本段：1+ 个 text Step（每个 {t:ID} 一步，或同一步多个 {t:}）
-#       - 媒体段：1+ 个 visual / audio / mixed Step（图像、音频或视频）
-#     允许「文本在前」或「媒体在前」，但两段必须各自连续、只允许一次切换；
-#     ext / tool 标记步只是边界标记，不参与两段判定，也不参与池化。
-#   * 媒体的形态由内容推断：全 audio = audio；单个纯 visual 步 = image；
-#     其余（多个 visual 步、mixed 步）= video。三者走同一套 CLIP 损失。
+#   * 现行配对（clip_folder v1）= 通用 A/B 两段，模态任意组合
+#     （图×图、视频×视频、文本×图都行），用 PAIR_SPLIT_ID 的 tool 步分界；
+#     N 个真实配对同批做对称 InfoNCE，负样本来自批内其它配对。
+#   * 旧「文本段 × 媒体段」配对仍能被 parse_items 读出来（旧队列文件兼容），
+#     但新 UI 不再产生；两段各自连续、只允许一次切换，媒体形态由内容推断
+#     （全 audio=audio / 单个纯 visual 步=image / 其余=video）。
 #
 # 与既有代码的关系：只 import tok6/spec，不改动任何既有模块；LM 训练路径
 # 完全不经过本模块（除非文件名被标记为 clip）。
@@ -30,9 +30,9 @@ import uuid
 import spec
 from tokens import tok6
 
-# 训练方式：lm = 教师强制语言模型训练；clip = 旧「文本×媒体」配对对比训练；
-# pair = 2026-11-07 新「A 段 × B 段」通用对比训练（两段可以是任意模态，
-# 甚至图片×图片）。pair 是本模块新增的通用配对，旧 clip 契约逐字保留。
+# 训练方式：lm = 教师强制语言模型训练；clip = 对比训练（现行 = 数据集
+# 文件夹 v1 的 N 个真实配对）；pair = 旧「两文件对比」队列文件的兼容标记，
+# 新 UI 不再产生，仅保证历史队列文件仍能被读完。
 MODES = ("lm", "clip", "pair")
 # optimizer：muon = 参杂（隐藏层 2D 矩阵走 Muon、其余走 AdamW，历史默认）；
 # adamw = 全部 AdamW；allmuon = 全部 Muon（非 2D 参数由 Muon 内部兜底）。

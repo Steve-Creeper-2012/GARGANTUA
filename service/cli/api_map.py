@@ -101,6 +101,9 @@ API_COMMANDS: dict[str, dict] = {
     "tokens decode":         _c("POST", "/api/tokens/decode", ".tokens→显示文本（HTTP 版）"),
     "tokens export":         _c("POST", "/api/tokens/export", "显示文本→.tokens（HTTP 版）"),
     "vocab token":           _c("POST", "/api/vocab/token", "词表 token 操作"),
+    "vocab add":             _c("POST", "/api/vocab/add",
+                                "添加词表 token（兼容别名，等价 vocab token --param action=add）",
+                                defaults={"action": "add"}),
     "vocab source-set":      _c("POST", "/api/vocab/source", "设置词表源"),
     "vocab fork":            _c("POST", "/api/vocab/fork", "派生词表"),
     "vocab copy":            _c("POST", "/api/vocab/copy", "复制词表"),
@@ -140,7 +143,7 @@ API_COMMANDS: dict[str, dict] = {
 def endpoint_set() -> set[str]:
     """返回被命名命令覆盖的 path 集合（/api/task/<id> 原样返回）。
 
-    GET 30 + POST 55 个 method+path 组合，去重后 84 个 path（因为
+    GET 33 + POST 58 个 method+path 组合，去重后 90 个 path（因为
     /api/vocab/source 的 GET 与 POST 共享同一个 path）。
     """
     return {c["path"] for c in API_COMMANDS.values()}

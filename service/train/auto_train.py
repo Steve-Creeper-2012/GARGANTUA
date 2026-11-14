@@ -81,13 +81,58 @@ from tokens.tokenset import read_doc
 from train_step import forward_window, window_index, window_loss
 from tokens.vocab import set_model_vocab
 
-# 2026-11-07：三档优化器（见 muon.build_optimizers）。"muon" = 参杂分工，
-# "allmuon" = 全部 2D 矩阵走 Muon，"adamw" = 全部 AdamW。
-_OPTIMIZERS = ("muon", "adamw", "allmuon")
+# 三档优化器（见 muon.build_optimizers）的唯一真源 = clip_data.OPTIMIZERS，
+# 与 server_train / 终端 CLI 共用，不再在本文件另抄一份常量。
 
 
 class _NoModelError(RuntimeError):
     """ 无活动模型：文件应保留在队列而非被归档。 """
+
+
+# ---------------------------------------------------------------------------
+# 阶段 0 谱诊断（opt-in，默认关闭；2026-11-13 交叉审计补齐）
+# ---------------------------------------------------------------------------
+# auto_train 是 server 按需拉起的常驻进程，CLI 参数不便透传，所以用
+# 环境变量开关。三个变量都在进程启动时读取：
+#   GARGANTUA_DIAG_EVERY          >0 才启用（采样间隔，step 1 也会采）
+#   GARGANTUA_DIAG_LOG            JSONL 路径（缺省 data/tmp/manifold_diag.jsonl）
+#   GARGANTUA_DIAG_MAX_MATRICES   每次采集矩阵上限，0 = 全量（缺省 24）
+# 未启用时本模块连 manifold_diag 都不 import，不挂任何属性、零额外开销。
+_DIAG_ENV_EVERY = "GARGANTUA_DIAG_EVERY"
+_DIAG_ENV_LOG = "GARGANTUA_DIAG_LOG"
+_DIAG_ENV_MAX = "GARGANTUA_DIAG_MAX_MATRICES"
+
+
+def _diag_settings():
+    """→ (every, log_path, max_matrices) 或 None（关闭）。坏值按关闭处理。"""
+    try:
+        every = int(os.environ.get(_DIAG_ENV_EVERY, "0"))
+    except (TypeError, ValueError):
+        every = 0
+    if every <= 0:
+        return None
+    try:
+        maxm = int(os.environ.get(_DIAG_ENV_MAX, "24"))
+    except (TypeError, ValueError):
+        maxm = 24
+    return every, os.environ.get(_DIAG_ENV_LOG, ""), maxm
+
+
+def _open_diag(m, opts, settings):
+    """延迟 import + attach；settings=None 时返回 None。"""
+    if settings is None:
+        return None
+    from manifold_diag import ModelDiagnostics
+    return ModelDiagnostics(m, opts, every=settings[0],
+                            log_path=settings[1] or None,
+                            max_matrices=settings[2]).attach()
+
+
+def _rebind_diag(old, m, opts, settings):
+    """模型热替换：旧观测器恢复属性后再挂到新实例/新优化器上。"""
+    if old is not None:
+        old.detach()
+    return _open_diag(m, opts, settings)
 
 
 class Trainer:
@@ -123,7 +168,7 @@ class Trainer:
         self.log_path = log_path or project_dir("logs", "auto_train.jsonl")
         self._block_size = validate_block_size(block_size)
         self._steps_per_file = validate_steps(steps_per_file)
-        self._optimizer = spec.OPTIMIZER      # "muon"（Muon+AdamW 分工）或 "adamw"
+        self._optimizer = spec.OPTIMIZER      # muon / adamw / allmuon，见 clip_data.OPTIMIZERS
         # 2026-11-06：CLIP 对比训练参数（校验口径与 server_train 一致）
         if (isinstance(clip_batch_size, bool)
                 or not isinstance(clip_batch_size, int)
@@ -186,7 +231,7 @@ class Trainer:
 
     @optimizer.setter
     def optimizer(self, v) -> None:
-        if v not in _OPTIMIZERS:
+        if v not in clip_data.OPTIMIZERS:
             raise ValueError(f"未知优化器: {v}")
         self._optimizer = v
 
@@ -274,7 +319,7 @@ class Trainer:
                         # 回落到固定步数默认值，不让 validate_steps 报 400
                         self._steps_per_file = validate_steps(
                             meta["steps"] or 20)
-                    if meta.get("optimizer") in _OPTIMIZERS:
+                    if meta.get("optimizer") in clip_data.OPTIMIZERS:
                         self._optimizer = meta["optimizer"]
                     cb = meta.get("clip_batch_size")
                     if (isinstance(cb, int) and not isinstance(cb, bool)
@@ -460,65 +505,92 @@ class Trainer:
         opts = build_optimizers(m, self._optimizer, spec.ADAMW_LR,
                                 spec.MUON_LR, spec.MUON_MOMENTUM)
         stop_hit = False        # 2026-10-27 审计修复：每文档至少一个窗口含 STOP
-        for step in range(self._steps_per_file):
-            if self._stop.is_set():
-                break
-            m_now = self.get_model()
-            if m_now is not m:              # 训练中模型被替换：重建优化器
-                m = m_now
-                opts = build_optimizers(m, self._optimizer, spec.ADAMW_LR,
-                                        spec.MUON_LR, spec.MUON_MOMENTUM)
-                self._log("[auto_train] 检测到模型热替换，优化器已重建")
-            # step 0 强制尾部窗口：STOP 在序列末尾，只有 i = n-B 的窗口
-            # 能让 y 覆盖最后一个 token，单文件训练因此必有停止监督
-            i = window_index(doc, B, random, force_last=(step == 0))
-            if i is None:
-                continue
-            with self.lock:                          # 训练与推理互斥
-                m.train()
-                logits, y, n_valid = forward_window(m, doc, i, B)
-                if n_valid == 0:                     # 整窗都是媒体，无目标
+
+        # 阶段 0 谱诊断：opt-in，默认 diag=None → 下面每个分支都是零成本。
+        diag_settings = _diag_settings()
+        diag = _open_diag(m, opts, diag_settings)
+        grad_norm_fn = None
+        if diag is not None:
+            from manifold_diag import grad_norm_before_clip
+            grad_norm_fn = grad_norm_before_clip
+        try:
+            for step in range(self._steps_per_file):
+                if self._stop.is_set():
+                    break
+                m_now = self.get_model()
+                if m_now is not m:              # 训练中模型被替换：重建优化器
+                    m = m_now
+                    opts = build_optimizers(m, self._optimizer, spec.ADAMW_LR,
+                                            spec.MUON_LR, spec.MUON_MOMENTUM)
+                    if diag is not None:        # 观测器必须跟着换模型/优化器
+                        diag = _rebind_diag(diag, m, opts, diag_settings)
+                    self._log("[auto_train] 检测到模型热替换，优化器已重建")
+                # step 0 强制尾部窗口：STOP 在序列末尾，只有 i = n-B 的窗口
+                # 能让 y 覆盖最后一个 token，单文件训练因此必有停止监督
+                i = window_index(doc, B, random, force_last=(step == 0))
+                if i is None:
                     continue
-                if spec.STOP_ID in y[0].tolist():
-                    stop_hit = True
-                loss = window_loss(logits, y)
-                for o in opts:
-                    o.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
-                for o in opts:
-                    o.step()
-                m.reset_memory()                      # 样本间截断持久记忆（含 MoMW）
-                m.eval()
+                with self.lock:                      # 训练与推理互斥
+                    m.train()
+                    logits, y, n_valid = forward_window(m, doc, i, B)
+                    if n_valid == 0:                 # 整窗都是媒体，无目标
+                        continue
+                    if spec.STOP_ID in y[0].tolist():
+                        stop_hit = True
+                    loss = window_loss(logits, y)
+                    for o in opts:
+                        o.zero_grad(set_to_none=True)
+                    loss.backward()
+                    # 阶段 0：裁剪前全局 grad norm（clip 到 1.0 会掩盖退化）
+                    diag_grad = (grad_norm_fn(m.parameters())
+                                 if grad_norm_fn is not None else None)
+                    clip_return = torch.nn.utils.clip_grad_norm_(
+                        m.parameters(), 1.0)
+                    for o in opts:
+                        o.step()
+                    # 交叉审计修复：observe 必须在 reset_memory 之前，否则
+                    # fast_weight._state 已被清空，KDA 状态恒 present=False。
+                    if diag is not None:
+                        diag.observe(
+                            self._step + 1, loss.item(),
+                            preclip_grad_norm=diag_grad,
+                            extra={"clip_return": float(clip_return),
+                                   "optimizer": self._optimizer,
+                                   "source": "auto_train"})
+                    m.reset_memory()              # 样本间截断持久记忆（含 MoMW）
+                    m.eval()
 
-            self._step += 1
-            # 2026-10-23 审计修复（P3）：补 file 字段——前端 drawLoss 的
-            # hover 提示读 r.file 展示「样本: …」，此前后端从不发送，
-            # 该提示是死代码。一个点 = 一个样本窗口的独立 loss。
-            rec = {"step": self._step, "loss": round(loss.item(), 6),
-                   "ts": time.time(),
-                   "file": os.path.basename(path)}
-            self._loss_tail.append(rec)
-            with open(self.log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec) + "\n")
+                self._step += 1
+                # 2026-10-23 审计修复（P3）：补 file 字段——前端 drawLoss 的
+                # hover 提示读 r.file 展示「样本: …」，此前后端从不发送，
+                # 该提示是死代码。一个点 = 一个样本窗口的独立 loss。
+                rec = {"step": self._step, "loss": round(loss.item(), 6),
+                       "ts": time.time(),
+                       "file": os.path.basename(path)}
+                self._loss_tail.append(rec)
+                with open(self.log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec) + "\n")
 
-        # 2026-10-27 审计修复：区分「完成」与「停止」——停止时不再保存
-        # 检查点（部分参数更新直接丢弃，文件保留在队列由下次 start 重训），
-        # 只有完整执行完 steps_per_file 步才落盘并归档。
-        if self._stop.is_set():
-            return "stopped"
+            # 2026-10-27 审计修复：区分「完成」与「停止」——停止时不再保存
+            # 检查点（部分参数更新直接丢弃，文件保留在队列由下次 start 重训），
+            # 只有完整执行完 steps_per_file 步才落盘并归档。
+            if self._stop.is_set():
+                return "stopped"
 
-        with self.lock:                              # 检查点落盘
-            self.save_fn(m)
-        if not stop_hit:
-            self._log(f"[auto_train] 警告：{os.path.basename(path)} 本轮采样"
-                      f"未覆盖 <stop> 目标（步数过少）")
-        if self._loss_tail:
-            self._log(f"[auto_train] step={self._step} "
-                      f"loss={self._loss_tail[-1]['loss']:.4f} 已落盘")
-        else:
-            self._log(f"[auto_train] step={self._step} 已落盘（无有效 step）")
-        return "ok"
+            with self.lock:                          # 检查点落盘
+                self.save_fn(m)
+            if not stop_hit:
+                self._log(f"[auto_train] 警告：{os.path.basename(path)} 本轮采样"
+                          f"未覆盖 <stop> 目标（步数过少）")
+            if self._loss_tail:
+                self._log(f"[auto_train] step={self._step} "
+                          f"loss={self._loss_tail[-1]['loss']:.4f} 已落盘")
+            else:
+                self._log(f"[auto_train] step={self._step} 已落盘（无有效 step）")
+            return "ok"
+        finally:
+            if diag is not None:
+                diag.detach()
 
     def _train_clip_batch(self, paths):
         """训练一批 CLIP 配对文件（>=2 个，InfoNCE 负样本）。返回
@@ -793,7 +865,7 @@ def serve(idle_timeout: int = 300) -> int:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", help="模型目录（含 model.safetensors）")
+    ap.add_argument("--model", help="模型目录（config.json + weights/ + vocab/）")
     from paths import project_dir
     ap.add_argument("--data", default=project_dir("data"),
                     help="数据根目录（queue/done 在其下）")

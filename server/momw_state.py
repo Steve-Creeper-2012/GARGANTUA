@@ -29,6 +29,8 @@ from typing import Optional
 import torch
 from safetensors.torch import load_file, save_file
 
+import spec
+
 STATE_DIRNAME = "momw_state"
 LAYOUT_VERSION = 1
 LAYOUT_NAME = "layout.json"
@@ -77,8 +79,20 @@ def _atomic_save_tensors(sd: dict, path: str) -> None:
                 pass
 
 
-def save(dst_dir: str, pool, extra: Optional[dict] = None) -> str:
-    """把一个 MoMWPool 的运行时状态写成快照（原子写每个文件）。"""
+def _persist_torch_dtype(name: str):
+    """落盘精度 → torch dtype；非法值按 fp32 处理（不让它破坏快照）。"""
+    return getattr(torch, spec.MOMW_PERSIST_DTYPE_MAP.get(
+        str(name).lower(), "float32"))
+
+
+def save(dst_dir: str, pool, extra: Optional[dict] = None,
+         persist_dtype: Optional[str] = None) -> str:
+    """把一个 MoMWPool 的运行时状态写成快照（原子写每个文件）。
+
+    `pool.cfg["persist_dtype"]` 决定落盘精度（fp32 默认 / fp16 减半）。
+    所有状态张量在写 safetensors 之前统一降精度；恢复时按模型自身 dtype
+    转回（见 MoMW.load_state），所以落盘精度只影响磁盘体积与重启舍入。
+    """
     os.makedirs(dst_dir, exist_ok=True)
     tensors: dict = {}
     layers = []
@@ -107,6 +121,12 @@ def save(dst_dir: str, pool, extra: Optional[dict] = None) -> str:
             tensors[f"L{i}.E"] = l._rt["E"].detach().cpu().contiguous()
         if l._rt["P_override"] is not None:
             tensors[f"L{i}.P"] = l._rt["P_override"].detach().cpu().contiguous()
+    # 显式参数优先（MoMW.cfg 是权威；pool.cfg 是建池时的快照，运行时改
+    # 配置后两者可能不同步）
+    persist_dtype = str(persist_dtype
+                        or pool.cfg.get("persist_dtype", "fp32")).lower()
+    tensors = {k: v.to(_persist_torch_dtype(persist_dtype)).contiguous()
+               for k, v in tensors.items()}
     _atomic_save_tensors(tensors, os.path.join(dst_dir, TENSORS_NAME))
     _atomic_write_json(os.path.join(dst_dir, LAYOUT_NAME), {
         "layout_version": LAYOUT_VERSION,
@@ -119,6 +139,9 @@ def save(dst_dir: str, pool, extra: Optional[dict] = None) -> str:
         "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "steps": None,
         "config": dict(pool.cfg),
+        "persist_dtype": persist_dtype,
+        "tensor_bytes": sum(int(v.numel() * v.element_size())
+                            for v in tensors.values()),
     }
     if extra:
         meta.update(extra)

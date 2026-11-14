@@ -1,13 +1,17 @@
 # ===========================================================================
 # GARGANTUA — start/boot.py：路径引导（唯一事实来源）
 # ---------------------------------------------------------------------------
-# 项目目录树（2026-10-24 重构）：
+# 项目目录树（2026-11-12 整理）：
 #   start/       启动链（terminal 脚本 + 分类 requirements + 本引导模块）
+#   launcher/    POSIX 一键启动器（由根目录 启动.sh / 启动.command 调用）
 #   server/      冻结契约（spec.py）+ 模型基础设施 + 全部 server 文件
-#   service/     各服务（infer / train / init / tokens / web / test /
-#                window ...），每个服务一个目录，按需启动
-#   models/      models/NAME/{model.safetensors, config.json, vocab.txt?}
-#   logs/
+#   service/     各服务（infer / train / init / tokens / prims / web / test /
+#                window / cli ...），每个服务一个目录，按需启动
+#   docs/        文档索引与历史评估归档（唯一文档入口见 docs/README.md）
+#   experiments/ 后续测试对比数据的预留目录（暂不放数据）
+#   vocabs/      版本化基础词表 base<ver>/{vocab.vfc, config.json, ...}
+#   models/      models/NAME/{config.json, weights/, vocab/, momw_state/}
+#   data/ logs/  运行时数据 / 日志 / 临时文件（均被 .gitignore 忽略）
 #
 # 旧版所有代码同根平铺，`import spec` 靠 cwd 命中；分目录后由本模块把
 # 各代码根放上 sys.path——**业务文件的 import 语句零改动**：

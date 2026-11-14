@@ -2,58 +2,80 @@
 
 > A multimodal early-fusion autoregressive model for world perception and reliable understanding.
 
-GARGANTUA is a next-generation AI framework built from the ground up for **multimodal understanding and generation**. It unifies text, video, and audio within a single transformer architecture, sharing the same `d_model` and KV cache while maintaining modality-specific embedding projections and mechanisms.
+GARGANTUA is a next-generation AI framework built from the ground up for **multimodal understanding and generation**. It unifies text, image, video, audio and primitive drawings within a single transformer architecture, sharing the same `d_model` and KV stream while maintaining modality-specific embedding projections.
+
+This README describes the code as it actually is (verified 2026-11-12). Every architecture constant has one owner — `server/spec.py` — and every runtime path has one owner — `server/paths.py`. The UI reads IDs / layouts from `/api/agent/spec`, `/api/status` and `/api/train/dataset/spec` instead of copying constants.
+
+## Documentation map
+
+| Document | What it owns |
+| --- | --- |
+| `README.md` | Architecture, formats, CLI/API surface, directory layout (this file) |
+| `docs/README.md` | Index of every document and the rule for where new docs go |
+| `docs/VOCAB_EXPANSION_EVAL.md` | **Historical** vocabulary-expansion evaluation (superseded by base1.3.0; do not implement from it) |
+| `service/web/plugins/README.md` | Infer display-plugin protocol (8 sections) |
+| `service/web/plugins/AGENT_TOKENS.md` | Full contract-head / slot / core / typst token contract |
+| `service/web/plugins/TYPST_TOKENS.md` | Generated 114-construct / 228-token Typst table (do not hand-edit IDs) |
+| `service/prims/README.md` | GPU vs CPU primitive paths and their environment variables |
+| `service/README.md` | One-folder-per-service convention, including `output/` artifacts |
+| `environment/README.md` | Zero-system-dependency contract: one dependency = one folder + `pack.json` |
+| `start/requirements/README.md` | `must.txt` / `necessary.txt` and the single install entry point |
+| `experiments/README.md` | Reserved folder for future comparison/test data (intentionally empty) |
 
 ## Architecture Overview
 
 ### Core Design
 
-- **Encoder-Decoder**: Standard encoder-decoder with shared KV cache. The encoder processes user input bidirectionally; the decoder generates autoregressively.
-- **Early Fusion**: All modalities (text, image, video, audio) are embedded into the same `d_model=1024` dimensional space before entering the transformer, but each modality uses its own projection mechanism.
-- **Shared KV**: A unified KV sequence stream split into two segments — full-resolution KV + a compressed segment that carries two independent compressions (CSA retrieval view, HCA global-summary view).
-- **No Cross-Attention / No Prefill**: The encoder writes the input into the shared KV; the decoder reads it directly and starts from the last input token. There is no cross-attention and no separate prefill pass.
+- **Encoder-Decoder with a shared KV stream**: the encoder processes user input bidirectionally; the decoder generates autoregressively. Both write into / read from the same `SharedKV` — there is **no cross-attention and no separate prefill pass**.
+- **Early Fusion**: all modalities are projected into the same semantic width (`d_model`, default 1024) before entering the transformer, but each modality has its own projection.
+- **Shared KV, two views**: the stream is split into a full-resolution recent region and an older compressed region carrying two *independent* compressions of the same content (CSA retrieval view, HCA global-summary view).
+- **Time step is atomic**: compression, sliding-window eviction and causality never split a step; a step is never empty.
 
 ### Block Structure
-
-Each block follows the order:
 
 ```
 KDA → FFN → KDA → FFN → KDA → FFN → MLA-CSA → FFN → MLA-HCA → FFN → AttnRes
 ```
 
-(2026-11-04 reorder: every recurrence/attention sub-layer is immediately
-followed by its own FFN; the five FFNs are independent instances, not one
-layer reused five times. `spec.BLOCK_ORDER` is the single source of truth.)
+`spec.BLOCK_ORDER` is the single source of truth; `Block.__init__` asserts that this order matches the hand-written `forward`. Since 2026-11-04 each recurrence/attention sub-layer is immediately followed by **its own** FFN: five independent `GLUFFN` instances and ten `RMSNorm`s per block, not one FFN reused five times. Checkpoints created before that date have a different `state_dict` layout (`ffn_up`/`ffn_down` vs `ffns.i.*`) and must be re-initialized.
 
-- **KDA** (Kimi-style Delta Attention): Gated linear recurrence with delta-state updates, inspired by Moonshot AI. Three KDA layers carry the recurrent/positional path, interleaved with FFNs.
-- **MLA** (Multi-head Latent Attention): Low-rank joint KV compression, NoPE (no RoPE branch), inspired by DeepSeek-V2.
-  - **MLA-CSA**: the retrieval view — 4:1 compressed segment + the whole full-KV segment.
-  - **MLA-HCA**: the global-summary view — 32:1 compressed segment + the whole full-KV segment.
-  - Both layers are plain MLA when the KV they read is uncompressed; the difference is which compressed segment they see.
-- **FFN**: GLU variant, `d_ff=4096`, five independent instances per block. Default 4+6 blocks therefore reach ~1.03B params (~4.1 GB fp32); use `d_model`, block counts or shared weights to scale down. Checkpoints created before 2026-11-04 have a different state_dict layout (`ffn_up`/`ffn_down` vs `ffns.i.*`) and must be re-initialized.
-- **AttnRes** (Kimi/Moonshot, [Attention Residuals](https://github.com/MoonshotAI/Attention-Residuals), arXiv 2603.15031): before every sub-layer, the block aggregates the token embedding, all completed block representations and the current partial sum with a softmax pseudo-query (`h = softmax(norm(V)·w)ᵀV`); block-internal accumulation stays standard residual. A zero-initialized scalar gate at the block end mixes the block input back in (both residual forms are kept, complementarily).
+- **KDA** (Kimi-style Delta Attention): gated linear recurrence with delta-state updates; three KDA layers carry the recurrent/positional path.
+- **MLA** (DeepSeek-V2): low-rank joint KV compression, NoPE. **MLA-CSA** reads a 4:1 compressed segment plus the whole full-KV segment; **MLA-HCA** reads a 32:1 compressed segment plus the whole full-KV segment. When nothing is compressed yet, both are plain MLA.
+- **FFN**: GLU variant, `FFN_HIDDEN = 4096`. Default 4+6 blocks ≈ **1.03B params** (~4.1 GB fp32); use `d_model`, block counts or shared weights to scale down.
+- **AttnRes** ([MoonshotAI/Attention-Residuals](https://github.com/MoonshotAI/Attention-Residuals), arXiv 2603.15031): before every sub-layer the block aggregates token embedding, completed block representations and the current partial sum with a softmax pseudo-query; a zero-initialized scalar gate at the block end mixes the block input back in.
+
+**Configurable width**: `d_model` is chosen at creation (`spec.check_d_model`): any multiple of `HEAD_DIM = 128`, **≥ 128 with no upper bound**, default 1024. It only changes semantic width; head count/head dim, MLA ranks and `FFN_HIDDEN` stay frozen. `config.json` is the only input to `common.build_model()`.
+
+**Encoder/decoder weight sharing** (optional): `share_enc_dec=true` ties `enc_blocks[i]`/`dec_blocks[i]` `nn.Parameter` objects and both final norms, so both block counts must be equal. Only *parameters* are shared — the two `Block` instances keep their bidirectional/causal behaviour. Tied weights are stored once on the encoder side (safetensors forbids shared storage) and mirrored on load by `common.strip/expand_tied_dec_keys`. Old model folders without the field load as separate-weight models.
 
 ### Fast Weight Memory
 
-A global `FastWeightBank` serves as long-term memory. It is **structurally one KDA layer** (same q/k/v projections, causal short conv, L2 norm, channel-wise forget gate, output gate, RMSNorm); the only difference is that its state persists across calls. It is invoked once after the first block in both encoder and decoder, reading with the old state and then writing every token. Based on Schmidhuber's 1991 fast weight paper.
+A global `FastWeightBank` is structurally one KDA layer (same q/k/v projections, causal short conv, L2 norm, channel-wise forget gate, output gate, RMSNorm); the only difference is that its state `(S, conv_cache)` persists across calls. `S` is `[B,H,dk,dv]`, **not** `[D,D]`. It is invoked once after the first block in both encoder and decoder, reading with the old state and then writing every token. Based on Schmidhuber's 1991 fast-weight paper.
+
+**Sample boundaries are mandatory**: all training / inference / CLIP entry points call `Gargantua.reset_memory()`. Skipping it leaks state across samples (measured logits gap 20.19). Inference session state lives in an external `state` dict so multi-turn chat can carry memory intentionally.
 
 ### MoMW — optional three-stage memory valve
 
-`MoMW` (Mixture-of-Memory-Weights) adds the selective filtering that the single global bank lacks. It is **off by default** and sits next to the fast-weight bank after the first block. Every pool layer shares the same `KDAAttention` reference and only keeps its own recurrence state `S_i`, so enabling it adds **zero parameters and zero persistent buffers**: `state_dict()` is identical with the valve on or off, and existing model folders load unchanged.
+`MoMW` (Mixture-of-Memory-Weights, `server/momw.py`) is **off by default** and sits next to the fast-weight bank after the first block. Every pool layer shares the same `KDAAttention` reference and keeps only its own recurrence state `S_i`, so enabling it adds **zero parameters and zero persistent buffers**: `state_dict()` is byte-identical with the valve on or off.
 
-Routing runs in three stages:
+1. **Cold start (anchor seeding)**: each layer is bound to a class anchor `P_k`, computed lazily on the first forward as the mean embedding of representative tokens from `wte.weight`; `set_anchor_provider()` can inject real text-embedding means.
+2. **Drift from anchor to state feature**: the principal direction of `S_hᵀS_h` is tracked online with **Oja's rule** (one fixed-cost update per write) and projected back through the KDA `w_o` to form `E_i`; `γ_i = 1 − exp(−writes/k)` moves the score from `cos(H_t, P_i)` toward `cos(H_t, E_i)`.
+3. **Expansion**: overload is judged on *relative* quantities — `‖S_i‖` above `saturation_ratio ×` the same-type median, or growing faster than `growth_ratio ×` its own previous norm. A **zero-state** layer is appended (states are never cloned); new layers get an exponentially decaying bonus `B₀·e^(−age/M)` and same-type layers are softly load-balanced.
 
-1. **Cold start (anchor seeding).** Each layer is bound to a class anchor `P_k`, computed lazily on the first forward as the mean embedding of deterministically sampled representative tokens from `wte.weight` (modeling-time embeddings are still random, so this cannot happen in `__init__`). `set_anchor_provider()` can inject real text-embedding means instead.
-2. **Drift from anchor to state feature.** The principal direction of `S_hᵀS_h` is tracked **online with Oja's rule** — one fixed-cost `O(H·dk·dv)` update per write (with a single power-iteration warm start), projected back to `d_model` through the KDA `w_o` to form `E_i`. The mix `γ_i = 1 − exp(−writes/k)` moves the score from `cos(H_t, P_i)` toward `cos(H_t, E_i)`, i.e. from the external prototype to what the layer actually remembers.
-3. **Expansion (empty-layer split).** Overload is judged on **relative** quantities — `‖S_i‖` above `saturation_ratio ×` the same-type median, or growing faster than `growth_ratio ×` its own previous norm (absolute thresholds remain only as fallbacks). A **zero-state** layer is then appended. States are never cloned; only the anchor direction is inherited. New layers get an exponentially decaying bonus `B₀·e^(−age/M)` to break the cold-start deadlock, and same-type layers are softly load-balanced toward the layer with more headroom.
+The admission threshold is **data-driven** (`threshold_mode="quantile"`, default p=0.9): a sliding window of recent scores, with a fixed fallback while the window is cold. `MoMW.calibrate(batches)` returns suggested percentiles but never writes them back to config. Nothing activates below the threshold — the block then returns `H_1` unchanged and un-recalled layers are never forwarded. The whole valve runs under `torch.no_grad()`, is isolated per session, supports a **silent mode** (write but do not inject `ΔH`), and applies a cost-aware gate `exp(−c·E_fw)` so the two memory paths do not both spike the residual norm.
 
-The admission threshold is **data-driven**: a sliding window of recent scores plus a configurable quantile (`threshold_mode="quantile"`, default p=0.9 ⇒ roughly the top 10% of inputs are admitted), falling back to the fixed value while the window is still cold. `MoMW.calibrate(batches)` runs seed inputs offline and returns per-type score percentiles plus a suggested threshold — as a suggestion, never silently written back to the config.
+Pool snapshots go to `models/NAME/momw_state/{layout,tensors,meta}` (separate from `weights/` and `config.json`); a corrupt snapshot just means starting from zero. `async_write=true` moves writes to a single-writer thread; `flush()` joins before persisting/unloading. The inference panel shows per-layer γ / writes / ‖S‖ / Oja steps / activation plus the live threshold and gate; `/api/momw/control` and the `momw control` CLI command offer the same `clear` / `silent` operations. `spec.momw_default_config()` owns the 25 config keys.
 
-Nothing is activated below `threshold` — the block then returns `H_1` unchanged. Un-recalled layers are never forwarded, so their state does not advance. The valve is gradient-free (`torch.no_grad()`), isolated per session (`state["momw"]`), and can run in **silent mode**: routing and writes continue, but `ΔH` is not injected into the output. A **cost-aware gate** (`exp(−c·E_fw)`) shrinks the injection when the fast-weight readout is already strong, so the two memory paths do not both spike the residual norm.
+### SOMN — optional self-organising memory network
 
-Pool snapshots are written to `models/NAME/momw_state/` (a separate subdirectory — `weights/` and the `config.json` manifest are untouched), and restored on the next `build_model`; a missing or corrupt snapshot just means starting from zero. Writes can also run **asynchronously** through a single-writer thread (`async_write=true`): the forward path only reads a snapshot of the state, `flush()` joins pending writes before persisting or unloading.
+`SOMN` (`server/somn.py`, v4-somn, merged 2026-11-12) is a second, **independent** fast-weight system that can be attached alongside the fast-weight bank and MoMW after the first block. It is **off by default**: `attach_somn()` must be called explicitly; without it `Gargantua` returns `None`, the numerical output is unchanged and `state_dict()` gains no keys. Layers and their `S` matrices live in a plain dict `_rt['somn']` (callable entry at `['module']`), never in the module registration tree, so the "state in ordinary dicts" invariant holds.
 
-The inference panel shows per-layer γ / writes / ‖S‖ / Oja steps / activation plus the live threshold and gate, and can clear the pool or toggle silent mode; `/api/momw/control` and the `momw control` CLI command cover the same operations.
+- `IndependentFWLayer`: an `S = [D,D]` delta-rule memory (read `H@S` with the old state, then update). Stability requires `eta·λ_max(C) < 2`; the implementation uses **`eta = 0.01·64/D`** (equals the spec value at D=64, scales down for larger widths) with the split threshold linked as `5.0·eta/0.01`.
+- `EnergyElbowRouter`: scores a layer by **cosine reconstruction match** `cos(H, H@S).mean()` (the old `‖H@S‖` norm could not distinguish structured from random inputs). `min_score=0.5` admits a layer, empty layers score 0.5, cold start forces a write. `min_energy` remains an alias.
+- **Alternating SVD split**: on expansion the parent takes singular values at even indices and the child at odd indices, so `S_main + S_sec = S` stays lossless while both children get comparable energy (measured energy ratio 1.0241 vs 7.6×10⁶ for the old top/bottom split).
+- **Warm-up birth privilege**: new layers are unconditionally active for N steps, receive an **additive** bonus decaying linearly 1→0, and are exempt from re-splitting. This removes the "zombie layer" failure where a newborn layer never gets a write.
+
+`reset_memory()` also resets SOMN unless `persist_across_samples=True` is set. `service/test/test_somn.py` (30 cases) is registered in `SUITES`; `python server/somn.py --demo` prints layer growth over 100 samples. SOMN is a code-level opt-in feature — there is no UI toggle and no HTTP endpoint yet; document any future UI/API addition here.
 
 ### KV Cache Design
 
@@ -63,272 +85,141 @@ Full KV (uncompressed) | Compressed KV
                        └── HCA view  (32:1, global summary) → MLA-HCA
 ```
 
-- **Full KV**: uncompressed, the most recent `ctx_full` tokens.
-- **Compressed KV**: everything older, kept as **two independent compressions of the same content** — CSA and HCA.
-- Both views read **the compressed segment + the entire full segment**; when the input is still inside the full region there is nothing to compress and the layers behave as standard MLA (the old `csa_local_window` knob was removed on 2026-10-25).
-- **Compression Rule**: a time step is atomic. A group never straddles a step boundary, and an oversized step may be compressed internally into several tokens that all keep that step's id. Each group targets the compression ratio (4 or 32) tokens; when whole steps cannot hit it exactly, the grouping with the smallest error wins (a slight overshoot is allowed, ties prefer the smaller side).
-- **Eviction**: at time-step granularity (whole steps discarded together). Evicted KV vectors are dropped, but their **original token ids are archived** (`SharedKV.archive`) — context overflow loses the KV view, never the raw ids.
-- **Buffer**: compensates for length changes when primitive/audio tokens are compressed.
+- **Full KV**: the most recent `ctx_full` tokens, uncompressed.
+- **Compressed KV**: everything older, kept as two independent compressions of the same content. Both views read the compressed segment **plus the entire full segment**.
+- **Compression rule**: a time step is atomic; a group never straddles a step boundary and an oversized step may be compressed internally into several tokens that all keep that step's id. Each group targets the ratio (4 or 32); when whole steps cannot hit it exactly, the grouping with the smallest error wins.
+- **Eviction**: whole steps are discarded together. Evicted KV *vectors* are dropped, but their original token ids are archived in `SharedKV.archive` — context overflow loses the KV view, never the raw ids.
+- **Causality**: MLA's causal mask is step-aware **and token-aware** — within one step a token only sees earlier tokens of that step (`within_step_pos`), and compressed aggregate entries (`pos = -1`) are hidden from same-step queries. A causal MLA without `step_ids`/`pos` raises instead of silently leaking the future. Encoder blocks stay bidirectional.
+- Drawing primitives are packed 9:1 in the KV after a primitive's 9 tokens are written (`DRAW_KV_COMPRESS = 9`).
 
 ### Context Length (model-creation-time option)
-
-The unified KV stream is split into two regions, and the split is chosen when the model is created (recorded in `config.json`, honored by every entry point via `common.build_model`):
 
 | Region | Meaning | Default |
 |---|---|---|
 | **Full** (`ctx_full`) | Uncompressed recent tokens | 1024 |
 | **Compressed** (`ctx_compress`) | Capacity, counted in **original** tokens, of everything older | 3072 |
 
-Total context = `ctx_full + ctx_compress` (default 4096). The compressed region is served by **two views over the same content** — this is the "two compression layers" of the spec:
-
-- **CSA** (`csa_ratio`:1, default 4): the retrieval view — learnable step-grouped compression of the compressed segment, then standard MLA over the whole full segment.
-- **HCA** (`hca_ratio`:1, default 32): the global-summary view — heavier compression of the same segment, then the same whole full segment.
-
-Compression, eviction and the causal mask are all **time-step atomic** — a group never straddles a step boundary, and eviction discards whole steps. `csa_ratio` is an architectural parameter (the compressor's position embedding is `[ratio, d_model]`), so changing it changes the checkpoint layout; `hca_ratio ≥ csa_ratio` is enforced. There is no separate CSA window: the retained region of CSA **is** the full-KV region.
-
-Choose it three ways (all validated, all landing in the same `config.json` contract):
+Total = `ctx_full + ctx_compress` (default 4096). `csa_ratio` (default 4) / `hca_ratio` (default 32, must be ≥ `csa_ratio`) are architectural — the compressor's position embedding is `[ratio, d_model]`, so changing them changes the checkpoint layout. There is no separate CSA window: CSA's retained region **is** the full-KV region (the old `csa_local_window` knob was removed).
 
 ```bash
 python service/init/init.py --name alpha --ctx-full 2048 --ctx-compress 8192 \
     --csa-ratio 8 --hca-ratio 64                      # total 10240
-# 或走 Web UI 的建模表单 / POST /api/model/init（同一套参数）
 ```
 
-or in the web UI's model-creation form (four number inputs, defaults shown), or `POST /api/model/init` with `ctx_full` / `ctx_compress` / `csa_ratio` / `hca_ratio` (omitted = spec default, illegal value = 400). `GET /api/status` and `GET /api/system` return the active model's real configuration (`ctx` + `kv_note`), so the UI never shows a stale spec constant.
+The same four values are accepted by the Web UI's creation form and `POST /api/model/init` (omitted = spec default, illegal = 400). `GET /api/status` / `GET /api/system` report the active model's real configuration (`ctx` + `kv_note`).
 
 ## Token System
 
-All text tokens are discrete. The `.tokens` binary is **token-6** (2026-11-05):
-a 6-bit bitstream over 29 single characters
-(`0-9 { } < > | : w t v A-F x y [ ]`) plus 6 atomic boundary tokens
-(`[model] [user] [model/] [user/] [sys] [sys/]`, codes 29–34), terminated by
-code 63 and zero-padded to a byte boundary. Codes 35–62 are reserved.
-Any other program opening it sees garbage; `tokens/tok6.py` is the interpreter.
-**No backward compatibility**: token-5 (5-bit) files are no longer readable.
+### token-6 stream
 
-Inside the stream, every element is wrapped in a time step:
+`.tokens` is a **token-6** bitstream (`service/tokens/tok6.py`, 2026-11-05): 6 bits per symbol over 29 single characters
+
+```
+0 1 2 3 4 5 6 7 8 9 { } < > | : w t v A B C D E F x y [ ]
+```
+
+plus 6 atomic boundary tokens (`[model] [user] [model/] [user/] [sys] [sys/]`, codes 29–34). Codes 35–62 are reserved, **63 terminates** the stream, which is then zero-padded to a byte boundary. IDs inside the stream are uppercase, self-delimiting hexadecimal. `tok5.py` is only an import alias for token-6; token-5 files are **not readable**, and `tok32.py` remains solely as a reader for historical uint32/hex files. `spec.py` is the single source of truth for every code and ID.
 
 | Element | Meaning |
-|---|---|
+| --- | --- |
 | `{t:00001}` | text token — visible, has a vector, enters the loss |
 | `{w:<hex>}` | audio token — 533 samples × 16 bit = 2132 hex chars |
 | `{v:<hex>x:10y:24}` | visual patch — 32×32 px, RGBA 10 bit each = 10240 hex chars |
-| `[00005]` / `[user]` | extended token / atomic boundary — has an embedding, not displayed as content, still enters the main AR loss |
-| `<00000>` / `<caps>` | `core` mechanism marker (single-handled category) — has KV, **enters** the loss |
-| `<0000C>` / `<s0>` | numbered slot token — has KV, **enters** the loss, rendered as a "slot N" badge |
+| `[00005]` / `[user]` | extended token / atomic boundary — has an embedding, not displayed as content, **still enters** the main AR loss |
+| `<00000>` / `<caps>` | `core` mechanism marker — `<>` shaped, no closing form, enters the loss, has KV |
+| `<0000C>` / `<s0>` / `<DOC>` | slot / Typst tool element — enters the loss, has KV |
 | `{ } \| [ ] < >` | structure characters — **not** tokens (no position, no loss, no embedding) |
 
-Multiple elements in one step are separated by `|`; `[...]` and `<...>` live at
-stream level, outside `{}`. The human-readable form is `{text: 00001}`,
-`{wave: <hex>}`, `{visual: <hex> x: 10 y: 24}`, `[user]`, `<caps>`, `<s0>` —
-the editor accepts both compact and display forms.
+Multiple elements in one step are separated by `|`; `[...]` and `<...>` live at stream level, outside `{}`. The human-readable form is `{text: 00001}`, `{wave: <hex>}`, `{visual: <hex> x: 10 y: 24}`, `[user]`, `<caps>`, `<s0>`; the editor accepts both compact and display forms. Typst names take precedence over `<HEX>` parsing, otherwise `<B>` (bold) would be misread as ID 0xB.
 
-**Wrapping semantics**: `[]` is for the six `boundary` segment markers
-(`[user] … [sys/]`); `<>` is for the three `core` mechanism markers and the
-numbered `slot` tokens. `spec.py` is the single source of truth for every
-code and ID.
+**Wrapping semantics / loss**: `[]` is for the six `boundary` segment markers; `<>` is for `core`, `slot` and `typst` tool elements. Both shapes **enter the main AR loss and have KV + fast weight**. Only media positions (no vocabulary ID) are given target `-100` and excluded from the loss. `spec.segment_type_of()` defines four segment types — `TYPE_USER=0`, `TYPE_MODEL=1`, `TYPE_NONE=2`, `TYPE_SYS=3`.
 
-Why extended tokens carry the "position embedding" role: KDA lets the model
-learn relative order itself, so the standard Transformer position-embedding
-job is delegated to these extensible tokens; plain structure characters need
-no embedding at all.
+### base1.3.0 vocabulary
 
-### base1.3.0 vocabulary and numbered slots
+A vocabulary is a **folder** `<name>/{vocab.vfc, config.json}`. `.vfc` holds one token per line (`内容:ID`, invisible tokens wrapped in `<>`, IDs uppercase hexadecimal), strictly continuous `0..N-1`; deletion compacts the file. `config.json` declares `vocab_size`, `head_size`, `slot_count` and the ordered `regions`. The versioned base is `vocabs/base1.3.0/` (`vocab_version: "1.3.0"`, `token_encoding: "token-6"`); `service/tokens/{vocab.vfc, config.json}` is the active global runtime copy, and each model gets its own `vocab/` copy at creation.
 
-The base vocabulary is versioned: `vocabs/base1.3.0/{vocab.vfc, config.json}`
-(`vocab_version: "1.3.0"`, `token_encoding: "token-6"`). The head layout has
-**six segments**: `core 3 + boundary 6 + system 3 + slot N + typst 228 +
-draw 9605 = 9845 + N` IDs, where **N is `config.json`'s `slot_count`, not a
-constant in `spec.py`**. The `typst` segment is **228 `<>` tools** — 114 Typst
-syntax constructs, each with an explicit open/close pair (`<DOC>`/`</DOC>`,
-`<H1>`/`</H1>`, … `<ATTR>`/`</ATTR>`); like `core` they are invisible, enter
-the loss, have KV and carry `TYPE_NONE`. It sits between `slot` and `draw`
-(`TYPST_BEGIN = 12 + N`, `TYPST_END = 240 + N`).
-**The base vocabulary has zero reserved slots** (N=0 → `HEAD_SIZE = 9845`,
-`DRAW_BEGIN = 240`, visible IDs start at 9845).
+The contract head has **six segments**:
 
-To get reserved slots, generate a new vocabulary from base:
+```
+core 3 + boundary 6 + system 3 + slot N + typst 228 + draw 9605 = 9845 + N
+```
+
+- `core` = `<caps>`(0) `<stop>`(**1**) `<draw:end>`(2) — earliest mechanism markers, single-handled, not `[]` boundaries or tool calls.
+- `boundary` = `[user] [user/] [model] [model/] [sys] [sys/]` (IDs 3–8); `[sys]…[sys/]` is the `TYPE_SYS` system segment used for tool results / system prompts.
+- `system` = `{ } |` (IDs 9–11), time-step structure.
+- `slot` = `<s0>…<sN-1>` (IDs `12 … 11+N`), numbered placeholders with **no preset semantics**. `N` comes from that vocabulary's `config.json`, not from `spec.py`; base has **zero** reserved slots. Since 1.2.0 every predefined agent tool / formatting token is gone (`TOOL_SPECS`, `TOOL_EXECUTABLE` are empty, `SLOT_DEFS = {}`) and tool execution is disabled in this tooling/test bench. Define names, kinds and open/close pairs yourself; `GET /api/agent/spec` is the only source for IDs.
+- `typst` = 114 Typst syntax constructs × explicit open/close pairs = 228 `<>` tools (`<DOC>`/`</DOC>` … `<ATTR>`/`</ATTR>`), `TYPE_NONE`, invisible, in loss, with KV. `TYPST_BEGIN = 12+N`, `TYPST_END = 240+N` — it **must** follow `slot`, because `vfc.infer_slot_count()` derives N by counting from ID 12 to the first Typst token.
+- `draw` = 9605 output-side tokens; `DRAW_BEGIN = 240 + N`.
+
+For base (N=0): `HEAD_SIZE = 9845`, `DRAW_BEGIN = 240`, visible IDs start at 9845 and **`vocab_size = 80262`**. Ten visible regions follow the head: `digit 10 / whitespace 6 / symbol 7263 / emoji 1517 / cjk 27584 / english 30000 / extra 0 / fallback 26 / code 474 / unicode_ext 3537`. `code` is 474 cross-language code tokens appended after `fallback`; `unicode_ext` adds 3537 characters from 31 Unicode blocks (Latin extended, Cyrillic, Greek, kana, math symbols, …). `MAX_VOCAB_SIZE = 100000` is only a defensive upper bound for IDs in the bitstream, not the vocabulary length.
+
+To reserve slots, derive a new vocabulary (base itself is never edited):
 
 ```bash
 python service/tokens/gen_vocab.py --name mymodel --slots 128
-# vocabs/mymodel/{vocab.vfc, config.json}, config.slot_count=128
+# vocabs/mymodel/{vocab.vfc, config.json}, slot_count=128
 # --activate makes it the global runtime layout (restart the server)
 ```
 
-`spec.head_layout(n)` is the pure layout function; `vfc.infer_slot_count()`
-reads N back from any `.vfc`, so a derived vocabulary loads correctly even
-when the global spec layout differs.
+`spec.head_layout(n)` is the pure layout function; `vfc.infer_slot_count()` reads N back from any `.vfc`, so a derived vocabulary loads correctly even when the global layout differs. Full contracts: `service/web/plugins/AGENT_TOKENS.md` and `TYPST_TOKENS.md`.
 
-**Since 1.2.0 every predefined agent tool / formatting token is removed.**
-Slots `<s0>`…`<sN-1>` (IDs `12 .. 11+N`) are shown by number with **no preset
-semantics at all**; define names, kinds and open/close pairing in
-`spec.SLOT_DEFS`. Tool execution is **disabled entirely** for now (this repo
-is a tooling/test bench; the runtime will live in a separate inference app).
-`GET /api/agent/spec` is the only source for IDs — see
-`service/web/plugins/AGENT_TOKENS.md` for the full contract.
+**Version history / compatibility**: 1.0.0 introduced token-6; 1.1.0 appended `code`; 1.2.0 rewrote the head; 1.3.0 inserted `typst` and `unicode_ext`. IDs shifted wholesale in 1.2.0 **and again in 1.3.0** (draw and the whole visible area +228) — old `.tokens` files, weights and archives are not readable, and no compatibility layer is provided. Changing the head requires synchronizing `vfc.head_entries()`, `build_vocab.build_entries()`, the `.vfc`/`config.json` copies, the "About" page SVG, `minify.py` rebuild and tests.
 
-`<caps>` / `<stop>` / `<draw:end>` are **not** slots: they are the earliest
-mechanism markers and get their own `core` category — `<>` shaped, no closing
-form, not `[]` boundaries, not system/special tokens, not tool calls. They
-still enter the loss and have KV.
+### Regions, add-token and codecs
 
-At the end of the visible area (after the `code` region) 1.3.0 appends a
-**`unicode_ext` region of 3537 characters** drawn from 31 Unicode blocks
-(Latin extended, Cyrillic, Greek, kana, mathematical symbols, …), all in the
-`regular` category. The total `vocab_size` is **80262** (76497 + 228 + 3537);
-`MAX_VOCAB_SIZE` stays 100000.
+Surface strings are unique across the whole vocabulary (single-letter words `a`/`i` are not word tokens — fallback letters cover them), so reverse lookup is unambiguous. Adding a token is **region-scoped**: `spec.REGION_ADD_POLICY` / `check_add_region()` are the policy source — `core`/`boundary`/`system`/`typst`/`draw` are locked, `slot` accepts `<angle>` names, the ten visible regions accept text.
 
-Version history: `1.0.0` introduced token-6; `1.1.0` appended a `code` region
-(474 cross-language code tokens) at the end of the visible area; `1.2.0`
-rewrote the head; `1.3.0` inserted the `typst` head segment and the
-`unicode_ext` visible region. **IDs shifted wholesale in 1.2.0, and again in
-1.3.0 (draw and the whole visible area +228) — old `.tokens` files, weights
-and archives are not readable.**
+- `POST /api/vocab/token` with `{name, action: add|remove|query, token, region?}` is the canonical endpoint; `POST /api/vocab/add` is a thin compatibility alias that forces `action=add` (no duplicated logic).
+- `Vocab.add_token(text, category, region=None)` / `remove_token()` keep `config.json` regions, `head_size` and `slot_count` in sync. Only `slot` tokens can be removed.
+- Other vocabulary endpoints: `GET /api/vocab`, `/api/vocab/list`, `/api/vocab/regions`, `/api/vocab/source`; `POST /api/vocab/source`, `/fork`, `/copy`, `/create`, `/delete`. The **base** vocabulary is protected — fork before editing.
+- **enctok** (`python service/tokens/enctok.py "text"`): `[A-Za-z]+` word segments hit the 30K word list (`<caps>` + word for `Hello`; ALL-CAPS/mixed case is spelled letter-by-letter, lossless); code tokens are matched verbatim first and by longest-match; other chars look up regular tokens then fallback letters; unmapped chars are skipped and reported. Output is hex text or a token-6 `.tokens` file. `--vocab` accepts a `.vfc` file, a vocabulary folder or a model folder (reads `vocab/`).
+- **dectok** (`python service/tokens/dectok.py stream.tokens`): renders token-6 as `{text: 00001} …`; `--text` renders surface text.
+- **gts** (`service/tokens/gts.py`): legacy tok-32-era editor parser, kept read-only; the editor now speaks token-6 directly via `POST /api/tokens/export`.
+- **tokenset** (`service/tokens/tokenset.py`): the only training reader. `read_doc()` returns `pos_ids` (text ID / `None` for media), `step_ids`, assembled `steps` and a `multimodal` flag; `read_stream()` is the text-only convenience entry and rejects media elements. `MAX_DOC_POSITIONS = 32768` guards memory. `.tokenvector` (UTF-8) archives audio/visual vectors with `dim=`/`precision=` headers for modalities that have no discrete IDs.
 
-`[sys]…[sys/]` is the system segment (`TYPE_SYS`, a 4th type embedding) used
-for tool results / system prompts. Infer-Plug v1.0.0 renders tool calls,
-streams text, previews draw output with a draggable timeline, and ends the
-preview on `<draw:end>`.
-
-The old tok-32 (big-endian `uint32`) format is retired; `tokens/tok32.py`
-remains only as a reader for historical files.
-
-The vocabulary (88,704 slots) is split into **four categories**; `enctok`
-only ever looks up the two visible ones:
-
-| Category | Contents | Example |
-|---|---|---|
-| `regular` (visible) | digits, whitespace, all Unicode P*/S* symbols (half+full width), all emoji (incl. ZWJ/VS16/tag components), all CJK basic + ext-A chars, 30K common English words | `你`, `😀`, `hello`, `！` |
-| `fallback` (visible) | 26 lowercase letters `a-z` (OOV words are spelled letter-by-letter) | `q` |
-| `special` (invisible) | `<caps>`, `<user>`, `<user/>`, `<model>`, `<model/>`, `<stop>`; primitive (draw) output tokens — geometrize_256_v1 layout | `<caps>` |
-| `system` (invisible) | time-step structure: `{` open, `}` close, `|` intra-step separator | `{` |
-
-- Every surface string is unique across the whole vocabulary (single-letter
-  words `a`/`i` are *not* word tokens — the fallback letters cover them), so
-  `token_to_id` reverse lookup is unambiguous. The only intentional exception:
-  the three system display characters `{ } |` also exist as visible symbols;
-  text→ID always resolves to the visible symbol, ID→display shows the literal.
-- **Adding tokens**: `POST /api/vocab/add` (or `Vocab.add_token`) with one of
-  the four categories. Duplicates are rejected against the entire vocabulary;
-  new tokens consume reserved tail slots of their category, so the model
-  output dimension never changes. User additions persist in `vocab.json`
-  (`meta["user_added"]`) and are replayed on rebuild.
-- **enctok** (`python service/tokens/enctok.py "text"`): word segments `[A-Za-z]+`
-  hit the word list (`<caps>` + word for `Hello`; ALL-CAPS/mixed case is
-  spelled letter-by-letter with `<caps>` per capital — lossless); other chars
-  look up regular tokens, then fallback letters; unmapped chars are skipped
-  and reported. Output: hex string or `.tokens` binary.
-  `--vocab <vocab.txt|模型目录>` 可用指定词表编码（见「每模型词表」）。
-- **tok6** (`tokens/tok6.py`): the token-6 codec — characters ↔ 6-bit
-  bitstream ↔ elements ↔ time-step stream, plus payload helpers
-  (`samples_to_hex`, `rgba8_to_hex`) and `to_display` / `parse_display`.
-- **dectok** (`python service/tokens/dectok.py stream.tokens`): renders a
-  token-6 file as `{text: 00001}` …; `--text` renders surface text.
-- **gts** (`tokens/gts.py`): *legacy* tok-32-era editor parser, kept read-only.
-  The editor now speaks token-6 directly (`POST /api/tokens/export`).
-- **tokenset** (`tokens/tokenset.py`): the only reader used by training —
-  token-6 `.tokens` → `(ids, step_ids)`, rejecting files without a valid
-  time-step structure and files carrying `{w:}`/`{v:}` elements (the current
-  `forward_train` only consumes discrete IDs).
-
-### Time-Step Format (.gts / { } |)
-
-A time-step is the atomic unit for KDA recurrent-state recursion and logical
-parallelism (compression, sliding-window eviction and causality never cross a
-step boundary). Each step is wrapped by the system tokens `{ }`; multiple
-tokens inside one step are separated by `|`:
+### Time-Step Format (`{ } |`)
 
 ```
-{<user>}{h|e|l|l|o}{<user/>}
+{[user]}{h|e|l|l|o}{[user/]}
 ```
 
-- Text: one token per time-step (`{ } |` stay implicit in the Step list).
-- Image: one time-step (all patch tokens inside).
-- Audio: 533 samples = one token = one time-step.
-- Video: each frame = one time-step (all patch tokens + that frame's audio
-  token inside).
-- `.tokenvector` (UTF-8) archives audio/visual vectors — no discrete IDs for
-  those modalities. Header declares `dim=` and `precision=` (`f32`/`f16`/
-  `bf16`); steps are `{ }`-delimited and intra-step token vectors are
-  `|`-separated; the body is numbers only. Video frames store patch and audio
-  vectors projected to the same `d_model` in a single file.
+A time step is the atomic unit for KDA recursion and logical parallelism. `{ }` wraps a step, `|` separates tokens inside it. Text: one token per step (compact form). Image: one step holding all patch tokens. Audio: 533 samples = one token = one step. Video: one frame = one step holding all patches + that frame's audio token(s). Inside a step all tokens share `step_id`; attention is still **token-level causal** (see KV Cache Design), not bidirectional.
 
 ## Embedding Strategy
 
-Embedding is **not unified** — each modality has its own projection path to `d_model=1024`:
+Embedding is **not unified** — each modality has its own projection to `d_model`:
 
-| Modality | Projection | Position Info |
-|---|---|---|
-| Text | `wte` lookup table | None |
-| Visual | `visual_proj` (4096 → 1024) | `visual_coord_x` + `visual_coord_y` (2D absolute) |
-| Audio | `audio_proj` (533 → 1024) | None |
-| Drawing | `wte` (in-vocab IDs) | None |
+| Modality | Projection | Position info |
+| --- | --- | --- |
+| Text | `wte` lookup | none |
+| Visual | `visual_proj` (4096 → `d_model`) | `visual_coord_x` + `visual_coord_y` (2D absolute) |
+| Audio | `audio_proj` (533 → `d_model`) | none |
+| Drawing | `wte` (in-vocabulary IDs) | none |
 
-**Segment marker = type embedding.** `type_emb` is a learned table with one
-entry per segment kind (user / model / none), applied to **every token inside
-that segment** — there is no start/end distinction. It plays the same role as
-a position embedding (a learned additive vector), not a token. The boundary
-tokens `<user>`, `<user/>`, `<model>`, `<model/>` are system-level markers:
-they do not enter the shared KV and are not ordinary tokens in the loss.
-
-Within a single time-step (e.g., one video frame), all patches and audio tokens share the same `step_id` and receive bidirectional attention (no causal mask within the step).
+**Segment marker = type embedding**: `type_emb` is a learned table with one entry per segment kind (`user / model / none / sys`, `NUM_TYPES = 4`), added to **every token inside that segment** — there is no start/end distinction. It plays the learned-additive-vector role of a position embedding; KDA learns relative order itself. The `[]` boundary markers are ordinary tokens in the loss with KV (see Token System), not "system-level markers excluded from KV".
 
 ## Visual Processing
 
-### Image → Patches
-- Input is padded to multiples of 32, split into 32×32 RGBA patches.
-- Each patch = 1024 pixels × 4 channels = 4096 bytes, flattened into a vector.
-- `visual_proj` maps the 4096-byte vector to `d_model=1024`.
+- Input is padded to multiples of 32 and split into 32×32 RGBA patches.
+- Each patch = 1024 pixels × 4 channels × 10 bit, flattened; `visual_proj` maps it to `d_model`.
 - `(gx, gy)` grid coordinates are added via learned position embeddings (not tokenized).
-
-### Video → Token Stream
-- Fixed 30fps.
-- **Frame 1**: Full input (all patches).
-- **Frames 2–30**: Only patches with pixel-level changes.
-- **Frame 31** (per second): Full input.
-- **All-changed frame**: If all patches change, full input + reset counter.
-- **Last frame**: Always full input.
-- Audio is aligned at 533 samples/frame (16kHz / 30fps).
+- **Video**: fixed 30 fps. Frame 1 = full input; frames 2–30 = only patches with pixel-level changes; frame 31 (per second) = full input; an all-changed frame = full input + counter reset; last frame = always full. Audio is aligned at 533 samples/frame (16 kHz / 30 fps).
 
 ## Audio Processing
 
-- **Input**: 16kHz mono, any format (mp3/flac/ogg/wav via ffmpeg).
-- **Tokenization**: 533 samples → 1 token (~30 tok/s).
-- **Embedding**: 533-sample vector → `audio_proj` → `d_model=1024`.
-- **Output**: MIDI discrete tokens temporarily removed (2026-10-24,
-  steve: to be redesigned; midi_codec and /api/codec/midi were removed).
+- Input: 16 kHz mono, any format (mp3/flac/ogg/wav via the bundled ffmpeg).
+- Tokenization: 533 samples → 1 token (~30 tok/s).
+- Embedding: 533-sample vector → `audio_proj` → `d_model`.
+- Output: MIDI discrete tokens were removed on 2026-10-24 (`midi_codec` and `/api/codec/midi` are gone; recoverable from git history).
 
 ## Primitive Pipeline (image → primitive tokens)
 
-Adopted from [wonderfulearth/primitive-operation-painter](https://github.com/wonderfulearth/primitive-operation-painter)
-(the converter under `service/prims/fast_shape_render/` is copied byte-for-byte
-and never modified; the rest of the upstream repo — model / training code,
-~11MB — was **deleted** on 2026-10-31 since nothing here referenced it, and is
-recoverable from git history).
-**Languages**: the image→sequence converter (`fast_shape_render/`) is
-**Rust + wgpu** (GPU compute; Metal on macOS, DirectX 12 on Windows,
-Vulkan on Linux); the driver + CPU fallback is **Python + numpy**.
+Adopted from [wonderfulearth/primitive-operation-painter](https://github.com/wonderfulearth/primitive-operation-painter); the converter under `service/prims/fast_shape_render/` is vendored verbatim (Rust + wgpu: Metal / DX12 / Vulkan). The rest of the upstream repo (~11 MB of model/training code) was removed on 2026-10-31 and is recoverable from git history. Driver + CPU fallback are Python + numpy.
 
-- **Converter (照搬第三方代码)**: reads images, fits a sequence of
-  rectangle/ellipse operations on the GPU (275 search steps), and writes
-  CSV (`image_name,cx,cy,w,h,shape_type,theta,r,g,b`; first row per image
-  is the background). Driven by `service/prims/image_to_primitives.py`
-  (`convert_with_renderer`, subprocess).
-- **CPU fallback**: the same greedy algorithm in pure numpy (no GPU
-  required), outputting the identical primitive schema.
-- **Tokens (`geometrize_256_v1` 布局，2026-11-01/02 起扩展)**: 9 tokens per
-  primitive in field order `x, y, theta, w, h, shape, r, g, b`, each field an
-  independent bin range (token ID = `DRAW_BEGIN + field offset + bin`);
-  `x/y/w/h` are all 1 token = 1 px (upper bound = canvas max 1920×1080),
-  `theta` 3 bins/degree, `r/g/b` 10 bit (1024 levels). A canvas declaration
-  (`<x> digits <x/> <y> digits <y/>`) opens the sequence and may be any size
-  from 1×1 to 1920×1080. See `server/spec.py` (DRAW_*) and
-  `service/tokens/draw_codec.py`.
-- **Quality modes** (CPU path): `fast` = 20 candidates/step, no
-  hill-climbing (~2–5s/100 steps); `slow` = 50 candidates + short
-  hill-climbing (~30–60s/100 steps).
-- **CSA Compression**: after a primitive's 9 tokens are written, the KV
-  cache compresses them 9:1 in place.
+- **GPU converter**: fits rectangle/ellipse operations in 275 search steps and writes CSV (`image_name,cx,cy,w,h,shape_type,theta,r,g,b`; first row = background). Driven by `service/prims/image_to_primitives.py`.
+- **CPU fallback**: the same greedy algorithm in pure numpy, identical schema, any canvas up to 1920×1080. `quality=fast` (20 candidates/step, no hill-climbing) or `slow` (50 candidates + short hill-climbing); `engine=auto|gpu|cpu`.
+- **Tokens (`geometrize_256_v1`)**: a canvas declaration (`<x> digits <x/> <y> digits <y/>`) opens the sequence, then N × 9 tokens in field order `x, y, theta, w, h, shape, r, g, b`. `x/y/w/h` are 1 token = 1 px, `theta` 3 bins/degree, `r/g/b` **10 bit (0..1023)** internally. CSV / PNG / SVG are 8-bit boundaries converted with `color_to8` / `color_to10`. `/api/status.draw_layout` (built solely by `server.draw_layout_payload()`) is the front-end's layout source.
+- Rendering endpoints (`POST /api/codec/draw`, `/api/codec/image2prims`) return `202` with a `task_id`; poll `GET /api/task/<task_id>`.
 
 ### Startup dependencies
 
@@ -336,55 +227,58 @@ Vulkan on Linux); the driver + CPU fallback is **Python + numpy**.
 sh service/prims/setup.sh
 ```
 
-installs the Rust toolchain **into `environment/rust/`** (fully isolated
-from the system: `RUSTUP_HOME`/`CARGO_HOME` are redirected, `--no-modify-path`
-keeps your shell config untouched), then builds the GPU converter
-(`cargo build --release`, first run ~5–15 min). Download mirrors are
-auto-selected by live speed test (USTC → TUNA → official; override with
-`RUSTUP_DIST_SERVER` / `CARGO_CRATES_MIRROR`). macOS needs Xcode Command
-Line Tools for the linker/Metal SDK. Without the build the pipeline
-automatically falls back to the CPU fitter; `GARGANTUA_SHAPE_RENDERER`
-overrides the binary path. Converter env vars (`SHAPE_RENDERER_INPUT_DIR`,
-`_OUTPUT_DIR`, `_NUM_VERSIONS`, `_MAX_OUTPUT_STEPS`) are documented in
-`service/prims/fast_shape_render/README.md`.
+installs the Rust toolchain into `environment/rust/` (redirected `RUSTUP_HOME`/`CARGO_HOME`, `--no-modify-path`) and builds the GPU converter (`cargo build --release`, 5–15 min). Mirrors are selected by speed test; macOS needs Xcode Command Line Tools, Windows has no POSIX `setup.sh` and simply uses the CPU fallback (or a prebuilt binary via `GARGANTUA_SHAPE_RENDERER`). Without a built binary the pipeline automatically falls back to CPU. Converter env vars are documented in `service/prims/fast_shape_render/README.md`.
 
 ## Training
 
 ### Optimizer Strategy
-- **Muon**: Applied to all hidden-layer 2D matrices (attention, FFN, projections).
-- **AdamW**: Applied to embedding tables, prediction head, and RMSNorm parameters.
-- Muon can be disabled — falls back to full AdamW.
 
-### Data Format
-Training data is a **`.tokens` file** — the token-6 bitstream, with the
-`{ }` time-step structure written out explicitly. The Token editor exports
-exactly this format (Export .tokens), and it is the only accepted training
-input; JSON/JSONL uploads are rejected with `400`.
+`clip_data.OPTIMIZERS` is the only source for the three modes, shared by the UI, the queue filename, the CLI and the trainer:
 
-```bash
-# queue one stream (CLI side, same file the editor produces)
-cp stream.tokens data/queue/
+| Mode | Behaviour |
+| --- | --- |
+| `muon` (default) | hidden-layer 2D matrices → Muon; embeddings / head / norms / 1D params → AdamW |
+| `adamw` | all parameters → AdamW |
+| `allmuon` | **all** 2D matrices → Muon; 1D params still AdamW (Muon orthogonalizes matrices, not vectors) |
+
+Implemented once in `muon.build_optimizers()`; `service/train/train.py`, `auto_train.py`, `server_train.py` and the CLI all validate against the same tuple.
+
+### Data formats
+
+**Language-model training** accepts only a token-6 **`.tokens` file** with explicit `{ }` time-step structure — the Token editor's "Export .tokens" produces exactly this, and JSON/JSONL uploads are rejected with 400. `tokenset` appends a `<stop>` step at the end of each document; files without valid structure are rejected before training. A file may mix `{t:}`, `{w:}` and `{v:}`: text-only docs go through `make_batch` + `forward_train`, multimodal docs through `make_batch_emb` + `forward_train_embeddings` (media positions get target `-100`, so media is context only). Both paths share `service/train/train_step.py`.
+
+**Contrastive training = CLIP dataset folder v1** (`service/train/clip_folder.py` is the single source; `GET /api/train/dataset/spec` renders the spec for the UI):
+
+```
+<dataset>/
+├── dataset.json          # format=gargantua-clip-folder, version=1
+└── pairs/
+    ├── 001/{a.tokens, b.tokens}
+    ├── 002/{a.tokens, b.tokens}
+    └── ...                # at least 2 pairs
 ```
 
-Each file is one token stream. The trainer expands it into flat positions
-plus a parallel `step_ids` array (`tokens/tokenset.py`), and appends a
-`<stop>` step at the end of the document. Files without a valid `{ }`
-structure are rejected before training starts.
+The top level allows only `dataset.json` and `pairs/`; each pair directory holds exactly `a.tokens` and `b.tokens`, whose internal modalities are arbitrary (image×image, video×video, text×image, …). `dataset.json` may optionally set `name`, `pairs` (order), `batch_size` (2..64) and `temperature` (0,100]. `clip.clip_loss` is standard symmetric InfoNCE with negatives drawn from the other pairs in the batch — **no** synthetic `(A,B)+(B,A)` negatives. Four pairs start at loss ≈ ln(4) = 1.386386, a useful regression anchor. The legacy two-file `mode=pair` queue format is read-only compatibility; the new UI never creates it.
 
-**Multimodal documents.** A file may mix `{t:}`, `{w:}` and `{v:}` elements.
-Text-only docs go through `make_batch` + `forward_train` (embedding lookup,
-cheapest). Docs containing media go through `make_batch_emb` +
-`forward_train_embeddings`: the whole document is projected once
-(`visual_proj` / `audio_proj`, both plain `Linear(…, d_model)`), and media
-positions are given target `-100` — the `lm_head` can only predict vocabulary
-IDs, so images and audio act purely as context while the text targets drive
-the loss. Both paths share `service/train/train_step.py`, so the queue daemon
-and the CLI trainer can never diverge.
+**Training granularity**: one file = a fixed number of `steps`; each step samples one random window, computes one average loss over the whole window and takes one optimizer step. Token-level sequential traversal was removed. Loss records carry `step/loss/ts/file` (plus `mode/n_pairs` for CLIP); the loss curve has one tab per file with no vertical token-segment lines.
 
-### Training Script
+### Queue and task metadata
+
+`data/queue/` holds pending `.tokens` files, `data/done/` holds trained ones (`data/failed/` on error), and `data/task_meta/<queue-name>.json` sidecars store target / optimizer / block_size / steps / CLIP batch size / temperature. Queue filenames encode mode + optimizer (`clip_data.parse_queue_name`). `auto_train._task_scope()` applies each task's parameters temporarily and restores them afterwards. Editing an unfinished task from the UI (`POST /api/train/task/update`) rewrites its sidecar and, when the optimizer changes, renames the queue file.
+
+Training endpoints: `/api/train/{enqueue,start,stop,delete,status,queue,events,loss,task/update,dataset/spec}`. `queue` reports `pending / done / failed / running`; `delete` takes a `where`. Every one of them has a named terminal command in `service/cli/api_map.py` (a static test asserts full coverage).
+
+### Running training
+
 ```bash
-python service/train/train.py --model models/my_model --data data/
+python service/train/train.py --model models/my_model --data data/ \
+    --steps 200 --block-size 32 --optimizer muon
+cp stream.tokens data/queue/                       # queue daemon path
+python service/train/auto_train.py --model models/my_model
+./gargantua queue add --file stream.tokens --mode lm
 ```
+
+The Web UI's training page has one block for creating/editing a task, the pending queue above the completed queue on the right, and a three-view top bar (tasks / logs / loss). CLIP upload is a single folder (`webkitdirectory` + recursive drag-and-drop); LM upload accepts multiple `.tokens` files, one task each.
 
 ## Inference
 
@@ -392,145 +286,61 @@ python service/train/train.py --model models/my_model --data data/
 python service/infer/infer.py --model models/my_model --prompt "Hello"
 ```
 
-The decoder stops immediately when `<stop>` (ID 5) is sampled.
+The decoder stops as soon as `<stop>` (**ID 1**) is sampled. `POST /api/infer` accepts `media: [{kind, b64, filename}]` with `kind ∈ image | audio | video` (up to 4 attachments, 64 MB total). Media is decoded into patches / 533-sample tokens, placed before the text prompt, projected into `d_model` and encoded into the KV cache; generation stays textual, so at least one text token is needed as decode seed. Streaming goes through `GET /api/infer/stream`, which returns each new token with `char` / `tool` metadata.
 
-**Multimodal prompts.** `POST /api/infer` accepts `media: [{kind, b64,
-filename}]` with `kind` ∈ `image | audio | video` (up to 4 attachments, 64 MB
-total). The media is decoded in the inference service (patches / 533-sample
-tokens), placed *before* the text prompt, projected into the same `d_model`,
-and encoded into the KV cache — generation itself stays textual, so at least
-one text token is required as the decode seed.
-
-### Token-id archive (inference)
-
-Every inference call persists its token ids before/while generating:
+### Token-id archive
 
 ```
-logs/infer_archive/<YYYYmmdd_HHMMSS>_<id>.tokens   # token-6，每个 { id } 一步
+logs/infer_archive/<YYYYmmdd_HHMMSS>_<id>.tokens   # token-6，每步一个 id
 logs/infer_archive/<...>.json                      # model / counts / ctx_total / n_evicted
 ```
 
-The `.tokens` file receives the prompt at start and each generated token as it
-is sampled (flushed per token), so a crash, an idle exit or KV eviction can
-never lose ids — only KV *vectors* are dropped when the context overflows.
-The sidecar records `n_tokens`, `n_prompt_tokens`, `n_generated_tokens`,
-`ctx_total` and `n_evicted`. `--archive-dir` overrides the location; the
-server passes `<log dir>/infer_archive` and returns the path as `archive` in
-the inference result. Archiving failure is logged to stderr and degrades to
-"no archive" — it never blocks inference.
+The `.tokens` file receives the prompt at start and each generated token as it is sampled (flushed per token), so a crash or KV eviction can never lose ids. The sidecar records `n_tokens`, `n_prompt_tokens`, `n_generated_tokens`, `ctx_total`, `n_evicted`. `--archive-dir` overrides the location; the server passes `<log dir>/infer_archive` and returns the path as `archive`. Archiving failure degrades to "no archive" and never blocks inference.
 
 ## Web Interface
 
-A built-in web UI provides:
-- **Model Management**: Create models with configurable encoder/decoder block counts **and context length** (full / compressed capacity + CSA/HCA compression ratios — see "Context Length" above).
-- **Training Queue**: Upload `.tokens` streams, queue training tasks with automatic execution.
-- **Inference Chat**: 推理页中间整块（左右边栏之间、磨砂顶栏之下，**含输入框**）
-  由**可插拔显示插件**渲染，因为不同词表的 token 显示方式不同。插件只负责
-  「把用户输入转成 infer 请求（含 max_new_tokens / temperature / top_p）→
-  读流式输出 → 自己画 HTML」。选择器与导入入口在「开发者选项 → 显示插件」，
-  默认插件是 **Infer-Plug v1.0.0**（正常文字输入、文件 chip 内联拼接、
-  图元画布实时预览 + 可拖拽时间轴、流式输出、工具调用徽标）；另一个内置
-  插件「token 对话」保留转换器格式 `[]`/`<>` 显示。完整协议与开发文档见
-  `service/web/plugins/README.md`。
-- **开发者选项**（右侧边栏）：上下文占用、KV cache、**fast weight 状态热力图
-  与逐步写入幅度折线**、**MoMW 记忆阀门面板**（状态条常驻指标；点开看每层
-  类型 / γ / 写入次数 / ‖S‖ / 是否激活，并可清空记忆池或切换静默激活）、
-  显示插件选择/导入、采样参数。
-- **Codec Visualizers**:
-  - Text → Token conversion
-  - Audio → Wave token conversion
-  - Image/Video → Patch token conversion
-  - Image → Primitive sequence conversion
-  - Token editor with a spec-aligned palette and **Export .tokens** (writes the same token-6 stream training consumes)
-  - **Vocabulary page**: ID-region occupancy, presets, plus global search / add-token (the editor itself no longer carries vocabulary operations)
+A built-in single-page UI (`service/web/index_source.html` → minified `index.html`) provides:
+
+- **Model management**: create / load / delete models with block counts, context length, `d_model`, weight-sharing and MoMW options; per-model parameter estimates.
+- **Training queue**: `.tokens` upload, CLIP folder upload, task editing, live events and per-file loss curves.
+- **Inference chat**: the whole middle block (including the input box) is rendered by a **pluggable display plugin**, because token display differs per vocabulary. Default is **Infer-Plug v1.0.0** (contenteditable with inline file chips, canvas SVG preview with a draggable timeline, streaming text, tool badges); the built-in `tokens` plugin keeps the converter-style `[]`/`<>` multi-turn view. Selector / import entry: Developer options → 显示插件. Protocol: `service/web/plugins/README.md`.
+- **Developer options**: context usage, KV cache, fast-weight heatmap + per-step write magnitude, MoMW panel (per-layer type / γ / writes / ‖S‖ / activation, clear pool, silent toggle), plugin selector, sampling parameters.
+- **Codec visualizers**: text / audio / image / video → token, image → primitive sequence, token editor with spec-aligned palette and **Export .tokens**, and a vocabulary page (region occupancy, presets, search, region-scoped add-token).
+- **Environment & dependencies**: read-only cards plus a resource monitor; installs/updates are terminal-only (see `start/requirements/README.md`).
+- **Built-in terminal**: a PTY shell locked to the project root (POSIX only; on Windows the endpoint returns a clear message and the external terminal is used).
 
 ### Launch
 
-终端脚本只负责「把隔离环境准备好，然后**把控制权交给 server 并自己退出**」；
-环境检查、窗口拉起、服务调度全部由 server 自己做：
-
 ```bash
-# 根目录只暴露三个中文名启动脚本；内部启动器在 launcher/ 子目录，一般无需直接调用
 ./启动.sh                        # macOS / Linux 终端
 ./启动.command                   # macOS: 双击启动（Finder）
 启动.bat                         # Windows: 双击启动（调用 start\terminal\start.bat）
-# 内部实现（launcher/ 子目录）：launcher/start-server.sh / launcher/setup-environment.sh
+./gargantua --help               # 终端接口（POSIX）；Windows 用 gargantua.bat
 ```
 
-**交接（2026-10-29 起）**：`start-server.sh` 不再 `exec` 顶替自己，而是用
-`nohup … &` + `disown` 把 server 放进**后台独立进程**（stdin 接 `/dev/null`，
-stdout 追加到 `logs/server.log`，PID 写 `logs/server.pid`），等 `/api/status`
-就绪后打印地址就退出。于是：
+The terminal scripts only prepare the isolated environment and **hand control to the server, then exit**. `launcher/start-server.sh` checks the bundled Python + venv + pywebview, calls `launcher/setup-environment.sh` if anything is missing, then spawns the server into a detached background process (`nohup` + a one-shot Python `os.setsid()` + `disown`, stdin `/dev/null`, stdout appended to `logs/server.log`, PID in `logs/server.pid`), waits for `/api/status` and prints the address.
 
-- 终端窗口不再被 server 占着；双击 `启动.command` 时窗口会在交接成功后**自动关闭**
-  （只关自己那个窗口，且仅在 Terminal.app 内、退出码为 0 时才关）。
-- server 与窗口都用 `setsid` 脱离了启动它的会话，所以关终端、断 SSH 都碰不到它们
-  （只靠 `nohup` 挡 SIGHUP 是不够的：终端窗口关闭时整个会话被销毁，窗口会跟着消失）。
-- 重复双击不会起第二个 server；如果 server 在跑但**窗口没了**，会直接把窗口补开
-  （窗口是子进程，关掉就没了，server 自己不会再拉一次）。
-- 停止：`./启动.sh --stop`（pidfile 丢了也能按端口找；顺手收掉该端口的窗口）。
-- 调试想占住终端：`./启动.sh --foreground`（保留老的 `exec` 行为，窗口跑在终端会话里）。
+- Closing the terminal or an SSH session does not kill the server; closing/crashing the *window* also leaves the server running.
+- Double-clicking twice does not start a second server; if the server is alive but the window is gone, the launcher reopens just the window.
+- Stop: `./启动.sh --stop` (falls back to finding the listener by port if the pidfile is gone). Debug/foreground: `./启动.sh --foreground`.
+- Exiting the server takes the window and all service subprocesses with it (no orphans pointing at a dead port).
 
-首次启动 `setup-environment.sh` / `setup.bat` 会：
-
-1. 检测 `environment/python/` 里的 standalone CPython 3.12；没有就**自动
-   测速选镜像**（GitHub 直连 / gh-proxy / SJTU）下载 python-build-standalone
-   到 `environment/_cache/downloads/` 并解包（缓存命中即完全离线）。
-   **绝不探测或复用系统 Python、绝不用系统包管理器**；
-2. 用项目内 Python 执行 `start/setup_env.py`：建 `environment/venv/`
-   （`pyvenv.cfg` 必须指向项目内，否则离线迁移旧轮子后重建）；下载、pip、
-   编译缓存全部写 `environment/_cache/`，临时文件写 `data/tmp/`，不落项目外；
-3. 装 `start/requirements/must.txt`（python + pywebview，启动只查这份）；
-   `necessary.txt`（torch / numpy / pillow / safetensors / pytest / ffmpeg /
-   rust）由终端脚本按需装：`python3 start/setup_env.py install`（装齐）或
-   `python3 start/setup_env.py update`（升到允许的最新版），也可设
-   `GARGANTUA_FULL_SETUP=1` 让启动引导一次装齐；**GUI 不再提供安装/更新入口**；
-4. 把依赖清单哈希与 OS/CPU 架构指纹写进
-   `environment/venv/.gargantua_setup_stamp`——之后启动秒过；清单变了重装，
-   换平台自动重建 venv（不会复用旧架构的 `.so`/`.pyd`）。
-
-随后 `server/server.py` 启动：先做环境预检（解释器 ≥3.12 且 ≤3.12 系列、
-主依赖可导入——torch 2.2.2 没有 3.13 预编译轮子，版本不对会给可执行提示
-而不是 20 分钟源码编译），再起 HTTP 服务与独立桌面窗口。
-
-所有依赖与工具链（Python / venv / Rust / ffmpeg / node）统一放在 `environment/`，
-**绝不复用系统 Python 或系统包管理器**（空目录也能自动下载安装；跨 OS/CPU 的
-硬限制见上面的 Portability and isolation）——契约见 `environment/README.md`。**一个依赖一个文件夹**，每个
-文件夹带一份 `pack.json` 清单；主页「环境包」区就是该目录的**只读镜像**
-（多一个文件夹就多一张卡），所以不会有「装了但主页看不见」的依赖。
+First-run setup: download standalone CPython 3.12 into `environment/python/` with automatic mirror speed-probing (never reuses system Python or a system package manager), create `environment/venv/` via `start/setup_env.py`, install `must.txt`, and write a dependency-hash + OS/arch fingerprint to `environment/venv/.gargantua_setup_stamp`. Set `GARGANTUA_FULL_SETUP=1` to also install `necessary.txt` in one pass. All downloads, pip caches and temp files stay inside the project (`environment/_cache/`, `data/tmp/`).
 
 | Flag | Effect |
 | --- | --- |
-| `--port N` | Port for the HTTP server (default 8712) |
-| `--no-window` | Server only — no GUI window (SSH / servers / CI) |
+| `--port N` | HTTP port (default 8712) |
+| `--host H` | Bind address (default 127.0.0.1) |
+| `--no-window` | Server only — SSH / CI / headless |
 | `--idle-timeout S` | Service subprocess idle self-exit (default 300s) |
 | `--model-dir` / `--data-dir` / `--log-file` | Override default paths |
-| `--foreground` (launcher) | 前台 `exec`，不交接、不关窗（调试 / systemd / 容器） |
-| `--stop` (launcher) | 读 `logs/server.pid` 停掉后台 server |
+| `--foreground` / `--stop` (launcher) | Foreground exec / stop the background server |
 
-环境变量：`GARGANTUA_PY_RELEASE` / `GARGANTUA_PY_VERSION`（锁定
-python-build-standalone 版本）、`GARGANTUA_PY_BASE_URL`（指定 Python
-下载镜像）、`GARGANTUA_FULL_SETUP=1`（setup 阶段连 necessary.txt 一起装，
-默认只装 must）、`PIP_INDEX_URL`（自定义 pip 源）。
+Environment variables: `GARGANTUA_PY_RELEASE` / `GARGANTUA_PY_VERSION` (pin python-build-standalone), `GARGANTUA_PY_BASE_URL` (mirror), `GARGANTUA_FULL_SETUP=1`, `PIP_INDEX_URL`, `GARGANTUA_SHAPE_RENDERER`.
 
 ### The window is not a browser
 
-The UI opens in a **standalone desktop window** via
-[pywebview](https://pywebview.flowrl.com/) (macOS `WKWebView` / Windows
-`WebView2` / Linux `WebKitGTK`) — the OS web component, not a second browser
-engine. Chrome/Firefox spend 300–800 MB per tab on renderer processes,
-extensions and their own GPU pipeline; that budget belongs to training here
-(model + optimizer state + KV cache). The window dependency lives in
-`must.txt` (lightweight startup set):
-
-```bash
-pip install -r start/requirements/must.txt   # ~18 MB, python + pywebview
-```
-
-Without it the server still starts and prints the URL — you can open it in
-a browser by hand.
-
-Process model (deliberate, Steam-like):
+The UI opens in a standalone desktop window via [pywebview](https://pywebview.flowrl.com/) (macOS `WKWebView` / Windows `WebView2` / Linux `WebKitGTK`) — the OS web component, not a second browser engine. The window dependency lives in the lightweight `must.txt`; without it the server still starts and prints a URL you can open manually.
 
 ```
 启动脚本 ──→ 预检 + 交接（nohup，随后自己退出）
@@ -538,234 +348,122 @@ server.py ──┬── infer/train/init 服务子进程   按需拉起，空�
             └── window.py                    UI 窗口（崩了不影响 server）
 ```
 
-- 启动脚本交接完就退出，不占终端；server 是独立进程，关终端/断 SSH 都不影响它。
-- Closing or crashing the window leaves the server running; the log prints
-  the command to reopen the UI.
-- Exiting the server takes the window and all service subprocesses down
-  with it (no orphans pointing at a dead port). Ctrl-C / SIGTERM both go
-  through the cleanup path. 后台启动的 server 用 `./启动.sh --stop` 停。
+### Services start on demand
 
-### Services start on demand (memory)
-
-推理 / 训练 / 建模是重活（模型权重单个 safetensors 可达数 GB），全部以
-**独立子进程**按需拉起，server 本体只做 HTTP 路由 + 记账，常驻不带权重：
-
-- 协议 = JSON-lines over stdin/stdout（请求 `{"id","op",...}` → 响应
-  `{"id","ok",result|error}`；服务 stdout 只准写 JSON 行，人肉日志走
-  stderr）；服务退出条件 = `shutdown` / stdin EOF（server 死了）/ 空闲超时。
-- infer 服务：请求带 `model_dir`，换了模型才重载；空闲 300s 自行退出。
-- train 服务：`start` 下发模型/队列/日志路径与 block_size/steps/optimizer；
-  启动时从 `logs/auto_train.jsonl` 回填 loss 曲线；训练进行中（队列有文件）
-  绝不因空闲退出。
-- init 是一次性重活：`run_oneshot` 起进程、`--json` 末行协议拿结果、跑完即退。
-- PyTorch 的 CPU 分配器在进程内不向 OS 归还内存——所以「按需」必须是
-  进程级的，进程退出才是真省内存。
+Inference / training / model-init are heavy (weights can be several GB), so they run as **independent subprocesses**; the server itself only routes HTTP and does bookkeeping. Protocol = JSON-lines over stdin/stdout (`{"id","op",…}` → `{"id","ok",result|error}`); service stdout carries JSON lines only, human logs go to stderr; exit conditions are `shutdown` / stdin EOF / idle timeout. The infer service reloads only when `model_dir` changes (idle 300s); the train service restores the loss curve from `logs/auto_train.jsonl` on start and never idles out while the queue has files; init is a one-shot `run_oneshot` with a trailing `--json` line. PyTorch's CPU allocator does not return memory to the OS within a process, so "on demand" must be process-level.
 
 ### HTTP contract
 
-All `/api/*` endpoints share one error convention, so the UI never has to
-guess:
+All `/api/*` endpoints share one error convention:
 
 | Status | Meaning |
 | --- | --- |
 | `400` | Invalid/missing parameter (odd `block_size`, `steps < 1`, `temperature <= 0`, illegal model name, unknown `quality`, malformed JSON) |
-| `404` | Unknown path |
+| `403` | Illegal source / path traversal |
+| `404` | Unknown path or task |
 | `409` | State conflict — training running while switching/creating a model, or overwriting an existing model without `overwrite:true` |
 | `411` | `Content-Length` required (chunked encoding rejected) |
 | `413` | Body larger than 512 MB |
 
-Long-running work (inference, model init, image→primitives, **drawing render**) returns `202` with a `task_id`; poll `GET /api/task/<task_id>` until `status == "done"`. Numeric parameters are never silently defaulted: an explicit `0` is validated as `0` rather than being replaced by the default value. Booleans, non-numeric strings and negative `Content-Length` are rejected with `400` (the last one used to bypass the 512 MB cap and turn into an unbounded read).
+Long-running work (inference, model init, image→primitives, drawing render) returns `202` with a `task_id`; poll `GET /api/task/<task_id>` until `status == "done"`. Numeric parameters are never silently defaulted (an explicit `0` is validated as `0`); booleans, non-numeric strings and negative `Content-Length` are rejected with 400.
+
+The complete endpoint inventory lives in **`service/cli/api_map.py`** (90 distinct paths: 33 GET + 58 POST method/path pairs). Every GUI endpoint has a named `./gargantua …` command; `api <METHOD> <PATH>` is the generic escape hatch. Endpoint families: `/api/status`, `/api/system*`, `/api/env/*`, `/api/models*`, `/api/model/*`, `/api/infer*`, `/api/train/*`, `/api/codec/*`, `/api/tokens/*`, `/api/vocab*`, `/api/agent/*`, `/api/plugin/*`, `/api/prims/*`, `/api/session*`, `/api/term/*`, `/api/task/<id>`, `/api/momw/control`.
 
 ## Project Structure
 
 ```
 .
-├── 启动.sh                    # 中文名启动（macOS / Linux 终端）→ launcher/start-server.sh
-├── 启动.command               # 中文名启动（macOS 双击）→ launcher/start-server.sh
-├── 启动.bat                   # 中文名启动（Windows 双击）→ start\terminal\start.bat
-├── launcher/                  # 内部启动器（由根目录 启动.* 调用，一般无需直接调用）
-│   ├── start-server.sh        # POSIX one-shot launch (macOS / Linux) → setup → exec server.py
-│   ├── start-server.command   # macOS double-click launch (same as above, .command)
-│   └── setup-environment.sh   # Isolated Python 3.12.x + venv + deps (idempotent,
-│                             #   mirrors auto-selected by live speed test)
-├── start/                     # 启动链：路径引导 + 分类依赖 + Windows 入口
-│   ├── boot.py                # Path bootstrap: server/ + service/* onto sys.path
-│   ├── terminal/              # Windows-only entry points (.bat)
-│   │   ├── setup.bat          # Isolated Python 3.12.x + venv + deps (Windows)
-│   │   └── start.bat          # setup → exec server.py (Windows)
-│   └── requirements/          # Dependency manifests (single source: reqs.py)
-│       ├── must.txt           # python + pywebview — startup-required (light)
-│       └── necessary.txt      # torch / numpy / pillow / safetensors / pytest /
-│                             #   ffmpeg / rust — install on demand from the UI
-├── environment/               # ALL dependencies & toolchains (system-isolated)
-│   ├── python/                # standalone CPython 3.12.x (downloaded by setup)
-│   │   └── pack.json          #   manifest (title / probe / install / contents)
-│   ├── venv/                  # virtual env on the above interpreter
-│   │   └── pack.json
-│   ├── rust/                  # Rust toolchain (installed by service/prims/setup.sh)
-│   │   └── pack.json
-│   └── README.md              # the contract (see it before touching this dir)
-├── server/                    # All server files
-│   ├── spec.py                # Frozen architecture contract (single source of truth)
-│   ├── common.py              # Shared checkpoint I/O + validation (config.json
-│   │                          #   contract, incl. vocab.txt reader)
-│   ├── model.py               # Gargantua model (KDA, MLA, FastWeight, SharedKV)
-│   ├── muon.py                # Muon optimizer implementation
-│   ├── server.py              # App assembly + routing + startup orchestration
-│   ├── server_env.py          # Env precheck + subprocess helpers
-│   ├── server_services.py     # ServiceSupervisor: on-demand subprocesses (JSON-lines)
-│   ├── server_models.py       # ModelManager (registry, no weights) / TaskPool
-│   ├── server_media.py        # Uploaded-media decode + size guards (b64_to_pil / ffmpeg)
-│   ├── server_codecs.py       # CodecApi mixin — all /api/codec/* endpoints
-│   ├── server_train.py        # TrainApi mixin — all /api/train/* endpoints
-│   ├── server_tokens.py       # TokensApi mixin — /api/tokens/* + /api/vocab/add
-│   ├── server_term.py         # Built-in terminal: PTY shell locked to project root
-│   ├── server_prims.py        # Primitive job queue (create/run/live/result, output/)
-│   └── server_util.py         # num_param / pip source / optional-install command
-├── service/                   # One folder per service (started on demand)
-│   ├── infer/infer.py         # Autoregressive generation (CLI + --serve mode)
-│   ├── train/train.py         # Training loop with Muon/AdamW optimizer routing
-│   ├── train/auto_train.py    # Queue trainer daemon (CLI + --serve mode)
-│   ├── init/init.py           # Model initialization (CLI + --json one-shot mode)
-│   ├── tokens/                # Codecs for all modalities
-│   │   ├── tok32.py           # tok-32 interpreter: .tokens binary ↔ IDs ↔ hex
-│   │   ├── gts.py             # editor text (.gts) → IDs, backs Export .tokens
-│   │   ├── tokenset.py        # .tokens training streams → (ids, step_ids)
-│   │   ├── enctok.py          # Text → token ID stream (regular first, fallback next)
-│   │   ├── dectok.py          # Token ID stream → readable ({ } | + hex / surface text)
-│   │   ├── timestep.py        # { } | time-step structure (wrap/unwrap/render)
-│   │   ├── tokenvector.py     # .tokenvector vector archive format (dim+precision)
-│   │   ├── text_codec.py      # Text ↔ List[Step] (one token per step)
-│   │   ├── audio_codec.py     # Audio → wave tokens (+ .tokenvector export)
-│   │   ├── image_codec.py     # Image/Video → patch tokens (+ .tokenvector export)
-│   │   ├── draw_codec.py      # Primitive sequence ↔ drawing tokens + PNG/SVG render
-│   │   ├── build_vocab.py     # vocab.json generator (layout from spec.py)
-│   │   ├── vocab.py           # Vocab view: global + per-model (vocab.txt) + add_token
-│   │   ├── vocab.json         # Built global vocabulary (88,704 slots)
-│   │   └── words_en.txt       # 30K English word list (frequency order)
-│   ├── prims/                 # Primitive pipeline (image → primitive sequence)
-│   │   ├── image_to_primitives.py  # Driver: GPU subprocess + CPU fallback fitter
-│   │   ├── setup.sh           # Build GPU converter (Rust into environment/rust/)
-│   │   ├── fast_shape_render/ # ★ vendored Rust/wgpu converter, verbatim
-│   │   └── README.md          # two paths (GPU 256²→any canvas / CPU any canvas)
-│   ├── web/                   # Frontend
-│   │   ├── index_source.html  # Single-page app source (13 pages, incl. terminal)
-│   │   ├── index.html         # Minified artifact (regenerate via web/minify.py)
-│   │   └── minify.py          # Safe minifier with --check self-test
-│   ├── window/window.py       # Standalone desktop window (pywebview, no browser)
-│   └── test/                  # Unit + integration tests
-│       ├── test_model.py
-│       ├── test_codecs.py
-│       ├── test_tokens.py
-│       ├── test_image2prim.py
-│       ├── test_server.py
-│       ├── test_fixes.py      # Regression tests for the 2026-10-20 audit
-│       ├── test_audit_20261023.py  # 2026-10-23 audit fixes + context-length feature
-│       ├── test_services.py   # 2026-10-24: supervisor / vocab.txt / env precheck
-│       ├── verify_formats.py  # Format round-trip verifier
-│       └── run_tests.py       # Full regression, one process per suite
-├── models/                    # models/NAME/{model.safetensors, config.json, vocab.txt?}
-├── data/                      # data/queue/ (pending) + data/done/ (trained)
-└── logs/                      # auto_train.jsonl and friends
+├── README.md                     # 本文：架构 / 格式 / API / 目录树
+├── VERSION                       # 关于页版本徽章的数据源
+├── LICENSE                       # GPLv3
+├── docs/                         # 文档索引 + 历史评估归档
+│   ├── README.md
+│   └── VOCAB_EXPANSION_EVAL.md   # 历史评估稿（base1.2.0 时代，未实施）
+├── experiments/                  # 预留：后续测试对比数据（暂为空）
+│   └── README.md
+├── 启动.sh / 启动.command / 启动.bat   # 三平台中文名入口（薄包装）
+├── gargantua / gargantua.bat     # 终端 CLI 入口（POSIX / Windows）
+├── launcher/                     # POSIX 启动器 + 环境搭建
+│   ├── start-server.sh           #   预检 → 后台交接 → 退出
+│   ├── start-server.command      #   历史路径兼容壳 → 根目录 启动.command
+│   └── setup-environment.sh      #   镜像测速 + 隔离 Python/venv
+├── start/                        # 启动链
+│   ├── boot.py                   #   sys.path 引导（唯一路径引导）
+│   ├── setup_env.py              #   唯一安装器
+│   ├── requirements/{must,necessary}.txt
+│   ├── requirements/README.md
+│   └── terminal/{start,setup}.bat  # Windows 入口
+├── environment/                  # 全部依赖与工具链（系统隔离，运行时生成）
+│   ├── README.md                 #   契约：一个依赖一个文件夹 + pack.json
+│   └── python/, rust/, venv/, tools/, _cache/ …
+├── server/                       # 常驻 HTTP 服务 + 冻结架构契约
+│   ├── spec.py                   # ★ 所有区间/维度常数的唯一真源
+│   ├── paths.py                  # ★ 所有项目内路径的唯一真源
+│   ├── model.py                  #   Gargantua / KDA / MLA / SharedKV / Block
+│   ├── common.py                 #   检查点 I/O + config.json + build_model
+│   ├── muon.py / precision.py / param_estimate.py / reqs.py
+│   ├── momw.py / momw_state.py   #   MoMW 三阶段记忆阀门 + 快照
+│   ├── somn.py                   #   SOMN 自组织记忆（可选、默认关闭）
+│   ├── agent_tools.py            #   纯槽位协议（工具执行禁用）
+│   ├── vocab_presets.py          #   vocabs/ 预设增删查改
+│   ├── server.py                 #   装配 + 路由 + 启动编排
+│   ├── server_*.py               #   env / services / models / media / codecs /
+│   │                             #   train / tokens / agent / monitor / prims /
+│   │                             #   sessions / term / util  各一个职责
+│   └── env_manager.py / env_install.py
+├── service/                      # 一个服务一个目录，按需拉起
+│   ├── README.md                 #   服务层约定（含 output/ 产物目录）
+│   ├── infer/infer.py            #   自回归生成 + id 存档
+│   ├── init/init.py              #   建模（CLI + --json 一次性）
+│   ├── train/                    #   train.py / auto_train.py / train_step.py /
+│   │                             #   clip.py / clip_data.py / clip_folder.py
+│   ├── tokens/                   #   tok6.py / vfc.py / vocab.py / build_vocab.py /
+│   │                             #   gen_vocab.py / gen_typst_map.py / enctok.py /
+│   │                             #   dectok.py / tokenset.py / timestep.py /
+│   │                             #   *_codec.py / tok32.py(历史) / tok5.py(shim)
+│   │                             #   + 全局 vocab.vfc / config.json / words_en.txt
+│   ├── prims/                    #   image_to_primitives.py / setup.sh /
+│   │                             #   fast_shape_render/(vendored Rust) / README.md
+│   ├── web/                      #   index_source.html / index.html / minify.py /
+│   │                             #   app.css / app.js / plugins/(js,css,3 份 md)
+│   ├── cli/                      #   gargantua.py / local.py / api_map.py
+│   ├── window/window.py          #   pywebview 独立窗口
+│   ├── calib/                    #   本地标定脚本（工作区产物）
+│   └── test/                     #   run_tests.py + 31 个套件 / verify_formats.py
+├── vocabs/base1.3.0/             # 版本化基础词表（进仓库）
+│   └── vocab.vfc / config.json / typst_map.json
+├── models/                       # 运行时：models/NAME/…（.gitignore）
+├── data/                         # 运行时：queue / done / failed / task_meta / tmp
+├── logs/                         # 运行时：server.log / auto_train.jsonl / …
+└── service/*/output/             # 运行时：各服务产物（.gitignore）
 ```
 
-`server.py` is routing + startup orchestration (~600 lines) plus focused
-modules: `server_env` (env precheck + window integrity), `server_services`
-(on-demand service supervision), `server_models` (registry + task pool),
-`server_media`, `server_codecs`, `server_train`, `server_tokens`,
-`server_util`; `App` composes the three API mixins. All previous
-`from server import X` paths still work through re-exports.
+`server.py` composes the API mixins (`TrainApi`, `CodecApi`, `AgentApi`, `MonitorApi`, `PrimsApi`, `TokensApi`) and delegates startup, subprocess supervision, model registry, media decoding and utilities to focused modules; `App` is the single assembly point. Runtime directories (`models/`, `data/`, `logs/`, `environment/*`, `service/*/output/`) are git-ignored and created on demand — the checked-out tree contains only source and contracts.
 
 ### Model directory contract
 
-Every model lives in `models/NAME/` with `model.safetensors` (weights) and
-`config.json` (records `n_enc_blocks` / `n_dec_blocks` and more). All entry
-points (`service/init/init.py`, `service/train/train.py`,
-`service/infer/infer.py`, `service/train/auto_train.py`) construct and load
-models through `common.build_model()` so a model created with custom block
-counts loads identically everywhere.
+```
+models/NAME/
+├── config.json       # manifest: blocks / d_model / ctx / share_enc_dec / momw /
+│                     #   vocab_source / weights 三文件路径 …
+├── weights/          # 三个 safetensors：主权重 / wte. / visual_proj.+coords+audio_proj.
+├── vocab/            # 建模时从 vocabs/<name>/ 整目录复制的词表副本
+└── momw_state/       # 可选：MoMW 池快照（layout / tensors / meta），不进权重契约
+```
 
-**Encoder/decoder weight sharing** (optional, 2026-11-04): when creating a
-model, pick `separate` (default) or `shared` weights. With shared weights,
-`enc_blocks[i]` and `dec_blocks[i]` are the *same* `nn.Parameter` objects (the
-two final norms are tied too), so `n_enc_blocks` must equal `n_dec_blocks`: the
-API rejects unequal counts, the UI locks the decoder field to the encoder
-value, and both defaults collapse to `spec.SHARED_DEFAULT_BLOCKS`. Only
-parameters are tied — encoder blocks stay bidirectional and decoder blocks
-stay causal, since they remain two distinct `Block` instances. Only one copy
-of the tied weights is written into `weights/` (safetensors forbids two keys
-sharing storage); `config.json` records `"share_enc_dec": true` and the loader
-mirrors the encoder keys back for a strict `load_state_dict`. Old model
-directories without the field load as separate-weight models unchanged.
-CLI: `python service/init/init.py --name alpha --share-enc-dec --enc-blocks 4`.
+`common.build_model(model_dir)` is the **only** model construction entry point (used by init / train / auto_train / infer / server); it builds from `config.json` and does a strict `load_state_dict`. `save_checkpoint` writes versioned snapshots with atomic single-file replace; `split_state_dict` guarantees the three files are disjoint and complete. After `apply_precision()` it must call `retie_shared_weights()` because `model.to(dtype)` replaces `Parameter` objects and breaks tying. A missing `d_model` / `share_enc_dec` / `momw` field falls back to the documented default (1024 / false / off), so old folders still load.
 
-**Configurable model width** (optional, 2026-11-04): `d_model` can be chosen at
-creation time (default 1024, any multiple of `HEAD_DIM=128` in
-`[128, 2048]`; `spec.check_d_model` is the single validation rule). It only
-changes the semantic vector width — embeddings, projections, shared KV and
-each block's input/output projections — while attention heads/head dim, MLA
-low ranks and FFN hidden width stay frozen. `config.json` records `d_model`
-and `common.build_model()` reads it back; old directories without a valid
-value fall back to 1024. CLI: `--d-model 512`.
-
-**Per-model vocabulary** (optional): drop a `vocab.txt` into the model
-directory and that model gets its own token↔ID mapping — one token per
-line, line *N* → ID `INVISIBLE_END + N` (the invisible region below
-`INVISIBLE_END` holds the fixed special/system/modal tokens: `<stop>`,
-`<caps>`, `{ } |`, draw tokens — their IDs are an architectural contract and
-a custom vocab never occupies them). Empty lines are skipped; duplicates are
-rejected; at most `VOCAB_SIZE_PADDED - INVISIBLE_END` entries. Models
-without `vocab.txt` use the global vocabulary
-`service/tokens/vocab.json`. When the active model changes, the server and
-the infer/train service processes each call `set_model_vocab()`, so
-`/api/tokens/*`, `/api/vocab`, training and inference all speak that
-model's vocabulary. Export a starting point with
-`python service/tokens/build_vocab.py --export-txt models/NAME/vocab.txt`.
+**Per-model vocabulary**: `vocab/` is a full copy of a vocabulary folder, so deleting or editing another model's vocabulary can never invalidate a checkpoint. Without it, the global `service/tokens/vocab.vfc` is used. When the active model changes, the server and the infer/train subprocesses each call `set_model_vocab()` so `/api/tokens/*`, `/api/vocab/*`, training and inference all speak the same mapping. Encode with a specific vocabulary via `--vocab <.vfc|vocab folder|model folder>` on `enctok`/`dectok`.
 
 ## Portability and isolation
 
-Everything the app writes stays **inside the project folder**: `logs/`,
-`data/tmp/` (runtime temp files), `environment/_cache/` (downloads, pip
-wheels), `models/`, `vocabs/`, `service/*/output/`. `server/paths.py`
-derives the project root from `__file__` — never from the current working
-directory, `HOME`, or an absolute path baked into a script. Launchers
-(`启动.sh` / `启动.command` / `启动.bat`) resolve the root from their own
-location, so the folder can be moved or renamed freely. `setup-environment.sh`
-and `setup.bat` prefer the bundled `environment/python/` standalone
-interpreter, pin pip/download caches inside the project, and record an
-OS/architecture fingerprint in `environment/venv/.gargantua_setup_stamp` so
-a venv built on another machine is rebuilt instead of silently reused.
-`service/test/test_portability.py` is a static gate that fails if a
-machine-specific absolute path, an unpinned `tempfile.*` call, a
-`shutil.which()` fallback, a system package manager, or a venv bound to a
-system Python reappears.
+Everything the app writes stays **inside the project folder**. `server/paths.py` derives the root from `__file__` — never from cwd, `HOME`, or a baked-in absolute path. Launchers resolve the root from their own location, so the folder can be moved or renamed freely. Runtime temp files use `paths.project_tmp_dir()` (`data/tmp/`), downloads and pip caches use `paths.project_cache_dir()` (`environment/_cache/`), and subprocesses inherit `paths.isolated_env()`. `service/test/test_portability.py` is a static gate that fails if a machine-specific absolute path, an unpinned `tempfile.*` call, a `shutil.which()` fallback, a system package manager, or a venv bound to a system Python reappears.
 
-**Zero system dependency (hard rule).** Launchers check for the bundled
-standalone Python, an isolated venv and `pywebview`; if any is missing they
-call `setup-environment.sh` / `setup.bat`, which probe several mirrors with
-Range requests, pick the fastest, and download the standalone CPython into
-`environment/python/`. Everything after that runs under that bundled Python
-through `start/setup_env.py`: venv creation (`pyvenv.cfg` must point inside
-the project or it is rebuilt with its old wheels migrated offline), pip
-installs with mirror speed-probing, project-local caches, and the optional
-`ffmpeg` / `node` binaries. An empty `environment/` therefore boots from
-scratch, and dropping the archives into `environment/_cache/downloads/` makes
-it fully offline. Manual "install / update" clicks in the window go through
-`server/env_install.py` → the very same installer, never a second path using
-the system interpreter. The only system binaries ever *read* are `curl`/`tar`
-for that one-time bootstrap (plus the platform linker if you build the Rust
-renderer); nothing is installed, modified, or written outside the project.
+**Zero system dependency (hard rule)**: the only Python base is the standalone CPython downloaded into `environment/python/`; `pyvenv.cfg` must point inside the project (`paths.venv_is_isolated()`), otherwise `start/setup_env.py` rebuilds the venv (migrating its site-packages with a same-partition `os.replace`, never a copy). All installs go through `start/setup_env.py`; runtime binaries are resolved only through `paths.bundled_tool()` — no `shutil.which()` / PATH fallback for tools, no system package manager. The only system binaries ever *read* are `curl`/`tar` for the one-time bootstrap (plus the platform linker when building the Rust renderer); nothing is installed or written outside the project.
 
-**Hard limit — one folder cannot run unchanged on every OS/CPU.** Native
-wheels (`torch 2.2.2` has macOS x86_64 wheels here), the vendored Rust
-renderer binary, and the system WebView (WKWebView / WebView2 / WebKitGTK)
-are platform-specific; `pty`/`sysctl`/`ioreg` based features are POSIX-only.
-Moving between different OSes or CPU architectures therefore requires one
-`environment/` built per target platform (or a container image) sharing the
-same project sources — the code paths, API and model formats are identical,
-but native binaries must be rebuilt/reinstalled for the target. A true
-Docker-level guarantee needs an actual container runtime; no Python script
-can emulate a different kernel or CPU architecture.
+**Cross-platform behaviour**: POSIX uses `launcher/*.sh` + `启动.sh` / `启动.command`; Windows uses `start/terminal/*.bat` + `启动.bat` and `gargantua.bat`. `server_monitor.py` branches on `platform.system()` for device/process queries; `server_term.py` detects PTY support and degrades the built-in terminal to a clear error on Windows instead of failing server startup; `paths._exe()` appends `.exe` on Windows. The Rust GPU renderer and `setup.sh` are optional — the pure-numpy CPU fallback works everywhere.
+
+**Hard limit — one folder cannot run unchanged on every OS/CPU**: native wheels (torch 2.2.2 macOS x86_64 here), the vendored Rust renderer binary and the system WebView (WKWebView / WebView2 / WebKitGTK) are platform-specific. Moving between OSes or CPU architectures requires one `environment/` built per target platform (or a container image) sharing the same sources — the code paths, API and model formats are identical, but native binaries must be rebuilt/reinstalled for the target.
 
 ## Testing
 
@@ -776,23 +474,18 @@ python service/test/run_tests.py --suite test_model # a single suite
 python -m unittest service.test.test_model -v       # unittest directly
 ```
 
-`run_tests.py` first runs static gates (`py_compile` on every `.py`,
-`bash -n` on every `.sh`, `minify.py --check`), then each suite in its own
-subprocess. Suites run in **separate processes** on purpose: a full
-`Gargantua()` is ~1.03B params (~4.1 GB fp32 since the 2026-11-04 block
-reorder; the shape tests use 1+1 blocks to stay light), and PyTorch's CPU allocator
-keeps freed blocks in its own pool, so RSS never drops within a process —
-running every suite under one `unittest discover` gets SIGKILLed (exit 137)
-partway through `test_model`.
+`run_tests.py` first runs static gates (`py_compile` on every `.py`, `bash -n` on every `.sh`, `minify.py --check`), then each of the 31 registered suites in its own subprocess. Suites run in separate processes on purpose: a full `Gargantua()` is ~1.03B params (~4.1 GB fp32 since the 2026-11-04 block reorder; shape tests use 1+1 blocks to stay light) and PyTorch's CPU allocator keeps freed blocks in its pool, so RSS never drops within a process. A full regression takes ≈13.5 minutes on this machine and requires explicit authorization; day-to-day changes are checked with `py_compile` / `node --check` / `minify.py --check` plus the affected suite only. New suites must be registered in `run_tests.SUITES`. Changing `index_source.html` requires rebuilding `index.html` via `service/web/minify.py` and re-running `--check`.
 
 ## Technical References
 
 - **MLA**: DeepSeek-V2 — low-rank joint KV compression, NoPE.
 - **KDA**: Moonshot AI / Kimi — linear gated delta recurrence.
 - **CSA/HCA Compression**: DeepSeek NSA — learnable MLP compression within time-steps.
-- **AttnRes**: Moonshot AI / Kimi — [Attention Residuals](https://github.com/MoonshotAI/Attention-Residuals) (arXiv 2603.15031), Block AttnRes over depth plus a block-level scalar gate.
+- **AttnRes**: Moonshot AI / Kimi — [Attention Residuals](https://github.com/MoonshotAI/Attention-Residuals) (arXiv 2603.15031).
 - **Fast Weight**: Schmidhuber 1991 — persistent associative memory layer.
-- **Primitive Rendering**: [wonderfulearth/primitive-operation-painter](https://github.com/wonderfulearth/primitive-operation-painter) — GPU image-to-sequence converter with hill-climbing shape fitting.
+- **Muon**: matrix-orthogonalizing optimizer for hidden 2D weights.
+- **CLIP**: symmetric InfoNCE over in-batch negatives.
+- **Primitive Rendering**: [wonderfulearth/primitive-operation-painter](https://github.com/wonderfulearth/primitive-operation-painter).
 
 ## License
 

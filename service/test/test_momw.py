@@ -85,12 +85,13 @@ class TestMoMWConfig(unittest.TestCase):
         c = spec.momw_default_config()
         self.assertFalse(c["enabled"])
         self.assertEqual(set(c), set(spec.MOMW_CONFIG_FIELDS))
-        self.assertEqual(len(c), 25)
+        self.assertEqual(len(c), 26)
         self.assertGreater(c["B0"], c["threshold"])
         self.assertLess(c["threshold"], 1.0)
         self.assertEqual(c["threshold_mode"], "fixed")
         self.assertFalse(c["async_write"])
         self.assertTrue(c["persist"])
+        self.assertEqual(c["persist_dtype"], "fp32")
 
     def test_validate(self):
         self.assertFalse(validate_momw_config(None)["enabled"])
@@ -105,6 +106,7 @@ class TestMoMWConfig(unittest.TestCase):
             "quantile_window": 32, "saturation_ratio": 1.2,
             "growth_ratio": 0.3, "oja_eta": 0.05, "fw_gate_c": 3.0,
             "async_write": True, "persist": False,
+            "persist_dtype": "fp16",
         })
         self.assertEqual(c["N"], 3)
         self.assertEqual(c["tau"], 0.5)
@@ -115,6 +117,7 @@ class TestMoMWConfig(unittest.TestCase):
         self.assertEqual(c["oja_eta"], 0.05)
         self.assertTrue(c["async_write"])
         self.assertFalse(c["persist"])
+        self.assertEqual(c["persist_dtype"], "fp16")
         bad = (
             {"enabled": "yes"}, {"N": True}, {"N": 0},
             {"tau": 0}, {"tau": float("nan")},
@@ -130,6 +133,7 @@ class TestMoMWConfig(unittest.TestCase):
             {"oja_eta": 0.0}, {"oja_eta": 2.0},
             {"fw_gate_c": -1.0}, {"fw_gate_c": 99.0},
             {"async_write": "yes"}, {"persist": 2},
+            {"persist_dtype": "int8"}, {"persist_dtype": 7},
             {"nope": 1}, 42, "abc",
         )
         for v in bad:
@@ -471,6 +475,34 @@ class TestV3Features(unittest.TestCase):
             m(_x())
             self.assertIsNone(m.save_state(tmp))
             self.assertFalse(momw_state.has_state(tmp))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_persist_dtype_fp16_halves_snapshot(self):
+        """fp16 落盘体积约减半，恢复时按模型 dtype 转回 fp32。"""
+        tmp = tempfile.mkdtemp(prefix="garg-momw-f16-")
+        try:
+            c = _cfg(B0=0.6, threshold=-1e9, **_CALM)
+            m = momw.MoMW(_kda(), c)
+            for _ in range(2):
+                m(_x())
+            p32 = m.save_state(tmp)
+            f32 = os.path.getsize(os.path.join(p32,
+                                              momw_state.TENSORS_NAME))
+            m.cfg["persist_dtype"] = "fp16"
+            p16 = m.save_state(tmp)
+            f16 = os.path.getsize(os.path.join(p16,
+                                              momw_state.TENSORS_NAME))
+            self.assertLess(f16, f32 * 0.75,
+                            f"fp16 快照应明显更小: {f16} vs {f32}")
+            snap = momw_state.load(p16)
+            self.assertEqual(snap["meta"]["persist_dtype"], "fp16")
+            self.assertEqual(snap["tensors"]["L0.v"].dtype, torch.float16)
+            m2 = momw.MoMW(_kda(), c)
+            self.assertTrue(m2.load_state(tmp))
+            self.assertEqual(m2.pool.kda_layers[0].S.dtype, torch.float32)
+            self.assertEqual(m2.pool.kda_layers[0]._rt["writes"],
+                             m.pool.kda_layers[0]._rt["writes"])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

@@ -214,7 +214,7 @@ def draw_head_names() -> list:
     """从 spec 推导 DRAW 区全部 token 名字（含尖括号），顺序即 DRAW 区布局。
 
     第 0 段是 4 个画布定界符，其后 9 段是图元字段，末尾是 special bins。
-    名字与 spec.SPECIAL_TOKENS / vocab.json 的 id_to_token 拼写完全一致，
+    名字与 spec.SPECIAL_TOKENS / .vfc 的 id_to_token 拼写完全一致，
     加载侧可直接装进 id_to_token。
     """
     names = []

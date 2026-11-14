@@ -4,7 +4,8 @@
 # 数据：data/ 下所有 .tokens 文件（token-6 位流，必须带 { } 时间步结构），
 # 由 tokens/tokenset 展开成「扁平 token_ids + 并行 step_ids」；
 # 每个窗口切成 user 段（encoder）+ model 段（decoder 预测目标）。
-# 优化器：Muon（隐藏层 2D）+ AdamW（embedding/head/norm），--optimizer 可关。
+# 优化器：muon（隐藏层 2D Muon + 其余 AdamW，默认）/ adamw / allmuon，
+# 三档取值唯一真源 = clip_data.OPTIMIZERS。
 # 用法：
 #   python train.py --model models/alpha --data data --steps 200 --block-size 32
 #
@@ -36,6 +37,7 @@ else:
 import boot
 boot.bootstrap()
 import spec
+import clip_data
 from common import (build_model, read_config, resolve_weights_path,
                     save_checkpoint,
                     validate_block_size)
@@ -57,7 +59,8 @@ def load_corpus_ids(data_dir: str):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True, help="模型目录（含 model.safetensors）")
+    ap.add_argument("--model", required=True,
+                    help="模型目录（config.json + weights/ + vocab/）")
     ap.add_argument("--data", default="data")
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--block-size", type=int, default=32,
@@ -65,9 +68,23 @@ def main():
     ap.add_argument("--lr", type=float, default=spec.ADAMW_LR)
     ap.add_argument("--muon-lr", type=float, default=spec.MUON_LR)
     ap.add_argument("--optimizer", default=spec.OPTIMIZER,
-                    choices=["muon", "adamw"])
+                    choices=list(clip_data.OPTIMIZERS))
     ap.add_argument("--save-every", type=int, default=100)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--diag", action="store_true", default=False,
+                    help="阶段 0 零风险谱诊断（只读观测，默认关闭）")
+    ap.add_argument("--diag-every", type=int, default=50,
+                    help="诊断采样间隔步数（step 1 也会采样）")
+    ap.add_argument("--diag-log", type=str, default="",
+                    help="诊断 JSONL 路径（缺省 data/tmp/manifold_diag.jsonl）")
+    ap.add_argument("--diag-max-matrices", type=int, default=24,
+                    help="每次采样最多采集的 MLA/FFN 矩阵数（0 = 全量，覆盖所有 block）")
+    # 阶段 0 Muon 校准对照（默认全部不传 → build_optimizers 沿用类默认值，
+    # 既有训练行为逐位不变）。只用于诊断「步子太大」假设，不进生产配置。
+    ap.add_argument("--no-muon-rms-align", action="store_true",
+                    help="关闭 Muon 的 RMS 对齐（去掉 ×√max(shape) 放大）")
+    ap.add_argument("--muon-weight-decay", type=float, default=None,
+                    help="覆盖 Muon 组的解耦 weight decay（默认 0）")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -75,11 +92,13 @@ def main():
 
     B = validate_block_size(args.block_size)
     m = build_model(args.model)
-    set_model_vocab(args.model)          # 每模型词表（vocab.txt 覆盖）
+    set_model_vocab(args.model)          # 每模型词表（models/NAME/vocab/ 副本）
     m.train()
 
-    opts = build_optimizers(m, args.optimizer, args.lr, args.muon_lr,
-                            spec.MUON_MOMENTUM)
+    opts = build_optimizers(
+        m, args.optimizer, args.lr, args.muon_lr, spec.MUON_MOMENTUM,
+        muon_rms_align=(False if args.no_muon_rms_align else None),
+        muon_weight_decay=args.muon_weight_decay)
     docs = load_corpus_ids(args.data)
     # 文档边界保留：窗口只在单个文档内采样，绝不跨 <stop>（2026-10-27
     # 审计修复）；过短（装不下一个完整窗口）的文档跳过。
@@ -92,35 +111,61 @@ def main():
           f"（多模态 {n_mm}）  steps={args.steps}  block={B}  "
           f"optimizer={args.optimizer}")
 
+    diag = None
     t0 = time.time()
     skipped = 0
-    for step in range(1, args.steps + 1):
-        doc = random.choice(usable)                # 先选文档，再在文档内开窗
-        i = window_index(doc, B, random, force_last=(step == 1))
-        if i is None:
-            skipped += 1
-            continue
-        logits, y, n_valid = forward_window(m, doc, i, B)
-        if n_valid == 0:                           # 整窗都是媒体，无目标可训
-            skipped += 1
-            continue
-        loss = window_loss(logits, y)
-        for o in opts:
-            o.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
-        for o in opts:
-            o.step()
-        m.fast_weight.reset()          # 样本间截断持久记忆
+    try:
+        if args.diag:
+            # 阶段 0 零风险谱诊断：只在显式 --diag 时才 import / 计算，
+            # 默认路径连 manifold_diag 的 bootstrap 都不触发（零额外开销）。
+            from manifold_diag import ModelDiagnostics, grad_norm_before_clip
+            diag = ModelDiagnostics(
+                m, opts, every=args.diag_every,
+                log_path=args.diag_log or None,
+                max_matrices=args.diag_max_matrices).attach()
+        for step in range(1, args.steps + 1):
+            doc = random.choice(usable)            # 先选文档，再在文档内开窗
+            i = window_index(doc, B, random, force_last=(step == 1))
+            if i is None:
+                skipped += 1
+                continue
+            logits, y, n_valid = forward_window(m, doc, i, B)
+            if n_valid == 0:                       # 整窗都是媒体，无目标可训
+                skipped += 1
+                continue
+            loss = window_loss(logits, y)
+            for o in opts:
+                o.zero_grad(set_to_none=True)
+            loss.backward()
+            # 阶段 0：裁剪前全局 grad norm（clip 到 1.0 会掩盖退化）
+            diag_grad = None
+            if diag is not None:
+                diag_grad = grad_norm_before_clip(m.parameters())
+            clip_return = torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
+            for o in opts:
+                o.step()
+            # 阶段 0 交叉审计修复：observe 必须在 reset_memory 之前。
+            # _collect_kda() 读 fast_weight._state，而 reset_memory() 会把它
+            # 清成 None —— 旧顺序让 KDA 状态恒为 present=False，白采一批空数据。
+            # 观测只读、不改数值；复位仍在同一步内、下一个 forward 之前完成。
+            if diag is not None:
+                diag.observe(step, loss.item(),
+                             preclip_grad_norm=diag_grad,
+                             extra={"clip_return": float(clip_return),
+                                    "optimizer": args.optimizer})
+            m.reset_memory()            # 统一出口：含 fast weight / MoMW / SOMN / 未来新增记忆组件
 
-        if step % 10 == 0 or step == 1:
-            el = time.time() - t0
-            print(f"[train] step {step:4d}/{args.steps}  "
-                  f"loss {loss.item():.4f}  {el/step:.2f}s/it"
-                  + (f"  (跳过 {skipped} 窗)" if skipped else ""))
-        if step % args.save_every == 0:
-            save_checkpoint(args.model, m, _config_dict(args, m))
-            print(f"[train] saved {resolve_weights_path(args.model)}")
+            if step % 10 == 0 or step == 1:
+                el = time.time() - t0
+                print(f"[train] step {step:4d}/{args.steps}  "
+                      f"loss {loss.item():.4f}  {el/step:.2f}s/it"
+                      + (f"  (跳过 {skipped} 窗)" if skipped else ""))
+            if step % args.save_every == 0:
+                save_checkpoint(args.model, m, _config_dict(args, m))
+                print(f"[train] saved {resolve_weights_path(args.model)}")
+    finally:
+        if diag is not None:
+            diag.detach()
     save_checkpoint(args.model, m, _config_dict(args, m))
     print(f"[train] done, saved {resolve_weights_path(args.model)}")
 

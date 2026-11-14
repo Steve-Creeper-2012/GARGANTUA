@@ -22,7 +22,7 @@
 #   server_media.py    上传媒体解码与尺寸守卫（b64_to_pil / ffmpeg / 抽帧）
 #   server_codecs.py   CodecApi   —— /api/codec/* 全部端点
 #   server_train.py    TrainApi   —— /api/train/* 全部端点（走训练服务）
-#   server_tokens.py   TokensApi  —— /api/tokens/* 与 /api/vocab/add
+#   server_tokens.py   TokensApi  —— /api/tokens/* 与 /api/vocab/*
 #   server_util.py     num_param / pip 源 / 可选依赖安装命令
 # App 以 mixin 组合上面几个 Api；原 `from server import X` 的路径全部通过
 # 文件末尾的 re-export 保持可用。
@@ -328,8 +328,8 @@ class App(TrainApi, CodecApi, TokensApi, MonitorApi, PrimsApi, AgentApi):
         self.sessions = SessionStore()
 
     def apply_model_vocab(self) -> None:
-        """活动模型的词表覆盖（每模型可有自己的 vocab.txt，2026-10-24）。
-        没有 vocab.txt 就用全局词表（service/tokens/vocab.json）。
+        """活动模型的词表覆盖（每模型可有自己的 vocab/ 目录，2026-10-30）。
+        没有 vocab/ 就用全局词表 service/tokens/{vocab.vfc, config.json}。
 
         2026-10-27 审计修复（M7）：词表损坏时清退到全局词表，而不是沿用
         上一模型的词表（旧模型的映射对新模型是错的）。"""
@@ -1825,6 +1825,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/tokens/decode": app.api_tokens_decode,
             "/api/tokens/export": app.api_tokens_export,
             "/api/vocab/token": app.api_vocab_token,
+            "/api/vocab/add": app.api_vocab_add,        # 兼容别名，见 TokensApi
             "/api/vocab/source": app.api_vocab_source,
             "/api/vocab/fork": app.api_vocab_fork,
             "/api/vocab/copy": app.api_vocab_fork,

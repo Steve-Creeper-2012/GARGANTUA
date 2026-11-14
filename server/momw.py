@@ -376,6 +376,20 @@ class MoMWRouter(nn.Module):
         self.last_cos_state: List[float] = []
         self.last_gamma: List[float] = []
 
+    def reset_cache(self) -> None:
+        """样本边界：清空三阶段打分留下的全部 last_* 观测缓存。
+
+        MoMW.reset() 会重建 pool（pool 内的 last_* 随之归零），但
+        self.router 是 MoMW 长期持有的成员，不会被重建 —— 旧实现只清了
+        MoMW 自身的 last_*，router 的 last_raw/last_scores/last_cos_*/
+        last_gamma 会残留到下一个样本（交叉审计发现的缓存死角）。
+        """
+        self.last_raw = []
+        self.last_scores = []
+        self.last_cos_anchor = []
+        self.last_cos_state = []
+        self.last_gamma = []
+
     def score_all(self, H_t: torch.Tensor,
                   layers: Sequence[FastWeightLayer],
                   anchors: Optional[torch.Tensor], cfg: dict
@@ -809,6 +823,8 @@ class MoMW(nn.Module):
         self.steps = 0
         self.last_raw, self.last_scores, self.last_indices = [], [], []
         self.last_fw_energy, self.last_gate = 0.0, 1.0
+        # router 不随 pool 重建，必须单独清空它的 last_* 观测缓存
+        self.router.reset_cache()
 
     def _pool_for(self, state: Optional[dict]) -> MoMWPool:
         if state is None:
@@ -872,9 +888,11 @@ class MoMW(nn.Module):
         pool = self._pool_for(state)
         pool.flush()
         dst = _ms.state_dir(model_dir)
-        _ms.save(dst, pool, extra={"steps": self.steps,
-                                   "fw_gate_c": self.cfg["fw_gate_c"],
-                                   **(extra or {})})
+        _ms.save(dst, pool,
+                 extra={"steps": self.steps,
+                        "fw_gate_c": self.cfg["fw_gate_c"],
+                        **(extra or {})},
+                 persist_dtype=self.cfg["persist_dtype"])
         pool._persist_path = dst
         return dst
 
@@ -885,6 +903,12 @@ class MoMW(nn.Module):
         snap = _ms.load(_ms.state_dir(model_dir))
         if snap is None:
             return False
+        # 快照可能是 fp16/bf16 存的，但计算必须用模型自身 dtype：
+        # 恢复时统一转回，避免 fp32 模型拿到半精度 S 后每次前向都触发
+        # dtype 守卫做一次拷贝。
+        w = self._refs["kda"].w_o.weight
+        device = device if device is not None else w.device
+        dtype = dtype if dtype is not None else w.dtype
         self._pool_for(state).restore(snap, device=device, dtype=dtype)
         return True
 
