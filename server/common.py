@@ -758,6 +758,70 @@ def read_manifold_config(cfg: dict) -> dict:
         return out
 
 
+# ---------------------------------------------------------------------------
+# SOMN 配置（2026-11-14 主干接线）——与 MoMW / Manifold 同款容错契约
+# ---------------------------------------------------------------------------
+def read_somn_config(cfg: dict) -> dict:
+    """build_model 用：读 config.json 的 "somn" 开关与调优字段。
+
+    config.json 是配置的唯一事实源，Gargantua 不自己读文件。缺字段 →
+    {"enabled": False}（主干零开销、state_dict 逐字不变）；坏值只告警并
+    按关闭处理，绝不让单个模型目录报废。调优字段走 spec 白名单，避免
+    未知键打穿 attach_somn(**kwargs)。
+    """
+    v = cfg.get(spec.SOMN_CONFIG_KEY)
+    if v is None:
+        return spec.somn_default_config()
+    if isinstance(v, bool):
+        return {"enabled": v}
+    if not isinstance(v, dict):
+        _warn(f"config.json {spec.SOMN_CONFIG_KEY} 必须是对象或布尔值，"
+              "按关闭处理")
+        return spec.somn_default_config()
+    out = {"enabled": False}
+    try:
+        e = v.get("enabled", False)
+        if isinstance(e, bool):
+            out["enabled"] = e
+        elif isinstance(e, int) and e in (0, 1):
+            out["enabled"] = bool(e)
+        elif isinstance(e, str) and e.strip().lower() in ("true", "false"):
+            out["enabled"] = e.strip().lower() == "true"
+        else:
+            raise ValueError(f"somn.enabled 必须是布尔值: {e!r}")
+        for key in spec.SOMN_INT_FIELDS:
+            if key in v:
+                n = _ctx_int(v[key], f"somn.{key}")
+                if n < 0:
+                    raise ValueError(f"somn.{key} 必须 ≥ 0: {n}")
+                out[key] = n
+        for key in spec.SOMN_BOOL_FIELDS:
+            if key in v:
+                b = v[key]
+                if isinstance(b, bool):
+                    out[key] = b
+                elif isinstance(b, int) and b in (0, 1):
+                    out[key] = bool(b)
+                elif isinstance(b, str) and b.strip().lower() in ("true", "false"):
+                    out[key] = b.strip().lower() == "true"
+                else:
+                    raise ValueError(f"somn.{key} 必须是布尔值: {b!r}")
+        for key in spec.SOMN_FLOAT_FIELDS:
+            if key in v and v[key] is not None:
+                f = float(v[key])
+                if isinstance(v[key], bool) or not math.isfinite(f) or f < 0:
+                    raise ValueError(f"somn.{key} 必须是 ≥ 0 的有限数: {v[key]!r}")
+                out[key] = f
+        unknown = set(v) - set(spec.SOMN_CONFIG_FIELDS)
+        if unknown:
+            _warn(f"config.json somn 忽略未知字段: "
+                  f"{', '.join(sorted(unknown))}")
+    except (TypeError, ValueError) as e:
+        _warn(f"config.json {spec.SOMN_CONFIG_KEY} 非法，按关闭处理: {e}")
+        return spec.somn_default_config()
+    return out
+
+
 def normalize_shared_blocks(enc, dec, share: bool):
     """建模入口共用的 block 数归一化（server.py 与 init.py 都走这里）。
 
@@ -808,6 +872,10 @@ def build_model(model_dir: str):
                   vocab_size=model_vocab_size(model_dir),
                   share_enc_dec=share, d_model=read_d_model(cfg),
                   momw=read_momw_config(cfg),
+                  # 2026-11-14：config.json 的 "somn.enabled" 是 SOMN 的
+                  # 唯一开关；true 时 Gargantua.__init__ 显式 attach_somn，
+                  # 旧目录缺字段 = 关闭（state_dict 零新增 key）。
+                  somn=read_somn_config(cfg),
                   # 锚点用模型自己的词表副本编码类别代表文本（不依赖硬编码
                   # token ID；版本升级时全局 ID 位移也不影响）
                   vocab_dir=model_vocab_dir(model_dir),

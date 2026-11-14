@@ -2,7 +2,10 @@
 # GARGANTUA v1 — 模型核心
 # ---------------------------------------------------------------------------
 # 架构（冻结契约见 spec.py）：
-#   encoder-decoder，共享统一 KV 序列流，无 cross attention；
+#   encoder-decoder，共享统一 KV 序列流；MLA 的 Q 来自 decoder hidden、
+#   K/V 从共享 KV 流重建，即 **Q/KV 不同源**（有「共享 KV 读取」语义），
+#   但主干没有独立的 cross-attention 子层；旧注释那句绝对化表述与张量
+#   实况不符，已按 Q/KV 不同源的事实改写；
 #   block（2026-11-04）= KDA>FFN>KDA>FFN>KDA>FFN>MLA-CSA>FFN>
 #                        MLA-HCA>FFN>AttnRes（5 个独立 GLU-FFN）；
 #   AttnRes = Kimi Block AttnRes（每个子层前做深度注意力聚合）
@@ -340,6 +343,7 @@ class MLAAttention(nn.Module):
         v = self.w_uv(c).view(B, Tk, self.H, self.dh).transpose(1, 2)
 
         attn = torch.einsum('bhqd,bhkd->bhqk', q, k) / math.sqrt(self.dh)
+        valid = None
         if self.causal and kv_step_ids is not None and x_step_ids is not None:
             past = kv_step_ids.unsqueeze(1) < x_step_ids.unsqueeze(2)
             same = kv_step_ids.unsqueeze(1) == x_step_ids.unsqueeze(2)
@@ -348,9 +352,22 @@ class MLAAttention(nn.Module):
                 & (kv_pos.unsqueeze(1) <= x_pos.unsqueeze(2))
             mask = past | within                             # [B,Tq,Tk]
             attn = attn.masked_fill(~mask.unsqueeze(1), float('-inf'))
+            valid = mask.any(dim=-1)                         # [B,Tq]
         if self.diag_probe is not None:
             self.diag_probe(attn.detach())
-        out = torch.einsum('bhqk,bhkd->bhqd', attn.softmax(-1), v)
+        if valid is None:
+            probs = attn.softmax(-1)
+        else:
+            # 2026-11-14 审计修复（P0）：某 query 的所有可见位置都被遮蔽时，
+            # 该行全是 -inf，softmax 返回 NaN 并经 einsum 污染整个模型。
+            # 参照 server/manifold_diag.py:211-215 的 valid 掩码保护：先把
+            # 全遮蔽行的 -inf 换成 0（softmax 得有限值），再把概率整体置零
+            # → 输出恒为 0；两条分支都不含 NaN，反向梯度同样安全。
+            keep = valid.unsqueeze(1).unsqueeze(-1)          # [B,1,Tq,1]
+            p = torch.where(keep, attn,
+                            torch.zeros_like(attn)).softmax(-1)
+            probs = torch.where(keep, p, torch.zeros_like(p))
+        out = torch.einsum('bhqk,bhkd->bhqd', probs, v)
         out = out.transpose(1, 2).reshape(B, Tq, self.H * self.dh)
         return self.w_o(out)
 
@@ -882,7 +899,8 @@ def tie_module_parameters(dst: nn.Module, src: nn.Module) -> None:
 # Gargantua 主模型
 # ---------------------------------------------------------------------------
 # 输入流（spec 8）：分模态 embedding → encoder → 注入统一 KV（类型嵌入）
-# → decoder 读 KV（无 cross attention）→ 自回归输出 → 回写 KV。
+# → build_views 构造 HCA/CSA 视图 → decoder 读共享 KV（Q 来自 decoder
+# hidden、K/V 来自共享流，两者不同源）→ 自回归输出 → 回写 KV。
 # ===========================================================================
 class Gargantua(nn.Module):
     def __init__(self, n_enc_blocks: int | None = None,
@@ -895,6 +913,7 @@ class Gargantua(nn.Module):
                  share_enc_dec: bool = spec.SHARE_ENC_DEC,
                  d_model: int | None = None,
                  momw: dict | None = None,
+                 somn: dict | None = None,
                  vocab_dir: str | None = None):
         super().__init__()
         # 2026-11-04：模型宽度建模可选（缺省 = spec.D_MODEL，旧目录行为不变）
@@ -968,6 +987,17 @@ class Gargantua(nn.Module):
         # Block 实例仍保留自己的 is_decoder / MLA.causal / rec_state 语义。
         self.apply(self._init)
         self.retie_shared_weights()
+        # —— SOMN（v4-somn，可选，默认关闭，2026-11-14 主干接线）——
+        # config.json 的 "somn" 由 common.read_somn_config() 读入后传进来
+        # （Gargantua 不直接读文件）；enabled=true 时显式 attach_somn(self, D)。
+        # 管理器只落在普通字典 self._rt['somn']['module'] 里，不注册为子模块
+        # → state_dict / strict load 逐字不变，reset_memory() 统一复位其状态。
+        self.somn_config = dict(somn) if isinstance(somn, dict) else {}
+        if bool(self.somn_config.get("enabled", False)):
+            from somn import attach_somn
+            kwargs = {k: v for k, v in self.somn_config.items()
+                      if k != "enabled"}
+            attach_somn(self, D, **kwargs)
 
     def retie_shared_weights(self) -> None:
         """重建 enc/dec 参数绑定（任何可能替换 Parameter 的转换之后调用）。
@@ -1017,7 +1047,11 @@ class Gargantua(nn.Module):
         if self.momw is not None:
             self.momw.reset()
         somn_mgr = self._somn_module()
-        if somn_mgr is not None and not somn_mgr.persist_across_samples:
+        # 2026-11-14：SOMN 已由 __init__ 按 config 挂载到 _rt，不再是孤儿。
+        # somn.reset() 会清层池 S / stats / router 打分缓存 / 异步分裂队列；
+        # persist_across_samples=true 是显式实验开关，默认仍按样本边界复位。
+        if somn_mgr is not None and not getattr(
+                somn_mgr, "persist_across_samples", False):
             somn_mgr.reset()
 
     @staticmethod
@@ -1116,16 +1150,20 @@ class Gargantua(nn.Module):
         return self.dec_final_norm(x)
 
     def build_views(self, vecs: torch.Tensor, step_ids: torch.Tensor):
-        """ 从活张量构建 HCA/CSA 视图（训练路径，梯度不断）。
+        """ 从活张量构建 HCA/CSA 视图（梯度不断）。
         vecs: [1, N, D]，step_ids: [1, N]。
 
+        这是主干唯一在跑的视图构造：训练走 forward_train → build_views，
+        推理走 infer.generate → build_views。历史 SharedKV 类未接入主干，
+        两侧不存在第二套视图语义。
+
         2026-10-20 修复（审查结论）：
-        1. CSA 视图与推理路径 SharedKV.view("csa") 对齐（此前 n ≤ CTX_FULL
-           时 CSA 直接返回全量 n，而推理同长度只保留尾部 512，train/infer
-           不一致）。
+        1. CSA 视图训练/推理统一：此前 n ≤ CTX_FULL 时 CSA 直接返回全量
+           n，而同长度推理只保留尾部 512；现在两侧都由本方法计算，语义
+           一致。
         2. 压缩区按整步截断到 ctx_compress：此前 n > 4096 时压缩区
-           无界增长，压缩注意力 O((n-1024)²) 爆炸；现在与 SharedKV
-           的滑窗语义一致（超出部分按整步原子丢弃）。
+           无界增长，压缩注意力 O((n-1024)²) 爆炸；现在超出部分按整步
+           原子丢弃（train/infer 共用本方法，没有第二套滑窗语义）。
         2026-10-23：容量/比例全部读实例属性（建模时可配），默认即
         spec 常量。
         2026-10-25：删除 CSA 局部窗——CSA 的保留区就是完整 KV 区，
@@ -1137,11 +1175,11 @@ class Gargantua(nn.Module):
         full_n = min(n, self.ctx_full)
         full = vecs[:, n - full_n:]
         full_s = step_ids[:, n - full_n:]
-        # 完整区步内序号：与 SharedKV.view 同一语义（保留区内的 run 序）
+        # 完整区步内序号：保留区内的 run 序（由 build_views 统一计算）
         full_p = within_step_pos(full_s)
         comp, comp_s = self._cap_comp(vecs[:, :n - full_n],
                                       step_ids[:, :n - full_n])
-        # HCA：重压缩区 + 完整区（comp 为空时即全量，与 SharedKV 一致）
+        # HCA：重压缩区 + 完整区（comp 为空时即全量，train/infer 同语义）
         if comp.shape[1] > 0:
             hca_c = self._compress_live(comp, comp_s, self.hca_compressor)
             kv_hca = (torch.cat([hca_c[0], full], 1),

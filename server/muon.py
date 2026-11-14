@@ -128,11 +128,13 @@ def build_optimizers(model, optimizer: str = "muon",
       "adamw"    全部参数 AdamW；
       "muon"     参杂：隐藏层 2D 矩阵 Muon，embedding / lm_head / norm /
                  标量 / 卷积等其余参数 AdamW（历史默认分工）；
-      "allmuon"  全 Muon：把 **所有 2D 参数**（含 embedding / lm_head）
-                 都交给 Muon；只有 1D 参数仍走 AdamW——Muon 的核心是
-                 矩阵正交化，对向量参数没有意义，且 2e-2 的 lr 会把
-                 RMSNorm / bias 直接推爆。这是 Muon 的物理边界，不是
-                 「没做到全 Muon」。
+      "allmuon"  全 Muon：把 **所有满秩 2D 参数**（含 embedding /
+                 lm_head）都交给 Muon；1D 参数与 **min(shape) < 2 的
+                 退化 2D 矩阵**（如 [1,D] 的 attn_res_proj /
+                 mlp_res_proj）仍走 AdamW——Muon 的核心是矩阵正交化，
+                 对向量/秩 1 矩阵没有意义，且 2e-2 的 lr 叠加 RMS 对齐
+                 会把它们直接推爆。判据与 model._classify_param 一致，
+                 是 Muon 的物理边界，不是「没做到全 Muon」。
 
     manifold（阶段 2，Manifold Muon）：
       可选配置 dict；None 时回退 getattr(model, "manifold_config", None)。
@@ -206,9 +208,16 @@ def build_optimizers(model, optimizer: str = "muon",
             exact_msign=cfg.get("exact_msign", False))
 
     if optimizer == "allmuon":
-        matrices = [p for p in groups["muon"] + groups["adamw"]
-                    if p.ndim == 2]
-        vectors = [p for p in groups["adamw"] if p.ndim != 2]
+        # 2026-11-14 审计修复（P0）：原实现只按 p.ndim == 2 从两组里捞
+        # 矩阵，绕过了 model._classify_param 的形状兜底，把 4 个 [1,D]
+        # 秩 1 投影（attn_res_proj / mlp_res_proj）塞进 Newton-Schulz。
+        # 这里补上 min(shape) >= 2 判据，并用 id 做一次完整划分，保证
+        # 每个可训练参数恰好落进 Muon 或 AdamW 之一（不重不漏）。
+        all_params = groups["muon"] + groups["adamw"]
+        matrices = [p for p in all_params
+                    if p.ndim == 2 and min(p.shape) >= 2]
+        matrix_ids = {id(p) for p in matrices}
+        vectors = [p for p in all_params if id(p) not in matrix_ids]
         matrices, mm_groups = _split(matrices)
         if mm_groups is not None:
             opts.append(_make_manifold(mm_groups))

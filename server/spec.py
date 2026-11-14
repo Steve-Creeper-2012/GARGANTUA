@@ -1448,6 +1448,32 @@ CLIP_FOLDER_DEFAULT_BATCH = 16
 CLIP_FOLDER_TEMPERATURE = 0.07
 
 # ---------------------------------------------------------------------------
+# 6c. SOMN（v4-somn，可选，默认关闭）——2026-11-14 主干接线
+# ---------------------------------------------------------------------------
+# config.json 的 "somn" 是唯一开关：enabled=true 时 common.build_model 把
+# 配置传给 Gargantua.__init__，由它显式 attach_somn()。缺字段 / 坏值一律
+# 按关闭处理；管理器只落在普通 dict 里，不新增 state_dict key。
+SOMN_CONFIG_KEY = "somn"
+SOMN_ENABLED_DEFAULT = False
+# 允许透传给 somn.attach_somn(**kwargs) 的调优字段（白名单，唯一真源）。
+SOMN_CONFIG_FIELDS = (
+    "enabled", "max_write_count", "max_layers", "warmup_steps",
+    "warmup_bonus", "persist_across_samples", "eta", "lam",
+    "elbow_alpha", "min_score", "min_energy", "explore_every",
+    "async_split", "expand_growth_threshold",
+)
+SOMN_INT_FIELDS = ("max_write_count", "max_layers", "warmup_steps",
+                   "explore_every")
+SOMN_BOOL_FIELDS = ("persist_across_samples", "async_split")
+SOMN_FLOAT_FIELDS = ("warmup_bonus", "eta", "lam", "elbow_alpha",
+                     "min_score", "min_energy", "expand_growth_threshold")
+
+
+def somn_default_config() -> dict:
+    """SOMN 默认配置：只带开关，其余调优参数由 server/somn.py 自带默认。"""
+    return {"enabled": SOMN_ENABLED_DEFAULT}
+
+# ---------------------------------------------------------------------------
 # 7. 运行环境
 # ---------------------------------------------------------------------------
 # Python 3.12 系列最新版（standalone，项目内隔离安装；steve 2026-10-24：

@@ -329,5 +329,100 @@ class TestMultimodalAssemble(unittest.TestCase):
         self.assertIsNotNone(m.visual_proj.weight.grad)
 
 
+class TestAuditFixes20261114(unittest.TestCase):
+    """2026-11-14 第三方盲审的 P0/P2 修复回归（每条可单独运行）。"""
+
+    def test_allmuon_excludes_rank1_2d_projections(self):
+        """P0-1：allmuon 档不得把 4 个 [1,1024] 秩 1 投影送进 Muon。"""
+        import muon
+        # 与审计报告同一口径：1+1 blocks / d_model=1024 → 恰好 4 个 [1,1024]
+        m = model.Gargantua(n_enc_blocks=1, n_dec_blocks=1,
+                            d_model=spec.D_MODEL, vocab_size=256)
+        rank1 = [(n, p) for n, p in m.named_parameters()
+                 if p.ndim == 2 and min(p.shape) == 1]
+        self.assertEqual(len(rank1), 4, [n for n, _ in rank1])
+        self.assertTrue(all(tuple(p.shape) == (1, spec.D_MODEL)
+                            for _, p in rank1))
+        opts = muon.build_optimizers(m, "allmuon")
+        muon_ids, adamw_ids = set(), set()
+        for opt in opts:
+            ids = {id(p) for g in opt.param_groups for p in g["params"]}
+            if isinstance(opt, muon.Muon):
+                muon_ids |= ids
+            elif isinstance(opt, torch.optim.AdamW):
+                adamw_ids |= ids
+        for n, p in rank1:
+            self.assertNotIn(id(p), muon_ids, n)
+            self.assertIn(id(p), adamw_ids, n)
+        self.assertFalse(muon_ids & adamw_ids, "Muon / AdamW 组有重叠")
+        self.assertEqual(muon_ids | adamw_ids,
+                         {id(p) for p in m.parameters() if p.requires_grad},
+                         "allmuon 分组必须不重不漏")
+        del m
+
+    def test_causal_mla_fully_masked_row_is_zero_not_nan(self):
+        """P0-2：因果掩码全遮蔽行必须输出 0，不能是 NaN。"""
+        torch.manual_seed(0)
+        mla = model.MLAAttention(d_model=32, n_head=2, head_dim=8,
+                                 causal=True)
+        x = torch.randn(1, 2, 32, requires_grad=True)
+        kv = torch.randn(1, 3, 32)
+        # kv 全在未来 step、且都是 pos=-1 的聚合条目 → 两行全遮蔽
+        x_steps = torch.zeros(1, 2, dtype=torch.long)
+        kv_steps = torch.ones(1, 3, dtype=torch.long)
+        x_pos = torch.tensor([[0, 1]])
+        kv_pos = torch.full((1, 3), -1, dtype=torch.long)
+        out = mla(x, kv, kv_steps, x_steps, kv_pos, x_pos)
+        self.assertTrue(torch.isfinite(out).all(), "全遮蔽行出现 NaN/Inf")
+        self.assertTrue(torch.equal(out, torch.zeros_like(out)),
+                        "全遮蔽行应输出 0")
+        out.sum().backward()
+        self.assertTrue(torch.isfinite(x.grad).all(),
+                        "全遮蔽行的反向梯度出现 NaN/Inf")
+
+    def test_causal_mla_partial_mask_keeps_valid_rows(self):
+        """全遮蔽行置零时，正常可见行的计算与梯度不受影响。"""
+        torch.manual_seed(0)
+        mla = model.MLAAttention(d_model=32, n_head=2, head_dim=8,
+                                 causal=True)
+        x = torch.randn(1, 2, 32, requires_grad=True)
+        kv = torch.randn(1, 3, 32)
+        x_steps = torch.tensor([[0, 1]])
+        kv_steps = torch.ones(1, 3, dtype=torch.long)
+        x_pos = torch.tensor([[0, 0]])
+        kv_pos = torch.zeros(1, 3, dtype=torch.long)
+        # 第 0 行：step 0 的查询看不到 step 1 的 kv → 全遮蔽
+        # 第 1 行：同 step 且 kv_pos <= x_pos → 3 个 kv 全部可见
+        out = mla(x, kv, kv_steps, x_steps, kv_pos, x_pos)
+        self.assertTrue(torch.isfinite(out).all())
+        self.assertTrue(torch.equal(out[:, :1], torch.zeros_like(out[:, :1])))
+        ref = mla(x[:, 1:2], kv, kv_steps, x_steps[:, 1:2],
+                  kv_pos, x_pos[:, 1:2])
+        self.assertTrue(torch.allclose(out[:, 1:2], ref, atol=1e-6),
+                        "正常行的输出被保护逻辑改动了")
+        out.sum().backward()
+        self.assertTrue(torch.isfinite(x.grad).all())
+
+    def test_ffmpeg_cache_is_bounded(self):
+        """P2：ffmpeg 探测缓存必须有 maxlen，不能只增不减。"""
+        from collections import deque
+        import server_media
+        cache = server_media._FFMPEG_CACHE
+        self.assertIsInstance(cache, deque)
+        self.assertIsNotNone(cache.maxlen)
+        self.assertEqual(cache.maxlen, server_media._FFMPEG_CACHE_MAXLEN)
+        saved = list(cache)
+        try:
+            for i in range(200):
+                cache.append(f"/fake/ffmpeg/{i}")
+            self.assertLessEqual(len(cache),
+                                 server_media._FFMPEG_CACHE_MAXLEN)
+            self.assertTrue(cache)                 # 命中路径仍可读
+            self.assertIsInstance(cache[0], str)
+        finally:
+            cache.clear()
+            cache.extend(saved)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -493,6 +493,77 @@ class TestModelIntegration(unittest.TestCase):
         self.assertIsNone(mgr.layers[0].S)
         self.assertEqual(len(mgr.layers), 1)
 
+    # ---- 2026-11-14 第三方盲审 P0-1：主干接线（原来 _somn_module() 恒 None）----
+    def test_config_enabled_attaches_somn_and_runs_forward(self):
+        """config 开关 → 主干自动挂载 → 完整训练前向 → 复位清空。"""
+        import model as model_mod
+        m = model_mod.Gargantua(
+            n_enc_blocks=1, n_dec_blocks=1, d_model=128, vocab_size=256,
+            somn={"enabled": True, "warmup_steps": 0,
+                  "max_write_count": 10 ** 6},
+        )
+        mgr = m._somn_module()
+        self.assertIsNotNone(mgr, "config somn.enabled=true 必须挂上 SOMN")
+        self.assertEqual(mgr.dim, m.d_model)
+        self.assertTrue(m.somn_config["enabled"])
+        self.assertFalse(any("somn" in k for k in m.state_dict().keys()),
+                         "挂载不得新增 state_dict key")
+        torch.manual_seed(0)
+        ids_in = torch.randint(0, 256, (1, 6))
+        steps_in = torch.arange(6).unsqueeze(0)
+        ids_t = torch.randint(0, 256, (1, 4))
+        steps_t = torch.arange(6, 10).unsqueeze(0)
+        logits = m.forward_train(ids_in, steps_in, ids_t, steps_t)
+        self.assertEqual(logits.shape, (1, 4, m.n_vocab))
+        self.assertTrue(torch.isfinite(logits).all())
+        self.assertGreater(mgr.layers[0].write_count, 0,
+                           "主干 encode/decode 必须真的调用到 SOMN")
+        m.reset_memory()
+        self.assertIsNone(mgr.layers[0].S)
+        self.assertEqual(len(mgr.layers), 1)
+        self.assertEqual(mgr.stats()["steps"], 0)
+
+    def test_read_somn_config_defaults_and_bad_values(self):
+        """缺字段 / 坏值按关闭处理，不让单个模型目录报废。"""
+        import common
+        self.assertEqual(common.read_somn_config({}), {"enabled": False})
+        self.assertTrue(common.read_somn_config(
+            {"somn": {"enabled": True}})["enabled"])
+        self.assertTrue(common.read_somn_config({"somn": True})["enabled"])
+        self.assertFalse(common.read_somn_config(
+            {"somn": {"enabled": "oops"}})["enabled"])
+        self.assertFalse(common.read_somn_config(
+            {"somn": {"enabled": True, "eta": float("inf")}})["enabled"])
+
+    def test_build_model_reads_somn_enabled_from_config(self):
+        """端到端：build_model 从 config.json 的 somn 字段挂载。
+
+        用只读配置替身，不落盘、不删目录（宿主 safe-delete 守卫会拦
+        rmdir）；其余构建链（strict load 入口 / 精度 / 上下文）全部真跑。
+        """
+        from unittest import mock
+        import common
+        cfg = {"n_enc_blocks": 1, "n_dec_blocks": 1,
+               "d_model": 128, "vocab_size": 256,
+               "somn": {"enabled": True}}
+        with mock.patch.object(common, "read_config", return_value=cfg), \
+             mock.patch.object(common, "model_vocab_size", return_value=256), \
+             mock.patch.object(common, "load_model_state_dict",
+                               return_value={}):
+            m = common.build_model("/somn/config/only")
+        mgr = m._somn_module()
+        self.assertIsNotNone(mgr)
+        self.assertEqual(mgr.dim, m.d_model)
+        self.assertFalse(any("somn" in k for k in m.state_dict().keys()))
+        # 同一个构建入口、配置里关掉开关 → 主干零挂载
+        cfg_off = dict(cfg, somn={"enabled": False})
+        with mock.patch.object(common, "read_config", return_value=cfg_off), \
+             mock.patch.object(common, "model_vocab_size", return_value=256), \
+             mock.patch.object(common, "load_model_state_dict",
+                               return_value={}):
+            m_off = common.build_model("/somn/config/only")
+        self.assertIsNone(m_off._somn_module())
+
 
 def run_growth_demo():
     """100 条混合数据的层数增长 + 三项验收指标。"""

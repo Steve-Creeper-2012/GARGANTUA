@@ -12,6 +12,7 @@
 # server.py re-export 这些符号，老 import 路径保持可用。
 # ===========================================================================
 import base64
+from collections import deque
 import glob
 import os
 import subprocess
@@ -65,7 +66,11 @@ def _bytes_io(b64):
     return io.BytesIO(base64.b64decode(b64))
 
 
-_FFMPEG_CACHE = []
+# 2026-11-14 审计修复（P2）：原先是无界 list，只 append、无淘汰，长跑
+# 进程里探测路径会缓慢累积。改成有界 deque，maxlen 由容器自身保证；
+# 命中时仍只读首个已通过 -version 冒烟测试的路径。
+_FFMPEG_CACHE_MAXLEN = 8
+_FFMPEG_CACHE = deque(maxlen=_FFMPEG_CACHE_MAXLEN)
 
 
 def find_ffmpeg():
