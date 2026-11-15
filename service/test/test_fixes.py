@@ -297,8 +297,10 @@ class TestCompressionCausality(unittest.TestCase):
         self.assertEqual(kv_hca[0].shape[1], n)
 
     def test_build_views_equiv_sharedkv_long(self):
-        """ 与推理路径 SharedKV 在 n=1100 时逐字节一致（审查探针 [8]）。
-        注意：两侧必须使用【相同 step 结构】（本测试 1 token/step）。 """
+        """ build_views 与历史 SharedKV 参考实现在 n=1100 时的形状对照
+        （审查探针 [8]）。注意：SharedKV 类不在主干链上，这里只把它当作
+        旧契约的对照物，**不表示训练/推理会走它**；两侧必须使用【相同
+        step 结构】（本测试 1 token/step）。 """
         torch.manual_seed(5)
         n = 1100
         vecs = torch.randn(1, n, spec.D_MODEL)

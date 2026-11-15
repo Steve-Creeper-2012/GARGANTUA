@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -997,7 +998,20 @@ class Gargantua(nn.Module):
             from somn import attach_somn
             kwargs = {k: v for k, v in self.somn_config.items()
                       if k != "enabled"}
-            attach_somn(self, D, **kwargs)
+            try:
+                attach_somn(self, D, **kwargs)
+            except Exception as e:
+                # 2026-11-14 复核修复：SOMN 内部还有自己的配置断言，
+                # read_somn_config 不可能覆盖全部。任何挂载失败都必须
+                # 降级为「关闭」而不是让 build_model / 模型目录报废：
+                # 清掉可能写了一半的 _rt['somn']，告警，模型照常加载。
+                rt = getattr(self, "_rt", None)
+                if isinstance(rt, dict):
+                    rt.pop("somn", None)
+                self.somn_config["enabled"] = False
+                warnings.warn(
+                    f"SOMN 挂载失败，已降级为关闭（模型照常加载）: {e}",
+                    RuntimeWarning, stacklevel=2)
 
     def retie_shared_weights(self) -> None:
         """重建 enc/dec 参数绑定（任何可能替换 Parameter 的转换之后调用）。

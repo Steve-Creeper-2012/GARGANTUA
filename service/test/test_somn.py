@@ -564,6 +564,66 @@ class TestModelIntegration(unittest.TestCase):
             m_off = common.build_model("/somn/config/only")
         self.assertIsNone(m_off._somn_module())
 
+    # ---- 2026-11-14 复核回归：坏 config 不得让模型目录报废 ----
+    def test_somn_float_fields_respect_internal_assertions(self):
+        """read_somn_config 必须在配置层就拦住 SOMN 内部断言与 eta 上界。"""
+        import common
+        import spec
+        base = {"enabled": True}
+        bad_values = (("elbow_alpha", 0.0), ("elbow_alpha", 2.0),
+                      ("lam", 1.5), ("eta", 0.01), ("min_score", 3.0))
+        for key, bad in bad_values:
+            cfg = {"d_model": 128,
+                   spec.SOMN_CONFIG_KEY: dict(base, **{key: bad})}
+            out = common.read_somn_config(cfg)
+            self.assertFalse(out["enabled"], f"{key}={bad} 未被配置层拦截")
+        # 安全范围内仍可透传（D=128 → eta 上界 0.005）
+        ok = common.read_somn_config(
+            {"d_model": 128, spec.SOMN_CONFIG_KEY:
+             {"enabled": True, "elbow_alpha": 0.6, "lam": 0.99,
+              "eta": 0.004}})
+        self.assertTrue(ok["enabled"])
+        self.assertAlmostEqual(ok["eta"], 0.004)
+
+    def test_build_model_bad_elbow_alpha_degrades_to_disabled(self):
+        """端到端：elbow_alpha=2.0 时 build_model 不抛异常、SOMN 降级关闭。"""
+        from unittest import mock
+        import common
+        cfg = {"n_enc_blocks": 1, "n_dec_blocks": 1,
+               "d_model": 128, "vocab_size": 256,
+               "somn": {"enabled": True, "elbow_alpha": 2.0}}
+        with mock.patch.object(common, "read_config", return_value=cfg), \
+             mock.patch.object(common, "model_vocab_size", return_value=256), \
+             mock.patch.object(common, "load_model_state_dict",
+                               return_value={}):
+            m = common.build_model("/somn/bad/config")
+        self.assertIsNone(m._somn_module())
+        self.assertFalse(m.somn_config["enabled"])
+        self.assertEqual(m.d_model, 128)                # 模型本体照常构造
+        self.assertFalse(any("somn" in k for k in m.state_dict().keys()))
+
+    def test_attach_failure_degrades_to_disabled(self):
+        """SOMN 内部断言失败 → 清掉半挂载状态 + 告警 + 降级关闭。"""
+        import warnings
+        from unittest import mock
+        import model as model_mod
+
+        def _half_mount_then_fail(root, dim, **kwargs):
+            root._rt = {"somn": {"module": object()}}   # 模拟写了一半再抛
+            raise ValueError("boom")
+
+        with mock.patch.object(somn, "attach_somn",
+                               side_effect=_half_mount_then_fail), \
+             warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            m = model_mod.Gargantua(
+                n_enc_blocks=1, n_dec_blocks=1, d_model=128,
+                vocab_size=256, somn={"enabled": True})
+        self.assertIsNone(m._somn_module(), "半挂载状态必须被清掉")
+        self.assertFalse(m.somn_config["enabled"])
+        self.assertTrue(any("SOMN 挂载失败" in str(w.message)
+                            for w in caught))
+
 
 def run_growth_demo():
     """100 条混合数据的层数增长 + 三项验收指标。"""

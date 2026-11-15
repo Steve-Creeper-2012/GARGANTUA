@@ -806,11 +806,28 @@ def read_somn_config(cfg: dict) -> dict:
                     out[key] = b.strip().lower() == "true"
                 else:
                     raise ValueError(f"somn.{key} 必须是布尔值: {b!r}")
+        # 2026-11-14 复核修复：SOMN 内部还有自己的硬断言（EnergyElbowRouter
+        # 的 elbow_alpha ∈ (0,1]、IndependentFWLayer 的 lam ∈ [0,1]），以及
+        # eta·λ_max(C)<2 的稳定性上界 0.01*64/D。这些必须在这里就拦下，
+        # 否则坏 config 会在 Gargantua.__init__ 的 attach_somn 抛 ValueError，
+        # 直接把整个模型目录打崩（违背「坏值按关闭处理」的容错契约）。
+        safe_eta = 0.01 * (64.0 / float(read_d_model(cfg)))
         for key in spec.SOMN_FLOAT_FIELDS:
             if key in v and v[key] is not None:
                 f = float(v[key])
                 if isinstance(v[key], bool) or not math.isfinite(f) or f < 0:
                     raise ValueError(f"somn.{key} 必须是 ≥ 0 的有限数: {v[key]!r}")
+                if key == "elbow_alpha" and not (0.0 < f <= 1.0):
+                    raise ValueError(f"somn.elbow_alpha 须在 (0,1]: {f}")
+                if key == "lam" and f > 1.0:
+                    raise ValueError(f"somn.lam 须在 [0,1]: {f}")
+                if key == "eta" and not (0.0 < f <= safe_eta):
+                    raise ValueError(
+                        f"somn.eta 须在 (0,{safe_eta:g}]（0.01*64/d_model "
+                        f"稳定性上界）: {f}")
+                if key in ("min_score", "min_energy") and f > 1.0:
+                    raise ValueError(
+                        f"somn.{key} 须 ≤ 1（路由打分 ∈ [-1,1]）: {f}")
                 out[key] = f
         unknown = set(v) - set(spec.SOMN_CONFIG_FIELDS)
         if unknown:
